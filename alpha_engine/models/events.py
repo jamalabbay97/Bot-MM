@@ -1,0 +1,119 @@
+"""
+alpha_engine.models.events — Pipeline Event Schemas
+===================================================
+Multi-Chain Paper Trading & Alpha Analytics Engine
+Python 3.11+ | Pydantic v2
+"""
+
+from __future__ import annotations
+
+import uuid
+from decimal import Decimal
+from typing import Annotated, Optional
+
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    field_validator,
+    model_validator,
+)
+
+from alpha_engine.models.base import _STRICT_MODEL_CFG
+from alpha_engine.models.enums import ChainIdentifier, OrderSide, SignalStrength
+from alpha_engine.models.state import PoolState, SecurityReport
+
+
+class SwapEvent(BaseModel):
+    """
+    Represents a single DEX swap captured from a chain's event stream.
+
+    Fields
+    ------
+    timestamp_ns    : Wall-clock nanoseconds at ingestion time (not block time).
+    block_number    : Confirmed block / slot number.
+    chain           : Which network this swap originated from.
+    pool_address    : The liquidity pool contract / account address.
+    token_in        : Address (EVM hex or SVM base58) of the sold token.
+    token_out       : Address of the bought token.
+    amount_in       : Decimal-normalised token units sent into the pool (pre-fee).
+    amount_out      : Decimal-normalised token units received from the pool (post-fee).
+    sender          : Initiating wallet address.
+    tx_hash         : Transaction hash (hex string for EVM; base58 sig for SVM).
+    log_index       : EVM log index within the block (None for Solana).
+    """
+
+    model_config = _STRICT_MODEL_CFG
+
+    timestamp_ns: Annotated[int, Field(gt=0, description="Wall-clock ns at ingestion")]
+    block_number: Annotated[int, Field(ge=0)]
+    chain: ChainIdentifier
+    pool_address: Annotated[str, Field(min_length=32, max_length=66)]
+    token_in: Annotated[str, Field(min_length=32, max_length=66)]
+    token_out: Annotated[str, Field(min_length=32, max_length=66)]
+    amount_in: Decimal
+    amount_out: Decimal
+    sender: Annotated[str, Field(min_length=32, max_length=66)]
+    tx_hash: Annotated[str, Field(min_length=32, max_length=90)]
+    log_index: Optional[int] = None  # EVM only
+
+    @field_validator("amount_in", "amount_out", mode="before")
+    @classmethod
+    def coerce_to_decimal(cls, v: object) -> Decimal:
+        """Accept int / float / str and coerce; reject negatives."""
+        d = Decimal(str(v))
+        if d < 0:
+            raise ValueError("Swap amounts must be non-negative.")
+        return d
+
+    @model_validator(mode="after")
+    def token_addresses_differ(self) -> "SwapEvent":
+        if self.token_in == self.token_out:
+            raise ValueError("token_in and token_out must be distinct addresses.")
+        return self
+
+
+class SignalEvent(BaseModel):
+    """
+    A trading signal generated after ingestion filtering and security gating.
+    Passed via asyncio.Queue to the execution engine.
+    """
+
+    model_config = _STRICT_MODEL_CFG
+
+    signal_id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    timestamp_ns: Annotated[int, Field(gt=0)]
+    chain: ChainIdentifier
+    pool_address: Annotated[str, Field(min_length=32, max_length=66)]
+    token_address: Annotated[str, Field(min_length=32, max_length=66)]
+    suggested_side: OrderSide
+    trigger_swap: SwapEvent
+    pool_state: PoolState
+    security_report: SecurityReport
+    strength: SignalStrength
+    alpha_score: Annotated[float, Field(ge=0.0, le=1.0)]
+
+
+class PoolStateUpdateEvent(BaseModel):
+    """
+    Emitted by the EVM ingester when a Uniswap v2 / Aerodrome `Sync` log
+    is decoded. Carries a freshly normalised PoolState so the engine's
+    PoolRegistry never operates on stale liquidity.
+    """
+
+    model_config = _STRICT_MODEL_CFG
+
+    timestamp_ns: Annotated[int, Field(gt=0)]
+    chain: ChainIdentifier
+    pool_address: Annotated[str, Field(min_length=32, max_length=66)]
+    new_pool_state: PoolState
+
+
+class ShutdownSentinel(BaseModel):
+    """
+    Enqueued into every asyncio.Queue to signal consumers to drain and exit.
+    Identified by its type; no fields required.
+    """
+
+    model_config = ConfigDict(frozen=True)
+    reason: str = "graceful_shutdown"
