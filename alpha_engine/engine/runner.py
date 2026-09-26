@@ -1,8 +1,8 @@
 """
-alpha_engine.engine.runner — Async Main Loop & System Orchestrator
-==================================================================
-Multi-Chain Paper Trading & Alpha Analytics Engine
-Python 3.11+ | asyncio
+alpha_engine.engine.runner — Async Main Loop, 24/7 Supervisor & System Orchestrator
+===================================================================================
+Multi-Chain Paper Trading & Alpha Analytics Engine (Bot-MM)
+Python 3.11+ | asyncio | 24/7 Self-Healing Supervisor | Zero-Leak Production Grade
 """
 
 from __future__ import annotations
@@ -10,10 +10,19 @@ from __future__ import annotations
 import asyncio
 import logging
 import signal
+import sys
 import time
 from decimal import Decimal
+from typing import Optional
 
 import aiohttp
+
+try:
+    import psutil
+    PSUTIL_AVAILABLE = True
+except ImportError:  # pragma: no cover
+    psutil = None
+    PSUTIL_AVAILABLE = False
 
 from alpha_engine.config import EngineConfig
 from alpha_engine.engine.registry import PoolRegistry
@@ -22,9 +31,16 @@ from alpha_engine.execution.book import PositionBook, RunningMetrics
 from alpha_engine.execution.executor import PaperExecutor
 from alpha_engine.execution.ledger import SQLiteLedger
 from alpha_engine.ingestion.coordinator import IngestionCoordinator
-from alpha_engine.models.enums import ChainIdentifier, OrderSide
+from alpha_engine.logging_config import setup_production_logging
+from alpha_engine.models.enums import (
+    ChainIdentifier,
+    OrderSide,
+    SignalSource,
+    SignalStrength,
+)
 from alpha_engine.models.events import (
     PoolStateUpdateEvent,
+    RawSignalEvent,
     ShutdownSentinel,
     SignalEvent,
     SwapEvent,
@@ -39,12 +55,13 @@ logger = logging.getLogger(__name__)
 class PaperTradingEngine:
     """
     Top-level engine that wires all subsystems together and runs the
-    async event loop.
+    async event loop under an autonomous self-healing supervisor.
     """
 
     def __init__(self, config: EngineConfig) -> None:
         self._cfg = config
         self._shutdown_event = asyncio.Event()
+        self._start_time = time.time()
 
         self._limiter = RateLimiterRegistry.default()
         self._pool_registry = PoolRegistry()
@@ -56,11 +73,12 @@ class PaperTradingEngine:
         self._sol_price = config.sol_price_usd
         self._eth_price = config.eth_price_usd
 
+        max_q = getattr(config, "max_queue_size", 100)
         self._ingestion_q: asyncio.Queue[
-            SwapEvent | PoolStateUpdateEvent | ShutdownSentinel
-        ] = asyncio.Queue(maxsize=512)
+            SwapEvent | PoolStateUpdateEvent | RawSignalEvent | ShutdownSentinel
+        ] = asyncio.Queue(maxsize=max_q)
         self._signal_q: asyncio.Queue[SignalEvent | ShutdownSentinel] = (
-            asyncio.Queue(maxsize=256)
+            asyncio.Queue(maxsize=max_q)
         )
 
         self._signal_gen = SignalGenerator(hold_seconds=300.0)
@@ -71,19 +89,44 @@ class PaperTradingEngine:
 
         self._trades_since_kelly_refresh = 0
         self._kelly_refresh_interval = 10
+        self._signal_handlers_installed = False
 
     def _install_signal_handlers(self) -> None:
-        loop = asyncio.get_running_loop()
+        """
+        Registers asynchronous handlers for SIGINT and SIGTERM to initiate
+        a clean, graceful shutdown sequence.
+        """
+        if self._signal_handlers_installed:
+            return
 
-        def _on_signal(sig: signal.Signals) -> None:
-            logger.info("Received %s — initiating graceful shutdown.", sig.name)
+        def _on_signal(sig_name: str) -> None:
+            logger.info("Received %s — initiating graceful system teardown.", sig_name)
             self._shutdown_event.set()
 
-        for sig in (signal.SIGINT, signal.SIGTERM):
-            try:
-                loop.add_signal_handler(sig, _on_signal, sig)
-            except (NotImplementedError, RuntimeError):
-                pass  # May fail on non-main thread or unsupported platforms
+        try:
+            loop = asyncio.get_running_loop()
+            for sig in (signal.SIGINT, signal.SIGTERM):
+                try:
+                    loop.add_signal_handler(sig, _on_signal, sig.name)
+                except (NotImplementedError, RuntimeError):
+                    # Fallback for Windows or non-main thread environments
+                    signal.signal(
+                        sig,
+                        lambda s, _: _on_signal(signal.Signals(s).name),
+                    )
+            self._signal_handlers_installed = True
+            logger.debug("Signal handlers registered for SIGINT and SIGTERM.")
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Could not register async signal handlers: %s", exc)
+
+    def _reset_queues(self) -> None:
+        """
+        Safely clears and reinitializes runtime queues between restart cycles.
+        """
+        max_q = getattr(self._cfg, "max_queue_size", 100)
+        self._ingestion_q = asyncio.Queue(maxsize=max_q)
+        self._signal_q = asyncio.Queue(maxsize=max_q)
+        logger.debug("Runtime queues reinitialized (capacity=%d).", max_q)
 
     def _current_equity_usd(self) -> Decimal:
         cash_usd = (
@@ -101,7 +144,7 @@ class PaperTradingEngine:
             item = await self._ingestion_q.get()
 
             if isinstance(item, ShutdownSentinel):
-                logger.info("Ingestion processor received shutdown sentinel.")
+                logger.info("Ingestion processor received shutdown sentinel. Forwarding to signal queue.")
                 await self._signal_q.put(ShutdownSentinel())
                 return
 
@@ -111,6 +154,62 @@ class PaperTradingEngine:
                     "Pool registry refreshed from Sync: pool=%s native=%s",
                     item.pool_address[:10],
                     item.new_pool_state.native_reserve,
+                )
+                continue
+
+            if isinstance(item, RawSignalEvent):
+                raw_sig: RawSignalEvent = item
+                try:
+                    report = await gk.screen_token(
+                        token_address=raw_sig.token_address,
+                        chain=raw_sig.chain,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    logger.error(
+                        "Security gatekeeper raised for raw signal %s: %s",
+                        raw_sig.token_address[:10],
+                        exc,
+                    )
+                    continue
+
+                if not report.passes_hard_gates:
+                    logger.info(
+                        "Raw signal token %s rejected by gatekeeper (tier=%s).",
+                        raw_sig.token_address[:10],
+                        report.tier.value,
+                    )
+                    continue
+
+                pool = self._pool_registry.get(raw_sig.token_address)
+                if pool is None:
+                    logger.debug(
+                        "Token %s from Telegram feed passed security; awaiting liquidity pool seeding.",
+                        raw_sig.token_address[:10],
+                    )
+                    continue
+
+                signal_event = SignalEvent(
+                    timestamp_ns=raw_sig.timestamp_ns,
+                    chain=raw_sig.chain,
+                    pool_address=pool.pool_address,
+                    token_address=raw_sig.token_address,
+                    suggested_side=OrderSide.BUY,
+                    pool_state=pool,
+                    security_report=report,
+                    strength=SignalStrength.STRONG,
+                    alpha_score=0.85,
+                    source=SignalSource.TELEGRAM_SCRAPER,
+                )
+                if self._ledger:
+                    await self._ledger.record_signal(signal_event)
+
+                await self._signal_q.put(signal_event)
+                logger.info(
+                    "Telegram Signal [%s] queued: %s (channel: %s, sybil_count=%d)",
+                    signal_event.signal_id[:8],
+                    raw_sig.token_address[:10],
+                    raw_sig.originating_channel,
+                    raw_sig.sybil_channel_count,
                 )
                 continue
 
@@ -174,7 +273,7 @@ class PaperTradingEngine:
             item = await self._signal_q.get()
 
             if isinstance(item, ShutdownSentinel):
-                logger.info("Signal processor received shutdown sentinel.")
+                logger.info("Signal processor received shutdown sentinel. Terminating queue.")
                 return
 
             signal_item: SignalEvent = item
@@ -246,6 +345,7 @@ class PaperTradingEngine:
                     self._shutdown_event.wait(),
                     timeout=self._cfg.snapshot_interval_s,
                 )
+                break
             except asyncio.TimeoutError:
                 pass
 
@@ -272,6 +372,65 @@ class PaperTradingEngine:
                 self._metrics.win_rate_pct,
             )
 
+    async def _heartbeat_task(self) -> None:
+        """
+        Telemetry Watchdog: Emits periodic system health metrics every 60 seconds
+        (CPU %, memory RSS MB, queue depths, open positions, uptime).
+        """
+        while not self._shutdown_event.is_set():
+            try:
+                await asyncio.wait_for(
+                    self._shutdown_event.wait(),
+                    timeout=self._cfg.snapshot_interval_s,
+                )
+                break
+            except asyncio.TimeoutError:
+                pass
+
+            uptime_s = time.time() - self._start_time
+            hrs, rem = divmod(int(uptime_s), 3600)
+            mins, secs = divmod(rem, 60)
+            uptime_str = f"{hrs:02d}h {mins:02d}m {secs:02d}s"
+
+            rss_mb = 0.0
+            cpu_pct = 0.0
+            if PSUTIL_AVAILABLE and psutil is not None:
+                try:
+                    proc = psutil.Process()
+                    rss_mb = proc.memory_info().rss / (1024 * 1024)
+                    cpu_pct = proc.cpu_percent(interval=None)
+                except Exception as exc:  # noqa: BLE001
+                    logger.debug("Telemetry read error (psutil): %s", exc)
+            else:
+                try:
+                    import resource
+                    # ru_maxrss is KiB on Linux
+                    rss_mb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024.0
+                except Exception:
+                    pass
+
+            open_positions = self._position_book.open_position_count()
+            equity = self._current_equity_usd()
+            realized_pnl = self._metrics.cumulative_realized_usd
+
+            logger.info(
+                "HEARTBEAT | Uptime: %s | CPU: %.1f%% | RSS: %.1fMB | "
+                "Queues: [Ingest: %d/%d, Signal: %d/%d] | Open Lots: %d | "
+                "Trades: %d | Equity: $%.2f | Realized PnL: $%.2f | MDD: %.2f%%",
+                uptime_str,
+                cpu_pct,
+                rss_mb,
+                self._ingestion_q.qsize(),
+                self._ingestion_q.maxsize,
+                self._signal_q.qsize(),
+                self._signal_q.maxsize,
+                open_positions,
+                self._metrics.total_trades,
+                float(equity),
+                float(realized_pnl),
+                self._metrics.max_drawdown_pct,
+            )
+
     async def _refresh_kelly(
         self,
         executor: PaperExecutor,
@@ -292,21 +451,17 @@ class PaperTradingEngine:
             stats["total_trades"],
         )
 
-    async def run(
+    async def _run_single_cycle(
         self,
         pool_watchlist: list[tuple[str, str, str, int, int, str]],
         svm_pool_registry: dict[str, tuple[str, str, int, int]],
         seed_pool_states: dict[str, PoolState] | None = None,
     ) -> None:
+        """
+        Executes a single cycle of the trading engine pipelines.
+        Raises any unhandled critical exception so the parent supervisor can catch and restart.
+        """
         cfg = self._cfg
-        self._install_signal_handlers()
-
-        logging.basicConfig(
-            level=getattr(logging, cfg.log_level.upper(), logging.INFO),
-            format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-        )
-
-        logger.info("PaperTradingEngine starting | equity=$%.2f", float(cfg.initial_equity_usd))
 
         if seed_pool_states:
             for addr, state in seed_pool_states.items():
@@ -315,7 +470,7 @@ class PaperTradingEngine:
 
         async with (
             aiohttp.ClientSession(
-                headers={"User-Agent": "PaperTradingEngine/1.0"}
+                headers={"User-Agent": "Bot-MM-Engine/1.0"}
             ) as session,
             SQLiteLedger(cfg.db_path) as ledger,
         ):
@@ -342,42 +497,216 @@ class PaperTradingEngine:
                 pool_watchlist=pool_watchlist,
                 pool_registry=svm_pool_registry,
                 limiter=self._limiter,
+                telegram_api_id=cfg.telegram_api_id,
+                telegram_api_hash=cfg.telegram_api_hash,
+                telegram_session_name=cfg.telegram_session_name,
+                telegram_bot_token=cfg.telegram_bot_token,
+                telegram_channels=cfg.telegram_channels,
             )
 
             async with coordinator:
                 async def _bridge_queues() -> None:
-                    async for event in coordinator:
-                        if self._shutdown_event.is_set():
-                            break
-                        await self._ingestion_q.put(event)
-                    await self._ingestion_q.put(ShutdownSentinel())
+                    try:
+                        async for event in coordinator:
+                            if self._shutdown_event.is_set():
+                                break
+                            await self._ingestion_q.put(event)
+                    finally:
+                        await self._ingestion_q.put(ShutdownSentinel())
 
-                tasks = [
-                    asyncio.create_task(_bridge_queues(), name="queue_bridge"),
-                    asyncio.create_task(
-                        self._process_ingestion_queue(), name="ingestion_processor"
-                    ),
-                    asyncio.create_task(
-                        self._process_signal_queue(), name="signal_processor"
-                    ),
-                    asyncio.create_task(
-                        self._snapshot_scheduler(), name="snapshot_scheduler"
-                    ),
-                ]
+                bridge_task = asyncio.create_task(_bridge_queues(), name="queue_bridge")
+                ingest_task = asyncio.create_task(
+                    self._process_ingestion_queue(), name="ingestion_processor"
+                )
+                signal_task = asyncio.create_task(
+                    self._process_signal_queue(), name="signal_processor"
+                )
+                snapshot_task = asyncio.create_task(
+                    self._snapshot_scheduler(), name="snapshot_scheduler"
+                )
+                heartbeat_task = asyncio.create_task(
+                    self._heartbeat_task(), name="heartbeat_watchdog"
+                )
 
-                logger.info("All pipelines active. Waiting for market events...")
+                worker_tasks = [bridge_task, ingest_task, signal_task, snapshot_task, heartbeat_task]
+                logger.info("All engine pipelines active. Awaiting market and social signals...")
 
-                await self._shutdown_event.wait()
-                logger.info("Shutdown event received — draining pipelines.")
+                # Monitor tasks: wait for either graceful shutdown or unexpected worker crash
+                shutdown_waiter = asyncio.create_task(
+                    self._shutdown_event.wait(), name="shutdown_waiter"
+                )
+                done, _ = await asyncio.wait(
+                    [shutdown_waiter, *worker_tasks],
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
 
-                tasks[0].cancel()
-                await asyncio.gather(*tasks, return_exceptions=True)
+                # Check if a worker task crashed unexpectedly
+                for t in done:
+                    if t is not shutdown_waiter and not t.cancelled():
+                        exc = t.exception()
+                        if exc is not None:
+                            logger.error("Pipeline task %s failed with exception: %s", t.get_name(), exc)
+                            # Re-raise so supervisor can contain and backoff restart
+                            raise exc
+
+                # If shutdown was signaled, execute graceful teardown
+                if self._shutdown_event.is_set():
+                    logger.info("Graceful shutdown in progress: draining remaining events...")
+                    # 1. Stop ingestion loops (WebSocket & Telegram)
+                    await coordinator.stop()
+                    bridge_task.cancel()
+
+                    # 2. Drain queues with a safety timeout
+                    try:
+                        await asyncio.wait_for(
+                            asyncio.gather(ingest_task, signal_task, return_exceptions=True),
+                            timeout=15.0,
+                        )
+                        logger.info("All queues successfully drained and processed.")
+                    except asyncio.TimeoutError:
+                        logger.warning("Queue drain timed out after 15s; proceeding with teardown.")
+                        ingest_task.cancel()
+                        signal_task.cancel()
+
+                    # 3. Cancel background monitoring tasks
+                    snapshot_task.cancel()
+                    heartbeat_task.cancel()
+                    shutdown_waiter.cancel()
+                    await asyncio.gather(snapshot_task, heartbeat_task, return_exceptions=True)
+
+                    # 4. Flush and checkpoint SQLite database
+                    await ledger.checkpoint()
 
         logger.info(
-            "Engine stopped cleanly. Final equity: $%.2f | Trades: %d",
+            "Engine cycle completed. Current equity: $%.2f | Closed Trades: %d",
             float(self._current_equity_usd()),
             self._metrics.total_trades,
         )
+
+    async def run_supervised(
+        self,
+        pool_watchlist: list[tuple[str, str, str, int, int, str]],
+        svm_pool_registry: dict[str, tuple[str, str, int, int]],
+        seed_pool_states: dict[str, PoolState] | None = None,
+        max_restarts: int | None = None,
+        initial_backoff_s: float = 5.0,
+        max_backoff_s: float = 60.0,
+        backoff_factor: float = 2.0,
+    ) -> None:
+        """
+        24/7 Self-Healing Supervisor Loop.
+        Catches unhandled runtime exceptions, applies exponential backoff,
+        and automatically restarts the trading engine without killing the parent process.
+        """
+        self._install_signal_handlers()
+        setup_production_logging(
+            log_level=self._cfg.log_level,
+            max_bytes=20 * 1024 * 1024,
+            backup_count=5,
+        )
+
+        restart_count = 0
+        backoff = initial_backoff_s
+
+        logger.info(
+            "24/7 Self-Healing Supervisor initialized | initial_backoff=%.1fs | max_backoff=%.1fs",
+            initial_backoff_s,
+            max_backoff_s,
+        )
+
+        while not self._shutdown_event.is_set():
+            cycle_start = time.time()
+            try:
+                logger.info(
+                    "Supervisor: starting engine cycle (restart_count=%d)...",
+                    restart_count,
+                )
+                await self._run_single_cycle(
+                    pool_watchlist=pool_watchlist,
+                    svm_pool_registry=svm_pool_registry,
+                    seed_pool_states=seed_pool_states,
+                )
+                if self._shutdown_event.is_set():
+                    logger.info("Supervisor: shutdown event flagged. Exiting supervisor loop.")
+                    break
+
+            except (asyncio.CancelledError, KeyboardInterrupt):
+                logger.info("Supervisor: received cancellation/interrupt. Halting gracefully.")
+                self._shutdown_event.set()
+                break
+
+            except Exception as exc:
+                if self._shutdown_event.is_set():
+                    logger.info("Supervisor: exception occurred during active shutdown: %s", exc)
+                    break
+
+                restart_count += 1
+                run_duration = time.time() - cycle_start
+
+                # Reset backoff if engine ran stably for at least 2 minutes
+                if run_duration >= 120.0:
+                    backoff = initial_backoff_s
+
+                logger.critical(
+                    "SUPERVISOR RECOVERY: Engine cycle crashed (#%d) after %.1fs: %s. "
+                    "Applying exponential backoff: restarting in %.1fs...",
+                    restart_count,
+                    run_duration,
+                    exc,
+                    backoff,
+                    exc_info=True,
+                )
+
+                if max_restarts is not None and restart_count >= max_restarts:
+                    logger.error(
+                        "Supervisor reached maximum allowed restarts (%d). Halting.",
+                        max_restarts,
+                    )
+                    break
+
+                # Sleep with interruptible wait on shutdown event
+                try:
+                    await asyncio.wait_for(self._shutdown_event.wait(), timeout=backoff)
+                    if self._shutdown_event.is_set():
+                        break
+                except asyncio.TimeoutError:
+                    pass
+
+                backoff = min(max_backoff_s, backoff * backoff_factor)
+                self._reset_queues()
+
+        logger.info(
+            "24/7 Autonomous Supervisor terminated. Total restarts: %d | Final Equity: $%.2f",
+            restart_count,
+            float(self._current_equity_usd()),
+        )
+
+    async def run(
+        self,
+        pool_watchlist: list[tuple[str, str, str, int, int, str]],
+        svm_pool_registry: dict[str, tuple[str, str, int, int]],
+        seed_pool_states: dict[str, PoolState] | None = None,
+        supervised: bool = True,
+        max_restarts: int | None = None,
+    ) -> None:
+        """
+        Engine entry point. By default, executes inside the 24/7 self-healing supervisor loop.
+        """
+        if supervised:
+            await self.run_supervised(
+                pool_watchlist=pool_watchlist,
+                svm_pool_registry=svm_pool_registry,
+                seed_pool_states=seed_pool_states,
+                max_restarts=max_restarts,
+            )
+        else:
+            self._install_signal_handlers()
+            setup_production_logging(log_level=self._cfg.log_level)
+            await self._run_single_cycle(
+                pool_watchlist=pool_watchlist,
+                svm_pool_registry=svm_pool_registry,
+                seed_pool_states=seed_pool_states,
+            )
 
 
 def _build_example_config() -> tuple[
@@ -427,3 +756,11 @@ async def _async_main() -> None:
         svm_pool_registry=svm_reg,
         seed_pool_states=seed_states,
     )
+
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(_async_main())
+    except KeyboardInterrupt:
+        print("\n[Bot-MM] Shutdown initiated by operator.")
+        sys.exit(0)

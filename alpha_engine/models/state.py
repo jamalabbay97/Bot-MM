@@ -18,7 +18,13 @@ from pydantic import (
 )
 
 from alpha_engine.models.base import _STRICT_MODEL_CFG
-from alpha_engine.models.enums import ChainIdentifier, OrderSide, SecurityTier
+from alpha_engine.models.enums import (
+    ChainIdentifier,
+    ExitStage,
+    OrderSide,
+    SecurityTier,
+    TradeExitReason,
+)
 
 
 class PoolState(BaseModel):
@@ -207,6 +213,8 @@ class TradeRecord(BaseModel):
     kelly_fraction: float
     portfolio_equity_usd: Decimal
     realized_pnl_usd: Optional[Decimal] = None   # Set on SELL only
+    exit_reason: Optional[TradeExitReason] = None
+    exit_stage: Optional[ExitStage] = None
     signal_timestamp_ns: int
     fill_timestamp_ns: int
 
@@ -216,6 +224,8 @@ class TradeRecord(BaseModel):
         fill: "PaperFill",
         signal_id: str,
         realized_pnl_usd: Optional[Decimal] = None,
+        exit_reason: Optional[TradeExitReason] = None,
+        exit_stage: Optional[ExitStage] = None,
     ) -> "TradeRecord":
         """
         Construct a TradeRecord from a completed PaperFill and its signal ID.
@@ -246,9 +256,53 @@ class TradeRecord(BaseModel):
             kelly_fraction=fill.kelly_fraction,
             portfolio_equity_usd=fill.portfolio_equity_usd,
             realized_pnl_usd=realized_pnl_usd,
+            exit_reason=exit_reason,
+            exit_stage=exit_stage,
             signal_timestamp_ns=fill.signal_timestamp_ns,
             fill_timestamp_ns=fill.fill_timestamp_ns,
         )
+
+
+class OpenPositionLot(BaseModel):
+    """
+    Tracks an active open position lot undergoing staged exit monitoring.
+    """
+
+    model_config = _STRICT_MODEL_CFG
+
+    lot_id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    order_id: str
+    token_address: str
+    pool_address: str
+    chain: ChainIdentifier
+    initial_tokens: Decimal
+    remaining_tokens: Decimal
+    entry_native_spent: Decimal
+    entry_price: Decimal
+    entry_timestamp_ns: int
+    highest_price_observed: Decimal
+    current_stage: ExitStage = ExitStage.NONE
+    tp1_sold: bool = False
+    tp2_sold: bool = False
+    trailing_sl_price: Decimal
+
+
+class ExitOrder(BaseModel):
+    """
+    Simulated sell order triggered by the autonomous exit engine.
+    """
+
+    model_config = _STRICT_MODEL_CFG
+
+    order_id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    lot_id: str
+    token_address: str
+    pool_address: str
+    chain: ChainIdentifier
+    tokens_to_sell: Decimal
+    reason: TradeExitReason
+    stage: ExitStage
+    timestamp_ns: int
 
 
 class PortfolioSnapshot(BaseModel):
@@ -270,4 +324,7 @@ class PortfolioSnapshot(BaseModel):
     max_drawdown_pct: Annotated[float, Field(ge=0.0, le=100.0)]
     win_rate_pct: Annotated[float, Field(ge=0.0, le=100.0)]
     profit_factor: Annotated[float, Field(ge=0.0)]
+    sharpe_ratio: float = 0.0
+    win_loss_ratio: float = 0.0
     total_gas_spent_usd: Annotated[Decimal, Field(ge=Decimal(0))]
+

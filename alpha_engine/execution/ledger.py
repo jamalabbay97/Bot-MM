@@ -103,8 +103,21 @@ class SQLiteLedger:
         await self._initialise()
         return self
 
+    async def checkpoint(self) -> None:
+        """
+        Explicitly checkpoint the Write-Ahead Log (WAL) into the main database.
+        """
+        if self._conn:
+            try:
+                await self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE);")
+                await self._conn.commit()
+                logger.info("SQLite WAL checkpoint (TRUNCATE) successfully executed.")
+            except Exception as exc:
+                logger.warning("WAL checkpoint failed: %s", exc)
+
     async def __aexit__(self, *_: object) -> None:
         if self._conn:
+            await self.checkpoint()
             await self._conn.close()
             self._conn = None
 

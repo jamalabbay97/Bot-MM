@@ -1,24 +1,42 @@
 """
-models.py — Domain Models, Types, and Event Schemas (Compatibility Facade)
-==========================================================================
+models.py — Domain Models, Types, and Event Schemas
+===================================================
+Multi-Chain Paper Trading & Alpha Analytics Engine (Bot-MM)
+Python 3.11+ | Pydantic v2
 Re-exports all domain models from alpha_engine.models for full backwards compatibility.
 """
 
 from alpha_engine.models import (
     _STRICT_MODEL_CFG,
     ChainIdentifier,
+    ExitOrder,
+    ExitStage,
+    FundingHop,
+    InitialTxRecord,
+    NewsSignalEvent,
+    NewsSignalStatus,
+    OpenPositionLot,
     OrderSide,
     PaperFill,
     PoolState,
     PoolStateUpdateEvent,
     PortfolioSnapshot,
+    RawSignalEvent,
     SecurityReport,
     SecurityTier,
     ShutdownSentinel,
     SignalEvent,
+    SignalSource,
     SignalStrength,
     SwapEvent,
+    TelegramMessage,
+    TradeExitReason,
     TradeRecord,
+    WalletClassification,
+    WalletProfile,
+    WalletTradeRecord,
+    WhitelistRecord,
+    WhitelistStatus,
 )
 
 __all__ = [
@@ -27,13 +45,29 @@ __all__ = [
     "OrderSide",
     "SecurityTier",
     "SignalStrength",
+    "WalletClassification",
+    "WhitelistStatus",
+    "NewsSignalStatus",
+    "SignalSource",
+    "ExitStage",
+    "TradeExitReason",
     "SwapEvent",
     "SignalEvent",
+    "RawSignalEvent",
     "PoolStateUpdateEvent",
     "ShutdownSentinel",
+    "TelegramMessage",
+    "NewsSignalEvent",
+    "WalletTradeRecord",
+    "FundingHop",
+    "InitialTxRecord",
+    "WalletProfile",
+    "WhitelistRecord",
     "PoolState",
     "SecurityReport",
     "PaperFill",
     "TradeRecord",
+    "OpenPositionLot",
+    "ExitOrder",
     "PortfolioSnapshot",
 ]

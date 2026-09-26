@@ -10,7 +10,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import random
-from typing import Sequence
+from typing import Any, Optional, Sequence
 
 from alpha_engine.ingestion.decoders import SvmPoolMeta
 from alpha_engine.ingestion.evm import (
@@ -21,8 +21,10 @@ from alpha_engine.ingestion.evm import (
     _RECONNECT_MULTIPLIER,
 )
 from alpha_engine.ingestion.svm import SVMIngester
+from alpha_engine.ingestion.telegram import TelegramIngester
 from alpha_engine.models.events import (
     PoolStateUpdateEvent,
+    RawSignalEvent,
     ShutdownSentinel,
     SwapEvent,
 )
@@ -62,7 +64,7 @@ class ExponentialBackoff:
 
 class IngestionCoordinator:
     """
-    Manages EVM and SVM ingesters under a single asyncio task group,
+    Manages EVM, SVM, and Telegram ingesters under a single lifecycle coordinator,
     exposing a unified async-iterable event stream.
     """
 
@@ -74,9 +76,15 @@ class IngestionCoordinator:
         pool_registry: dict[str, SvmPoolMeta],
         limiter: RateLimiterRegistry,
         queue_maxsize: int = 256,
+        telegram_api_id: Optional[int] = None,
+        telegram_api_hash: Optional[str] = None,
+        telegram_session_name: str = "bot_mm_session",
+        telegram_bot_token: Optional[str] = None,
+        telegram_channels: Optional[Sequence[str | int]] = None,
+        telegram_ingester: Optional[TelegramIngester] = None,
     ) -> None:
         self._queue: asyncio.Queue[
-            SwapEvent | PoolStateUpdateEvent | ShutdownSentinel
+            SwapEvent | PoolStateUpdateEvent | RawSignalEvent | ShutdownSentinel
         ] = asyncio.Queue(maxsize=queue_maxsize)
 
         self._evm = EVMIngester(
@@ -91,35 +99,83 @@ class IngestionCoordinator:
             event_queue=self._queue,
             limiter=limiter,
         )
+
+        if telegram_ingester is not None:
+            self._telegram = telegram_ingester
+        else:
+            self._telegram = TelegramIngester(
+                event_queue=self._queue,
+                api_id=telegram_api_id,
+                api_hash=telegram_api_hash,
+                session_name=telegram_session_name,
+                bot_token=telegram_bot_token,
+                target_channels=telegram_channels,
+                limiter=limiter,
+            )
+
         self._tasks: list[asyncio.Task[None]] = []
 
     @property
     def event_queue(
         self,
-    ) -> asyncio.Queue[SwapEvent | PoolStateUpdateEvent | ShutdownSentinel]:
+    ) -> asyncio.Queue[SwapEvent | PoolStateUpdateEvent | RawSignalEvent | ShutdownSentinel]:
         return self._queue
 
-    async def __aenter__(self) -> "IngestionCoordinator":
+    @property
+    def evm_ingester(self) -> EVMIngester:
+        return self._evm
+
+    @property
+    def svm_ingester(self) -> SVMIngester:
+        return self._svm
+
+    @property
+    def telegram_ingester(self) -> TelegramIngester:
+        return self._telegram
+
+    async def start(self) -> None:
+        """
+        Spawns all three ingestion loops (EVM, SVM, Telegram) concurrently.
+        """
+        if self._tasks:
+            return
+
         self._tasks = [
             asyncio.create_task(self._evm.run(), name="evm_ingester"),
             asyncio.create_task(self._svm.run(), name="svm_ingester"),
+            asyncio.create_task(self._telegram.run(), name="telegram_ingester"),
         ]
-        logger.info("IngestionCoordinator started (EVM + SVM ingesters running).")
+        logger.info("IngestionCoordinator started (EVM + SVM + Telegram ingesters running).")
+
+    async def stop(self) -> None:
+        """
+        Gracefully stop all three ingesters and tear down tasks.
+        """
+        await self._evm.stop()
+        await self._svm.stop()
+        await self._telegram.stop()
+
+        for task in self._tasks:
+            task.cancel()
+
+        if self._tasks:
+            await asyncio.gather(*self._tasks, return_exceptions=True)
+            self._tasks = []
+
+        await self._queue.put(ShutdownSentinel())
+        logger.info("IngestionCoordinator stopped.")
+
+    async def __aenter__(self) -> "IngestionCoordinator":
+        await self.start()
         return self
 
     async def __aexit__(self, *_: object) -> None:
-        await self._evm.stop()
-        await self._svm.stop()
-        for task in self._tasks:
-            task.cancel()
-        await asyncio.gather(*self._tasks, return_exceptions=True)
-        await self._queue.put(ShutdownSentinel())
-        logger.info("IngestionCoordinator stopped.")
+        await self.stop()
 
     def __aiter__(self) -> "IngestionCoordinator":
         return self
 
-    async def __anext__(self) -> SwapEvent | PoolStateUpdateEvent:
+    async def __anext__(self) -> SwapEvent | PoolStateUpdateEvent | RawSignalEvent:
         item = await self._queue.get()
         if isinstance(item, ShutdownSentinel):
             raise StopAsyncIteration

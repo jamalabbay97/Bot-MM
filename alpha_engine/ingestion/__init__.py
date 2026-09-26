@@ -20,6 +20,7 @@ from alpha_engine.ingestion.decoders import (
 )
 from alpha_engine.ingestion.evm import EVMIngester
 from alpha_engine.ingestion.svm import SVMIngester
+from alpha_engine.ingestion.telegram import TelegramIngester
 
 __all__ = [
     "EvmPoolMeta",
@@ -31,6 +32,7 @@ __all__ = [
     "_parse_raydium_log_line",
     "EVMIngester",
     "SVMIngester",
+    "TelegramIngester",
     "IngestionCoordinator",
     "_SWAP_TOPIC",
     "_SYNC_TOPIC",

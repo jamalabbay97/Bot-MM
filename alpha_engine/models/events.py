@@ -7,6 +7,7 @@ Python 3.11+ | Pydantic v2
 
 from __future__ import annotations
 
+import time
 import uuid
 from decimal import Decimal
 from typing import Annotated, Optional
@@ -20,7 +21,13 @@ from pydantic import (
 )
 
 from alpha_engine.models.base import _STRICT_MODEL_CFG
-from alpha_engine.models.enums import ChainIdentifier, OrderSide, SignalStrength
+from alpha_engine.models.enums import (
+    ChainIdentifier,
+    NewsSignalStatus,
+    OrderSide,
+    SignalSource,
+    SignalStrength,
+)
 from alpha_engine.models.state import PoolState, SecurityReport
 
 
@@ -87,11 +94,12 @@ class SignalEvent(BaseModel):
     pool_address: Annotated[str, Field(min_length=32, max_length=66)]
     token_address: Annotated[str, Field(min_length=32, max_length=66)]
     suggested_side: OrderSide
-    trigger_swap: SwapEvent
+    trigger_swap: Optional[SwapEvent] = None
     pool_state: PoolState
     security_report: SecurityReport
     strength: SignalStrength
     alpha_score: Annotated[float, Field(ge=0.0, le=1.0)]
+    source: SignalSource = SignalSource.DEX_SWAP
 
 
 class PoolStateUpdateEvent(BaseModel):
@@ -117,3 +125,26 @@ class ShutdownSentinel(BaseModel):
 
     model_config = ConfigDict(frozen=True)
     reason: str = "graceful_shutdown"
+
+
+class RawSignalEvent(BaseModel):
+    """
+    Raw signal emitted by external scrapers (e.g., Telegram / social sentiment scraper)
+    prior to pool-lookup and two-tier security gating.
+    """
+
+    model_config = _STRICT_MODEL_CFG
+
+    signal_id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    timestamp_ns: Annotated[int, Field(gt=0)] = Field(default_factory=lambda: time.time_ns())
+    chain: ChainIdentifier
+    token_address: Annotated[str, Field(min_length=32, max_length=66)]
+    source: SignalSource = SignalSource.TELEGRAM_SCRAPER
+    originating_channel: str = ""
+    channel_id: int = 0
+    message_id: int = 0
+    raw_text: str = ""
+    status: NewsSignalStatus = NewsSignalStatus.VALID
+    sybil_channel_count: Annotated[int, Field(ge=1)] = 1
+    is_edit: bool = False
+

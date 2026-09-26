@@ -1,0 +1,47 @@
+[Unit]
+Description=Bot-MM Multi-Chain Paper Trading & Alpha Analytics Engine
+Documentation=https://github.com/jamalabbay97/Bot-MM
+After=network.target network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=botmm
+Group=botmm
+WorkingDirectory=/opt/bot-mm
+
+# Environment & Secret Management
+EnvironmentFile=-/opt/bot-mm/.env
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONDONTWRITEBYTECODE=1
+
+# Execution
+ExecStart=/opt/bot-mm/.venv/bin/python -m alpha_engine.engine.runner
+
+# Resilience & Self-Healing
+Restart=always
+RestartSec=5s
+KillMode=mixed
+KillSignal=SIGTERM
+TimeoutStopSec=30s
+
+# Resource Constraints & Capping
+LimitNOFILE=65535
+MemoryHigh=800M
+MemoryMax=1G
+CPUQuota=150%
+
+# Sandboxing & Hardening
+NoNewPrivileges=true
+ProtectSystem=full
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/opt/bot-mm/logs /opt/bot-mm/data /opt/bot-mm
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=bot-mm
+
+[Install]
+WantedBy=multi-user.target
