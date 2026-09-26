@@ -81,6 +81,9 @@ class IngestionCoordinator:
         telegram_session_name: str = "bot_mm_session",
         telegram_bot_token: Optional[str] = None,
         telegram_channels: Optional[Sequence[str | int]] = None,
+        telegram_admin_ids: Optional[Sequence[int]] = None,
+        db_path: str = "paper_trading.db",
+        status_provider: Optional[Any] = None,
         telegram_ingester: Optional[TelegramIngester] = None,
     ) -> None:
         self._queue: asyncio.Queue[
@@ -110,6 +113,9 @@ class IngestionCoordinator:
                 session_name=telegram_session_name,
                 bot_token=telegram_bot_token,
                 target_channels=telegram_channels,
+                admin_ids=telegram_admin_ids,
+                db_path=db_path,
+                status_provider=status_provider,
                 limiter=limiter,
             )
 

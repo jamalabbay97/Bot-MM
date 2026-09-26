@@ -16,7 +16,7 @@ from alpha_engine.models.enums import ChainIdentifier, OrderSide
 logger = logging.getLogger(__name__)
 
 # Simulated priority fees charged per trade (USD)
-GAS_COST_SOL_USD: Decimal = Decimal("0.03")
+GAS_COST_SOL_USD: Decimal = Decimal("0.02")
 GAS_COST_BASE_USD: Decimal = Decimal("0.05")
 
 # Maximum portfolio fraction per position (hard risk cap)

@@ -353,6 +353,212 @@ def test_unresolvable_channels_graceful_skipping():
     asyncio.run(run())
 
 
+class MockTelethonDMEvent:
+    """Mock Telegram event representing a private direct message (DM)."""
+
+    def __init__(self, text: str, sender_id: int = 123456789, msg_id: int = 101) -> None:
+        self.raw_text = text
+        self.text = text
+        self.sender_id = sender_id
+        self.id = msg_id
+        self.is_private = True
+        self.chat_id = sender_id
+        self.replies: list[str] = []
+
+    async def reply(self, message: str) -> None:
+        self.replies.append(message)
+
+    async def respond(self, message: str) -> None:
+        self.replies.append(message)
+
+
+def test_interactive_dm_start_and_help():
+    """Test 8: Interactive /start and /help commands in DM."""
+    async def run():
+        queue: asyncio.Queue = asyncio.Queue()
+        ingester = TelegramIngester(event_queue=queue)
+
+        evt_start = MockTelethonDMEvent("/start")
+        await ingester._handle_dm_message(evt_start)
+        assert len(evt_start.replies) == 1
+        reply = evt_start.replies[0]
+        assert "/status" in reply
+        assert "/scan" in reply
+        assert "/trades" in reply
+        assert "Bot-MM Alpha Engine" in reply
+
+        evt_help = MockTelethonDMEvent("/help")
+        await ingester._handle_dm_message(evt_help)
+        assert len(evt_help.replies) == 1
+
+    asyncio.run(run())
+
+
+def test_interactive_dm_status_command():
+    """Test 9: Interactive /status command with provider metrics."""
+    async def run():
+        queue: asyncio.Queue = asyncio.Queue()
+
+        def status_mock():
+            return {
+                "uptime_str": "01h 23m 45s",
+                "rss_mb": 95.5,
+                "equity_usd": 8550.00,
+                "realized_pnl_usd": 250.00,
+                "open_positions": 2,
+                "win_rate_pct": 66.7,
+                "max_drawdown_pct": 1.25,
+                "ingest_q_size": 3,
+                "ingest_q_max": 100,
+                "signal_q_size": 1,
+                "signal_q_max": 100,
+            }
+
+        ingester = TelegramIngester(
+            event_queue=queue,
+            status_provider=status_mock,
+        )
+
+        evt = MockTelethonDMEvent("/status")
+        await ingester._handle_dm_message(evt)
+        assert len(evt.replies) == 1
+        msg = evt.replies[0]
+        assert "01h 23m 45s" in msg
+        assert "95.5 MB" in msg
+        assert "$8550.00" in msg
+        assert "$250.00" in msg
+        assert "Active Lots:** `2`" in msg
+        assert "66.7%" in msg
+        assert "1.25%" in msg
+        assert "3/100" in msg
+
+    asyncio.run(run())
+
+
+def test_interactive_dm_scan_command_and_direct_ca():
+    """Test 10: /scan <CA> and direct CA pasting in DM."""
+    async def run():
+        queue: asyncio.Queue = asyncio.Queue()
+        ingester = TelegramIngester(event_queue=queue)
+
+        # 1. Base EVM address via /scan
+        evm_ca = "0x285617313860407d647990b50375990264186566"
+        evt_scan = MockTelethonDMEvent(f"/scan {evm_ca}")
+        await ingester._handle_dm_message(evt_scan)
+        assert len(evt_scan.replies) == 1
+        assert "🔎 Ingested CA:" in evt_scan.replies[0]
+        assert evm_ca in evt_scan.replies[0]
+        assert "Dispatching to SecurityGatekeeper & AMM Math Engine" in evt_scan.replies[0]
+
+        event = queue.get_nowait()
+        assert isinstance(event, RawSignalEvent)
+        assert event.token_address == evm_ca
+        assert event.chain == ChainIdentifier.BASE_MAINNET
+
+        # 2. Solana Base58 address pasted directly (no /scan prefix)
+        svm_ca = "7GCihgDB8fe6KNjn2MYtkzZcRjQy3t9GHdC8uHYmW2hr"
+        evt_direct = MockTelethonDMEvent(svm_ca)
+        await ingester._handle_dm_message(evt_direct)
+        assert len(evt_direct.replies) == 1
+        assert svm_ca in evt_direct.replies[0]
+
+        event2 = queue.get_nowait()
+        assert isinstance(event2, RawSignalEvent)
+        assert event2.token_address == svm_ca
+        assert event2.chain == ChainIdentifier.SOLANA_MAINNET
+
+        # 3. Invalid address rejected
+        evt_invalid = MockTelethonDMEvent("/scan invalid_token_123")
+        await ingester._handle_dm_message(evt_invalid)
+        assert "Invalid Contract Address" in evt_invalid.replies[0]
+        assert queue.empty()
+
+    asyncio.run(run())
+
+
+def test_interactive_dm_trades_command(tmp_path):
+    """Test 11: /trades command reading executed trades from SQLite."""
+    async def run():
+        import aiosqlite
+        db_file = tmp_path / "test_paper_trading.db"
+
+        # Create trades table and insert 2 dummy trades
+        async with aiosqlite.connect(str(db_file)) as db:
+            await db.execute(
+                """
+                CREATE TABLE trades (
+                    trade_id TEXT PRIMARY KEY,
+                    order_id TEXT,
+                    signal_id TEXT,
+                    chain TEXT,
+                    token_address TEXT,
+                    pool_address TEXT,
+                    side TEXT,
+                    native_spent TEXT,
+                    tokens_delta TEXT,
+                    effective_price TEXT,
+                    price_impact_bps INTEGER,
+                    gas_cost_usd TEXT,
+                    fill_latency_ms INTEGER,
+                    kelly_fraction REAL,
+                    portfolio_equity_usd TEXT,
+                    realized_pnl_usd TEXT,
+                    signal_timestamp_ns INTEGER,
+                    fill_timestamp_ns INTEGER,
+                    created_at INTEGER
+                )
+                """
+            )
+            await db.execute(
+                """
+                INSERT INTO trades (trade_id, chain, token_address, side, effective_price, realized_pnl_usd, created_at)
+                VALUES ('t1', 'base_mainnet', '0x285617313860407d647990b50375990264186566', 'buy', '0.000125', '0.00', 100),
+                       ('t2', 'solana_mainnet', '7GCihgDB8fe6KNjn2MYtkzZcRjQy3t9GHdC8uHYmW2hr', 'sell', '0.004210', '12.50', 200)
+                """
+            )
+            await db.commit()
+
+        queue: asyncio.Queue = asyncio.Queue()
+        ingester = TelegramIngester(event_queue=queue, db_path=str(db_file))
+
+        evt = MockTelethonDMEvent("/trades")
+        await ingester._handle_dm_message(evt)
+        assert len(evt.replies) == 1
+        msg = evt.replies[0]
+        assert "Last 5 Executed Paper Trades" in msg
+        assert "TOKEN" in msg
+        assert "SIDE" in msg
+        assert "BUY" in msg
+        assert "SELL" in msg
+        assert "+$12.50" in msg
+
+    asyncio.run(run())
+
+
+def test_admin_authorization_enforcement():
+    """Test 12: Admin ID enforcement silently ignores unauthorized callers."""
+    async def run():
+        queue: asyncio.Queue = asyncio.Queue()
+        admin_id = 999888777
+        ingester = TelegramIngester(
+            event_queue=queue,
+            admin_ids=[admin_id],
+        )
+
+        # 1. Unauthorized user
+        evt_unauth = MockTelethonDMEvent("/status", sender_id=111222333)
+        await ingester._handle_dm_message(evt_unauth)
+        assert len(evt_unauth.replies) == 0, "Unauthorized caller must be silently ignored."
+        assert queue.empty()
+
+        # 2. Authorized admin
+        evt_auth = MockTelethonDMEvent("/status", sender_id=admin_id)
+        await ingester._handle_dm_message(evt_auth)
+        assert len(evt_auth.replies) == 1, "Authorized admin must receive command reply."
+
+    asyncio.run(run())
+
+
 if __name__ == "__main__":
     print("=== RUNNING TELEGRAM INGESTION TEST SUITE ===")
     test_contract_address_extraction_and_filtering()
@@ -369,4 +575,12 @@ if __name__ == "__main__":
     print("  [PASS] test_coordinator_integration_with_telegram")
     test_unresolvable_channels_graceful_skipping()
     print("  [PASS] test_unresolvable_channels_graceful_skipping")
-    print("\nALL 7 TELEGRAM INGESTION TESTS PASSED WITH 100% SUCCESS!")
+    test_interactive_dm_start_and_help()
+    print("  [PASS] test_interactive_dm_start_and_help")
+    test_interactive_dm_status_command()
+    print("  [PASS] test_interactive_dm_status_command")
+    test_interactive_dm_scan_command_and_direct_ca()
+    print("  [PASS] test_interactive_dm_scan_command_and_direct_ca")
+    test_admin_authorization_enforcement()
+    print("  [PASS] test_admin_authorization_enforcement")
+    print("\nALL 12 TELEGRAM INGESTION TESTS PASSED WITH 100% SUCCESS!")

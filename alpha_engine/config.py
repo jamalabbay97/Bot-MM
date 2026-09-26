@@ -83,6 +83,10 @@ class EngineConfig(BaseSettings):
         default_factory=list,
         description="Target alpha channels/groups to scrape (comma-separated or JSON array)",
     )
+    telegram_admin_ids: list[int] = Field(
+        default_factory=list,
+        description="Authorized Telegram user IDs for interactive admin bot controls (comma-separated)",
+    )
 
     # -------------------------------------------------------------------------
     # 4. Engine Operations & Logging
@@ -163,6 +167,34 @@ class EngineConfig(BaseSettings):
             return [ch.strip() for ch in clean.split(",") if ch.strip()]
         if isinstance(v, (list, tuple, set)):
             return [str(ch).strip() for ch in v if str(ch).strip()]
+        return []
+
+    @field_validator("telegram_admin_ids", mode="before")
+    @classmethod
+    def parse_telegram_admin_ids(cls, v: Any) -> list[int]:
+        """Convert comma-separated strings or list of int/str to list[int]."""
+        if v is None:
+            return []
+        if isinstance(v, str):
+            clean = v.strip()
+            if not clean:
+                return []
+            ids: list[int] = []
+            for item in clean.split(","):
+                item_s = item.strip()
+                if item_s.lstrip("-").isdigit():
+                    ids.append(int(item_s))
+            return ids
+        if isinstance(v, (list, tuple, set)):
+            res: list[int] = []
+            for item in v:
+                if isinstance(item, int):
+                    res.append(item)
+                elif isinstance(item, str) and item.strip().lstrip("-").isdigit():
+                    res.append(int(item.strip()))
+            return res
+        if isinstance(v, int):
+            return [v]
         return []
 
     @field_validator("telegram_api_id", mode="before")

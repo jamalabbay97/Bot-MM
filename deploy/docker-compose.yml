@@ -1,0 +1,49 @@
+# ==============================================================================
+# docker-compose.yml — Bot-MM 24/7 Autonomous Daemon Deployment
+# ==============================================================================
+version: '3.8'
+
+services:
+  bot-mm:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: runner
+    container_name: bot-mm-engine
+    restart: unless-stopped
+    user: "10001:10001"
+    
+    # Secret & Environment Management
+    # Centralized .env file loaded into container environment
+    env_file:
+      - .env
+    environment:
+      - PYTHONUNBUFFERED=1
+      - DB_PATH=/app/data/paper_trading.db
+      - LOG_LEVEL=INFO
+    
+    # Persistent Volume Mappings (SQLite WAL Database & Rotated Logs)
+    volumes:
+      - ./data:/app/data:rw
+      - ./logs:/app/logs:rw
+      - ./.env:/app/.env:ro
+
+    # Resource Constraints to Prevent Host Exhaustion
+    deploy:
+      resources:
+        limits:
+          cpus: '1.50'
+          memory: 1024M
+        reservations:
+          cpus: '0.25'
+          memory: 256M
+
+    # Docker-level Log Rotation Guard
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "20m"
+        max-file: "5"
+
+    # Stop grace period to allow queue draining & WAL checkpointing
+    stop_grace_period: 30s

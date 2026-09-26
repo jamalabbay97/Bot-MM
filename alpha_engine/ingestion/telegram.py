@@ -1,8 +1,21 @@
 """
-alpha_engine.ingestion.telegram — Telegram & Social Media Sentiment Scraper
-===========================================================================
+alpha_engine.ingestion.telegram — Telegram & Social Media Sentiment Scraper + Interactive Bot
+============================================================================================
 Multi-Chain Paper Trading & Alpha Analytics Engine (Bot-MM)
-Python 3.11+ | telethon | asyncio
+Python 3.11+ | telethon | asyncio | aiosqlite
+
+Dual-Mode Architecture:
+  1. Passive Channel Scraping:
+     Monitors target alpha call channels, detects contract addresses (EVM & SVM),
+     filters sybil coordinated dumps and bait-and-switch post edits, and routes
+     RawSignalEvent objects to the ingestion queue without generating chat replies.
+  2. Interactive Bot Control & DM Interface:
+     Listens to direct messages (DMs), enforces admin authorization (TELEGRAM_ADMIN_IDS),
+     and executes command handlers:
+       - /start & /help : Help overview and usage instructions.
+       - /status        : Real-time engine health, uptime, memory, equity, PnL, queues.
+       - /scan <CA>     : Direct token submission -> immediate validation and pipeline injection.
+       - /trades        : ASCII summary of the last 5 executed paper trades.
 """
 
 from __future__ import annotations
@@ -12,11 +25,26 @@ import logging
 import re
 import time
 from collections import defaultdict
-from typing import Any, Optional, Sequence, Set
+from decimal import Decimal
+from typing import Any, Awaitable, Callable, Optional, Sequence, Set
 
 try:
-    from telethon import TelegramClient, events
-    from telethon.errors import FloodWaitError
+    import aiosqlite
+    AIOSQLITE_AVAILABLE = True
+except ImportError:
+    AIOSQLITE_AVAILABLE = False
+    aiosqlite = None  # type: ignore
+
+try:
+    import psutil
+    PSUTIL_AVAILABLE = True
+except ImportError:
+    PSUTIL_AVAILABLE = False
+    psutil = None  # type: ignore
+
+try:
+    from telethon import TelegramClient, events, utils
+    from telethon.errors import FloodWaitError, RPCError
     TELETHON_AVAILABLE = True
 except ImportError:  # pragma: no cover
     TELETHON_AVAILABLE = False
@@ -28,9 +56,13 @@ except ImportError:  # pragma: no cover
             pass
 
     events = None  # type: ignore
+    utils = None   # type: ignore
 
     class FloodWaitError(Exception):  # type: ignore
         seconds: int = 0
+
+    class RPCError(Exception):  # type: ignore
+        pass
 
 from alpha_engine.models.enums import ChainIdentifier, NewsSignalStatus, SignalSource
 from alpha_engine.models.events import RawSignalEvent, ShutdownSentinel
@@ -38,7 +70,7 @@ from alpha_engine.rate_limiter.registry import RateLimiterRegistry
 
 logger = logging.getLogger(__name__)
 
-# Base (EVM) 40-hex-char address regex
+# Base (EVM) 40-hex-char address regex (42 characters with 0x prefix)
 EVM_CA_REGEX = re.compile(r"\b(0x[a-fA-F0-9]{40})\b")
 
 # Solana (SVM) base58 32-44 character address regex
@@ -81,12 +113,16 @@ EVM_SYSTEM_ADDRESSES: Set[str] = {
 
 class TelegramIngester:
     """
-    Micro-service for scraping Telegram alpha signals and news channels.
+    Micro-service for scraping Telegram alpha signals and interactive bot management.
     Features:
       - Resilient MTProto client lifecycle via Telethon
+      - Dual-mode operation: Passive Channel Scraping + Interactive Admin DM Control
       - Dual-chain CA extraction (EVM Base & SVM Solana) with system router filtering
       - Anti-sybil coordinated dump detection (sliding window: 60s, burst: >=3 channels in <=15s)
       - Anti bait-and-switch protection (events.MessageEdited rejection)
+      - Interactive slash commands (/start, /help, /status, /scan, /trades) with admin check
+      - Direct CA pasting in DM for instant screening
+      - Non-blocking SQLite queries (aiosqlite)
       - FloodWaitError backoff and rate limiter integration
       - Non-crashing dormant fallback when credentials are not configured
     """
@@ -103,6 +139,9 @@ class TelegramIngester:
         session_name: str = "bot_mm_session",
         bot_token: Optional[str] = None,
         target_channels: Optional[Sequence[str | int]] = None,
+        admin_ids: Optional[Sequence[int]] = None,
+        db_path: str = "paper_trading.db",
+        status_provider: Optional[Callable[[], dict[str, Any] | Awaitable[dict[str, Any]]]] = None,
         limiter: Optional[RateLimiterRegistry] = None,
         client: Optional[TelegramClient] = None,
     ) -> None:
@@ -110,17 +149,23 @@ class TelegramIngester:
         self._api_id = api_id
         self._api_hash = api_hash
         self._bot_token = bot_token
-        # If session_name was mistakenly given as a bot token, extract it
+
+        # Normalize session name if inadvertently passed as a bot token
         if session_name and ":" in session_name:
             if not self._bot_token:
                 self._bot_token = session_name
             session_name = "bot_mm_session"
+
         self._session_name = session_name
         self._target_channels = list(target_channels) if target_channels else []
+        self._admin_ids: Set[int] = {int(x) for x in admin_ids} if admin_ids else set()
+        self._db_path = db_path
+        self._status_provider = status_provider
         self._limiter = limiter
 
         self._shutdown_event = asyncio.Event()
         self._running = False
+        self._start_time = time.time()
         self._client: Optional[TelegramClient] = client
 
         # Anti-sybil tracking: token_address.lower() -> list of (monotonic_timestamp, channel_id_str)
@@ -146,6 +191,17 @@ class TelegramIngester:
     @property
     def is_running(self) -> bool:
         return self._running
+
+    @property
+    def admin_ids(self) -> Set[int]:
+        return self._admin_ids
+
+    def set_status_provider(
+        self,
+        provider: Callable[[], dict[str, Any] | Awaitable[dict[str, Any]]],
+    ) -> None:
+        """Assign or update dynamic status provider callback."""
+        self._status_provider = provider
 
     def extract_contract_addresses(self, text: str) -> list[tuple[ChainIdentifier, str]]:
         """
@@ -248,10 +304,53 @@ class TelegramIngester:
             except asyncio.QueueFull:
                 logger.warning("Event queue full; dropped event %s", event)
 
-    async def _handle_new_message(self, event: Any) -> None:
+    async def _safe_reply(self, event: Any, text: str) -> None:
         """
-        Handle events.NewMessage from Telegram client.
+        Safely reply to a message in DM, catching RPCError or network failures.
         """
+        try:
+            if hasattr(event, "reply"):
+                res = event.reply(text)
+                if asyncio.iscoroutine(res):
+                    await res
+            elif hasattr(event, "respond"):
+                res = event.respond(text)
+                if asyncio.iscoroutine(res):
+                    await res
+            elif self._client is not None and hasattr(self._client, "send_message"):
+                sender_id = getattr(event, "sender_id", None)
+                if sender_id is not None:
+                    res = self._client.send_message(sender_id, text)
+                    if asyncio.iscoroutine(res):
+                        await res
+        except RPCError as exc:
+            logger.warning("[TelegramIngester] Telethon RPC error during reply: %s", exc)
+        except Exception as exc:
+            logger.warning("[TelegramIngester] Failed to send reply: %s", exc)
+
+    def _is_authorized(self, sender_id: Optional[int]) -> bool:
+        """
+        Check if sender is an authorized admin.
+        If TELEGRAM_ADMIN_IDS is configured, sender must be in the whitelist.
+        If TELEGRAM_ADMIN_IDS is empty, allows all direct message callers (development mode).
+        """
+        if not self._admin_ids:
+            return True
+        return sender_id in self._admin_ids
+
+    # -------------------------------------------------------------------------
+    # 1. Passive Channel Scraping Handlers (No Chat Replies)
+    # -------------------------------------------------------------------------
+
+    async def _handle_channel_message(self, event: Any) -> None:
+        """
+        Passive scraping handler for monitored public/private channels.
+        Extracts CAs, verifies anti-sybil and anti-bait-and-switch, and routes to queue.
+        Ignores private DMs (which are handled by _handle_dm_message).
+        """
+        if getattr(event, "is_private", False):
+            return
+
         channel_id, message_id, channel_title, text = self._extract_event_metadata(event)
         cas = self.extract_contract_addresses(text)
 
@@ -300,12 +399,15 @@ class TelegramIngester:
             )
             await self._enqueue_event(raw_signal)
 
-    async def _handle_edited_message(self, event: Any) -> None:
+    async def _handle_channel_edited_message(self, event: Any) -> None:
         """
-        Handle events.MessageEdited.
+        Handle events.MessageEdited in monitored channels.
         If a message was edited to insert a CA after posting, reject the signal
         immediately (classic bait-and-switch honeypot trap).
         """
+        if getattr(event, "is_private", False):
+            return
+
         channel_id, message_id, channel_title, text = self._extract_event_metadata(event)
         cas = self.extract_contract_addresses(text)
         if not cas:
@@ -325,13 +427,320 @@ class TelegramIngester:
                     channel_title,
                     message_id,
                 )
-                # Discard signal immediately
                 continue
+
+    # Backward compatibility aliases for existing tests
+    _handle_new_message = _handle_channel_message
+    _handle_edited_message = _handle_channel_edited_message
+
+    # -------------------------------------------------------------------------
+    # 2. Interactive Bot Control & DM Interface Handlers
+    # -------------------------------------------------------------------------
+
+    async def _handle_dm_message(self, event: Any) -> None:
+        """
+        Interactive command & control handler for Direct Messages (DMs).
+        Enforces admin authorization and processes commands:
+          /start, /help, /status, /scan <CA>, /trades, or raw CA pasting.
+        """
+        if not getattr(event, "is_private", False):
+            return
+
+        sender_id = getattr(event, "sender_id", None)
+        if sender_id is None:
+            sender = getattr(event, "sender", None)
+            sender_id = getattr(sender, "id", None)
+
+        if not self._is_authorized(sender_id):
+            logger.warning(
+                "[TelegramIngester] Unauthorized DM access attempt from user %s. Ignored.",
+                sender_id,
+            )
+            return
+
+        raw_text = getattr(event, "raw_text", getattr(event, "text", "")) or ""
+        text = raw_text.strip()
+        if not text:
+            return
+
+        lower_text = text.lower()
+        first_token = lower_text.split()[0].split("@")[0]
+
+        if first_token in ("/start", "/help"):
+            await self._cmd_start_help(event)
+        elif first_token == "/status":
+            await self._cmd_status(event)
+        elif first_token == "/trades":
+            await self._cmd_trades(event)
+        elif first_token == "/scan":
+            args = text[len(text.split()[0]):].strip()
+            await self._cmd_scan(event, args, sender_id)
+        else:
+            await self._cmd_direct_ca_or_help(event, text, sender_id)
+
+    async def _cmd_start_help(self, event: Any) -> None:
+        """Handle /start and /help command in DMs."""
+        msg = (
+            "🤖 **Bot-MM Alpha Engine & Trading Terminal**\n\n"
+            "**Status:** Online 🟢\n"
+            "**Engine Mode:** Paper Trading (Zero-Capital Simulation)\n\n"
+            "**Available Commands:**\n"
+            "• `/status` — View real-time system uptime, memory RSS, portfolio equity, PnL, and queue telemetry.\n"
+            "• `/scan <CA>` — Submit a Solana or Base token CA for immediate security audit & AMM execution.\n"
+            "• `/trades` — View the last 5 executed paper trades with entry price, side, and PnL.\n"
+            "• `/help` — Display this command reference.\n\n"
+            "💡 *Tip:* You can also directly paste a contract address (EVM `0x...` or Solana Base58) in this chat to trigger an immediate scan."
+        )
+        await self._safe_reply(event, msg)
+
+    async def _cmd_status(self, event: Any) -> None:
+        """Handle /status command in DMs."""
+        metrics: dict[str, Any] = {}
+        if self._status_provider is not None:
+            try:
+                res = self._status_provider()
+                if asyncio.iscoroutine(res):
+                    res = await res
+                if isinstance(res, dict):
+                    metrics = res
+            except Exception as exc:
+                logger.warning("[TelegramIngester] status_provider error: %s", exc)
+
+        # 1. System Uptime
+        uptime_str = metrics.get("uptime_str")
+        if not uptime_str:
+            uptime_s = time.time() - self._start_time
+            hrs, rem = divmod(int(uptime_s), 3600)
+            mins, secs = divmod(rem, 60)
+            uptime_str = f"{hrs:02d}h {mins:02d}m {secs:02d}s"
+
+        # 2. Memory RSS
+        rss_mb = metrics.get("rss_mb")
+        if rss_mb is None:
+            rss_mb = 0.0
+            if PSUTIL_AVAILABLE and psutil is not None:
+                try:
+                    rss_mb = psutil.Process().memory_info().rss / (1024 * 1024)
+                except Exception:
+                    pass
+            else:
+                try:
+                    import resource
+                    rss_mb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024.0
+                except Exception:
+                    pass
+
+        # 3. Portfolio & Ledger stats
+        equity_usd = metrics.get("equity_usd")
+        realized_pnl = metrics.get("realized_pnl_usd")
+        open_positions = metrics.get("open_positions")
+        wr = metrics.get("win_rate_pct")
+        mdd = metrics.get("max_drawdown_pct")
+
+        if equity_usd is None and AIOSQLITE_AVAILABLE and aiosqlite is not None:
+            try:
+                async with aiosqlite.connect(self._db_path) as db:
+                    async with db.execute(
+                        "SELECT total_equity_usd, realized_pnl_usd, open_positions, win_rate_pct, max_drawdown_pct "
+                        "FROM portfolio_snapshots ORDER BY created_at DESC LIMIT 1"
+                    ) as cur:
+                        row = await cur.fetchone()
+                        if row:
+                            equity_usd = Decimal(str(row[0]))
+                            realized_pnl = Decimal(str(row[1]))
+                            open_positions = int(row[2])
+                            wr = float(row[3])
+                            mdd = float(row[4])
+            except Exception as exc:
+                logger.debug("[TelegramIngester] DB status query fallback error: %s", exc)
+
+        equity_str = f"${float(equity_usd):.2f}" if equity_usd is not None else "$8300.00"
+        pnl_str = f"${float(realized_pnl):.2f}" if realized_pnl is not None else "$0.00"
+        open_lots_val = open_positions if open_positions is not None else 0
+        wr_str = f"{float(wr):.1f}%" if wr is not None else "0.0%"
+        mdd_str = f"{float(mdd):.2f}%" if mdd is not None else "0.00%"
+
+        # 4. Queue backlogs
+        ingest_q_size = metrics.get("ingest_q_size", self._queue.qsize())
+        ingest_q_max = metrics.get("ingest_q_max", getattr(self._queue, "maxsize", 100))
+        signal_q_size = metrics.get("signal_q_size", 0)
+        signal_q_max = metrics.get("signal_q_max", 100)
+
+        msg = (
+            "📊 **Bot-MM Engine Status Report**\n\n"
+            f"⏱ **Uptime:** `{uptime_str}`\n"
+            f"🧠 **Memory RSS:** `{float(rss_mb):.1f} MB`\n"
+            f"💰 **Portfolio Equity:** `{equity_str}`\n"
+            f"📈 **Realized PnL:** `{pnl_str}`\n"
+            f"📦 **Active Lots:** `{open_lots_val}`\n"
+            f"🎯 **Win Rate (WR):** `{wr_str}`\n"
+            f"📉 **Max Drawdown (MDD):** `{mdd_str}`\n\n"
+            "🚦 **Queue Backlog:**\n"
+            f"   • Ingest: `{ingest_q_size}/{ingest_q_max}`\n"
+            f"   • Signal: `{signal_q_size}/{signal_q_max}`\n\n"
+            "⚡ **Telemetry:** Normal 🟢"
+        )
+        await self._safe_reply(event, msg)
+
+    async def _cmd_scan(self, event: Any, args: str, sender_id: Optional[int]) -> None:
+        """Handle /scan <CONTRACT_ADDRESS> command."""
+        if not args:
+            await self._safe_reply(
+                event,
+                "ℹ️ **Usage:** `/scan <CONTRACT_ADDRESS>`\n\n"
+                "• Base (EVM): 42-char hex string starting with `0x`\n"
+                "• Solana (SVM): 32-44 char Base58 address\n\n"
+                "Example:\n`/scan 0x285617313860407d647990b50375990264186566`",
+            )
+            return
+
+        cas = self.extract_contract_addresses(args)
+        if not cas:
+            is_evm_syntax = bool(EVM_CA_REGEX.search(args))
+            is_svm_syntax = bool(SVM_CA_REGEX.search(args))
+            if is_evm_syntax or is_svm_syntax:
+                await self._safe_reply(
+                    event,
+                    "⚠️ Address is a recognized system program or DEX infrastructure router. Trade scanning rejected.",
+                )
+            else:
+                await self._safe_reply(
+                    event,
+                    "❌ Invalid Contract Address. Please provide a valid Base EVM (42 hex chars starting with 0x) or Solana (32-44 base58 chars) address.",
+                )
+            return
+
+        for chain, ca in cas:
+            raw_signal = RawSignalEvent(
+                timestamp_ns=time.time_ns(),
+                chain=chain,
+                token_address=ca,
+                source=SignalSource.TELEGRAM_SCRAPER,
+                originating_channel=f"DM:{sender_id or 'admin'}",
+                channel_id=int(sender_id or 0),
+                message_id=int(getattr(event, "id", 0) or 0),
+                raw_text=args,
+                status=NewsSignalStatus.VALID,
+                sybil_channel_count=1,
+                is_edit=False,
+            )
+            logger.info(
+                "[TelegramIngester] Admin DM scan dispatched: %s on %s by user %s",
+                ca,
+                chain.value,
+                sender_id,
+            )
+            await self._enqueue_event(raw_signal)
+            await self._safe_reply(
+                event,
+                f"🔎 Ingested CA: `{ca}` | Dispatching to SecurityGatekeeper & AMM Math Engine...",
+            )
+
+    async def _cmd_direct_ca_or_help(self, event: Any, text: str, sender_id: Optional[int]) -> None:
+        """Handle raw messages containing contract addresses in DM."""
+        cas = self.extract_contract_addresses(text)
+        if cas:
+            for chain, ca in cas:
+                raw_signal = RawSignalEvent(
+                    timestamp_ns=time.time_ns(),
+                    chain=chain,
+                    token_address=ca,
+                    source=SignalSource.TELEGRAM_SCRAPER,
+                    originating_channel=f"DM:{sender_id or 'admin'}",
+                    channel_id=int(sender_id or 0),
+                    message_id=int(getattr(event, "id", 0) or 0),
+                    raw_text=text,
+                    status=NewsSignalStatus.VALID,
+                    sybil_channel_count=1,
+                    is_edit=False,
+                )
+                logger.info(
+                    "[TelegramIngester] Direct DM CA dispatched: %s on %s by user %s",
+                    ca,
+                    chain.value,
+                    sender_id,
+                )
+                await self._enqueue_event(raw_signal)
+                await self._safe_reply(
+                    event,
+                    f"🔎 Ingested CA: `{ca}` | Dispatching to SecurityGatekeeper & AMM Math Engine...",
+                )
+        else:
+            if text.startswith("/"):
+                await self._safe_reply(
+                    event,
+                    f"❓ Unknown command: `{text.split()[0]}`. Use `/help` to see available commands.",
+                )
+
+    async def _cmd_trades(self, event: Any) -> None:
+        """Handle /trades command in DMs."""
+        if not AIOSQLITE_AVAILABLE or aiosqlite is None:
+            await self._safe_reply(event, "⚠️ SQLite async driver unavailable.")
+            return
+
+        try:
+            async with aiosqlite.connect(self._db_path) as db:
+                cursor = await db.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table' AND name IN ('trades', 'paper_trades')"
+                )
+                table_row = await cursor.fetchone()
+                if not table_row:
+                    await self._safe_reply(event, "📋 No executed paper trades recorded in ledger yet.")
+                    return
+
+                table_name = table_row[0]
+                async with db.execute(
+                    f"SELECT chain, token_address, side, effective_price, realized_pnl_usd "
+                    f"FROM {table_name} ORDER BY created_at DESC LIMIT 5"
+                ) as cur:
+                    rows = await cur.fetchall()
+
+            if not rows:
+                await self._safe_reply(event, "📋 No executed paper trades recorded in ledger yet.")
+                return
+
+            lines = [
+                "📋 **Last 5 Executed Paper Trades**\n",
+                "```",
+                f"{'TOKEN':<12} | {'CHAIN':<6} | {'SIDE':<4} | {'FILL PRICE':<12} | {'PNL':<9}",
+                "-" * 53,
+            ]
+            for r in rows:
+                chain_str = str(r[0]).replace("_mainnet", "")[:6]
+                token_str = str(r[1])
+                short_token = f"{token_str[:4]}..{token_str[-4:]}" if len(token_str) > 10 else token_str
+                side_str = str(r[2]).upper()
+                try:
+                    fill_p = f"{float(r[3]):.6f}"
+                except Exception:
+                    fill_p = str(r[3])[:10]
+                pnl_raw = r[4]
+                if pnl_raw is not None and str(pnl_raw) != "":
+                    try:
+                        pnl_f = float(pnl_raw)
+                        pnl_str = f"+${pnl_f:.2f}" if pnl_f > 0 else f"-${abs(pnl_f):.2f}" if pnl_f < 0 else "$0.00"
+                    except Exception:
+                        pnl_str = str(pnl_raw)
+                else:
+                    pnl_str = "OPEN"
+
+                lines.append(
+                    f"{short_token:<12} | {chain_str:<6} | {side_str:<4} | {fill_p:<12} | {pnl_str:<9}"
+                )
+            lines.append("```")
+            await self._safe_reply(event, "\n".join(lines))
+        except Exception as exc:
+            logger.error("[TelegramIngester] Failed to query trades: %s", exc)
+            await self._safe_reply(event, f"⚠️ Error querying trade history: {exc}")
+
+    # -------------------------------------------------------------------------
+    # 3. Lifecycle & Connection Management
+    # -------------------------------------------------------------------------
 
     async def start(self) -> None:
         """
         Initialize and connect the Telethon TelegramClient.
-        Registers event listeners for new and edited messages.
+        Registers event listeners for channel messages and admin DMs.
         """
         if self._is_dormant:
             logger.info("TelegramIngester starting in dormant mode (no credentials provided).")
@@ -340,7 +749,8 @@ class TelegramIngester:
 
         if self._client is None and TELETHON_AVAILABLE:
             assert self._api_id is not None and self._api_hash is not None
-            self._client = TelegramClient(self._session_name, self._api_id, self._api_hash)
+            session_name = self._session_name
+            self._client = TelegramClient(session_name, self._api_id, self._api_hash)
 
         if self._client is not None:
             # 1. Start and authenticate client first
@@ -388,19 +798,25 @@ class TelegramIngester:
                     len(self._target_channels),
                 )
 
-            # 3. Register event handlers
+            # 3. Register dual-mode event handlers
             if hasattr(self._client, "add_event_handler") and TELETHON_AVAILABLE:
+                # Passive Channel Scraping
                 self._client.add_event_handler(
-                    self._handle_new_message,
+                    self._handle_channel_message,
                     events.NewMessage(chats=chats_arg),
                 )
                 self._client.add_event_handler(
-                    self._handle_edited_message,
+                    self._handle_channel_edited_message,
                     events.MessageEdited(chats=chats_arg),
+                )
+                # Interactive DM Interface
+                self._client.add_event_handler(
+                    self._handle_dm_message,
+                    events.NewMessage(func=lambda e: bool(getattr(e, "is_private", False))),
                 )
 
             self._running = True
-            logger.info("TelegramIngester connected and listening to channels.")
+            logger.info("TelegramIngester connected: dual-mode active (passive channel scraping + interactive DM control).")
 
     async def stop(self) -> None:
         """Gracefully disconnect and tear down the client."""
@@ -446,7 +862,6 @@ class TelegramIngester:
                     wait_s,
                 )
                 if self._limiter is not None:
-                    # Penalize rate limiter if supported
                     try:
                         self._limiter.penalize("telegram", wait_s)
                     except Exception:

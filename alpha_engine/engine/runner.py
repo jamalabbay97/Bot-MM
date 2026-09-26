@@ -13,7 +13,7 @@ import signal
 import sys
 import time
 from decimal import Decimal
-from typing import Optional
+from typing import Any, Optional
 
 import aiohttp
 
@@ -431,6 +431,41 @@ class PaperTradingEngine:
                 self._metrics.max_drawdown_pct,
             )
 
+    def _get_engine_status(self) -> dict[str, Any]:
+        """Collects real-time engine telemetry for the interactive Telegram bot."""
+        uptime_s = time.time() - self._start_time if self._start_time else 0.0
+        hrs, rem = divmod(int(uptime_s), 3600)
+        mins, secs = divmod(rem, 60)
+        uptime_str = f"{hrs:02d}h {mins:02d}m {secs:02d}s"
+
+        rss_mb = 0.0
+        if PSUTIL_AVAILABLE and psutil is not None:
+            try:
+                proc = psutil.Process()
+                rss_mb = proc.memory_info().rss / (1024 * 1024)
+            except Exception:
+                pass
+        else:
+            try:
+                import resource
+                rss_mb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024.0
+            except Exception:
+                pass
+
+        return {
+            "uptime_str": uptime_str,
+            "rss_mb": rss_mb,
+            "equity_usd": self._current_equity_usd(),
+            "realized_pnl_usd": self._metrics.cumulative_realized_usd,
+            "open_positions": self._position_book.open_position_count(),
+            "win_rate_pct": self._metrics.win_rate_pct,
+            "max_drawdown_pct": self._metrics.max_drawdown_pct,
+            "ingest_q_size": self._ingestion_q.qsize(),
+            "ingest_q_max": self._ingestion_q.maxsize,
+            "signal_q_size": self._signal_q.qsize(),
+            "signal_q_max": self._signal_q.maxsize,
+        }
+
     async def _refresh_kelly(
         self,
         executor: PaperExecutor,
@@ -502,6 +537,9 @@ class PaperTradingEngine:
                 telegram_session_name=cfg.telegram_session_name,
                 telegram_bot_token=cfg.telegram_bot_token,
                 telegram_channels=cfg.telegram_channels,
+                telegram_admin_ids=cfg.telegram_admin_ids,
+                db_path=cfg.db_path,
+                status_provider=self._get_engine_status,
             )
 
             async with coordinator:
