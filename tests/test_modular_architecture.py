@@ -77,6 +77,57 @@ def test_modular_package_imports():
         SignalGenerator,
     )
 
+    for obj in (
+        EngineConfig,
+        ChainIdentifier,
+        OrderSide,
+        PoolState,
+        PoolStateUpdateEvent,
+        SecurityReport,
+        SecurityTier,
+        SwapEvent,
+        SignalStrength,
+        ShutdownSentinel,
+        SignalEvent,
+        PaperFill,
+        PortfolioSnapshot,
+        TradeRecord,
+        AsyncTokenBucket,
+        RateLimiterRegistry,
+        RateLimitError,
+        build_alchemy_limiter,
+        build_helius_limiter,
+        CpmmQuote,
+        LatencyResult,
+        classify_alpha_score,
+        compute_position_size,
+        cpmm_buy_quote,
+        cpmm_out,
+        cpmm_sell_quote,
+        gas_cost_usd,
+        half_kelly_fraction,
+        price_impact_bps,
+        simulate_latency,
+        spot_price,
+        SecurityGatekeeper,
+        EVMIngester,
+        IngestionCoordinator,
+        SVMIngester,
+        _decode_evm_swap_log,
+        _decode_evm_sync_log,
+        _normalise,
+        _parse_raydium_log_line,
+        OpenLot,
+        PaperExecutor,
+        PositionBook,
+        RunningMetrics,
+        SQLiteLedger,
+        PaperTradingEngine,
+        PoolRegistry,
+        SignalGenerator,
+    ):
+        assert obj is not None
+
     assert alpha_engine.__version__ == "0.1.0"
 
 
@@ -239,6 +290,8 @@ def test_evm_decoders_and_normalization():
     )
     from alpha_engine.models import ChainIdentifier, PoolState
 
+    assert ChainIdentifier.BASE_MAINNET.value == "base_mainnet"
+    assert PoolState is not None
     assert _normalise(10**18, 18) == Decimal("1")
     assert _normalise(1_500_000, 6) == Decimal("1.5")
 

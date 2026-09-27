@@ -33,9 +33,28 @@ class BytecodeInspectionResult(tuple):
         return _coro().__await__()
 
 
+def parse_payload_or_abi(
+    payload: Optional[Any] = None,
+    abi_params: Optional[dict[str, Any]] = None,
+    metadata: Optional[dict[str, Any]] = None,
+) -> dict[str, Any]:
+    """
+    Parse arbitrary transaction payload or ABI parameters with optional metadata.
+    """
+    result: dict[str, Any] = {}
+    if payload is not None:
+        result["payload"] = payload
+    if abi_params is not None:
+        result["abi"] = abi_params
+    if metadata is not None:
+        result["metadata"] = metadata
+    return result
+
+
 def inspect_bytecode_for_delayed_taxes(
     bytecode_or_w3: Any,
     token_address: Optional[str] = None,
+    metadata: Optional[Any] = None,
 ) -> Any:
     """
     Inspect contract bytecode for delayed fee modifications, dynamic tax setters,
@@ -47,9 +66,10 @@ def inspect_bytecode_for_delayed_taxes(
         if code_hex.startswith("0x"):
             code_hex = code_hex[2:]
         reasons: list[str] = []
-        for selector, name in TAX_MUTATION_MAP.items():
-            if selector in code_hex:
-                reasons.append(name)
+        if any(sel in code_hex for sel in TAX_MUTATION_SELECTORS):
+            for selector, name in TAX_MUTATION_MAP.items():
+                if selector in code_hex:
+                    reasons.append(name)
         return BytecodeInspectionResult((len(reasons) == 0, reasons))
 
     async def _async_inspect() -> tuple[bool, list[str]]:
@@ -63,9 +83,10 @@ def inspect_bytecode_for_delayed_taxes(
             if code_hex.startswith("0x"):
                 code_hex = code_hex[2:]
 
-            for selector, name in TAX_MUTATION_MAP.items():
-                if selector in code_hex:
-                    reasons.append(name)
+            if any(sel in code_hex for sel in TAX_MUTATION_SELECTORS):
+                for selector, name in TAX_MUTATION_MAP.items():
+                    if selector in code_hex:
+                        reasons.append(name)
 
             if reasons:
                 return False, reasons

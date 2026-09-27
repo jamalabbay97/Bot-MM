@@ -28,8 +28,8 @@ _LOGGING_INITIALIZED = False
 
 
 def setup_production_logging(
-    log_level: str = "INFO",
-    log_dir: str = "logs",
+    log_level: Optional[str] = None,
+    log_dir: Optional[str] = None,
     log_filename: str = "engine.log",
     max_bytes: int = 20 * 1024 * 1024,  # 20 MB
     backup_count: int = 5,
@@ -52,15 +52,18 @@ def setup_production_logging(
     """
     global _LOGGING_INITIALIZED
 
+    effective_level = log_level or os.getenv("LOG_LEVEL", "INFO")
+    effective_dir = log_dir or os.getenv("LOG_DIR", "logs")
+
     root_logger = logging.getLogger()
-    numeric_level = getattr(logging, log_level.upper(), logging.INFO)
+    numeric_level = getattr(logging, effective_level.upper(), logging.INFO)
     root_logger.setLevel(numeric_level)
 
     if _LOGGING_INITIALIZED:
         return root_logger
 
     # 1. Create logs directory if missing
-    dir_path = Path(log_dir)
+    dir_path = Path(effective_dir)
     dir_path.mkdir(parents=True, exist_ok=True)
     log_file_path = dir_path / log_filename
 

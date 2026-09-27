@@ -59,6 +59,22 @@ class SmartMoneyProfiler:
         """Initialize database tables and connections."""
         await self.whitelist_db.connect()
 
+    async def profile_wallets_batch(
+        self,
+        tasks: Sequence[tuple[str, ChainIdentifier, list[WalletTradeRecord], list[InitialTxRecord]]],
+    ) -> list[WalletProfile]:
+        """Concurrently profile multiple candidate wallets."""
+        coros = [
+            self.profile_and_whitelist_wallet(
+                wallet_address=addr,
+                chain=chain,
+                trade_records=trades,
+                first_transactions=first_txs,
+            )
+            for addr, chain, trades, first_txs in tasks
+        ]
+        return list(await asyncio.gather(*coros))
+
     async def trace_funding_hops(
         self,
         wallet_address: str,

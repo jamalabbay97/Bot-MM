@@ -131,7 +131,7 @@ class PrivateTxRouter:
         self,
         signed_raw_tx_hex: str,
         builder_url: Optional[str] = None,
-    ) -> dict[str, Any]:
+    ) -> Optional[dict[str, Any]]:
         """
         Broadcast signed EVM transaction directly to a private block builder.
         Bypasses the public mempool to prevent sandwich and MEV front-running.
@@ -168,19 +168,24 @@ class PrivateTxRouter:
 
     async def send_solana_jito_bundle(
         self,
-        encoded_transactions: list[str],
+        encoded_transactions: Sequence[str] | Sequence[bytes],
         tip_percentile: str = "p75",
-    ) -> dict[str, Any]:
+    ) -> Optional[dict[str, Any]]:
         """
         Submit a bundle of serialized base58/base64 transactions directly to Jito Block Engine.
         """
         tip_lamports = await self.get_jito_tip_floor(percentile=tip_percentile)
 
+        tx_payload: list[str] = [
+            tx.hex() if isinstance(tx, bytes) else str(tx)
+            for tx in encoded_transactions
+        ]
+
         payload = {
             "jsonrpc": "2.0",
             "id": 1,
             "method": "sendBundle",
-            "params": [encoded_transactions],
+            "params": [tx_payload],
         }
 
         should_close = False
@@ -204,3 +209,49 @@ class PrivateTxRouter:
         finally:
             if should_close and session is not None:
                 await session.close()
+
+    async def simulate_bundle(
+        self,
+        chain: ChainIdentifier,
+        transactions: Sequence[str] | Sequence[bytes],
+        target_block: Optional[int] = None,
+    ) -> Optional[dict[str, Any]]:
+        """
+        Simulate bundle execution against private builder or RPC endpoints.
+        """
+        if not transactions:
+            return None
+
+        tx_strings: list[str] = [
+            tx.hex() if isinstance(tx, bytes) else str(tx)
+            for tx in transactions
+        ]
+
+        if chain == ChainIdentifier.BASE_MAINNET:
+            try:
+                async with asyncio.timeout(3.0):
+                    return await self.send_evm_private_tx(tx_strings[0], builder_url=self.flashbots_rpc)
+            except (asyncio.TimeoutError, Exception) as exc:
+                logger.warning("Bundle simulation failed for %s: %s", chain.value, exc)
+                return {"error": str(exc)}
+        elif chain == ChainIdentifier.SOLANA_MAINNET:
+            try:
+                async with asyncio.timeout(3.0):
+                    return await self.send_solana_jito_bundle(tx_strings)
+            except (asyncio.TimeoutError, Exception) as exc:
+                logger.warning("Bundle simulation failed for %s: %s", chain.value, exc)
+                return {"error": str(exc)}
+        return None
+
+    async def route_bundle_for_chain(
+        self,
+        chain: ChainIdentifier,
+        transactions: Sequence[str] | Sequence[bytes],
+    ) -> Optional[str]:
+        """
+        Route transaction bundle for execution and return transaction or bundle identifier.
+        """
+        res = await self.simulate_bundle(chain, transactions)
+        if res and "result" in res and res["result"] is not None:
+            return str(res["result"])
+        return None

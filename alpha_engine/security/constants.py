@@ -76,6 +76,46 @@ MIXER_AND_RUG_FUNDING_ADDRESSES: CaseInsensitiveFrozenSet = CaseInsensitiveFroze
     "0x50de13ad81423ca5538e1a1005bc407817eb578a",  # Railgun Relayer
 })
 
+# Solana well-known system / DEX / router / program IDs to exclude from token screening
+SOLANA_SYSTEM_PROGRAM_IDS: frozenset[str] = frozenset({
+    "11111111111111111111111111111111",                     # System Program
+    "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",          # Token Program
+    "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb",          # Token-2022
+    "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL",          # Associated Token Account
+    "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8",          # Raydium Liquidity Pool V4
+    "CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK",          # Raydium CLMM
+    "CPMMoo8L3F4NbTegBCKVNunggL7H1ZpdTHKxQB5qKP1C",          # Raydium CPMM
+    "5Q544fKrFoe6tsEbD7S8EmxGTJYAKtTVhAW5Q5pge4j1",          # Raydium Authority
+    "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P",          # Pump.fun Program
+    "CebN5WGQ4jvEPvsVU4EoHEpgzq1VV7AbicfhtW4xC9iM",          # Pump.fun Fee Account
+    "Ce6TQqeHC9p8KetsN6JsjHK7UTZk7nasjjnr7XxXp9F1",          # Pump.fun Global
+    "srmqPvymJeFKQ4zGQed1GFppgkRHL9kaELCbyksJtPX",          # Serum v3
+    "opnb2TXrmDdHGauUQavWet8xTzJpdodAx7LvnR38sNY",          # OpenBook
+    "LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo",          # Meteora DLMM
+    "Eo7WjKq67rjJQSZxS6z3YkapzY3eMj6Xy8X5EQVn5UaB",          # Meteora Pools
+    "ComputeBudget111111111111111111111111111111",          # Compute Budget
+    "SysvarRent111111111111111111111111111111111",          # Sysvar Rent
+    "SysvarC1ock11111111111111111111111111111111",          # Sysvar Clock
+    "SysvarRecentB1ockHashes11111111111111111111",          # Sysvar Blockhashes
+    "So11111111111111111111111111111111111111112",          # Wrapped SOL
+    "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",          # USDC
+    "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB",          # USDT
+    "FLASHX8DrLbgeR8FcfNV1F5krxYcYMUdBkrP1EPBtxB9",          # Flash Trade
+    "JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4",          # Jupiter V6
+    "JUP4Fb2cqiRUcaTHdrPC8h2gNsA2ETXiPDD33WcGuJB",          # Jupiter V4
+    "whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc",          # Orca Whirlpool
+    "metaqbxxUerdq28cj1RbAWkYQm3ybzjb6a8bt518x1s",          # Metaplex Token Metadata
+})
+
+# EVM well-known system / router / zero addresses to exclude
+EVM_SYSTEM_ADDRESSES: CaseInsensitiveFrozenSet = CaseInsensitiveFrozenSet({
+    "0x0000000000000000000000000000000000000000",
+    "0x4200000000000000000000000000000000000006",          # Base WETH
+    "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913",          # Base USDC
+    "0xcf77a3ba9a5ca399b7c97c749566343833341fdc",          # Aerodrome Router
+})
+
+
 
 # Uniswap v2 / Aerodrome router ABI fragments needed for eth_call simulation
 _ROUTER_ABI_SWAP_EXACT_ETH: list[dict[str, Any]] = [

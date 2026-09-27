@@ -818,10 +818,13 @@ class TelegramIngester:
             self._running = True
             logger.info("TelegramIngester connected: dual-mode active (passive channel scraping + interactive DM control).")
 
-    async def stop(self) -> None:
+    async def stop(self, send_sentinel: bool = False) -> None:
         """Gracefully disconnect and tear down the client."""
         self._shutdown_event.set()
         self._running = False
+
+        if send_sentinel and self._queue is not None:
+            await self._queue.put(ShutdownSentinel())
 
         if self._client is not None:
             if hasattr(self._client, "disconnect"):

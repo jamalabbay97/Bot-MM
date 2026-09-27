@@ -212,7 +212,7 @@ class EngineConfig(BaseSettings):
             if not clean:
                 return []
             return [ch.strip() for ch in clean.split(",") if ch.strip()]
-        if isinstance(v, (list, tuple, set)):
+        if isinstance(v, (list, tuple, set, Sequence)):
             return [str(ch).strip() for ch in v if str(ch).strip()]
         return []
 
@@ -232,7 +232,7 @@ class EngineConfig(BaseSettings):
                 if item_s.lstrip("-").isdigit():
                     ids.append(int(item_s))
             return ids
-        if isinstance(v, (list, tuple, set)):
+        if isinstance(v, (list, tuple, set, Sequence)):
             res: list[int] = []
             for item in v:
                 if isinstance(item, int):

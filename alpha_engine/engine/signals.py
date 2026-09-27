@@ -10,7 +10,7 @@ from __future__ import annotations
 import logging
 import time
 from decimal import Decimal
-from typing import Any
+from typing import Any, Optional
 
 from alpha_engine.math.sizing import classify_alpha_score
 from alpha_engine.models.enums import (
@@ -36,6 +36,26 @@ class SignalGenerator:
         hold_seconds: float = 300.0,
     ) -> None:
         self._hold_s = hold_seconds
+
+    def validate_signal_strength(
+        self,
+        signal_event: SignalEvent,
+        min_strength: Optional[SignalStrength] = None,
+    ) -> bool:
+        """
+        Validate whether the signal meets the minimum strength threshold.
+        """
+        if signal_event.suggested_side == OrderSide.SELL:
+            return True
+        if min_strength is None:
+            return True
+
+        rank = {
+            SignalStrength.WEAK: 1,
+            SignalStrength.MODERATE: 2,
+            SignalStrength.STRONG: 3,
+        }
+        return rank.get(signal_event.strength, 0) >= rank.get(min_strength, 0)
 
     def score_swap(
         self,
@@ -63,6 +83,7 @@ class SignalGenerator:
         pool: PoolState,
         report: SecurityReport,
         source: SignalSource = SignalSource.DEX_SWAP,
+        min_strength: Optional[SignalStrength] = None,
     ) -> SignalEvent | None:
         """Generate a BUY SignalEvent for a qualifying swap."""
         alpha = self.score_swap(swap, pool, report)
@@ -77,7 +98,7 @@ class SignalGenerator:
         strength_str = classify_alpha_score(alpha)
         strength = SignalStrength(strength_str)
 
-        return SignalEvent(
+        signal = SignalEvent(
             timestamp_ns=time.time_ns(),
             chain=swap.chain,
             pool_address=swap.pool_address,
@@ -90,6 +111,12 @@ class SignalGenerator:
             alpha_score=alpha,
             source=source,
         )
+
+        if not self.validate_signal_strength(signal, min_strength=min_strength):
+            logger.debug("Signal rejected: strength %s below threshold %s", strength, min_strength)
+            return None
+
+        return signal
 
     def generate_social_signal(
         self,

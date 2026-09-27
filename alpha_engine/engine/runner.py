@@ -49,6 +49,7 @@ from alpha_engine.models.events import (
 )
 from alpha_engine.models.state import PoolState, PortfolioSnapshot, TradeRecord
 from alpha_engine.rate_limiter.registry import RateLimiterRegistry
+from alpha_engine.security.constants import EVM_SYSTEM_ADDRESSES, SOLANA_SYSTEM_PROGRAM_IDS
 from alpha_engine.security.gatekeeper import SecurityGatekeeper
 
 logger = logging.getLogger(__name__)
@@ -179,6 +180,20 @@ class PaperTradingEngine:
 
             if isinstance(item, RawSignalEvent):
                 raw_sig: RawSignalEvent = item
+                if raw_sig.chain == ChainIdentifier.SOLANA_MAINNET and (
+                    raw_sig.token_address in SOLANA_SYSTEM_PROGRAM_IDS
+                    or raw_sig.token_address.startswith("11111111")
+                ):
+                    logger.debug("Skipping system program token: %s", raw_sig.token_address)
+                    continue
+
+                if raw_sig.chain == ChainIdentifier.BASE_MAINNET and (
+                    raw_sig.token_address in EVM_SYSTEM_ADDRESSES
+                    or raw_sig.token_address.lower() in EVM_SYSTEM_ADDRESSES
+                ):
+                    logger.debug("Skipping system address token: %s", raw_sig.token_address)
+                    continue
+
                 try:
                     report = await gk.screen_token(
                         token_address=raw_sig.token_address,
@@ -354,6 +369,31 @@ class PaperTradingEngine:
                         )
                         await self._feedback.record_closed_trade(reflection)
 
+    def validate_signal_strength(
+        self,
+        signal_item: SignalEvent,
+        min_strength: Optional[SignalStrength] = None,
+    ) -> bool:
+        """
+        Validate whether the signal meets the minimum strength threshold before placing an order.
+        SELL signals always pass for risk management / staged exits.
+        """
+        if signal_item.suggested_side == OrderSide.SELL:
+            return True
+
+        threshold = min_strength or getattr(self._cfg, "min_signal_strength", None)
+        if threshold is None:
+            return True
+
+        rank = {
+            SignalStrength.WEAK: 1,
+            SignalStrength.MODERATE: 2,
+            SignalStrength.STRONG: 3,
+        }
+        item_rank = rank.get(signal_item.strength, 0)
+        req_rank = rank.get(threshold, 0)
+        return item_rank >= req_rank
+
     async def _process_signal_queue(self) -> None:
         executor = self._executor
         ledger = self._ledger
@@ -367,6 +407,14 @@ class PaperTradingEngine:
                 return
 
             signal_item: SignalEvent = item
+
+            if not self.validate_signal_strength(signal_item):
+                logger.info(
+                    "Signal for %s dropped: strength %s does not meet required threshold",
+                    getattr(signal_item, "token_address", "")[:10],
+                    getattr(signal_item, "strength", None),
+                )
+                continue
 
             equity = self._current_equity_usd()
             fill = await executor.execute_signal(signal_item, portfolio_equity_usd=equity)

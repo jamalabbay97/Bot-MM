@@ -42,6 +42,7 @@ class TradeReflection:
     realized_pnl_usd: Decimal = Decimal(0)
     roi_pct: float = 0.0
     is_win: bool = False
+    custom_metadata: Optional[dict[str, Any]] = None
     timestamp_ns: int = field(default_factory=time.time_ns)
 
     @classmethod
@@ -58,6 +59,7 @@ class TradeReflection:
         time_to_fill_ms: float = 50.0,
         expected_slippage_bps: int = 500,
         wallet_address: Optional[str] = None,
+        custom_metadata: Optional[dict[str, Any]] = None,
     ) -> TradeReflection:
         if entry_price > Decimal(0):
             roi = float((exit_price - entry_price) / entry_price * 100)
@@ -83,6 +85,7 @@ class TradeReflection:
             realized_pnl_usd=realized_pnl_usd,
             roi_pct=roi,
             is_win=is_win,
+            custom_metadata=custom_metadata,
             timestamp_ns=time.time_ns(),
         )
 
@@ -110,6 +113,7 @@ class AdaptiveFeedbackEngine:
         self._min_social_weight = min_social_weight
         self._decay_factor = decay_factor
         self._lookback_trades = lookback_trades
+        self._lock = asyncio.Lock()
 
         self._reflections: list[TradeReflection] = []
         self._source_history: dict[SignalSource, list[TradeReflection]] = defaultdict(list)
@@ -119,8 +123,9 @@ class AdaptiveFeedbackEngine:
         """
         Record a closed trade reflection and trigger weight adaptations and wallet pruning.
         """
-        self._reflections.append(reflection)
-        self._source_history[reflection.signal_source].append(reflection)
+        async with self._lock:
+            self._reflections.append(reflection)
+            self._source_history[reflection.signal_source].append(reflection)
 
         logger.info(
             "Recorded TradeReflection [%s] %s | PnL=$%.2f (%.1f%%) | Source=%s | ActualSlippage=%dbps | FillLatency=%.1fms",

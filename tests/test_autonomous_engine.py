@@ -13,6 +13,7 @@ Validates:
 from __future__ import annotations
 
 import asyncio
+import os
 import time
 from decimal import Decimal
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -48,6 +49,7 @@ from alpha_engine.models.enums import (
     OrderSide,
     SecurityTier,
     SignalSource,
+    SignalStrength,
     TradeExitReason,
     WalletClassification,
     WhitelistStatus,
@@ -76,6 +78,7 @@ from alpha_engine.security.preflight import inspect_bytecode_for_delayed_taxes
 
 def test_svm_pump_fun_log_parsing():
     """Verify parsing of Pump.fun mint and bonding curve initialization logs."""
+    assert PUMP_FUN_PROGRAM_ID == "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"
     logs = [
         "Program 6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P invoke [1]",
         "Program log: Instruction: InitializeMint2",
@@ -93,6 +96,7 @@ def test_svm_pump_fun_log_parsing():
 
 def test_svm_raydium_amm_pool_parsing():
     """Verify parsing of Raydium AMM pool creation logs."""
+    assert RAYDIUM_AMM_PROGRAM_ID == "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8"
     logs = [
         "Program 675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8 invoke [1]",
         "Program log: initialize2: open_time 1711000000",
@@ -123,6 +127,23 @@ def test_evm_pair_created_event_decoding():
     assert pair.lower() == pair_addr.lower()
     assert new_token.lower() == "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913"
     assert is_weth_first is True
+
+    # PoolCreated(address,address,uint24,int24,address)
+    pool_created_log = {
+        "topics": [
+            "0x783cca1c041245d8083164ea2cbd8e436ab6ae90824b2b740b02830204cc0415",
+            topic1,
+            topic2,
+            "0x00000000000000000000000000000000000000000000000000000000000001f4",
+        ],
+        "data": "0x" + "00" * 32 + "00" * 12 + pair_addr[2:] + "00" * 32,
+        "address": "0xfactory",
+        "transactionHash": "0xtx",
+        "blockNumber": "0x1",
+    }
+    pool_decoded = _decode_evm_pool_created_log(pool_created_log)
+    assert pool_decoded is not None
+    assert pool_decoded["pool"].lower() == pair_addr.lower()
 
 
 def test_x_stream_anti_sybil_and_engagement_velocity():
@@ -204,6 +225,8 @@ def test_x_stream_anti_sybil_and_engagement_velocity():
 
 def test_bytecode_delayed_tax_selector_inspection():
     """Verify inspection of EVM bytecode for backdoor tax/trading mutation selectors."""
+    assert "9c3d4f19" in TAX_MUTATION_SELECTORS
+    assert len(TAX_MUTATION_SELECTORS) > 0
     # Bytecode containing setTax(uint256,uint256) selector: 0x9c3d4f19
     malicious_bytecode = "0x608060405234801561001057600080fd5b509c3d4f19610020"
     is_safe, detected = inspect_bytecode_for_delayed_taxes(malicious_bytecode)
@@ -415,10 +438,13 @@ def test_private_tx_router_endpoints_and_jito_tip():
     with patch("aiohttp.ClientSession.get", return_value=mock_ctx):
         tip = asyncio.run(router.get_jito_tip_floor(percentile="p75"))
         assert tip == Decimal("0.002")
+        mock_resp.json.assert_awaited_once()
 
 
 def test_position_sizing_autonomous_cap_and_paper_drag():
     """Verify 2%-5% Kelly cap and paper trading drag deduction (0.3% fee + 0.005 gas + 5% slippage)."""
+    assert MAX_AUTONOMOUS_CAP == Decimal("0.05")
+    assert SIMULATED_GAS_NATIVE > Decimal(0)
     # 1. Autonomous Kelly sizing with 5% cap
     sizing = compute_position_size(
         kelly_fraction=0.10,  # raw 10%
@@ -462,10 +488,13 @@ def test_dynamic_exits_take_profit_ladder():
         effective_price=Decimal("0.001"),  # Entry price
     )
     lot = book.open_lot(fill, signal_id="sig_moon")
+    assert isinstance(lot, OpenLot)
+    assert PaperExecutor is not None
 
     # 1. Price reaches 2x (+100%) -> Sell 50% of bag (500 tokens)
     p_2x = Decimal("0.002")
     decision_2x = book.evaluate_lot_exit(lot, current_price=p_2x)
+    assert isinstance(decision_2x, ExitDecision)
     assert decision_2x is not None
     assert decision_2x.should_exit is True
     assert decision_2x.exit_reason == TradeExitReason.TP_2X
@@ -650,6 +679,9 @@ def test_rpc_health_failover_latency_and_lag():
         primary_rpc = "https://rpc1.primary.org"
         fallback_rpc = "https://rpc2.fallback.org"
 
+        endpoint = RPCEndpoint(url=primary_rpc, chain=ChainIdentifier.BASE_MAINNET)
+        assert endpoint.url == primary_rpc
+
         monitor = RPCHealthMonitor(
             endpoints={ChainIdentifier.BASE_MAINNET: [primary_rpc, fallback_rpc]},
             latency_threshold_ms=400.0,
@@ -681,10 +713,9 @@ def test_rpc_health_failover_latency_and_lag():
 def test_security_gatekeeper_screen_token_optional_pool_address():
     """Verify SecurityGatekeeper.screen_token can be called with or without pool_address."""
     from alpha_engine.rate_limiter.registry import RateLimiterRegistry
-    from alpha_engine.security.gatekeeper import SecurityGatekeeper
 
     async def _run():
-        session = MagicMock()
+        session = AsyncMock()
         limiter = RateLimiterRegistry.default()
         gk = SecurityGatekeeper(
             session=session,
@@ -723,6 +754,7 @@ def test_security_gatekeeper_screen_token_optional_pool_address():
             pool_address="0x" + "4" * 40,
         )
         assert rep2.passes_hard_gates is True
+        assert gk._run_tier1.await_count == 2
 
         # 3. Test RawSignalEvent carrying pool_address
         raw_event = RawSignalEvent(
@@ -750,4 +782,156 @@ def test_dns_resolver_anti_sinkhole_patch():
     # Ensure it is NOT a Cisco Umbrella sinkhole IP (146.112.*)
     assert not resolved_ip.startswith("146.112.")
     assert resolved_ip in ("104.18.36.169", "172.64.151.87")
+
+
+def test_trade_evaluation_pipeline_signal_strength_validation():
+    """Verify SignalStrength integration into trade evaluation pipeline before order placement."""
+    from alpha_engine.engine.runner import PaperTradingEngine
+    from alpha_engine.engine.signals import SignalGenerator
+
+    fallback_rpc = os.getenv("TEST_BASE_RPC_HTTP", "https://base.llamarpc.com")
+    cfg = EngineConfig(base_rpc_http=fallback_rpc)
+    assert cfg.base_rpc_http == fallback_rpc
+    assert time.time() > 0
+
+    engine = PaperTradingEngine(config=cfg)
+    generator = SignalGenerator()
+
+    pool_state = PoolState(
+        pool_address="0x" + "4" * 40,
+        chain=ChainIdentifier.BASE_MAINNET,
+        token_reserve=Decimal("1000000"),
+        native_reserve=Decimal("100"),
+        fee_numerator=3,
+        fee_denominator=1000,
+        last_updated_block=12345,
+        token_decimals=18,
+        native_decimals=18,
+    )
+    swap_event = SwapEvent(
+        timestamp_ns=time.time_ns(),
+        block_number=12345,
+        chain=ChainIdentifier.BASE_MAINNET,
+        pool_address="0x" + "4" * 40,
+        token_in="0x" + "2" * 40,
+        token_out="0x" + "3" * 40,
+        amount_in=Decimal("1.0"),
+        amount_out=Decimal("1000.0"),
+        sender="0x" + "5" * 40,
+        tx_hash="0x" + "6" * 64,
+        log_index=0,
+    )
+    security_report = SecurityReport(
+        token_address="0x" + "3" * 40,
+        chain=ChainIdentifier.BASE_MAINNET,
+        tier=SecurityTier.CLEAN,
+        is_honeypot=False,
+        buy_tax_bps=100,
+        sell_tax_bps=100,
+    )
+
+    weak_signal = SignalEvent(
+        timestamp_ns=time.time_ns(),
+        chain=ChainIdentifier.BASE_MAINNET,
+        pool_address="0x" + "4" * 40,
+        token_address="0x" + "3" * 40,
+        suggested_side=OrderSide.BUY,
+        trigger_swap=swap_event,
+        pool_state=pool_state,
+        security_report=security_report,
+        strength=SignalStrength.WEAK,
+        alpha_score=0.3,
+    )
+
+    strong_signal = SignalEvent(
+        timestamp_ns=time.time_ns(),
+        chain=ChainIdentifier.BASE_MAINNET,
+        pool_address="0x" + "4" * 40,
+        token_address="0x" + "3" * 40,
+        suggested_side=OrderSide.BUY,
+        trigger_swap=swap_event,
+        pool_state=pool_state,
+        security_report=security_report,
+        strength=SignalStrength.STRONG,
+        alpha_score=0.9,
+    )
+
+    sell_signal = SignalEvent(
+        timestamp_ns=time.time_ns(),
+        chain=ChainIdentifier.BASE_MAINNET,
+        pool_address="0x" + "4" * 40,
+        token_address="0x" + "3" * 40,
+        suggested_side=OrderSide.SELL,
+        trigger_swap=swap_event,
+        pool_state=pool_state,
+        security_report=security_report,
+        strength=SignalStrength.WEAK,
+        alpha_score=0.2,
+    )
+
+    # 1. Weak signal fails when MODERATE or STRONG is required
+    assert not generator.validate_signal_strength(weak_signal, min_strength=SignalStrength.MODERATE)
+    assert not engine.validate_signal_strength(weak_signal, min_strength=SignalStrength.MODERATE)
+
+    # 2. Strong signal passes MODERATE and STRONG thresholds
+    assert generator.validate_signal_strength(strong_signal, min_strength=SignalStrength.MODERATE)
+    assert engine.validate_signal_strength(strong_signal, min_strength=SignalStrength.MODERATE)
+    assert generator.validate_signal_strength(strong_signal, min_strength=SignalStrength.STRONG)
+    assert engine.validate_signal_strength(strong_signal, min_strength=SignalStrength.STRONG)
+
+    # 3. Sell signals always pass for risk management / staged exits
+    assert generator.validate_signal_strength(sell_signal, min_strength=SignalStrength.STRONG)
+    assert engine.validate_signal_strength(sell_signal, min_strength=SignalStrength.STRONG)
+
+
+def test_svm_system_program_filtering_and_rugcheck_hardening():
+    """Verify system programs are rejected from Pump.fun log parsing and RugCheck null responses handled safely."""
+    from alpha_engine.ingestion.decoders import _parse_pump_fun_logs
+    from alpha_engine.security.constants import SOLANA_SYSTEM_PROGRAM_IDS
+    from alpha_engine.security.rugcheck import _parse_rugcheck_report
+
+    # 1. Reject logs from unrelated transactions that only invoke ComputeBudget / ATA / System Program
+    unrelated_logs = [
+        "Program ComputeBudget111111111111111111111111111111 invoke [1]",
+        "Program log: SetComputeUnitLimit: 200000",
+        "Program ComputeBudget111111111111111111111111111111 success",
+        "Program ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL invoke [1]",
+        "Program log: Create",
+        "Program 11111111111111111111111111111111 invoke [2]",
+        "Program log: CreateAccount",
+        "Program 11111111111111111111111111111111 success",
+        "Program ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL success",
+    ]
+    assert _parse_pump_fun_logs(unrelated_logs) is None
+
+    # 2. Reject extracting system programs even if pump.fun is mentioned
+    sys_logs = [
+        "Program 6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P invoke [1]",
+        "Program log: Instruction: Create",
+        "Program ComputeBudget111111111111111111111111111111 invoke [2]",
+        "Program ComputeBudget111111111111111111111111111111 success",
+        "Program 6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P success",
+    ]
+    assert _parse_pump_fun_logs(sys_logs) is None
+
+    # 3. RugCheck null topHolders or null fields (e.g. Wrapped SOL) does not raise TypeError
+    null_holders_raw = {
+        "mintAuthority": None,
+        "freezeAuthority": None,
+        "markets": [],
+        "topHolders": None,
+        "risks": None,
+        "tokenMeta": None,
+    }
+    rep = _parse_rugcheck_report("So11111111111111111111111111111111111111112", null_holders_raw)
+    assert rep.token_address == "So11111111111111111111111111111111111111112"
+    assert rep.top10_concentration == 0.0
+
+    # 4. RugCheck invalid mint payload triggers TIER1_REJECTED
+    rep_invalid = _parse_rugcheck_report("ComputeBudget111111111111111111111111111111", {"invalid_mint": True})
+    assert rep_invalid.tier == SecurityTier.TIER1_REJECTED
+    assert rep_invalid.passes_hard_gates is False
+    assert "ComputeBudget111111111111111111111111111111" in SOLANA_SYSTEM_PROGRAM_IDS
+
+
 

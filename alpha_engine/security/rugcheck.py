@@ -23,6 +23,7 @@ from alpha_engine.security.constants import (
     _MAX_TOP10_CONCENTRATION,
     _MIN_LP_BURNED_RATIO,
     _RUGCHECK_URL,
+    SOLANA_SYSTEM_PROGRAM_IDS,
 )
 
 
@@ -35,6 +36,10 @@ async def _fetch_rugcheck_report(
     limiter: RateLimiterRegistry,
 ) -> dict[str, Any] | None:
     """Fetch token report from RugCheck API for a Solana token mint."""
+    if mint_address in SOLANA_SYSTEM_PROGRAM_IDS or mint_address.startswith("11111111"):
+        logger.debug("Skipping RugCheck for known Solana system/infrastructure address %s", mint_address)
+        return {"invalid_mint": True}
+
     url = _RUGCHECK_URL.format(mint=mint_address)
     await limiter.helius.acquire(cost=1.0)
 
@@ -43,6 +48,9 @@ async def _fetch_rugcheck_report(
             url,
             timeout=aiohttp.ClientTimeout(total=_API_TIMEOUT_S),
         ) as resp:
+            if resp.status in (400, 404):
+                logger.info("RugCheck indicated invalid/non-existent token mint %s (HTTP %d)", mint_address, resp.status)
+                return {"invalid_mint": True}
             if resp.status != 200:
                 logger.warning(
                     "RugCheck returned HTTP %d for %s", resp.status, mint_address
@@ -59,8 +67,23 @@ def _parse_rugcheck_report(
     raw: dict[str, Any],
 ) -> SecurityReport:
     """Parse a RugCheck API response into a SecurityReport."""
-    risks: list[dict[str, Any]] = raw.get("risks", [])
-    token_meta: dict[str, Any] = raw.get("tokenMeta", {})
+    if raw.get("invalid_mint"):
+        return SecurityReport(
+            token_address=mint_address,
+            chain=ChainIdentifier.SOLANA_MAINNET,
+            tier=SecurityTier.TIER1_REJECTED,
+            is_honeypot=False,
+            buy_tax_bps=10_000,
+            sell_tax_bps=10_000,
+            lp_burned_ratio=0.0,
+            top10_concentration=1.0,
+            mint_authority_disabled=False,
+            verified_source_code=False,
+            external_api_raw=json.dumps(raw),
+        )
+
+    risks: list[dict[str, Any]] = raw.get("risks") or []
+    token_meta: dict[str, Any] = raw.get("tokenMeta") or {}
 
     mint_authority = raw.get("mintAuthority")
     mint_disabled = mint_authority is None or str(mint_authority).lower() == "null"
@@ -70,15 +93,16 @@ def _parse_rugcheck_report(
     if has_freeze:
         mint_disabled = False
 
-    markets: list[dict[str, Any]] = raw.get("markets", [])
+    markets: list[dict[str, Any]] = raw.get("markets") or []
     lp_burned_ratio = 0.0
     if markets:
-        lp_info: dict[str, Any] = markets[0].get("lp", {})
+        first_m = markets[0]
+        lp_info: dict[str, Any] = (first_m.get("lp") or {}) if isinstance(first_m, dict) else {}
         lp_locked_pct = float(lp_info.get("lpLockedPct", 0) or 0)
         lp_burned_ratio = min(1.0, lp_locked_pct / 100.0)
 
-    top_holders: list[dict[str, Any]] = raw.get("topHolders", [])
-    non_insider = [h for h in top_holders if not h.get("insider", False)]
+    top_holders: list[dict[str, Any]] = raw.get("topHolders") or []
+    non_insider = [h for h in top_holders if isinstance(h, dict) and not h.get("insider", False)]
     top10_pcts = [float(h.get("pct", 0) or 0) for h in non_insider[:10]]
     top10_concentration = min(1.0, sum(top10_pcts) / 100.0)
 

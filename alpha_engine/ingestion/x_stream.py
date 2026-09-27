@@ -174,6 +174,10 @@ class EngagementEvaluation:
     def velocity_score(self) -> float:
         return self.organic_score
 
+    @property
+    def score_decimal(self) -> Decimal:
+        return Decimal(str(round(self.organic_score, 4)))
+
 
 class XStreamIngester:
     """
@@ -189,6 +193,7 @@ class XStreamIngester:
         proxy_pool: Optional[Sequence[str]] = None,
         limiter: Optional[RateLimiterRegistry] = None,
         poll_interval_s: float = 5.0,
+        session: Optional[aiohttp.ClientSession] = None,
     ) -> None:
         self._queue = event_queue
         self._bearer_token = bearer_token
@@ -196,10 +201,29 @@ class XStreamIngester:
         self._proxy_index = 0
         self._limiter = limiter
         self._poll_interval = poll_interval_s
+        self._session = session
         self._running = False
         self._blacklisted_symbols: Set[str] = set()
         self._seen_tweet_ids: Set[str] = set()
         self._backoff = ExponentialBackoff()
+
+    def to_news_signal_event(
+        self,
+        tweet: TweetPayload,
+        token_address: str,
+        chain: ChainIdentifier,
+    ) -> NewsSignalEvent:
+        """Convert an organic tweet into a structured NewsSignalEvent."""
+        return NewsSignalEvent(
+            timestamp_ns=int(getattr(tweet, "created_at_timestamp", time.time()) * 1e9),
+            token_address=token_address,
+            chain=chain,
+            originating_channel=f"@{tweet.author_username}",
+            channel_id=int(tweet.author_id) if tweet.author_id.isdigit() else 0,
+            message_id=int(tweet.tweet_id) if tweet.tweet_id.isdigit() else 0,
+            status=NewsSignalStatus.VALID,
+            raw_text=tweet.text,
+        )
 
     def is_symbol_blacklisted(self, symbol: str) -> bool:
         """Check if a token symbol/ticker is currently blacklisted."""

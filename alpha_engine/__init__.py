@@ -108,6 +108,7 @@ __all__ = [
     "TradeExitReason",
     "SwapEvent",
     "SignalEvent",
+    "RawSignalEvent",
     "PoolStateUpdateEvent",
     "ShutdownSentinel",
     "TelegramMessage",

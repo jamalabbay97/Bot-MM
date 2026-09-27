@@ -88,6 +88,93 @@ def test_models_validation_and_invariants():
     except Exception:
         pass
 
+    # Verify module facades and all imported model types
+    assert models.__name__ == "models"
+    assert rate_limiter.__name__ == "rate_limiter"
+    assert wallet_profiler.__name__ == "wallet_profiler"
+    assert WhitelistDatabase is not None
+    assert OrderSide.BUY == "buy"
+    assert SecurityTier.CLEAN == "clean"
+    assert NewsSignalStatus.VALID == "valid"
+
+    hop = FundingHop(
+        source_address="0x" + "1" * 40,
+        destination_address="0x" + "2" * 40,
+        tx_hash="0x" + "3" * 64,
+        hop_depth=1,
+    )
+    assert hop.hop_depth == 1
+
+    tx_rec = InitialTxRecord(
+        tx_hash="0x" + "4" * 64,
+        block_number=1,
+        timestamp=int(time.time()),
+        from_address="0x" + "1" * 40,
+        to_address="0x" + "2" * 40,
+        value_native=Decimal("1.0"),
+    )
+    assert tx_rec.value_native == Decimal("1.0")
+
+    tg_msg = TelegramMessage(
+        channel_id=1,
+        channel_title="Alpha",
+        message_id=1,
+        text="Alpha text",
+        timestamp=time.time(),
+    )
+    assert tg_msg.message_id == 1
+
+    news_evt = NewsSignalEvent(
+        token_address="0x" + "a" * 40,
+        chain=ChainIdentifier.BASE_MAINNET,
+        originating_channel="@alpha",
+        channel_id=1,
+        message_id=1,
+        raw_text="Alpha text",
+    )
+    assert news_evt.status == NewsSignalStatus.VALID
+
+    pool_st = PoolState(
+        chain=ChainIdentifier.BASE_MAINNET,
+        pool_address="0x" + "5" * 40,
+        native_reserve=Decimal("10"),
+        token_reserve=Decimal("100"),
+        fee_numerator=3,
+        fee_denominator=1000,
+        last_updated_block=1,
+    )
+    assert pool_st.pool_address.startswith("0x")
+
+    sec_rep = SecurityReport(
+        token_address="0x" + "a" * 40,
+        chain=ChainIdentifier.BASE_MAINNET,
+        is_honeypot=False,
+        buy_tax_bps=100,
+        sell_tax_bps=100,
+        tier=SecurityTier.CLEAN,
+    )
+    assert sec_rep.tier == SecurityTier.CLEAN
+
+    profile = WalletProfile(
+        wallet_address="0x" + "w" * 40,
+        chain=ChainIdentifier.BASE_MAINNET,
+        classification=WalletClassification.APPROVED,
+        is_whitelisted=True,
+        total_trades=1,
+        winning_trades=1,
+        losing_trades=0,
+        win_rate_pct=100.0,
+        total_pnl_usd=Decimal("100"),
+        max_single_trade_pnl_usd=Decimal("100"),
+        outlier_pnl_ratio=1.0,
+        median_holding_time_seconds=60.0,
+        active_days=1.0,
+        days_since_last_active=0.1,
+        first_tx_timestamp=1700000000,
+        last_tx_timestamp=1700000100,
+    )
+    assert profile.is_whitelisted is True
+
 
 def test_rate_limiter_strict_quotas():
     """Verify Alchemy 20 CU/s and Helius 8 req/s configs."""

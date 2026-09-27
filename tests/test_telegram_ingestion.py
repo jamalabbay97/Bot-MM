@@ -12,6 +12,7 @@ Tests:
 from __future__ import annotations
 
 import asyncio
+import os
 import sys
 import time
 from pathlib import Path
@@ -48,10 +49,19 @@ class MockTelethonEvent:
         self.chat = MagicMock()
         self.chat.id = chat_id
         self.chat.title = chat_title
+        self.created_at = time.time()
 
 
 def test_contract_address_extraction_and_filtering():
     """Test 1: Valid contract address parsing for Base and Solana, ignoring system IDs."""
+    session_fallback = os.getenv("TELEGRAM_SESSION_NAME", "test_session")
+    cfg = EngineConfig(telegram_session_name=session_fallback)
+    assert cfg.telegram_session_name == session_fallback
+    assert "11111111111111111111111111111111" in SOLANA_SYSTEM_PROGRAM_IDS
+    assert NewsSignalStatus.VALID == "valid"
+    assert ShutdownSentinel().reason == "graceful_shutdown"
+    assert time.time() > 0
+
     queue: asyncio.Queue = asyncio.Queue()
     ingester = TelegramIngester(event_queue=queue)
 
@@ -340,6 +350,7 @@ def test_unresolvable_channels_graceful_skipping():
         # start() should succeed without throwing
         await ingester.start()
         assert ingester.is_running is True
+        mock_client.start.assert_awaited_once()
 
         # Check that event handlers were registered with only the valid channel
         assert mock_client.add_event_handler.call_count >= 2
@@ -349,6 +360,7 @@ def test_unresolvable_channels_graceful_skipping():
 
         await ingester.stop()
         assert ingester.is_running is False
+        mock_client.disconnect.assert_awaited_once()
 
     asyncio.run(run())
 

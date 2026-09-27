@@ -30,7 +30,8 @@ class RPCEndpoint:
     latest_block: int = 0
     is_healthy: bool = True
     consecutive_errors: int = 0
-    last_checked_ns: int = 0
+    last_checked_ns: int = field(default=0)
+    metadata: dict[str, Any] = field(default_factory=dict)
 
 
 class RPCHealthMonitor:

@@ -370,6 +370,12 @@ def _parse_pump_fun_logs(logs: list[str], tx_sig: str = "") -> dict[str, Any] | 
     Detects InitializeMint2, Create, or bonding curve parameters.
     """
     import re
+    from alpha_engine.security.constants import SOLANA_SYSTEM_PROGRAM_IDS
+
+    all_logs_str = " ".join(logs).lower()
+    if PUMP_FUN_PROGRAM_ID.lower() not in all_logs_str and "6ef8rrecth" not in all_logs_str:
+        return None
+
     mint_address: str | None = None
     bonding_curve: str | None = None
     is_create = False
@@ -379,18 +385,25 @@ def _parse_pump_fun_logs(logs: list[str], tx_sig: str = "") -> dict[str, Any] | 
 
     for line in logs:
         line_lower = line.lower()
-        if "6ef8rrecth" in line_lower or "create" in line_lower or "initializemint" in line_lower:
+        if "create" in line_lower or "initializemint" in line_lower:
             is_create = True
 
         # Look for explicit mint keyword
-        if "mint:" in line_lower:
+        if "create mint" in line_lower:
             matches = b58_re.findall(line)
-            if matches:
-                mint_address = matches[-1]
+            valid = [m for m in matches if m not in SOLANA_SYSTEM_PROGRAM_IDS and not m.startswith("11111111")]
+            if valid:
+                mint_address = valid[-1]
+        elif "mint:" in line_lower:
+            matches = b58_re.findall(line)
+            valid = [m for m in matches if m not in SOLANA_SYSTEM_PROGRAM_IDS and not m.startswith("11111111")]
+            if valid:
+                mint_address = valid[-1]
         elif "bonding curve:" in line_lower:
             matches = b58_re.findall(line)
-            if matches:
-                bonding_curve = matches[-1]
+            valid = [m for m in matches if m not in SOLANA_SYSTEM_PROGRAM_IDS and not m.startswith("11111111")]
+            if valid:
+                bonding_curve = valid[-1]
 
     if not is_create:
         return None
@@ -400,14 +413,18 @@ def _parse_pump_fun_logs(logs: list[str], tx_sig: str = "") -> dict[str, Any] | 
         found_tokens: list[str] = []
         for line in logs:
             for token in b58_re.findall(line):
-                if token not in (PUMP_FUN_PROGRAM_ID, RAYDIUM_AMM_PROGRAM_ID) and len(token) >= 32:
+                if (
+                    token not in SOLANA_SYSTEM_PROGRAM_IDS
+                    and not token.startswith("11111111")
+                    and len(token) >= 32
+                ):
                     found_tokens.append(token)
         if found_tokens:
             mint_address = found_tokens[0]
             if len(found_tokens) > 1:
                 bonding_curve = found_tokens[1]
 
-    if not mint_address:
+    if not mint_address or mint_address in SOLANA_SYSTEM_PROGRAM_IDS:
         return None
 
     # Pump.fun standard bonding curve initial reserves:
@@ -426,6 +443,12 @@ def _parse_pump_fun_logs(logs: list[str], tx_sig: str = "") -> dict[str, Any] | 
 def _parse_raydium_initialize2_logs(logs: list[str], tx_sig: str = "") -> dict[str, Any] | None:
     """Parse Solana logs for Raydium AMM pool creation (Initialize2)."""
     import re
+    from alpha_engine.security.constants import SOLANA_SYSTEM_PROGRAM_IDS
+
+    all_logs_str = " ".join(logs).lower()
+    if RAYDIUM_AMM_PROGRAM_ID.lower() not in all_logs_str and "675kpx9m" not in all_logs_str:
+        return None
+
     b58_re = re.compile(r"\b[1-9A-HJ-NP-Za-km-z]{32,44}\b")
     is_raydium_init = False
     pool_address: str | None = None
@@ -436,8 +459,9 @@ def _parse_raydium_initialize2_logs(logs: list[str], tx_sig: str = "") -> dict[s
         if "initialize2" in line_lower or "createpool" in line_lower:
             is_raydium_init = True
             matches = b58_re.findall(line)
-            if matches:
-                pool_address = matches[0]
+            valid = [m for m in matches if m not in SOLANA_SYSTEM_PROGRAM_IDS and not m.startswith("11111111")]
+            if valid:
+                pool_address = valid[0]
             if "open_time" in line_lower:
                 tokens = line.replace(":", " ").replace(",", " ").split()
                 for i, tok in enumerate(tokens):

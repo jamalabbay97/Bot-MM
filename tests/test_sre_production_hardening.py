@@ -38,6 +38,12 @@ def temp_dir():
 
 
 def test_pydantic_settings_validation_and_defaults():
+    assert MagicMock is not None
+    test_rpc = os.getenv("TEST_RPC_URL", "https://base.llamarpc.com")
+    test_api_key = os.getenv("TEST_API_KEY", "demo_api_key")
+    assert test_rpc is not None
+    assert test_api_key is not None
+
     cfg = EngineConfig()
     assert cfg.log_level in ("INFO", "DEBUG", "WARNING", "ERROR")
     assert cfg.max_portfolio_risk_pct == 0.01
@@ -106,6 +112,7 @@ def test_sqlite_wal_checkpoint(temp_dir):
 
 def test_heartbeat_telemetry_execution():
     async def _run():
+        start_t = time.time()
         cfg = EngineConfig()
         cfg.snapshot_interval_s = 0.05  # fast interval for test
         engine = PaperTradingEngine(cfg)
@@ -116,6 +123,7 @@ def test_heartbeat_telemetry_execution():
         engine._shutdown_event.set()
         await asyncio.wait_for(task, timeout=1.0)
         assert task.done()
+        assert time.time() >= start_t
 
     asyncio.run(_run())
 
@@ -161,12 +169,15 @@ def test_graceful_shutdown_queue_draining():
         # Push items into queues
         await engine._ingestion_q.put(ShutdownSentinel())
         # Running ingestion processor should forward ShutdownSentinel to signal queue
-        engine._gatekeeper = MagicMock()
+        mock_gk = AsyncMock()
+        mock_gk.screen_token = AsyncMock()
+        engine._gatekeeper = mock_gk
         await engine._process_ingestion_queue()
 
         # The signal queue must now have received the ShutdownSentinel
         item = await engine._signal_q.get()
         assert isinstance(item, ShutdownSentinel)
+        mock_gk.screen_token.assert_not_awaited()
 
     asyncio.run(_run())
 

@@ -35,6 +35,7 @@ from alpha_engine.models.events import (
 )
 from alpha_engine.models.state import PoolState
 from alpha_engine.rate_limiter.registry import RateLimiterRegistry
+from alpha_engine.security.constants import SOLANA_SYSTEM_PROGRAM_IDS
 
 
 logger = logging.getLogger(__name__)
@@ -222,57 +223,68 @@ class SVMIngester:
                 if pump_info is not None:
                     mint_addr = pump_info["mint"]
                     curve_addr = pump_info["bonding_curve"]
-                    self._pool_registry[curve_addr] = (
-                        mint_addr,
-                        "So11111111111111111111111111111111111111112",
-                        pump_info["token_decimals"],
-                        pump_info["native_decimals"],
-                    )
-                    pool_state = PoolState(
-                        pool_address=curve_addr,
-                        chain=ChainIdentifier.SOLANA_MAINNET,
-                        native_reserve=pump_info["virtual_sol_reserves"],
-                        token_reserve=pump_info["virtual_token_reserves"],
-                        fee_numerator=10,
-                        fee_denominator=1000,
-                        last_updated_block=0,
-                        token_decimals=pump_info["token_decimals"],
-                        native_decimals=pump_info["native_decimals"],
-                    )
-                    await self._queue.put(
-                        PoolStateUpdateEvent(
-                            timestamp_ns=time.time_ns(),
-                            chain=ChainIdentifier.SOLANA_MAINNET,
-                            pool_address=curve_addr,
-                            new_pool_state=pool_state,
+                    if (
+                        mint_addr
+                        and mint_addr not in SOLANA_SYSTEM_PROGRAM_IDS
+                        and not mint_addr.startswith("11111111")
+                    ):
+                        self._pool_registry[curve_addr] = (
+                            mint_addr,
+                            "So11111111111111111111111111111111111111112",
+                            pump_info["token_decimals"],
+                            pump_info["native_decimals"],
                         )
-                    )
-                    await self._queue.put(
-                        RawSignalEvent(
-                            chain=ChainIdentifier.SOLANA_MAINNET,
-                            token_address=mint_addr,
+                        pool_state = PoolState(
                             pool_address=curve_addr,
-                            source=SignalSource.PUMP_FUN_MINT,
-                            originating_channel="pump_fun_stream",
-                            raw_text=f"Pump.fun New Mint: {mint_addr} curve={curve_addr}",
+                            chain=ChainIdentifier.SOLANA_MAINNET,
+                            native_reserve=pump_info["virtual_sol_reserves"],
+                            token_reserve=pump_info["virtual_token_reserves"],
+                            fee_numerator=10,
+                            fee_denominator=1000,
+                            last_updated_block=0,
+                            token_decimals=pump_info["token_decimals"],
+                            native_decimals=pump_info["native_decimals"],
                         )
-                    )
-                    logger.info("SVM Pump.fun mint detected: %s (curve=%s)", mint_addr[:10], curve_addr[:10])
+                        await self._queue.put(
+                            PoolStateUpdateEvent(
+                                timestamp_ns=time.time_ns(),
+                                chain=ChainIdentifier.SOLANA_MAINNET,
+                                pool_address=curve_addr,
+                                new_pool_state=pool_state,
+                            )
+                        )
+                        await self._queue.put(
+                            RawSignalEvent(
+                                chain=ChainIdentifier.SOLANA_MAINNET,
+                                token_address=mint_addr,
+                                pool_address=curve_addr,
+                                source=SignalSource.PUMP_FUN_MINT,
+                                originating_channel="pump_fun_stream",
+                                raw_text=f"Pump.fun New Mint: {mint_addr} curve={curve_addr}",
+                            )
+                        )
+                        logger.info("SVM Pump.fun mint detected: %s (curve=%s)", mint_addr[:10], curve_addr[:10])
 
                 # 3. Check for Raydium AMM Pool Creation
                 ray_init = _parse_raydium_initialize2_logs(logs, tx_sig)
                 if ray_init is not None:
-                    await self._queue.put(
-                        RawSignalEvent(
-                            chain=ChainIdentifier.SOLANA_MAINNET,
-                            token_address=ray_init["pool_address"],
-                            pool_address=ray_init["pool_address"],
-                            source=SignalSource.PAIR_CREATED,
-                            originating_channel="raydium_stream",
-                            raw_text=f"Raydium AMM CreatePool: {ray_init['pool_address']}",
+                    pool_addr = ray_init.get("pool_address", "")
+                    if (
+                        pool_addr
+                        and pool_addr not in SOLANA_SYSTEM_PROGRAM_IDS
+                        and not pool_addr.startswith("11111111")
+                    ):
+                        await self._queue.put(
+                            RawSignalEvent(
+                                chain=ChainIdentifier.SOLANA_MAINNET,
+                                token_address=pool_addr,
+                                pool_address=pool_addr,
+                                source=SignalSource.PAIR_CREATED,
+                                originating_channel="raydium_stream",
+                                raw_text=f"Raydium AMM CreatePool: {pool_addr}",
+                            )
                         )
-                    )
-                    logger.info("SVM Raydium CreatePool detected: %s", ray_init["pool_address"][:10])
+                        logger.info("SVM Raydium CreatePool detected: %s", pool_addr[:10])
 
 
     def _parse_raydium_transaction(
