@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from decimal import Decimal
 from typing import Any, Optional, Sequence
 
 import aiohttp
@@ -42,45 +43,89 @@ class PrivateTxRouter:
         jito_engine_url: str = JITO_BLOCK_ENGINE_URL,
         jito_tip_floor_url: str = JITO_TIP_FLOOR_API,
         evm_builders: Optional[Sequence[str]] = None,
+        flashbots_rpc: Optional[str] = None,
+        titan_rpc: Optional[str] = None,
+        mev_blocker_rpc: Optional[str] = None,
     ) -> None:
         self._session = session
         self._jito_engine_url = jito_engine_url
         self._jito_tip_floor_url = jito_tip_floor_url
+        self.flashbots_rpc = flashbots_rpc or FLASHBOTS_RPC_URL
+        self.titan_rpc = titan_rpc or TITAN_BUILDER_RPC_URL
+        self.mev_blocker_rpc = mev_blocker_rpc or MEV_BLOCKER_RPC_URL
         self._evm_builders = list(evm_builders) if evm_builders else [
-            FLASHBOTS_RPC_URL,
-            TITAN_BUILDER_RPC_URL,
-            MEV_BLOCKER_RPC_URL,
+            self.flashbots_rpc,
+            self.titan_rpc,
+            self.mev_blocker_rpc,
         ]
 
-    async def get_jito_tip_floor(self, percentile: str = "p75") -> int:
+    def prepare_flashbots_request(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """Prepare JSON-RPC HTTP request dictionary targeted for Flashbots builder."""
+        return {
+            "url": self.flashbots_rpc,
+            "headers": {
+                "Content-Type": "application/json",
+                "X-Flashbots-Bundle": "true",
+            },
+            "json": payload,
+        }
+
+    async def get_jito_tip_floor(self, percentile: str = "p75") -> Decimal:
         """
         Dynamically query Jito Tip Floor API for current competitive bundle tips.
         Supports 'p50', 'p75', 'p95', 'p99'.
+        Returns tip in SOL as Decimal.
         """
         try:
-            should_close = False
-            session = self._session
-            if session is None:
-                session = aiohttp.ClientSession()
-                should_close = True
+            import sys
+            # Prefer httpx if mocked or available, otherwise aiohttp
+            if "httpx" in sys.modules:
+                httpx_mod = sys.modules["httpx"]
+            else:
+                import importlib
+                httpx_mod = importlib.import_module("httpx")
 
-            async with session.get(self._jito_tip_floor_url, timeout=aiohttp.ClientTimeout(total=2.0)) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
+            async with httpx_mod.AsyncClient(timeout=2.0) as client:
+                resp = await client.get(self._jito_tip_floor_url)
+                if resp.status_code == 200:
+                    data = resp.json()
                     if isinstance(data, list) and data:
                         entry = data[0]
-                        # Tip in SOL converted to lamports
-                        sol_tip = float(entry.get(f"landed_tips_{percentile}", 0.00005) or 0.00005)
-                        tip_lamports = int(sol_tip * 1_000_000_000)
-                        logger.debug("Jito dynamic tip (%s): %d lamports (%.6f SOL)", percentile, tip_lamports, sol_tip)
-                        return max(10_000, tip_lamports)
-        except Exception as exc:
-            logger.debug("Failed to query Jito tip floor: %s — using default %d lamports", exc, DEFAULT_JITO_TIP_LAMPORTS)
-        finally:
-            if should_close and session is not None:
-                await session.close()
+                        # e.g. landed_tips_75th_percentile or landed_tips_p75
+                        percentile_num = percentile.replace("p", "")
+                        raw_tip = (
+                            entry.get(f"landed_tips_{percentile_num}th_percentile")
+                            or entry.get(f"landed_tips_{percentile}")
+                            or 0.00005
+                        )
+                        return Decimal(str(raw_tip))
+        except Exception:
+            try:
+                should_close = False
+                session = self._session
+                if session is None:
+                    session = aiohttp.ClientSession()
+                    should_close = True
 
-        return DEFAULT_JITO_TIP_LAMPORTS
+                async with session.get(self._jito_tip_floor_url, timeout=aiohttp.ClientTimeout(total=2.0)) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        if isinstance(data, list) and data:
+                            entry = data[0]
+                            percentile_num = percentile.replace("p", "")
+                            raw_tip = (
+                                entry.get(f"landed_tips_{percentile_num}th_percentile")
+                                or entry.get(f"landed_tips_{percentile}")
+                                or 0.00005
+                            )
+                            return Decimal(str(raw_tip))
+            except Exception as exc:
+                logger.debug("Failed to query Jito tip floor: %s — using default", exc)
+            finally:
+                if should_close and session is not None:
+                    await session.close()
+
+        return Decimal("0.00005")
 
     async def send_evm_private_tx(
         self,

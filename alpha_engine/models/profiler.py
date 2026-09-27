@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import time
 from decimal import Decimal
-from typing import Annotated, Optional
+from typing import Annotated, Any, Optional
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 
@@ -133,3 +133,9 @@ class WhitelistRecord(BaseModel):
     rejection_reasons: str = ""
     created_at_ns: int
     updated_at_ns: int
+
+    def __getitem__(self, item: str) -> Any:
+        val = getattr(self, item)
+        if hasattr(val, "value"):
+            return val.value
+        return val

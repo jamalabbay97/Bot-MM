@@ -38,8 +38,14 @@ class PoolRegistry:
         self._pools[swap.pool_address] = new_pool
         return new_pool
 
-    def get(self, pool_address: str) -> PoolState | None:
-        return self._pools.get(pool_address)
+    def get(self, pool_or_token_address: str) -> PoolState | None:
+        if pool_or_token_address in self._pools:
+            return self._pools[pool_or_token_address]
+        target_lower = pool_or_token_address.lower()
+        for p in self._pools.values():
+            if p.pool_address.lower() == target_lower or p.token_address.lower() == target_lower:
+                return p
+        return None
 
     def set(self, pool_address: str, state: PoolState) -> None:
         self._pools[pool_address] = state

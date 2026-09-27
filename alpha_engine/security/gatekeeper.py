@@ -67,7 +67,7 @@ class SecurityGatekeeper:
         self,
         token_address: str,
         chain: ChainIdentifier,
-        pool_address: str,
+        pool_address: str = "",
     ) -> SecurityReport:
         """Run the full dual-tier screening pipeline for a token."""
         tier1_report = await self._run_tier1(token_address, chain, pool_address)
@@ -84,7 +84,7 @@ class SecurityGatekeeper:
             )
             return tier1_report
 
-        if self._enable_tier2 and chain == ChainIdentifier.BASE_MAINNET:
+        if self._enable_tier2 and chain == ChainIdentifier.BASE_MAINNET and pool_address:
             is_clean = await _tier2_evm_preflight(
                 token_address=token_address,
                 pool_address=pool_address,
@@ -109,7 +109,7 @@ class SecurityGatekeeper:
         self,
         token_address: str,
         chain: ChainIdentifier,
-        pool_address: str,
+        pool_address: str = "",
     ) -> SecurityReport:
         if chain == ChainIdentifier.BASE_MAINNET:
             raw = await _fetch_goplus_report(

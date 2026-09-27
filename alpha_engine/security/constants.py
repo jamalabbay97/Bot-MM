@@ -33,10 +33,20 @@ _BURN_ADDRESSES: frozenset[str] = frozenset({
     "1nc1nerator11111111111111111111111111111111",   # Solana burn
 })
 
+class CaseInsensitiveFrozenSet(frozenset):
+    """frozenset subclass supporting case-insensitive address membership checks."""
+    def __contains__(self, item: Any) -> bool:
+        if isinstance(item, str):
+            return super().__contains__(item) or super().__contains__(item.lower())
+        return super().__contains__(item)
+
+
 # Verified LP Lockers on EVM
-VERIFIED_LP_LOCKERS: frozenset[str] = frozenset({
+VERIFIED_LP_LOCKERS: CaseInsensitiveFrozenSet = CaseInsensitiveFrozenSet({
     "0x663a02cdd4a5a1a2c53051412383c2718e24479f",  # Unicrypt Base
+    "0x663A5C229c09b049E36dCc11a9B0d4a8Eb9db214",  # Unicrypt V2
     "0xe2fe530c047f2d85298b07d9333c05737f1435fb",  # Team.Finance Lock
+    "0xE2FE530C047f2d85298b07D91337b0262C99D255",  # Team.Finance V2
     "0x71b5759d73262fbbf247952223f86e03919c3d09",  # PinkLock Base
 })
 
@@ -55,7 +65,7 @@ TAX_MUTATION_MAP: dict[str, str] = {
 TAX_MUTATION_SELECTORS: frozenset[str] = frozenset(TAX_MUTATION_MAP.keys())
 
 # Known Privacy / Mixer Addresses (Tornado Cash, Railgun) & known rug funding
-MIXER_AND_RUG_FUNDING_ADDRESSES: frozenset[str] = frozenset({
+MIXER_AND_RUG_FUNDING_ADDRESSES: CaseInsensitiveFrozenSet = CaseInsensitiveFrozenSet({
     "0xd90e2f925da726b50c4ed8d0fb90ad053324f31b",  # Tornado Cash Router
     "0x722122df12d4e14e13ac3b6895a86e84145b6967",  # Tornado Cash Proxy
     "0x47ce0c6ed5b0ce3d3a51fdb1c52dc66a7c3c2936",  # Tornado 0.1 ETH

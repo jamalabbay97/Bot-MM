@@ -43,6 +43,7 @@ class WalletClassification(str, Enum):
     """Classification assigned by the Smart Money Behavioral Profiler."""
 
     APPROVED = "approved"                     # Passes all criteria, whitelisted
+    SMART_MONEY = "approved"                  # Passes all criteria, smart money
     INSIDER = "insider"                       # Gas/funds trace to deployer/multisig <= 3 hops
     WASH_TRADER = "wash_trader"               # Self-funding or circular volume
     MEV_BOT = "mev_bot"                       # Median holding time < 45 seconds

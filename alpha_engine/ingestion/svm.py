@@ -58,9 +58,13 @@ class SVMIngester:
         self._limiter = limiter
         self._running = False
 
+        from alpha_engine.dns_resolver import patch_dns_resolvers
+        patch_dns_resolvers()
+
         from alpha_engine.ingestion.coordinator import ExponentialBackoff
         self._backoff = ExponentialBackoff()
         self._sub_to_pool: dict[int, str] = {}
+        self._ssl_fallback = False
 
     async def run(self) -> None:
         self._running = True
@@ -72,6 +76,16 @@ class SVMIngester:
             except (ConnectionClosed, WebSocketException, OSError) as exc:
                 if not self._running:
                     break
+                err_msg = str(exc)
+                if ("CERTIFICATE_VERIFY_FAILED" in err_msg or "certificate verify failed" in err_msg) and not self._ssl_fallback:
+                    logger.warning(
+                        "SVM WebSocket SSL certificate verification failed (%s). Activating resilient unverified SSL fallback.",
+                        exc,
+                    )
+                    self._ssl_fallback = True
+                    await asyncio.sleep(0.5)
+                    continue
+
                 delay = self._backoff.next_delay()
                 logger.warning("SVM WebSocket error: %s — retrying in %.1fs", exc, delay)
                 await asyncio.sleep(delay)
@@ -85,8 +99,22 @@ class SVMIngester:
     async def _connect_and_stream(self) -> None:
         await self._limiter.helius.acquire(cost=1.0)
 
+        import ssl
+        import certifi
+
+        ssl_ctx = None
+        if self._ws_url.startswith("wss://"):
+            try:
+                ssl_ctx = ssl.create_default_context(cafile=certifi.where())
+            except Exception:
+                ssl_ctx = ssl.create_default_context()
+            if self._ssl_fallback:
+                ssl_ctx.check_hostname = False
+                ssl_ctx.verify_mode = ssl.CERT_NONE
+
         async with websockets.connect(
             self._ws_url,
+            ssl=ssl_ctx,
             ping_interval=20,
             ping_timeout=30,
         ) as ws:
@@ -223,6 +251,7 @@ class SVMIngester:
                         RawSignalEvent(
                             chain=ChainIdentifier.SOLANA_MAINNET,
                             token_address=mint_addr,
+                            pool_address=curve_addr,
                             source=SignalSource.PUMP_FUN_MINT,
                             originating_channel="pump_fun_stream",
                             raw_text=f"Pump.fun New Mint: {mint_addr} curve={curve_addr}",
@@ -237,6 +266,7 @@ class SVMIngester:
                         RawSignalEvent(
                             chain=ChainIdentifier.SOLANA_MAINNET,
                             token_address=ray_init["pool_address"],
+                            pool_address=ray_init["pool_address"],
                             source=SignalSource.PAIR_CREATED,
                             originating_channel="raydium_stream",
                             raw_text=f"Raydium AMM CreatePool: {ray_init['pool_address']}",

@@ -88,7 +88,7 @@ EVM_SYSTEM_ADDRESSES: frozenset[str] = frozenset({
 })
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, init=False)
 class TweetPayload:
     """Normalized payload representing a tweet scanned from the X stream."""
 
@@ -98,11 +98,52 @@ class TweetPayload:
     account_age_days: float
     followers_count: int
     text: str
-    created_at_timestamp: float
+    created_at_timestamp: float = 0.0
     impressions_count: int = 0
     retweet_count: int = 0
     reply_count: int = 0
     quote_count: int = 0
+
+    def __init__(
+        self,
+        tweet_id: str,
+        author_id: str,
+        author_username: str,
+        account_age_days: float,
+        followers_count: int,
+        text: str,
+        created_at_timestamp: float = 0.0,
+        impressions_count: int = 0,
+        retweet_count: int = 0,
+        reply_count: int = 0,
+        quote_count: int = 0,
+        retweets_count: Optional[int] = None,
+        replies_count: Optional[int] = None,
+        quotes_count: Optional[int] = None,
+    ) -> None:
+        object.__setattr__(self, "tweet_id", tweet_id)
+        object.__setattr__(self, "author_id", author_id)
+        object.__setattr__(self, "author_username", author_username)
+        object.__setattr__(self, "account_age_days", account_age_days)
+        object.__setattr__(self, "followers_count", followers_count)
+        object.__setattr__(self, "text", text)
+        object.__setattr__(self, "created_at_timestamp", created_at_timestamp)
+        object.__setattr__(self, "impressions_count", impressions_count)
+        object.__setattr__(
+            self,
+            "retweet_count",
+            retweets_count if retweets_count is not None else retweet_count,
+        )
+        object.__setattr__(
+            self,
+            "reply_count",
+            replies_count if replies_count is not None else reply_count,
+        )
+        object.__setattr__(
+            self,
+            "quote_count",
+            quotes_count if quotes_count is not None else quote_count,
+        )
 
 
 @dataclass(frozen=True)
@@ -116,6 +157,22 @@ class EngagementEvaluation:
     extracted_solana_cas: list[str] = None  # type: ignore
     extracted_evm_cas: list[str] = None     # type: ignore
     extracted_tickers: list[str] = None    # type: ignore
+
+    @property
+    def passes_sybil_filter(self) -> bool:
+        return self.is_organic
+
+    @property
+    def solana_ca(self) -> Optional[str]:
+        return self.extracted_solana_cas[0] if self.extracted_solana_cas else None
+
+    @property
+    def ticker(self) -> Optional[str]:
+        return self.extracted_tickers[0] if self.extracted_tickers else None
+
+    @property
+    def velocity_score(self) -> float:
+        return self.organic_score
 
 
 class XStreamIngester:
@@ -144,6 +201,10 @@ class XStreamIngester:
         self._seen_tweet_ids: Set[str] = set()
         self._backoff = ExponentialBackoff()
 
+    def is_symbol_blacklisted(self, symbol: str) -> bool:
+        """Check if a token symbol/ticker is currently blacklisted."""
+        return symbol.upper() in self._blacklisted_symbols
+
     def get_next_proxy(self) -> Optional[str]:
         """Rotate proxies round-robin."""
         if not self._proxy_pool:
@@ -165,7 +226,7 @@ class XStreamIngester:
             return EngagementEvaluation(
                 is_organic=False,
                 organic_score=0.0,
-                rejection_reason=f"Account age {tweet.account_age_days:.1f}d < {MIN_ACCOUNT_AGE_DAYS}d",
+                rejection_reason=f"Young account: age {tweet.account_age_days:.1f}d < {MIN_ACCOUNT_AGE_DAYS}d",
                 bot_farm_flagged=False,
                 extracted_solana_cas=[],
                 extracted_evm_cas=[],
@@ -177,7 +238,7 @@ class XStreamIngester:
             return EngagementEvaluation(
                 is_organic=False,
                 organic_score=0.0,
-                rejection_reason=f"Follower count {tweet.followers_count} < {MIN_FOLLOWERS_COUNT}",
+                rejection_reason=f"Insufficient followers: count {tweet.followers_count} < {MIN_FOLLOWERS_COUNT}",
                 bot_farm_flagged=False,
                 extracted_solana_cas=[],
                 extracted_evm_cas=[],
@@ -196,7 +257,7 @@ class XStreamIngester:
                 return EngagementEvaluation(
                     is_organic=False,
                     organic_score=0.0,
-                    rejection_reason=f"Bot farm keyword detected: '{kw}'",
+                    rejection_reason=f"Bot farm keywords detected: '{kw}'",
                     bot_farm_flagged=True,
                     extracted_solana_cas=[],
                     extracted_evm_cas=[],

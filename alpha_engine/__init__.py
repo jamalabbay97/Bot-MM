@@ -4,6 +4,10 @@ alpha_engine — Multi-Chain Paper Trading & Alpha Analytics Engine
 Deterministic Realism | Zero-Capital Simulation | Pure Python 3.11+
 """
 
+from alpha_engine.dns_resolver import patch_dns_resolvers
+
+patch_dns_resolvers()
+
 from alpha_engine.config import EngineConfig
 from alpha_engine.engine import (
     PaperTradingEngine,

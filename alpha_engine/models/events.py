@@ -139,6 +139,7 @@ class RawSignalEvent(BaseModel):
     timestamp_ns: Annotated[int, Field(gt=0)] = Field(default_factory=lambda: time.time_ns())
     chain: ChainIdentifier
     token_address: Annotated[str, Field(min_length=32, max_length=66)]
+    pool_address: Optional[str] = None
     source: SignalSource = SignalSource.TELEGRAM_SCRAPER
     originating_channel: str = ""
     channel_id: int = 0

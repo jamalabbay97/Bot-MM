@@ -80,11 +80,11 @@ def inspect_bytecode_for_delayed_taxes(
 
 async def _tier2_evm_preflight(
     token_address: str,
-    pool_address: str,
-    weth_address: str,
-    router_address: str,
-    rpc_url: str,
-    limiter: RateLimiterRegistry,
+    pool_address: str = "",
+    weth_address: str = "",
+    router_address: str = "",
+    rpc_url: str = "",
+    limiter: Optional[RateLimiterRegistry] = None,
 ) -> bool:
     """
     Execute a sequential BUY + SELL simulation via eth_call to detect

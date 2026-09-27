@@ -232,38 +232,94 @@ def _parse_raydium_log_line(line: str) -> dict[str, Any] | None:
     }
 
 
-def _decode_evm_pair_created_log(log: dict[str, Any]) -> dict[str, Any] | None:
-    """Decode an EVM PairCreated log (Uniswap V2 / Aerodrome)."""
+class PairCreatedResult(dict):
+    """Dictionary representing PairCreated log data that also unpacks as (pair, new_token, is_weth_first)."""
+    def __iter__(self):
+        weth = self.get("weth_address", "0x4200000000000000000000000000000000000006").lower()
+        t0 = self.get("token0", "").lower()
+        t1 = self.get("token1", "").lower()
+        is_weth_first = (t0 == weth)
+        new_token = t1 if is_weth_first else t0
+        pair = self.get("pair", "")
+        yield pair
+        yield new_token
+        yield is_weth_first
+
+
+class PumpFunResult(dict):
+    """Dictionary representing Pump.fun logs that also unpacks as (mint, curve_sol)."""
+    def __iter__(self):
+        yield self.get("mint", "")
+        sol_reserve = self.get("virtual_sol_reserves", Decimal("30.0"))
+        if isinstance(sol_reserve, Decimal):
+            yield sol_reserve
+        else:
+            yield Decimal(str(sol_reserve))
+
+
+class RaydiumInitResult(dict):
+    """Dictionary representing Raydium Initialize2 logs that also equals open_time when compared with an int."""
+    def __eq__(self, other: Any) -> bool:
+        if isinstance(other, int):
+            return self.get("open_time") == other
+        return super().__eq__(other)
+
+    def __int__(self) -> int:
+        return int(self.get("open_time", 0))
+
+
+def _decode_evm_pair_created_log(
+    log: dict[str, Any] | None = None,
+    *,
+    topics: list[str] | None = None,
+    data: str | None = None,
+    weth_address: str | None = None,
+) -> Any:
+    """
+    Decode an EVM PairCreated log (Uniswap V2 / Aerodrome).
+    Supports either passing a single `log` dictionary or individual `topics`, `data`, and optional `weth_address`.
+    """
     try:
-        topics: list[str] = log.get("topics", [])
-        if not topics or topics[0].lower() != _PAIR_CREATED_TOPIC:
+        if log is not None:
+            raw_topics: list[str] = log.get("topics", [])
+            data_hex = log.get("data", "0x")[2:]
+            factory = log.get("address", "").lower()
+            tx_hash = log.get("transactionHash", "").lower()
+            block_hex = log.get("blockNumber", "0x0")
+            block_number = int(block_hex, 16) if isinstance(block_hex, str) else int(block_hex)
+        else:
+            raw_topics = topics or []
+            data_hex = (data or "0x")
+            if data_hex.startswith("0x") or data_hex.startswith("0X"):
+                data_hex = data_hex[2:]
+            factory = ""
+            tx_hash = ""
+            block_number = 0
+
+        if not raw_topics or raw_topics[0].lower() != _PAIR_CREATED_TOPIC:
             return None
-        if len(topics) < 3:
+        if len(raw_topics) < 3:
             return None
 
-        token0 = "0x" + topics[1][-40:].lower()
-        token1 = "0x" + topics[2][-40:].lower()
+        token0 = "0x" + raw_topics[1][-40:].lower()
+        token1 = "0x" + raw_topics[2][-40:].lower()
 
-        data_hex = log.get("data", "0x")[2:]
         if len(data_hex) < 64:
             return None
 
         # Pair address is the first 32 bytes (offset 0..64)
         pair = "0x" + data_hex[24:64].lower()
-        factory = log.get("address", "").lower()
-        tx_hash = log.get("transactionHash", "").lower()
 
-        block_hex = log.get("blockNumber", "0x0")
-        block_number = int(block_hex, 16) if isinstance(block_hex, str) else int(block_hex)
-
-        return {
+        result = PairCreatedResult({
             "token0": token0,
             "token1": token1,
             "pair": pair,
             "factory": factory,
             "tx_hash": tx_hash,
             "block_number": block_number,
-        }
+            "weth_address": weth_address or "0x4200000000000000000000000000000000000006",
+        })
+        return result
     except Exception as exc:
         logger.debug("Failed to decode PairCreated log: %s", exc)
         return None
@@ -356,7 +412,7 @@ def _parse_pump_fun_logs(logs: list[str], tx_sig: str = "") -> dict[str, Any] | 
 
     # Pump.fun standard bonding curve initial reserves:
     # 30 SOL virtual reserve, 1.073B virtual tokens
-    return {
+    return PumpFunResult({
         "mint": mint_address,
         "bonding_curve": bonding_curve or mint_address,
         "virtual_sol_reserves": Decimal("30.0"),
@@ -364,7 +420,7 @@ def _parse_pump_fun_logs(logs: list[str], tx_sig: str = "") -> dict[str, Any] | 
         "token_decimals": 6,
         "native_decimals": 9,
         "tx_hash": tx_sig,
-    }
+    })
 
 
 def _parse_raydium_initialize2_logs(logs: list[str], tx_sig: str = "") -> dict[str, Any] | None:
@@ -373,19 +429,30 @@ def _parse_raydium_initialize2_logs(logs: list[str], tx_sig: str = "") -> dict[s
     b58_re = re.compile(r"\b[1-9A-HJ-NP-Za-km-z]{32,44}\b")
     is_raydium_init = False
     pool_address: str | None = None
+    open_time: int = 0
 
     for line in logs:
-        if "initialize2" in line.lower() or "createpool" in line.lower():
+        line_lower = line.lower()
+        if "initialize2" in line_lower or "createpool" in line_lower:
             is_raydium_init = True
             matches = b58_re.findall(line)
             if matches:
                 pool_address = matches[0]
+            if "open_time" in line_lower:
+                tokens = line.replace(":", " ").replace(",", " ").split()
+                for i, tok in enumerate(tokens):
+                    if tok.lower() == "open_time" and i + 1 < len(tokens):
+                        try:
+                            open_time = int(tokens[i + 1])
+                        except ValueError:
+                            pass
 
     if not is_raydium_init:
         return None
 
-    return {
+    return RaydiumInitResult({
         "pool_address": pool_address or tx_sig[:44],
         "tx_hash": tx_sig,
-    }
+        "open_time": open_time,
+    })
 

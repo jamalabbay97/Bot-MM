@@ -11,7 +11,7 @@ import asyncio
 import logging
 import time
 from decimal import Decimal
-from typing import Optional
+from typing import Any, Optional
 
 import aiosqlite
 
@@ -156,6 +156,46 @@ class WhitelistDatabase:
             created_at_ns=created_at_ns,
             updated_at_ns=now_ns,
         )
+
+    async def insert_wallet(
+        self,
+        wallet_address: str,
+        chain: ChainIdentifier = ChainIdentifier.BASE_MAINNET,
+        classification: WalletClassification = WalletClassification.SMART_MONEY,
+        status: WhitelistStatus = WhitelistStatus.ACTIVE,
+        total_trades: int = 0,
+        win_rate: float = 0.0,
+        profit_factor: float = 0.0,
+        avg_holding_time_seconds: float = 0.0,
+        max_drawdown_pct: float = 0.0,
+        **kwargs: Any,
+    ) -> WhitelistRecord:
+        """Convenience method to insert or update a wallet with individual attributes."""
+        total_t = total_trades or 30
+        wr = win_rate if win_rate > 1.0 else win_rate * 100.0
+        wins = int(total_t * (wr / 100.0))
+        losses = total_t - wins
+        profile = WalletProfile(
+            wallet_address=wallet_address,
+            chain=chain,
+            classification=classification,
+            is_whitelisted=(status == WhitelistStatus.ACTIVE),
+            total_trades=total_t,
+            winning_trades=wins,
+            losing_trades=losses,
+            win_rate_pct=wr,
+            total_pnl_usd=Decimal(str(kwargs.get("total_pnl_usd", 1000))),
+            max_single_trade_pnl_usd=Decimal(str(kwargs.get("max_single_trade_pnl_usd", 100))),
+            outlier_pnl_ratio=float(kwargs.get("outlier_pnl_ratio", 0.10)),
+            median_holding_time_seconds=avg_holding_time_seconds,
+            active_days=float(kwargs.get("active_days", 30)),
+            days_since_last_active=float(kwargs.get("days_since_last_active", 1.0)),
+            first_tx_timestamp=int(kwargs.get("first_tx_timestamp", time.time() - 30 * 86400)),
+            last_tx_timestamp=int(kwargs.get("last_tx_timestamp", time.time())),
+            cluster_tag=kwargs.get("cluster_tag"),
+            rejection_reasons=[],
+        )
+        return await self.upsert_wallet(profile, status=status)
 
     async def get_wallet(self, wallet_address: str) -> Optional[WhitelistRecord]:
         """Query a single wallet by address."""

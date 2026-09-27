@@ -353,38 +353,40 @@ def test_autonomous_wallet_evaluator_30d_criteria():
     assert result_mev.classification == WalletClassification.MEV_BOT
 
 
-@pytest.mark.asyncio
-async def test_reverse_engineer_winning_tokens(tmp_path):
+def test_reverse_engineer_winning_tokens(tmp_path):
     """Verify autonomous reverse-engineering of winning tokens (>300% in 1 hr) discovering early buyers."""
-    db_file = tmp_path / "whitelist_test.db"
-    db = WhitelistDB(str(db_file))
-    profiler = SmartMoneyProfiler(whitelist_db=db)
-    await profiler.initialize()
-    try:
-        deployer = "0xdeployer00000000000000000000000000000000"
-        early_buyer = "0xearlybuyer11111111111111111111111111111111"
-        late_buyer = "0xlatebuyer222222222222222222222222222222222"
+    async def _run():
+        db_file = tmp_path / "whitelist_test.db"
+        db = WhitelistDB(str(db_file))
+        profiler = SmartMoneyProfiler(whitelist_db=db)
+        await profiler.initialize()
+        try:
+            deployer = "0xdeployer00000000000000000000000000000000"
+            early_buyer = "0xearlybuyer11111111111111111111111111111111"
+            late_buyer = "0xlatebuyer222222222222222222222222222222222"
 
-        creation_ts = 1000
-        token_trades = [
-            {"wallet": deployer, "block_number": 1, "timestamp": creation_ts + 5},
-            {"wallet": early_buyer, "block_number": 3, "timestamp": creation_ts + 30},
-            {"wallet": late_buyer, "block_number": 50, "timestamp": creation_ts + 600},
-        ]
+            creation_ts = 1000
+            token_trades = [
+                {"wallet": deployer, "block_number": 1, "timestamp": creation_ts + 5},
+                {"wallet": early_buyer, "block_number": 3, "timestamp": creation_ts + 30},
+                {"wallet": late_buyer, "block_number": 50, "timestamp": creation_ts + 600},
+            ]
 
-        discovered = await profiler.reverse_engineer_winning_tokens(
-            token_address="0xwinningtoken333333333333333333333333333333",
-            chain=ChainIdentifier.BASE_MAINNET,
-            price_gain_pct=350.0,  # > 300%
-            creation_timestamp=creation_ts,
-            early_trades=token_trades,
-            deployer_cluster=[deployer],
-        )
-        assert early_buyer.lower() in [d.lower() for d in discovered]
-        assert deployer.lower() not in [d.lower() for d in discovered]
-        assert late_buyer.lower() not in [d.lower() for d in discovered]
-    finally:
-        await db.close()
+            discovered = await profiler.reverse_engineer_winning_tokens(
+                token_address="0xwinningtoken333333333333333333333333333333",
+                chain=ChainIdentifier.BASE_MAINNET,
+                price_gain_pct=350.0,  # > 300%
+                creation_timestamp=creation_ts,
+                early_trades=token_trades,
+                deployer_cluster=[deployer],
+            )
+            assert early_buyer.lower() in [d.lower() for d in discovered]
+            assert deployer.lower() not in [d.lower() for d in discovered]
+            assert late_buyer.lower() not in [d.lower() for d in discovered]
+        finally:
+            await db.close()
+
+    asyncio.run(_run())
 
 
 # ==============================================================================
@@ -404,7 +406,13 @@ def test_private_tx_router_endpoints_and_jito_tip():
 
     # Jito Tip Floor mock
     mock_response = [{"landed_tips_50th_percentile": 0.001, "landed_tips_75th_percentile": 0.002, "landed_tips_95th_percentile": 0.005}]
-    with patch("httpx.AsyncClient.get", return_value=MagicMock(status_code=200, json=lambda: mock_response)):
+    mock_resp = MagicMock()
+    mock_resp.status = 200
+    mock_resp.json = AsyncMock(return_value=mock_response)
+    mock_ctx = MagicMock()
+    mock_ctx.__aenter__ = AsyncMock(return_value=mock_resp)
+    mock_ctx.__aexit__ = AsyncMock(return_value=None)
+    with patch("aiohttp.ClientSession.get", return_value=mock_ctx):
         tip = asyncio.run(router.get_jito_tip_floor(percentile="p75"))
         assert tip == Decimal("0.002")
 
@@ -562,103 +570,184 @@ def test_dynamic_exits_emergency_liquidity_drain():
 # 6. Self-Learning Feedback Loop & RPC Failover Tests
 # ==============================================================================
 
-@pytest.mark.asyncio
-async def test_adaptive_feedback_social_weight_decay():
+def test_adaptive_feedback_social_weight_decay():
     """Verify social signal weight decays if X Sentiment win-rate < 40% over last 10 trades."""
-    feedback = AdaptiveFeedbackEngine(initial_social_weight=1.0)
+    async def _run():
+        feedback = AdaptiveFeedbackEngine(initial_social_weight=1.0)
 
-    # Record 10 X Sentiment trades with only 2 wins (20% win rate)
-    for i in range(10):
-        is_win = i < 2
-        reflection = TradeReflection(
-            trade_id=f"trade_{i}",
-            token_address=f"0xtoken_{i}",
-            chain=ChainIdentifier.BASE_MAINNET,
-            signal_source=SignalSource.X_SENTIMENT,
-            entry_price=Decimal("1.0"),
-            exit_price=Decimal("1.5") if is_win else Decimal("0.8"),
-            realized_pnl_usd=Decimal("50.0") if is_win else Decimal("-20.0"),
-            is_win=is_win,
-        )
-        await feedback.record_closed_trade(reflection)
-
-    # Social weight decayed: 1.0 * 0.8 = 0.8
-    assert feedback.get_social_weight() < 1.0
-    assert feedback.get_social_weight() == pytest.approx(0.80, rel=1e-2)
-
-
-@pytest.mark.asyncio
-async def test_adaptive_feedback_wallet_pruning(tmp_path):
-    """Verify automated wallet demotion on 3 consecutive losing trades."""
-    db_file = tmp_path / "whitelist_prune.db"
-    db = WhitelistDB(str(db_file))
-    await db.connect()
-    try:
-        profiler = SmartMoneyProfiler(whitelist_db=db)
-
-        wallet = "0xwalletconsecutivelosses00000000000000"
-        await db.insert_wallet(
-            wallet_address=wallet,
-            chain=ChainIdentifier.BASE_MAINNET,
-            classification=WalletClassification.SMART_MONEY,
-            status=WhitelistStatus.ACTIVE,
-            total_trades=30,
-            win_rate=0.70,
-            profit_factor=2.5,
-            avg_holding_time_seconds=300,
-            max_drawdown_pct=15.0,
-        )
-
-        feedback = AdaptiveFeedbackEngine(profiler=profiler)
-
-        # Suffer 3 consecutive losing trades
-        for i in range(3):
+        # Record 10 X Sentiment trades with only 2 wins (20% win rate)
+        for i in range(10):
+            is_win = i < 2
             reflection = TradeReflection(
-                trade_id=f"loss_{i}",
+                trade_id=f"trade_{i}",
                 token_address=f"0xtoken_{i}",
                 chain=ChainIdentifier.BASE_MAINNET,
-                signal_source=SignalSource.WHALE_WALLET,
-                wallet_address=wallet,
-                realized_pnl_usd=Decimal("-50.0"),
-                is_win=False,
+                signal_source=SignalSource.X_SENTIMENT,
+                entry_price=Decimal("1.0"),
+                exit_price=Decimal("1.5") if is_win else Decimal("0.8"),
+                realized_pnl_usd=Decimal("50.0") if is_win else Decimal("-20.0"),
+                is_win=is_win,
             )
             await feedback.record_closed_trade(reflection)
 
-        # Check that wallet was demoted in DB
-        updated = await db.get_wallet(wallet)
-        assert updated is not None
-        assert updated["status"] == WhitelistStatus.SUSPENDED.value
-    finally:
-        await db.close()
+        # Social weight decayed: 1.0 * 0.8 = 0.8
+        assert feedback.get_social_weight() < 1.0
+        assert feedback.get_social_weight() == pytest.approx(0.80, rel=1e-2)
+
+    asyncio.run(_run())
 
 
-@pytest.mark.asyncio
-async def test_rpc_health_failover_latency_and_lag():
+def test_adaptive_feedback_wallet_pruning(tmp_path):
+    """Verify automated wallet demotion on 3 consecutive losing trades."""
+    async def _run():
+        db_file = tmp_path / "whitelist_prune.db"
+        db = WhitelistDB(str(db_file))
+        await db.connect()
+        try:
+            profiler = SmartMoneyProfiler(whitelist_db=db)
+
+            wallet = "0xwalletconsecutivelosses00000000000000"
+            await db.insert_wallet(
+                wallet_address=wallet,
+                chain=ChainIdentifier.BASE_MAINNET,
+                classification=WalletClassification.SMART_MONEY,
+                status=WhitelistStatus.ACTIVE,
+                total_trades=30,
+                win_rate=0.70,
+                profit_factor=2.5,
+                avg_holding_time_seconds=300,
+                max_drawdown_pct=15.0,
+            )
+
+            feedback = AdaptiveFeedbackEngine(profiler=profiler)
+
+            # Suffer 3 consecutive losing trades
+            for i in range(3):
+                reflection = TradeReflection(
+                    trade_id=f"loss_{i}",
+                    token_address=f"0xtoken_{i}",
+                    chain=ChainIdentifier.BASE_MAINNET,
+                    signal_source=SignalSource.WHALE_WALLET,
+                    wallet_address=wallet,
+                    realized_pnl_usd=Decimal("-50.0"),
+                    is_win=False,
+                )
+                await feedback.record_closed_trade(reflection)
+
+            # Check that wallet was demoted in DB
+            updated = await db.get_wallet(wallet)
+            assert updated is not None
+            assert updated["status"] == WhitelistStatus.SUSPENDED.value
+        finally:
+            await db.close()
+
+    asyncio.run(_run())
+
+
+def test_rpc_health_failover_latency_and_lag():
     """Verify RPC Health Monitor benchmarking and automatic failover on latency > 400ms or block lag > 2."""
-    primary_rpc = "https://rpc1.primary.org"
-    fallback_rpc = "https://rpc2.fallback.org"
+    async def _run():
+        primary_rpc = "https://rpc1.primary.org"
+        fallback_rpc = "https://rpc2.fallback.org"
 
-    monitor = RPCHealthMonitor(
-        endpoints={ChainIdentifier.BASE_MAINNET: [primary_rpc, fallback_rpc]},
-        latency_threshold_ms=400.0,
-        max_block_lag=2,
-    )
-    assert monitor.get_active_rpc(ChainIdentifier.BASE_MAINNET) == primary_rpc
+        monitor = RPCHealthMonitor(
+            endpoints={ChainIdentifier.BASE_MAINNET: [primary_rpc, fallback_rpc]},
+            latency_threshold_ms=400.0,
+            max_block_lag=2,
+        )
+        assert monitor.get_active_rpc(ChainIdentifier.BASE_MAINNET) == primary_rpc
 
-    # Mock benchmarks: primary has latency 450ms (> 400ms) and block lag 3; fallback has 50ms and latest block
-    async def mock_benchmark(endpoint, session=None, timeout_seconds=2.0):
-        if endpoint.url == primary_rpc:
-            endpoint.latency_ms = 450.0
-            endpoint.latest_block = 100
-            endpoint.is_healthy = True
-        else:
-            endpoint.latency_ms = 45.0
-            endpoint.latest_block = 105
-            endpoint.is_healthy = True
-        return endpoint
+        # Mock benchmarks: primary has latency 450ms (> 400ms) and block lag 3; fallback has 50ms and latest block
+        async def mock_benchmark(endpoint, session=None, timeout_seconds=2.0):
+            if endpoint.url == primary_rpc:
+                endpoint.latency_ms = 450.0
+                endpoint.latest_block = 100
+                endpoint.is_healthy = True
+            else:
+                endpoint.latency_ms = 45.0
+                endpoint.latest_block = 105
+                endpoint.is_healthy = True
+            return endpoint
 
-    monitor.benchmark_endpoint = mock_benchmark
+        monitor.benchmark_endpoint = mock_benchmark
 
-    new_active = await monitor.check_and_failover(ChainIdentifier.BASE_MAINNET)
-    assert new_active == fallback_rpc
-    assert monitor.get_active_rpc(ChainIdentifier.BASE_MAINNET) == fallback_rpc
+        new_active = await monitor.check_and_failover(ChainIdentifier.BASE_MAINNET)
+        assert new_active == fallback_rpc
+        assert monitor.get_active_rpc(ChainIdentifier.BASE_MAINNET) == fallback_rpc
+
+    asyncio.run(_run())
+
+
+def test_security_gatekeeper_screen_token_optional_pool_address():
+    """Verify SecurityGatekeeper.screen_token can be called with or without pool_address."""
+    from alpha_engine.rate_limiter.registry import RateLimiterRegistry
+    from alpha_engine.security.gatekeeper import SecurityGatekeeper
+
+    async def _run():
+        session = MagicMock()
+        limiter = RateLimiterRegistry.default()
+        gk = SecurityGatekeeper(
+            session=session,
+            limiter=limiter,
+            evm_rpc_url="https://base-mainnet.g.alchemy.com/v2/demo",
+            evm_router_address="0x" + "1" * 40,
+            weth_address="0x" + "2" * 40,
+            enable_tier2=False,  # Disable tier 2 so we test screen_token signature directly
+        )
+
+        mock_report = SecurityReport(
+            token_address="0x" + "3" * 40,
+            chain=ChainIdentifier.BASE_MAINNET,
+            tier=SecurityTier.CLEAN,
+            is_honeypot=False,
+            buy_tax_bps=100,
+            sell_tax_bps=100,
+            lp_burned_ratio=1.0,
+            top10_concentration=0.1,
+            mint_authority_disabled=True,
+            verified_source_code=True,
+        )
+        gk._run_tier1 = AsyncMock(return_value=mock_report)
+
+        # 1. Call without pool_address (default empty string)
+        rep1 = await gk.screen_token(
+            token_address="0x" + "3" * 40,
+            chain=ChainIdentifier.BASE_MAINNET,
+        )
+        assert rep1.passes_hard_gates is True
+
+        # 2. Call with pool_address
+        rep2 = await gk.screen_token(
+            token_address="0x" + "3" * 40,
+            chain=ChainIdentifier.BASE_MAINNET,
+            pool_address="0x" + "4" * 40,
+        )
+        assert rep2.passes_hard_gates is True
+
+        # 3. Test RawSignalEvent carrying pool_address
+        raw_event = RawSignalEvent(
+            chain=ChainIdentifier.BASE_MAINNET,
+            token_address="0x" + "3" * 40,
+            pool_address="0x" + "4" * 40,
+            source=SignalSource.PAIR_CREATED,
+        )
+        assert raw_event.pool_address == "0x" + "4" * 40
+
+    asyncio.run(_run())
+
+
+def test_dns_resolver_anti_sinkhole_patch():
+    """Verify anti-sinkhole DNS resolver intercepts Cisco Umbrella IPs and resolves real edge IPs."""
+    import socket
+    from alpha_engine.dns_resolver import patch_dns_resolvers
+
+    patch_dns_resolvers()
+
+    # Querying helius-rpc.com through socket.getaddrinfo
+    addrs = socket.getaddrinfo("mainnet.helius-rpc.com", 443)
+    assert len(addrs) > 0
+    resolved_ip = addrs[0][4][0]
+    # Ensure it is NOT a Cisco Umbrella sinkhole IP (146.112.*)
+    assert not resolved_ip.startswith("146.112.")
+    assert resolved_ip in ("104.18.36.169", "172.64.151.87")
+

@@ -271,7 +271,7 @@ class SmartMoneyProfiler:
         """Release DB resources."""
         await self.whitelist_db.close()
 
-    def reverse_engineer_winning_tokens(
+    async def reverse_engineer_winning_tokens(
         self,
         token_address: str,
         price_gain_pct: float,

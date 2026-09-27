@@ -183,6 +183,7 @@ class PaperTradingEngine:
                     report = await gk.screen_token(
                         token_address=raw_sig.token_address,
                         chain=raw_sig.chain,
+                        pool_address=raw_sig.pool_address or "",
                     )
                 except Exception as exc:  # noqa: BLE001
                     logger.error(
@@ -201,6 +202,8 @@ class PaperTradingEngine:
                     continue
 
                 pool = self._pool_registry.get(raw_sig.token_address)
+                if pool is None and raw_sig.pool_address:
+                    pool = self._pool_registry.get(raw_sig.pool_address)
                 if pool is None:
                     logger.debug(
                         "Token %s from Telegram feed passed security; awaiting liquidity pool seeding.",

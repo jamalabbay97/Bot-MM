@@ -20,7 +20,7 @@ from alpha_engine.math.sizing import (
     gas_cost_usd,
     half_kelly_fraction,
 )
-from alpha_engine.models.enums import OrderSide, TradeExitReason
+from alpha_engine.models.enums import ChainIdentifier, OrderSide, TradeExitReason
 from alpha_engine.models.events import SignalEvent
 from alpha_engine.models.state import PaperFill, PoolState
 

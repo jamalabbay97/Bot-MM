@@ -176,6 +176,7 @@ class EVMIngester:
                             RawSignalEvent(
                                 chain=ChainIdentifier.BASE_MAINNET,
                                 token_address=target_token,
+                                pool_address=new_pair,
                                 source=SignalSource.PAIR_CREATED,
                                 originating_channel="evm_factory_stream",
                                 raw_text=f"PairCreated: pair={new_pair} token0={t0} token1={t1} factory={pair_data['factory']}",
@@ -198,6 +199,7 @@ class EVMIngester:
                             RawSignalEvent(
                                 chain=ChainIdentifier.BASE_MAINNET,
                                 token_address=target_token,
+                                pool_address=new_pool,
                                 source=SignalSource.PAIR_CREATED,
                                 originating_channel="evm_v3_factory_stream",
                                 raw_text=f"PoolCreated: pool={new_pool} token0={t0} token1={t1} fee={pool_data['fee']}",
