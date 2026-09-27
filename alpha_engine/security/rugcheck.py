@@ -18,11 +18,13 @@ from alpha_engine.models.state import SecurityReport
 from alpha_engine.rate_limiter.registry import RateLimiterRegistry
 from alpha_engine.security.constants import (
     _API_TIMEOUT_S,
+    _MAX_BUY_TAX_BPS,
     _MAX_SELL_TAX_BPS,
     _MAX_TOP10_CONCENTRATION,
     _MIN_LP_BURNED_RATIO,
     _RUGCHECK_URL,
 )
+
 
 logger = logging.getLogger(__name__)
 
@@ -92,14 +94,19 @@ def _parse_rugcheck_report(
 
     raw_json = json.dumps(raw, default=str)
 
+    freeze_disabled = freeze_authority is None or str(freeze_authority).lower() == "null"
+
     tier = SecurityTier.CLEAN
     if (
         sell_tax_bps > _MAX_SELL_TAX_BPS
+        or buy_tax_bps > _MAX_BUY_TAX_BPS
         or lp_burned_ratio < _MIN_LP_BURNED_RATIO
         or not mint_disabled
+        or not freeze_disabled
         or top10_concentration > _MAX_TOP10_CONCENTRATION
     ):
         tier = SecurityTier.TIER1_REJECTED
+
 
     return SecurityReport(
         token_address=mint_address,

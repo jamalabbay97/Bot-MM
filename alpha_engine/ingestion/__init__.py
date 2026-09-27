@@ -21,6 +21,7 @@ from alpha_engine.ingestion.decoders import (
 from alpha_engine.ingestion.evm import EVMIngester
 from alpha_engine.ingestion.svm import SVMIngester
 from alpha_engine.ingestion.telegram import TelegramIngester
+from alpha_engine.ingestion.x_stream import XStreamIngester
 
 __all__ = [
     "EvmPoolMeta",
@@ -33,7 +34,9 @@ __all__ = [
     "EVMIngester",
     "SVMIngester",
     "TelegramIngester",
+    "XStreamIngester",
     "IngestionCoordinator",
     "_SWAP_TOPIC",
     "_SYNC_TOPIC",
 ]
+

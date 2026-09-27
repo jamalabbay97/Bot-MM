@@ -11,14 +11,71 @@ import logging
 import time
 from decimal import Decimal
 
+from typing import Any, Optional
+
 from alpha_engine.rate_limiter.registry import RateLimiterRegistry
 from alpha_engine.security.constants import (
     _ERC20_BALANCE_ABI,
     _MIN_SELL_RETURN_RATIO,
     _ROUTER_ABI_SWAP_EXACT_ETH,
+    TAX_MUTATION_MAP,
+    TAX_MUTATION_SELECTORS,
 )
 
 logger = logging.getLogger(__name__)
+
+
+class BytecodeInspectionResult(tuple):
+    """Tuple subclass that is also awaitable to allow dual sync/async calls."""
+    def __await__(self):
+        async def _coro():
+            return self
+        return _coro().__await__()
+
+
+def inspect_bytecode_for_delayed_taxes(
+    bytecode_or_w3: Any,
+    token_address: Optional[str] = None,
+) -> Any:
+    """
+    Inspect contract bytecode for delayed fee modifications, dynamic tax setters,
+    or trading trap functions (setTax, updateFees, enableTrading, setMaxTxPercent).
+    Supports direct bytecode string/bytes (sync/awaitable) or AsyncWeb3 instance (coroutine).
+    """
+    if isinstance(bytecode_or_w3, (str, bytes)):
+        code_hex = bytecode_or_w3.hex().lower() if isinstance(bytecode_or_w3, bytes) else str(bytecode_or_w3).lower()
+        if code_hex.startswith("0x"):
+            code_hex = code_hex[2:]
+        reasons: list[str] = []
+        for selector, name in TAX_MUTATION_MAP.items():
+            if selector in code_hex:
+                reasons.append(name)
+        return BytecodeInspectionResult((len(reasons) == 0, reasons))
+
+    async def _async_inspect() -> tuple[bool, list[str]]:
+        reasons: list[str] = []
+        try:
+            code = await bytecode_or_w3.eth.get_code(bytecode_or_w3.to_checksum_address(token_address))
+            if not code or code == b"" or code == "0x":
+                return False, ["No bytecode deployed at token address"]
+
+            code_hex = code.hex().lower() if isinstance(code, bytes) else str(code).lower()
+            if code_hex.startswith("0x"):
+                code_hex = code_hex[2:]
+
+            for selector, name in TAX_MUTATION_MAP.items():
+                if selector in code_hex:
+                    reasons.append(name)
+
+            if reasons:
+                return False, reasons
+            return True, []
+        except Exception as exc:
+            logger.debug("Bytecode inspection failed for %s: %s", token_address, exc)
+            return True, []
+
+    return _async_inspect()
+
 
 
 async def _tier2_evm_preflight(
@@ -48,9 +105,20 @@ async def _tier2_evm_preflight(
     w3 = AsyncWeb3(AsyncWeb3.AsyncHTTPProvider(rpc_url))
     w3.middleware_onion.inject(ExtraDataToPOAMiddleware, layer=0)
 
+    # ── Step 0: Bytecode delayed fee / dynamic tax inspection ────────────────
+    is_clean_bytecode, bytecode_reasons = await inspect_bytecode_for_delayed_taxes(w3, token_address)
+    if not is_clean_bytecode:
+        logger.warning(
+            "Tier 2 Bytecode inspection REJECTED %s: %s. Flagging as honeypot/trap.",
+            token_address,
+            "; ".join(bytecode_reasons),
+        )
+        return False
+
     sim_wallet = "0xDeaDbeefdEAdbeefdEadbEEFdeadbeEFdEaDbeeF"
     buy_amount_wei = w3.to_wei(Decimal("0.001"), "ether")
     deadline = int(time.time()) + 300
+
 
     token = w3.eth.contract(
         address=w3.to_checksum_address(token_address),

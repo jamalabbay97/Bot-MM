@@ -50,6 +50,7 @@ class WalletClassification(str, Enum):
     DEAD_REVIVAL = "dead_revival"             # Inactive >45 days, compromised/sold keys
     INSUFFICIENT_HISTORY = "insufficient_history"  # <15 trades or <21 days active
     LOW_WIN_RATE = "low_win_rate"             # Win rate < 55%
+    CIRCULAR_WASH = "circular_wash"           # Circular transaction loop / wash trading
 
 
 class WhitelistStatus(str, Enum):
@@ -68,6 +69,7 @@ class NewsSignalStatus(str, Enum):
     BAIT_AND_SWITCH = "bait_and_switch"       # MessageEdited event injected CA
     DUPLICATE = "duplicate"
     INVALID_CA = "invalid_ca"
+    BOT_FARM_FLAGGED = "bot_farm_flagged"     # Flagged by engagement velocity / anti-sybil
 
 
 class SignalSource(str, Enum):
@@ -76,26 +78,38 @@ class SignalSource(str, Enum):
     WHALE_WALLET = "whale_wallet"
     TELEGRAM_SCRAPER = "telegram_scraper"
     DEX_SWAP = "dex_swap"
+    X_SENTIMENT = "x_sentiment"
+    PUMP_FUN_MINT = "pump_fun_mint"
+    PAIR_CREATED = "pair_created"
 
 
 class ExitStage(str, Enum):
     """Lifecycle stages for staged exit execution."""
 
     NONE = "none"
-    TP1 = "tp1"             # 50% sold at +100% gain
-    TP2 = "tp2"             # 25% sold at +200% gain
-    MOONBAG = "moonbag"     # 25% running position
-    SL = "sl"               # Stop loss triggered
-    RUGPULL = "rugpull"     # Liquidity drain rug (<$500 pool)
+    TP1 = "tp1"             # 50% sold at +100% gain (2x)
+    TP2 = "tp2"             # 25% sold at +200% gain (3x)
+    TP3 = "tp3"             # Incremental sell at 5x
+    TP4 = "tp4"             # Incremental sell at 10x
+    MOONBAG = "moonbag"     # Running moonbag position
+    SL = "sl"               # Stop loss triggered (-15%)
+    TRAILING_SL = "trailing_sl"  # Trailing stop locked (+20% after +50%)
+    RUGPULL = "rugpull"     # Liquidity drain rug (<$500 pool or >30% drop)
 
 
 class TradeExitReason(str, Enum):
     """Specific exit condition triggering a sell order."""
 
-    TP_50 = "tp_50"                   # Staged Take-Profit 1 (+100% gain)
-    TP_25 = "tp_25"                   # Staged Take-Profit 2 (+200% gain)
+    TP_50 = "tp_50"                   # Staged Take-Profit 1 (+100% gain / 2x)
+    TP_25 = "tp_25"                   # Staged Take-Profit 2 (+200% gain / 3x)
+    TP_2X = "tp_2x"                   # Take Profit Ladder: 50% sold at 2x (+100%)
+    TP_3X = "tp_3x"                   # Take Profit Ladder: Incremental sold at 3x
+    TP_5X = "tp_5x"                   # Take Profit Ladder: Incremental sold at 5x
+    TP_10X = "tp_10x"                 # Take Profit Ladder: Incremental sold at 10x
     SL_INITIAL = "sl_initial"         # Initial hard stop-loss (-15%)
-    SL_TRAILING = "sl_trailing"       # Trailing break-even stop (+5% after +50%)
+    SL_TRAILING = "sl_trailing"       # Trailing stop (+20% lock once up +50%)
     RUG_LIQUIDITY_DRAIN = "rug_liquidity_drain"  # Pool reserves drop below $500
+    EMERGENCY_DRAIN = "emergency_drain"          # Pool reserves dropped >30% in single block
     MANUAL_CLOSE = "manual_close"
+
 

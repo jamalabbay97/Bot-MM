@@ -11,7 +11,7 @@ import asyncio
 import logging
 from collections import deque
 from decimal import Decimal
-from typing import Callable, Coroutine, Optional, Sequence, Set
+from typing import Any, Callable, Coroutine, Optional, Sequence, Set
 
 from alpha_engine.models.enums import ChainIdentifier, WalletClassification, WhitelistStatus
 from alpha_engine.models.profiler import (
@@ -270,3 +270,117 @@ class SmartMoneyProfiler:
     async def close(self) -> None:
         """Release DB resources."""
         await self.whitelist_db.close()
+
+    def reverse_engineer_winning_tokens(
+        self,
+        token_address: str,
+        price_gain_pct: float,
+        duration_seconds: float = 3600.0,
+        early_trades: Sequence[dict[str, Any]] = (),
+        creation_block: int = 0,
+        creation_timestamp: int = 0,
+        deployer_address: Optional[str] = None,
+        deployer_cluster: Optional[Set[str] | Sequence[str]] = None,
+        chain: Optional[ChainIdentifier] = None,
+    ) -> list[str]:
+        """
+        Reverse-Engineers Winning Tokens:
+        Every time a token runs > 300% within 1 hour:
+        1. Identify all wallets that bought within the first 10 blocks
+           (or first 2 minutes / 120s of curve creation).
+        2. Filter out developer, deployer, and wallets linked to deployer cluster.
+        Returns candidate smart wallet addresses.
+        """
+        if price_gain_pct < 300.0 or duration_seconds > 3600.0:
+            return []
+
+        dep_set = {d.lower() for d in (deployer_cluster or set())}
+        if deployer_address:
+            dep_set.add(deployer_address.lower())
+
+        candidates: list[str] = []
+        seen: set[str] = set()
+
+        for t in early_trades:
+            wallet = str(t.get("wallet", "")).lower()
+            if not wallet or wallet in dep_set or wallet in seen:
+                continue
+
+            block = int(t.get("block_number", 0))
+            ts = int(t.get("timestamp", 0))
+
+            is_first_10_blocks = (creation_block > 0 and block > 0 and block <= creation_block + 10)
+            is_first_2_mins = (creation_timestamp > 0 and ts > 0 and ts <= creation_timestamp + 120)
+
+            if is_first_10_blocks or is_first_2_mins:
+                seen.add(wallet)
+                candidates.append(wallet)
+
+        logger.info(
+            "Reverse-engineered winning token %s (+%.1f%% in %.0fs): found %d candidate smart wallets",
+            token_address[:10], price_gain_pct, duration_seconds, len(candidates)
+        )
+        return candidates
+
+    async def evaluate_and_whitelist_autonomous(
+        self,
+        wallet_address: str,
+        chain: ChainIdentifier,
+        trades: Sequence[WalletTradeRecord],
+        transfer_graph: Optional[Sequence[tuple[str, str]]] = None,
+        deployer_addresses: Optional[Set[str]] = None,
+        multisig_addresses: Optional[Set[str]] = None,
+        known_funding_hops: Optional[Sequence[FundingHop]] = None,
+        current_timestamp: Optional[int] = None,
+        cluster_tag: Optional[str] = None,
+    ) -> tuple[bool, WalletProfile]:
+        """
+        Evaluate a candidate smart wallet under autonomous rules:
+        - 30-day lookback, min 25 trades, WR > 60% (>50% ROI), PF > 2.0, MDD < 35%, hold time > 3m.
+        - Automatically inserts into whitelist_db if qualifying.
+        - If circular wash or insider, marks BANNED immediately.
+        """
+        await self.initialize()
+
+        hops = await self.trace_funding_hops(
+            wallet_address=wallet_address,
+            chain=chain,
+            deployer_addresses=deployer_addresses,
+            multisig_addresses=multisig_addresses,
+            max_hops=3,
+            initial_hops=known_funding_hops,
+        )
+
+        profile = self.evaluator.evaluate_autonomous(
+            wallet_address=wallet_address,
+            chain=chain,
+            trades=trades,
+            transfer_graph=transfer_graph,
+            funding_hops=hops,
+            current_timestamp=current_timestamp,
+            cluster_tag=cluster_tag,
+        )
+
+        if profile.classification in (WalletClassification.CIRCULAR_WASH, WalletClassification.INSIDER, WalletClassification.WASH_TRADER):
+            status = WhitelistStatus.BANNED
+        elif profile.is_whitelisted:
+            status = WhitelistStatus.ACTIVE
+        else:
+            status = WhitelistStatus.SUSPENDED
+
+        await self.whitelist_db.upsert_wallet(profile, status=status)
+        return profile.is_whitelisted, profile
+
+    async def demote_or_ban_wallet(
+        self,
+        wallet_address: str,
+        reason: str = "",
+        status: WhitelistStatus = WhitelistStatus.BANNED,
+        new_status: Optional[WhitelistStatus] = None,
+    ) -> None:
+        """Demote or ban an underperforming or malicious wallet."""
+        actual_status = new_status or status
+        await self.initialize()
+        await self.whitelist_db.update_status(wallet_address, status=actual_status)
+        logger.warning("Wallet %s demoted/banned (%s): %s", wallet_address[:10], actual_status.value, reason)
+

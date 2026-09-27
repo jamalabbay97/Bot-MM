@@ -19,13 +19,20 @@ logger = logging.getLogger(__name__)
 GAS_COST_SOL_USD: Decimal = Decimal("0.02")
 GAS_COST_BASE_USD: Decimal = Decimal("0.05")
 
-# Maximum portfolio fraction per position (hard risk cap)
-MAX_POSITION_FRACTION: Decimal = Decimal("0.01")  # 1 %
+# Maximum portfolio fraction per position (hard risk cap: 1% to 5%)
+MAX_POSITION_FRACTION: Decimal = Decimal("0.01")  # Default 1%
+MAX_AUTONOMOUS_CAP: Decimal = Decimal("0.05")     # Autonomous hard-stop cap 5%
+
+# Realistic paper-trading drag constants:
+DEX_SWAP_FEE_PCT: Decimal = Decimal("0.003")      # 0.3% DEX swap fee
+SIMULATED_GAS_NATIVE: Decimal = Decimal("0.005")  # 0.005 SOL or ETH
+ASSUMED_SLIPPAGE_PCT: Decimal = Decimal("0.05")   # 5% assumed execution slippage
 
 # Gas drag gate: reject trade if gas > 5 % of position value (usd_at_risk < gas_cost * 20).
 GAS_MULTIPLE_GATE: int = 20
 
 _DECIMAL_ZERO = Decimal("0")
+
 
 
 @dataclass(frozen=True)
@@ -91,11 +98,12 @@ def compute_position_size(
     native_price_usd: Decimal,
     chain: ChainIdentifier,
     side: OrderSide,
+    max_position_fraction: Decimal | None = None,
 ) -> KellySizing:
     """
     Translate a Kelly fraction into a concrete native-asset trade size,
     subject to:
-      (a) Hard 1 % portfolio cap.
+      (a) Hard portfolio cap (default 1%, or custom 2-5% cap).
       (b) Gas-drag rejection gate: if gas > 5 % of position (i.e.
           usd_at_risk < gas_cost_usd × 20), set size = 0 and flag rejected.
     """
@@ -104,8 +112,9 @@ def compute_position_size(
     if portfolio_equity_usd <= _DECIMAL_ZERO:
         raise ValueError(f"portfolio_equity_usd must be > 0, got {portfolio_equity_usd}")
 
+    cap = max_position_fraction if max_position_fraction is not None else MAX_POSITION_FRACTION
     kelly_dec = Decimal(str(kelly_fraction))
-    capped_fraction = min(kelly_dec, MAX_POSITION_FRACTION)
+    capped_fraction = min(kelly_dec, cap)
     usd_at_risk = capped_fraction * portfolio_equity_usd
 
     trade_gas_usd = gas_cost_usd(chain)
@@ -143,6 +152,35 @@ def compute_position_size(
         usd_at_risk=usd_at_risk,
         gas_rejected=False,
     )
+
+
+def apply_paper_trading_drag(
+    gross_amount: Decimal,
+    execution_price: Decimal,
+    side: OrderSide,
+    native_gas_cost: Decimal = SIMULATED_GAS_NATIVE,
+    swap_fee_pct: Decimal = DEX_SWAP_FEE_PCT,
+    slippage_pct: Decimal = ASSUMED_SLIPPAGE_PCT,
+) -> tuple[Decimal, Decimal, Decimal]:
+    """
+    Deduct dynamic simulated fees to reflect live market drag:
+    - 0.3% DEX swap fee
+    - 0.005 SOL/ETH gas
+    - 5% assumed execution slippage
+    Returns: (net_amount, adjusted_price, fee_drag_usd)
+    """
+    if side == OrderSide.BUY:
+        effective_price = execution_price * (Decimal("1") + slippage_pct)
+        swap_fee = gross_amount * swap_fee_pct
+        net_amount = (gross_amount - swap_fee) / effective_price
+    else:
+        effective_price = execution_price * (Decimal("1") - slippage_pct)
+        gross_native = gross_amount * effective_price
+        swap_fee = gross_native * swap_fee_pct
+        net_amount = max(Decimal("0"), gross_native - swap_fee - native_gas_cost)
+
+    return net_amount, effective_price, swap_fee
+
 
 
 def classify_alpha_score(alpha_score: float) -> str:

@@ -9,9 +9,11 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 from typing import Any
 
 import aiohttp
+
 
 from alpha_engine.models.enums import ChainIdentifier, SecurityTier
 from alpha_engine.models.state import SecurityReport
@@ -21,28 +23,46 @@ from alpha_engine.security.constants import (
     _BURN_ADDRESSES,
     _GOPLUS_CHAIN_IDS,
     _GOPLUS_URL,
+    _MAX_BUY_TAX_BPS,
     _MAX_SELL_TAX_BPS,
     _MAX_TOP10_CONCENTRATION,
     _MIN_LP_BURNED_RATIO,
+    MIN_LOCK_DURATION_SECONDS,
+    MIXER_AND_RUG_FUNDING_ADDRESSES,
+    VERIFIED_LP_LOCKERS,
 )
 
 logger = logging.getLogger(__name__)
 
 
 def _calculate_lp_burned_ratio(lp_holders: list[dict[str, Any]]) -> float:
-    """Compute the fraction of LP tokens held by known burn addresses."""
+    """
+    Compute the fraction of LP tokens held by known burn addresses
+    or verified lockers locked for at least 6 months.
+    """
     if not lp_holders:
         return 0.0
     total_pct = 0.0
-    burned_pct = 0.0
+    burned_or_locked_pct = 0.0
+    now = time.time()
     for holder in lp_holders:
         pct = float(holder.get("percent", 0) or 0)
         total_pct += pct
-        if holder.get("address", "").lower() in _BURN_ADDRESSES:
-            burned_pct += pct
+        addr = holder.get("address", "").lower()
+        if addr in _BURN_ADDRESSES:
+            burned_or_locked_pct += pct
+        elif addr in VERIFIED_LP_LOCKERS or holder.get("is_locked"):
+            # Check lock duration (at least 6 months = 180 days)
+            end_time = float(holder.get("end_time", 0) or 0)
+            if end_time > 0 and (end_time - now) >= MIN_LOCK_DURATION_SECONDS:
+                burned_or_locked_pct += pct
+            elif holder.get("is_locked") and not end_time:
+                # Treated as permanently locked
+                burned_or_locked_pct += pct
     if total_pct == 0.0:
         return 0.0
-    return min(1.0, burned_pct / total_pct)
+    return min(1.0, burned_or_locked_pct / total_pct)
+
 
 
 def _calculate_top10_concentration(holders: list[dict[str, Any]]) -> float:
@@ -118,15 +138,19 @@ def _parse_goplus_report(
         mint_disabled = False
 
     raw_json = json.dumps(raw, default=str)
+    creator_address = str(raw.get("creator_address", "")).lower()
 
     tier = SecurityTier.CLEAN
     if (
         sell_tax_bps > _MAX_SELL_TAX_BPS
+        or buy_tax_bps > _MAX_BUY_TAX_BPS
         or lp_burned_ratio < _MIN_LP_BURNED_RATIO
         or not mint_disabled
         or top10_concentration > _MAX_TOP10_CONCENTRATION
+        or creator_address in MIXER_AND_RUG_FUNDING_ADDRESSES
     ):
         tier = SecurityTier.TIER1_REJECTED
+
 
     return SecurityReport(
         token_address=token_address,

@@ -10,9 +10,16 @@ from __future__ import annotations
 import logging
 import time
 from decimal import Decimal
+from typing import Any
 
 from alpha_engine.math.sizing import classify_alpha_score
-from alpha_engine.models.enums import ChainIdentifier, OrderSide, SecurityTier, SignalStrength
+from alpha_engine.models.enums import (
+    ChainIdentifier,
+    OrderSide,
+    SecurityTier,
+    SignalSource,
+    SignalStrength,
+)
 from alpha_engine.models.events import SignalEvent, SwapEvent
 from alpha_engine.models.state import PoolState, SecurityReport
 
@@ -55,6 +62,7 @@ class SignalGenerator:
         swap: SwapEvent,
         pool: PoolState,
         report: SecurityReport,
+        source: SignalSource = SignalSource.DEX_SWAP,
     ) -> SignalEvent | None:
         """Generate a BUY SignalEvent for a qualifying swap."""
         alpha = self.score_swap(swap, pool, report)
@@ -80,6 +88,44 @@ class SignalGenerator:
             security_report=report,
             strength=strength,
             alpha_score=alpha,
+            source=source,
+        )
+
+    def generate_social_signal(
+        self,
+        raw_signal: Any,
+        pool: PoolState,
+        report: SecurityReport,
+        social_weight: float = 1.0,
+    ) -> SignalEvent | None:
+        """Generate a BUY SignalEvent from social sentiment (X or Telegram) with dynamic weight adaptation."""
+        tier_multiplier = 1.0 if report.tier == SecurityTier.CLEAN else 0.5
+        alpha = min(1.0, max(0.0, 0.85 * social_weight * tier_multiplier))
+
+        if alpha < 0.10:
+            logger.debug(
+                "Social alpha score %.4f too low for %s — skipping signal.",
+                alpha,
+                getattr(raw_signal, "token_address", "")[:10],
+            )
+            return None
+
+        strength_str = classify_alpha_score(alpha)
+        strength = SignalStrength(strength_str)
+
+        source = getattr(raw_signal, "source", SignalSource.X_SENTIMENT)
+
+        return SignalEvent(
+            timestamp_ns=getattr(raw_signal, "timestamp_ns", time.time_ns()),
+            chain=raw_signal.chain,
+            pool_address=pool.pool_address,
+            token_address=raw_signal.token_address,
+            suggested_side=OrderSide.BUY,
+            pool_state=pool,
+            security_report=report,
+            strength=strength,
+            alpha_score=alpha,
+            source=source,
         )
 
     def generate_sell_signal(

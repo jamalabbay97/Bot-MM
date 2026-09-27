@@ -30,6 +30,22 @@ _SYNC_TOPIC: str = (
     "0x1c411e9a96e071241c2f21f7726b17ae89e3cab4c78be50e062b03a9fffbbad1"
 )
 
+# Uniswap v2 / Aerodrome PairCreated event topic
+# PairCreated(address,address,address,uint256)
+_PAIR_CREATED_TOPIC: str = (
+    "0x0d3648bd0f6ba80134a33ba9275ac585d9d315f0ad8355cddefde31afa28d0e9"
+)
+
+# Uniswap v3 PoolCreated event topic
+# PoolCreated(address,address,uint24,int24,address)
+_POOL_CREATED_TOPIC: str = (
+    "0x783cca1c041245d8083164ea2cbd8e436ab6ae90824b2b740b02830204cc0415"
+)
+
+# Solana Program Constants
+PUMP_FUN_PROGRAM_ID: str = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"
+RAYDIUM_AMM_PROGRAM_ID: str = "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8"
+
 # EVM: pool_address → (token0, token1, decimals0, decimals1, native_token)
 EvmPoolMeta = tuple[str, str, int, int, str]
 
@@ -214,3 +230,162 @@ def _parse_raydium_log_line(line: str) -> dict[str, Any] | None:
         "pool_coin_reserve": pool_coin,
         "pool_pc_reserve": pool_pc,
     }
+
+
+def _decode_evm_pair_created_log(log: dict[str, Any]) -> dict[str, Any] | None:
+    """Decode an EVM PairCreated log (Uniswap V2 / Aerodrome)."""
+    try:
+        topics: list[str] = log.get("topics", [])
+        if not topics or topics[0].lower() != _PAIR_CREATED_TOPIC:
+            return None
+        if len(topics) < 3:
+            return None
+
+        token0 = "0x" + topics[1][-40:].lower()
+        token1 = "0x" + topics[2][-40:].lower()
+
+        data_hex = log.get("data", "0x")[2:]
+        if len(data_hex) < 64:
+            return None
+
+        # Pair address is the first 32 bytes (offset 0..64)
+        pair = "0x" + data_hex[24:64].lower()
+        factory = log.get("address", "").lower()
+        tx_hash = log.get("transactionHash", "").lower()
+
+        block_hex = log.get("blockNumber", "0x0")
+        block_number = int(block_hex, 16) if isinstance(block_hex, str) else int(block_hex)
+
+        return {
+            "token0": token0,
+            "token1": token1,
+            "pair": pair,
+            "factory": factory,
+            "tx_hash": tx_hash,
+            "block_number": block_number,
+        }
+    except Exception as exc:
+        logger.debug("Failed to decode PairCreated log: %s", exc)
+        return None
+
+
+def _decode_evm_pool_created_log(log: dict[str, Any]) -> dict[str, Any] | None:
+    """Decode an EVM PoolCreated log (Uniswap V3 / Aerodrome SlipStream)."""
+    try:
+        topics: list[str] = log.get("topics", [])
+        if not topics or topics[0].lower() != _POOL_CREATED_TOPIC:
+            return None
+        if len(topics) < 4:
+            return None
+
+        token0 = "0x" + topics[1][-40:].lower()
+        token1 = "0x" + topics[2][-40:].lower()
+        fee = int(topics[3], 16)
+
+        data_hex = log.get("data", "0x")[2:]
+        if len(data_hex) < 128:
+            return None
+
+        # Pool address is at offset 32..64 (chars 64..128)
+        pool = "0x" + data_hex[88:128].lower()
+        factory = log.get("address", "").lower()
+        tx_hash = log.get("transactionHash", "").lower()
+
+        block_hex = log.get("blockNumber", "0x0")
+        block_number = int(block_hex, 16) if isinstance(block_hex, str) else int(block_hex)
+
+        return {
+            "token0": token0,
+            "token1": token1,
+            "fee": fee,
+            "pool": pool,
+            "factory": factory,
+            "tx_hash": tx_hash,
+            "block_number": block_number,
+        }
+    except Exception as exc:
+        logger.debug("Failed to decode PoolCreated log: %s", exc)
+        return None
+
+
+def _parse_pump_fun_logs(logs: list[str], tx_sig: str = "") -> dict[str, Any] | None:
+    """
+    Parse Solana logs for Pump.fun program mint & bonding curve initialization.
+    Detects InitializeMint2, Create, or bonding curve parameters.
+    """
+    import re
+    mint_address: str | None = None
+    bonding_curve: str | None = None
+    is_create = False
+
+    # Regex for Solana base58 (32-44 characters)
+    b58_re = re.compile(r"\b[1-9A-HJ-NP-Za-km-z]{32,44}\b")
+
+    for line in logs:
+        line_lower = line.lower()
+        if "6ef8rrecth" in line_lower or "create" in line_lower or "initializemint" in line_lower:
+            is_create = True
+
+        # Look for explicit mint keyword
+        if "mint:" in line_lower:
+            matches = b58_re.findall(line)
+            if matches:
+                mint_address = matches[-1]
+        elif "bonding curve:" in line_lower:
+            matches = b58_re.findall(line)
+            if matches:
+                bonding_curve = matches[-1]
+
+    if not is_create:
+        return None
+
+    # If mint address wasn't explicitly prefixed, look for all base58 tokens excluding program IDs
+    if not mint_address:
+        found_tokens: list[str] = []
+        for line in logs:
+            for token in b58_re.findall(line):
+                if token not in (PUMP_FUN_PROGRAM_ID, RAYDIUM_AMM_PROGRAM_ID) and len(token) >= 32:
+                    found_tokens.append(token)
+        if found_tokens:
+            mint_address = found_tokens[0]
+            if len(found_tokens) > 1:
+                bonding_curve = found_tokens[1]
+
+    if not mint_address:
+        return None
+
+    # Pump.fun standard bonding curve initial reserves:
+    # 30 SOL virtual reserve, 1.073B virtual tokens
+    return {
+        "mint": mint_address,
+        "bonding_curve": bonding_curve or mint_address,
+        "virtual_sol_reserves": Decimal("30.0"),
+        "virtual_token_reserves": Decimal("1073000000.0"),
+        "token_decimals": 6,
+        "native_decimals": 9,
+        "tx_hash": tx_sig,
+    }
+
+
+def _parse_raydium_initialize2_logs(logs: list[str], tx_sig: str = "") -> dict[str, Any] | None:
+    """Parse Solana logs for Raydium AMM pool creation (Initialize2)."""
+    import re
+    b58_re = re.compile(r"\b[1-9A-HJ-NP-Za-km-z]{32,44}\b")
+    is_raydium_init = False
+    pool_address: str | None = None
+
+    for line in logs:
+        if "initialize2" in line.lower() or "createpool" in line.lower():
+            is_raydium_init = True
+            matches = b58_re.findall(line)
+            if matches:
+                pool_address = matches[0]
+
+    if not is_raydium_init:
+        return None
+
+    return {
+        "pool_address": pool_address or tx_sig[:44],
+        "tx_hash": tx_sig,
+    }
+

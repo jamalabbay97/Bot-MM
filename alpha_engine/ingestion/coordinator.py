@@ -22,6 +22,7 @@ from alpha_engine.ingestion.evm import (
 )
 from alpha_engine.ingestion.svm import SVMIngester
 from alpha_engine.ingestion.telegram import TelegramIngester
+from alpha_engine.ingestion.x_stream import XStreamIngester
 from alpha_engine.models.events import (
     PoolStateUpdateEvent,
     RawSignalEvent,
@@ -85,6 +86,9 @@ class IngestionCoordinator:
         db_path: str = "paper_trading.db",
         status_provider: Optional[Any] = None,
         telegram_ingester: Optional[TelegramIngester] = None,
+        x_stream_ingester: Optional[XStreamIngester] = None,
+        x_bearer_token: Optional[str] = None,
+        enable_x_stream: bool = False,
     ) -> None:
         self._queue: asyncio.Queue[
             SwapEvent | PoolStateUpdateEvent | RawSignalEvent | ShutdownSentinel
@@ -119,6 +123,17 @@ class IngestionCoordinator:
                 limiter=limiter,
             )
 
+        if x_stream_ingester is not None:
+            self._x_stream: Optional[XStreamIngester] = x_stream_ingester
+        elif enable_x_stream:
+            self._x_stream = XStreamIngester(
+                event_queue=self._queue,
+                bearer_token=x_bearer_token,
+                limiter=limiter,
+            )
+        else:
+            self._x_stream = None
+
         self._tasks: list[asyncio.Task[None]] = []
 
     @property
@@ -139,9 +154,13 @@ class IngestionCoordinator:
     def telegram_ingester(self) -> TelegramIngester:
         return self._telegram
 
+    @property
+    def x_stream_ingester(self) -> Optional[XStreamIngester]:
+        return self._x_stream
+
     async def start(self) -> None:
         """
-        Spawns all three ingestion loops (EVM, SVM, Telegram) concurrently.
+        Spawns all ingestion loops (EVM, SVM, Telegram, X-Stream) concurrently.
         """
         if self._tasks:
             return
@@ -151,15 +170,21 @@ class IngestionCoordinator:
             asyncio.create_task(self._svm.run(), name="svm_ingester"),
             asyncio.create_task(self._telegram.run(), name="telegram_ingester"),
         ]
-        logger.info("IngestionCoordinator started (EVM + SVM + Telegram ingesters running).")
+        if self._x_stream is not None:
+            self._tasks.append(
+                asyncio.create_task(self._x_stream.run(), name="x_stream_ingester")
+            )
+        logger.info("IngestionCoordinator started (EVM + SVM + Telegram + X-Stream running).")
 
     async def stop(self) -> None:
         """
-        Gracefully stop all three ingesters and tear down tasks.
+        Gracefully stop all ingesters and tear down tasks.
         """
         await self._evm.stop()
         await self._svm.stop()
         await self._telegram.stop()
+        if self._x_stream is not None:
+            await self._x_stream.stop()
 
         for task in self._tasks:
             task.cancel()
@@ -170,6 +195,7 @@ class IngestionCoordinator:
 
         await self._queue.put(ShutdownSentinel())
         logger.info("IngestionCoordinator stopped.")
+
 
     async def __aenter__(self) -> "IngestionCoordinator":
         await self.start()

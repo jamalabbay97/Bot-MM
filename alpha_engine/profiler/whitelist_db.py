@@ -218,6 +218,15 @@ class WhitelistDatabase:
 
     async def ban_wallet(self, wallet_address: str, reason: str) -> None:
         """Ban a compromised or insider wallet."""
+        await self.update_status(wallet_address, status=WhitelistStatus.BANNED, reason=f"BAN: {reason}")
+
+    async def update_status(
+        self,
+        wallet_address: str,
+        status: WhitelistStatus,
+        reason: str = "",
+    ) -> None:
+        """Update status of a wallet in whitelist DB (e.g. SUSPENDED, ACTIVE, or BANNED)."""
         await self.connect()
         assert self._conn is not None
 
@@ -225,12 +234,13 @@ class WhitelistDatabase:
             await self._conn.execute(
                 """
                 UPDATE wallet_whitelist
-                SET status = ?, rejection_reasons = rejection_reasons || ' | BAN: ' || ?, updated_at_ns = ?
+                SET status = ?, rejection_reasons = rejection_reasons || ' | ' || ?, updated_at_ns = ?
                 WHERE wallet_address = ?;
                 """,
-                (WhitelistStatus.BANNED.value, reason, time.time_ns(), wallet_address.lower()),
+                (status.value, reason, time.time_ns(), wallet_address.lower()),
             )
             await self._conn.commit()
+
 
     async def list_active(
         self,
@@ -278,3 +288,6 @@ class WhitelistDatabase:
         if self._conn is not None:
             await self._conn.close()
             self._conn = None
+
+
+WhitelistDB = WhitelistDatabase

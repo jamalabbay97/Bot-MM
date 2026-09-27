@@ -134,11 +134,13 @@ class SecurityReport(BaseModel):
         """
         return (
             self.sell_tax_bps <= 500
+            and self.buy_tax_bps <= 500
             and self.lp_burned_ratio >= 0.90
             and self.mint_authority_disabled
             and self.top10_concentration <= 0.20
             and not self.is_honeypot
         )
+
 
 
 class PaperFill(BaseModel):

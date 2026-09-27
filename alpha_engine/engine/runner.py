@@ -25,7 +25,9 @@ except ImportError:  # pragma: no cover
     PSUTIL_AVAILABLE = False
 
 from alpha_engine.config import EngineConfig
+from alpha_engine.engine.feedback import AdaptiveFeedbackEngine, TradeReflection
 from alpha_engine.engine.registry import PoolRegistry
+from alpha_engine.engine.rpc_health import RPCHealthMonitor
 from alpha_engine.engine.signals import SignalGenerator
 from alpha_engine.execution.book import PositionBook, RunningMetrics
 from alpha_engine.execution.executor import PaperExecutor
@@ -90,6 +92,24 @@ class PaperTradingEngine:
         self._trades_since_kelly_refresh = 0
         self._kelly_refresh_interval = 10
         self._signal_handlers_installed = False
+
+        self._feedback = AdaptiveFeedbackEngine()
+        base_urls = [config.base_rpc_http] + list(getattr(config, "base_fallback_rpcs", []))
+        solana_urls = [config.solana_rpc_http] + list(getattr(config, "solana_fallback_rpcs", []))
+        self._rpc_monitor = RPCHealthMonitor(
+            endpoints={
+                ChainIdentifier.BASE_MAINNET: [u for u in base_urls if u],
+                ChainIdentifier.SOLANA_MAINNET: [u for u in solana_urls if u],
+            }
+        )
+
+    @property
+    def feedback_engine(self) -> AdaptiveFeedbackEngine:
+        return self._feedback
+
+    @property
+    def rpc_monitor(self) -> RPCHealthMonitor:
+        return self._rpc_monitor
 
     def _install_signal_handlers(self) -> None:
         """
@@ -188,28 +208,27 @@ class PaperTradingEngine:
                     )
                     continue
 
-                signal_event = SignalEvent(
-                    timestamp_ns=raw_sig.timestamp_ns,
-                    chain=raw_sig.chain,
-                    pool_address=pool.pool_address,
-                    token_address=raw_sig.token_address,
-                    suggested_side=OrderSide.BUY,
-                    pool_state=pool,
-                    security_report=report,
-                    strength=SignalStrength.STRONG,
-                    alpha_score=0.85,
-                    source=SignalSource.TELEGRAM_SCRAPER,
+                social_weight = self._feedback.get_social_weight()
+                signal_event = self._signal_gen.generate_social_signal(
+                    raw_signal=raw_sig,
+                    pool=pool,
+                    report=report,
+                    social_weight=social_weight,
                 )
+                if signal_event is None:
+                    continue
+
                 if self._ledger:
                     await self._ledger.record_signal(signal_event)
 
                 await self._signal_q.put(signal_event)
                 logger.info(
-                    "Telegram Signal [%s] queued: %s (channel: %s, sybil_count=%d)",
+                    "Social Signal [%s] queued: %s (source=%s, sybil_count=%d, weight=%.2f)",
                     signal_event.signal_id[:8],
                     raw_sig.token_address[:10],
-                    raw_sig.originating_channel,
+                    signal_event.source.value,
                     raw_sig.sybil_channel_count,
+                    social_weight,
                 )
                 continue
 
@@ -247,6 +266,9 @@ class PaperTradingEngine:
 
             updated_pool = self._pool_registry.update_from_swap(swap, pool)
 
+            # Check dynamic exits (TP ladder, trailing stop-loss, emergency liquidity drain)
+            await self._check_dynamic_exits_for_swap(swap, updated_pool)
+
             signal_event = self._signal_gen.generate_buy_signal(swap, updated_pool, report)
             if signal_event is None:
                 continue
@@ -263,6 +285,71 @@ class PaperTradingEngine:
                 signal_event.alpha_score,
                 signal_event.strength.value,
             )
+
+    async def _check_dynamic_exits_for_swap(self, swap: SwapEvent, pool: PoolState) -> None:
+        executor = self._executor
+        ledger = self._ledger
+        if executor is None:
+            return
+
+        for token in (swap.token_out, swap.token_in):
+            open_lots = self._position_book.get_open_lots(chain=swap.chain, token_address=token)
+            for lot in open_lots:
+                decision = self._position_book.evaluate_lot_exit(
+                    lot=lot,
+                    current_price=pool.spot_price_native_per_token,
+                    current_pool_reserve_native=pool.native_reserve,
+                )
+                if decision is not None and decision.should_exit:
+                    exit_fill = await executor.execute_exit(
+                        chain=decision.chain,
+                        token_address=decision.token_address,
+                        pool=pool,
+                        tokens_to_sell=decision.tokens_to_sell,
+                        reason=decision.exit_reason,
+                        apply_drag=True,
+                    )
+                    if exit_fill is not None:
+                        native_price = (
+                            self._eth_price
+                            if decision.chain == ChainIdentifier.BASE_MAINNET
+                            else self._sol_price
+                        )
+                        pnl_native, _ = self._position_book.apply_exit_decision(
+                            decision, sell_price=exit_fill.effective_price
+                        )
+                        exit_pnl_usd = pnl_native * native_price
+                        if decision.chain == ChainIdentifier.BASE_MAINNET:
+                            self._cash_eth += exit_fill.simulated_native_spent
+                        else:
+                            self._cash_sol += exit_fill.simulated_native_spent
+
+                        new_equity = self._current_equity_usd()
+                        self._metrics.record_closed_trade(
+                            realized_pnl_usd=exit_pnl_usd,
+                            gas_cost_usd=exit_fill.simulated_gas_cost_usd,
+                            current_equity_usd=new_equity,
+                        )
+                        rec = TradeRecord.from_fill(
+                            fill=exit_fill,
+                            signal_id=lot.signal_id,
+                            realized_pnl_usd=exit_pnl_usd,
+                        )
+                        if ledger:
+                            await ledger.record_trade(rec)
+
+                        reflection = TradeReflection.from_trade(
+                            trade_id=exit_fill.order_id,
+                            token_address=exit_fill.token_address,
+                            chain=exit_fill.chain,
+                            signal_source=SignalSource.DEX_SWAP,
+                            entry_price=lot.entry_price,
+                            exit_price=exit_fill.effective_price,
+                            realized_pnl_usd=exit_pnl_usd,
+                            realized_pnl_native=pnl_native,
+                            time_to_fill_ms=exit_fill.fill_latency_ms,
+                        )
+                        await self._feedback.record_closed_trade(reflection)
 
     async def _process_signal_queue(self) -> None:
         executor = self._executor
@@ -286,7 +373,16 @@ class PaperTradingEngine:
             realized_pnl_usd: Decimal | None = None
 
             if fill.side == OrderSide.BUY:
-                self._position_book.open_lot(fill, signal_item.signal_id)
+                initial_reserve = (
+                    signal_item.pool_state.native_reserve
+                    if signal_item.pool_state
+                    else Decimal(0)
+                )
+                self._position_book.open_lot(
+                    fill,
+                    signal_item.signal_id,
+                    initial_pool_reserve_native=initial_reserve,
+                )
                 if signal_item.chain == ChainIdentifier.BASE_MAINNET:
                     self._cash_eth -= fill.simulated_native_spent
                 else:
@@ -327,6 +423,19 @@ class PaperTradingEngine:
                     self._metrics.max_drawdown_pct,
                     self._metrics.win_rate_pct,
                 )
+
+                reflection = TradeReflection.from_trade(
+                    trade_id=fill.order_id,
+                    token_address=fill.token_address,
+                    chain=fill.chain,
+                    signal_source=signal_item.source,
+                    entry_price=fill.effective_price,
+                    exit_price=fill.effective_price,
+                    realized_pnl_usd=realized_pnl_usd,
+                    realized_pnl_native=pnl_native,
+                    time_to_fill_ms=fill.fill_latency_ms,
+                )
+                await self._feedback.record_closed_trade(reflection)
 
             trade_record = TradeRecord.from_fill(
                 fill=fill,

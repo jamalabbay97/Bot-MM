@@ -48,8 +48,37 @@ class EngineConfig(BaseSettings):
         description="WebSocket RPC endpoint for Solana (SVM) log subscriptions",
     )
 
+    base_fallback_rpcs: list[str] = Field(
+        default_factory=lambda: ["https://mainnet.base.org", "https://base.llamarpc.com"],
+        description="Fallback HTTP RPC endpoints for Base (EVM)",
+    )
+    solana_fallback_rpcs: list[str] = Field(
+        default_factory=lambda: ["https://api.mainnet-beta.solana.com"],
+        description="Fallback HTTP RPC endpoints for Solana (SVM)",
+    )
+
     # -------------------------------------------------------------------------
-    # 2. DEX Protocol Addresses
+    # 2. Private Builder & MEV Protection Endpoints
+    # -------------------------------------------------------------------------
+    flashbots_rpc: str = Field(
+        default="https://rpc.flashbots.net",
+        description="Flashbots private EVM builder RPC",
+    )
+    titan_builder_rpc: str = Field(
+        default="https://rpc.titanbuilder.xyz",
+        description="Titan private builder RPC",
+    )
+    mev_blocker_rpc: str = Field(
+        default="https://rpc.mevblocker.io",
+        description="MEV Blocker private RPC",
+    )
+    jito_tip_floor_url: str = Field(
+        default="https://bundles.jito.wtf/api/v1/bundles/tip_floor",
+        description="Jito Bundles dynamic tip floor API endpoint",
+    )
+
+    # -------------------------------------------------------------------------
+    # 3. DEX Protocol Addresses
     # -------------------------------------------------------------------------
     aerodrome_router: str = Field(
         default="0xcF77a3Ba9A5CA399B7c97c749566343833341fdC",
@@ -61,8 +90,20 @@ class EngineConfig(BaseSettings):
     )
 
     # -------------------------------------------------------------------------
-    # 3. Telegram Scraper Credentials
+    # 4. Telegram & X (Twitter) Scraper Credentials
     # -------------------------------------------------------------------------
+    x_bearer_token: Optional[str] = Field(
+        default=None,
+        description="Twitter/X API v2 Bearer Token for sentiment streaming",
+    )
+    x_api_key: Optional[str] = Field(
+        default=None,
+        description="Twitter/X API Consumer Key",
+    )
+    x_api_secret: Optional[str] = Field(
+        default=None,
+        description="Twitter/X API Consumer Secret",
+    )
     telegram_api_id: Optional[int] = Field(
         default=None,
         description="Telegram API ID from my.telegram.org",
@@ -89,7 +130,7 @@ class EngineConfig(BaseSettings):
     )
 
     # -------------------------------------------------------------------------
-    # 4. Engine Operations & Logging
+    # 5. Engine Operations & Logging
     # -------------------------------------------------------------------------
     log_level: str = Field(
         default="INFO",
@@ -119,6 +160,12 @@ class EngineConfig(BaseSettings):
         ge=0.0001,
         le=0.10,
         description="Maximum risk allocation per trade (Half-Kelly cap, default: 1%)",
+    )
+    max_autonomous_risk_pct: float = Field(
+        default=0.05,
+        ge=0.0001,
+        le=0.10,
+        description="Maximum autonomous portfolio risk allocation per trade (2% to 5%)",
     )
     stop_loss_pct: float = Field(
         default=-0.15,

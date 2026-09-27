@@ -224,3 +224,210 @@ class WalletEvaluator:
             funding_hops=detected_hops,
             rejection_reasons=rejection_reasons,
         )
+
+    @classmethod
+    def detect_circular_wash_trading(
+        cls,
+        wallet_address: str,
+        trades: Sequence[WalletTradeRecord],
+        transfer_graph: Optional[Sequence[tuple[str, str]]] = None,
+    ) -> bool:
+        """
+        Detects wash-trading patterns and circular transaction loops:
+        1. Repeated round-trip trades with negligible net PnL.
+        2. Transaction transfer graph loops (A -> B -> C -> A).
+        """
+        if transfer_graph:
+            adj: dict[str, set[str]] = {}
+            for src, dst in transfer_graph:
+                src_l, dst_l = src.lower(), dst.lower()
+                adj.setdefault(src_l, set()).add(dst_l)
+
+            visited: set[str] = set()
+            rec_stack: set[str] = set()
+
+            def has_cycle(node: str) -> bool:
+                visited.add(node)
+                rec_stack.add(node)
+                for neighbor in adj.get(node, ()):
+                    if neighbor not in visited:
+                        if has_cycle(neighbor):
+                            return True
+                    elif neighbor in rec_stack:
+                        return True
+                rec_stack.remove(node)
+                return False
+
+            w_lower = wallet_address.lower()
+            if w_lower in adj and has_cycle(w_lower):
+                return True
+
+        token_trade_counts: dict[str, int] = {}
+        for t in trades:
+            token_trade_counts[t.token_address] = token_trade_counts.get(t.token_address, 0) + 1
+
+        for tok, count in token_trade_counts.items():
+            if count >= 6:
+                tok_trades = [t for t in trades if t.token_address == tok]
+                total_abs_pnl = sum(abs(t.realized_pnl_usd) for t in tok_trades)
+                if total_abs_pnl < Decimal("1.0"):
+                    return True
+
+        return False
+
+    @classmethod
+    def evaluate_autonomous(
+        cls,
+        wallet_address: str,
+        chain: ChainIdentifier,
+        trades: Sequence[WalletTradeRecord],
+        transfer_graph: Optional[Sequence[tuple[str, str]]] = None,
+        initial_txs: Optional[Sequence[InitialTxRecord]] = None,
+        funding_hops: Optional[Sequence[FundingHop]] = None,
+        current_timestamp: Optional[int] = None,
+        cluster_tag: Optional[str] = None,
+    ) -> WalletProfile:
+        """
+        Autonomous Smart Wallet Discovery & Machine Learning Profiler scoring:
+        - 30-day lookback window
+        - Minimum 25 total trades
+        - Win Rate (trades closing > 50% ROI) > 60%
+        - Profit Factor > 2.0
+        - Maximum Drawdown (MDD) < 35%
+        - Average Holding Time > 3 minutes (180s)
+        - Wash-trading & circular loop detection -> permanent blacklist
+        """
+        if current_timestamp is None:
+            current_timestamp = int(time.time())
+
+        rejection_reasons: list[str] = []
+        classification = WalletClassification.APPROVED
+
+        # 1. Circular wash trading & loop check
+        if cls.detect_circular_wash_trading(wallet_address, trades, transfer_graph):
+            classification = WalletClassification.CIRCULAR_WASH
+            rejection_reasons.append("Circular transaction loops / wash-trading detected")
+            return WalletProfile(
+                wallet_address=wallet_address.lower(),
+                chain=chain,
+                classification=classification,
+                is_whitelisted=False,
+                total_trades=len(trades),
+                winning_trades=0,
+                losing_trades=len(trades),
+                win_rate_pct=0.0,
+                total_pnl_usd=Decimal("0"),
+                max_single_trade_pnl_usd=Decimal("0"),
+                outlier_pnl_ratio=0.0,
+                median_holding_time_seconds=0.0,
+                active_days=0.0,
+                days_since_last_active=0.0,
+                first_tx_timestamp=current_timestamp,
+                last_tx_timestamp=current_timestamp,
+                cluster_tag=cluster_tag,
+                funding_hops=list(funding_hops) if funding_hops else [],
+                rejection_reasons=rejection_reasons,
+            )
+
+        # 2. Check insider funding provenance
+        detected_hops: list[FundingHop] = list(funding_hops) if funding_hops else []
+        for hop in detected_hops:
+            if hop.hop_depth <= cls.MAX_FUNDING_HOPS and (hop.is_deployer or hop.is_multisig):
+                classification = WalletClassification.INSIDER
+                rejection_reasons.append(
+                    f"Insider funding at hop {hop.hop_depth} to {hop.source_address}"
+                )
+                break
+
+        # 3. 30-day lookback window filter
+        lookback_s = 30 * 86400
+        trades_30d = [t for t in trades if t.sell_timestamp >= current_timestamp - lookback_s]
+
+        total_trades = len(trades_30d)
+        if total_trades < 25:
+            if classification == WalletClassification.APPROVED:
+                classification = WalletClassification.INSUFFICIENT_HISTORY
+            rejection_reasons.append(f"Insufficient trades in 30d lookback: {total_trades} < 25")
+
+        # Win Rate (trades closing > 50% ROI) > 60%
+        trades_above_50_roi = sum(1 for t in trades_30d if t.roi_pct > 50.0)
+        win_rate_50pct = (trades_above_50_roi / total_trades * 100.0) if total_trades > 0 else 0.0
+        if win_rate_50pct <= 60.0:
+            if classification == WalletClassification.APPROVED:
+                classification = WalletClassification.LOW_WIN_RATE
+            rejection_reasons.append(
+                f"Win rate (>50% ROI) {win_rate_50pct:.1f}% <= 60.0%"
+            )
+
+        # Profit Factor > 2.0
+        gross_profit = sum((t.realized_pnl_usd for t in trades_30d if t.realized_pnl_usd > 0), Decimal("0"))
+        gross_loss = abs(sum((t.realized_pnl_usd for t in trades_30d if t.realized_pnl_usd < 0), Decimal("0")))
+        profit_factor = float(gross_profit / gross_loss) if gross_loss > 0 else (999.0 if gross_profit > 0 else 0.0)
+        if profit_factor <= 2.0:
+            if classification == WalletClassification.APPROVED:
+                classification = WalletClassification.LOW_WIN_RATE
+            rejection_reasons.append(f"Profit factor {profit_factor:.2f} <= 2.0")
+
+        # Maximum Drawdown (MDD) < 35%
+        sorted_trades = sorted(trades_30d, key=lambda x: x.sell_timestamp)
+        cum_equity = Decimal("10000")
+        peak_equity = Decimal("10000")
+        max_dd_pct = 0.0
+        for t in sorted_trades:
+            cum_equity += t.realized_pnl_usd
+            if cum_equity > peak_equity:
+                peak_equity = cum_equity
+            elif peak_equity > 0:
+                dd = float((peak_equity - cum_equity) / peak_equity * 100)
+                if dd > max_dd_pct:
+                    max_dd_pct = dd
+        if max_dd_pct >= 35.0:
+            if classification == WalletClassification.APPROVED:
+                classification = WalletClassification.LOW_WIN_RATE
+            rejection_reasons.append(f"Maximum drawdown {max_dd_pct:.1f}% >= 35.0%")
+
+        # Average Holding Time > 3 minutes (180s)
+        avg_holding_time = (
+            sum(t.holding_time_seconds for t in trades_30d) / total_trades
+            if total_trades > 0 else 0.0
+        )
+        if avg_holding_time <= 180.0:
+            if classification == WalletClassification.APPROVED:
+                classification = WalletClassification.MEV_BOT
+            rejection_reasons.append(
+                f"Average holding time {avg_holding_time:.1f}s <= 180.0s (MEV bot filter)"
+            )
+
+        winning_trades = sum(1 for t in trades_30d if t.is_win)
+        losing_trades = total_trades - winning_trades
+        total_pnl_usd = sum((t.realized_pnl_usd for t in trades_30d), Decimal("0"))
+        max_single = max((t.realized_pnl_usd for t in trades_30d), default=Decimal("0"))
+        outlier_ratio = float(max_single / total_pnl_usd) if total_pnl_usd > 0 and max_single > 0 else 0.0
+
+        is_whitelisted = (classification == WalletClassification.APPROVED)
+
+        return WalletProfile(
+            wallet_address=wallet_address.lower(),
+            chain=chain,
+            classification=classification,
+            is_whitelisted=is_whitelisted,
+            total_trades=total_trades,
+            winning_trades=winning_trades,
+            losing_trades=losing_trades,
+            win_rate_pct=round(win_rate_50pct, 2),
+            total_pnl_usd=total_pnl_usd,
+            max_single_trade_pnl_usd=max_single,
+            outlier_pnl_ratio=round(outlier_ratio, 4),
+            median_holding_time_seconds=round(avg_holding_time, 2),
+            active_days=30.0,
+            days_since_last_active=0.0,
+            first_tx_timestamp=sorted_trades[0].buy_timestamp if sorted_trades else current_timestamp,
+            last_tx_timestamp=sorted_trades[-1].sell_timestamp if sorted_trades else current_timestamp,
+            cluster_tag=cluster_tag,
+            funding_hops=detected_hops,
+            rejection_reasons=rejection_reasons,
+        )
+
+
+detect_circular_wash_trading = WalletEvaluator.detect_circular_wash_trading
+
