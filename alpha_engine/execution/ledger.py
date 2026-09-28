@@ -139,7 +139,9 @@ class SQLiteLedger:
 
     async def record_trade(self, record: TradeRecord) -> None:
         conn = self._conn
-        assert conn is not None
+        if conn is None:
+            logger.debug("SQLiteLedger connection is closed; skipping trade.")
+            return
         await conn.execute(
             """
             INSERT INTO trades VALUES (
@@ -173,7 +175,9 @@ class SQLiteLedger:
 
     async def record_signal(self, signal: SignalEvent) -> None:
         conn = self._conn
-        assert conn is not None
+        if conn is None:
+            logger.debug("SQLiteLedger connection is closed; skipping signal.")
+            return
         sec = signal.security_report
         await conn.execute(
             """
@@ -201,7 +205,9 @@ class SQLiteLedger:
 
     async def record_snapshot(self, snapshot: PortfolioSnapshot) -> None:
         conn = self._conn
-        assert conn is not None
+        if conn is None:
+            logger.debug("SQLiteLedger connection is closed; skipping snapshot.")
+            return
         pf = snapshot.profit_factor
         pf_stored = pf if math.isfinite(pf) else 999999.0
         await conn.execute(
@@ -230,7 +236,13 @@ class SQLiteLedger:
 
     async def get_closed_trade_stats(self) -> dict[str, Any]:
         conn = self._conn
-        assert conn is not None
+        if conn is None:
+            return {
+                "win_rate": 0.5,
+                "avg_win_native": Decimal("0.1"),
+                "avg_loss_native": Decimal("0.05"),
+                "total_trades": 0,
+            }
 
         async with conn.execute(
             """

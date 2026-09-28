@@ -115,6 +115,48 @@ EVM_SYSTEM_ADDRESSES: CaseInsensitiveFrozenSet = CaseInsensitiveFrozenSet({
     "0xcf77a3ba9a5ca399b7c97c749566343833341fdc",          # Aerodrome Router
 })
 
+# Static fast-path blacklist tokens (native, wrapped, quote, and routing assets)
+SOLANA_BLACKLIST_TOKENS: frozenset[str] = SOLANA_SYSTEM_PROGRAM_IDS | frozenset({
+    "So11111111111111111111111111111111111111112",          # Wrapped SOL
+    "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",          # USDC
+    "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB",          # USDT
+    "mSoLzYCxHdYgdzU16g5QSh3i5K3z3KZK7ytfqcJm7So",          # mSOL
+    "bSo13r4TkiE4KumL71LsHTPpL2euBYLFx6h9HP3piy1",          # bSOL
+    "J1toso1uCk3RLmjorhTtrVwY9HJ7X8V9yYac6Y7kGCPn",          # JitoSOL
+    "7dHbWXmci3dT8UFYWYZweBLXgycu7Y3iL6trKn1Y7ARj",          # stSOL
+})
+
+EVM_BLACKLIST_TOKENS: CaseInsensitiveFrozenSet = CaseInsensitiveFrozenSet(
+    EVM_SYSTEM_ADDRESSES | {
+        "0x0000000000000000000000000000000000000000",
+        "0x4200000000000000000000000000000000000006",      # Base WETH
+        "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913",      # Base USDC
+        "0xd9aAEc86B65D86f6A7B5B1b0c42FFA531710b6CA",      # Base USDbC
+        "0x50c5725949A6F0c72E6C4a641F24049A917DB0Cb",      # Base DAI / USDT
+        "0xcf77a3ba9a5ca399b7c97c749566343833341fdc",      # Aerodrome Router
+    }
+)
+
+
+def is_blacklisted_token(token_address: str, chain: ChainIdentifier) -> bool:
+    """
+    Fast-path static lookup to identify native, wrapped, system, or quote tokens to ignore.
+    Prevents firing unnecessary external security API calls for known infrastructure tokens.
+    """
+    if not token_address:
+        return True
+    if chain == ChainIdentifier.SOLANA_MAINNET:
+        return (
+            token_address in SOLANA_BLACKLIST_TOKENS
+            or token_address.startswith("11111111")
+        )
+    if chain == ChainIdentifier.BASE_MAINNET:
+        return (
+            token_address in EVM_BLACKLIST_TOKENS
+            or token_address.lower() in EVM_BLACKLIST_TOKENS
+        )
+    return False
+
 
 
 # Uniswap v2 / Aerodrome router ABI fragments needed for eth_call simulation

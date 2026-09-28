@@ -364,12 +364,30 @@ def _decode_evm_pool_created_log(log: dict[str, Any]) -> dict[str, Any] | None:
         return None
 
 
+_B58_ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
+_PUMP_CREATE_EVENT_DISCRIMINATOR = bytes.fromhex("1b72a94ddeeb6376")
+
+
+def _b58encode(b: bytes) -> str:
+    """Encode bytes to Solana base58 string without external dependencies."""
+    n = int.from_bytes(b, "big")
+    chars = []
+    while n > 0:
+        n, rem = divmod(n, 58)
+        chars.append(_B58_ALPHABET[rem])
+    pad = len(b) - len(b.lstrip(b"\x00"))
+    return "1" * pad + "".join(reversed(chars))
+
+
 def _parse_pump_fun_logs(logs: list[str], tx_sig: str = "") -> dict[str, Any] | None:
     """
     Parse Solana logs for Pump.fun program mint & bonding curve initialization.
-    Detects InitializeMint2, Create, or bonding curve parameters.
+    Detects Anchor CreateEvent, InitializeMint2, Create, or bonding curve parameters.
+    Excludes smart contract / bot program IDs invoked in the transaction.
     """
+    import base64
     import re
+    import struct
     from alpha_engine.security.constants import SOLANA_SYSTEM_PROGRAM_IDS
 
     all_logs_str = " ".join(logs).lower()
@@ -380,41 +398,84 @@ def _parse_pump_fun_logs(logs: list[str], tx_sig: str = "") -> dict[str, Any] | 
     bonding_curve: str | None = None
     is_create = False
 
-    # Regex for Solana base58 (32-44 characters)
+    # Extract all invoked smart contract program IDs to prevent treating bot contracts as mints
+    invoked_programs: set[str] = set()
+    for line in logs:
+        if line.startswith("Program ") and any(
+            x in line for x in (" invoke", " success", " failed", " consumed")
+        ):
+            parts = line.split()
+            if len(parts) >= 2 and len(parts[1]) >= 32:
+                invoked_programs.add(parts[1])
+
+    # 1. Primary: Try decoding binary Anchor CreateEvent from 'Program data: '
+    for line in logs:
+        if line.startswith("Program data:"):
+            b64_str = line[len("Program data:"):].strip()
+            try:
+                raw_bytes = base64.b64decode(b64_str)
+                if len(raw_bytes) >= 116 and raw_bytes[:8] == _PUMP_CREATE_EVENT_DISCRIMINATOR:
+                    offset = 8
+                    n_len = struct.unpack_from("<I", raw_bytes, offset)[0]
+                    offset += 4 + n_len
+                    s_len = struct.unpack_from("<I", raw_bytes, offset)[0]
+                    offset += 4 + s_len
+                    u_len = struct.unpack_from("<I", raw_bytes, offset)[0]
+                    offset += 4 + u_len
+                    mint_b = raw_bytes[offset:offset + 32]
+                    offset += 32
+                    curve_b = raw_bytes[offset:offset + 32]
+                    mint_address = _b58encode(mint_b)
+                    bonding_curve = _b58encode(curve_b)
+                    is_create = True
+                    break
+            except Exception:
+                pass
+
+    # 2. Secondary: Text log pattern parsing if Anchor event is not present
     b58_re = re.compile(r"\b[1-9A-HJ-NP-Za-km-z]{32,44}\b")
 
-    for line in logs:
-        line_lower = line.lower()
-        if "create" in line_lower or "initializemint" in line_lower:
-            is_create = True
+    if not mint_address:
+        for line in logs:
+            line_lower = line.lower()
+            if "create" in line_lower or "initializemint" in line_lower:
+                is_create = True
 
-        # Look for explicit mint keyword
-        if "create mint" in line_lower:
-            matches = b58_re.findall(line)
-            valid = [m for m in matches if m not in SOLANA_SYSTEM_PROGRAM_IDS and not m.startswith("11111111")]
-            if valid:
-                mint_address = valid[-1]
-        elif "mint:" in line_lower:
-            matches = b58_re.findall(line)
-            valid = [m for m in matches if m not in SOLANA_SYSTEM_PROGRAM_IDS and not m.startswith("11111111")]
-            if valid:
-                mint_address = valid[-1]
-        elif "bonding curve:" in line_lower:
-            matches = b58_re.findall(line)
-            valid = [m for m in matches if m not in SOLANA_SYSTEM_PROGRAM_IDS and not m.startswith("11111111")]
-            if valid:
-                bonding_curve = valid[-1]
+            # Look for explicit mint keyword in log lines
+            if "create mint" in line_lower or "mint:" in line_lower:
+                matches = b58_re.findall(line)
+                valid = [
+                    m for m in matches
+                    if m not in SOLANA_SYSTEM_PROGRAM_IDS
+                    and m not in invoked_programs
+                    and not m.startswith("11111111")
+                ]
+                if valid:
+                    mint_address = valid[-1]
+            elif "bonding curve:" in line_lower:
+                matches = b58_re.findall(line)
+                valid = [
+                    m for m in matches
+                    if m not in SOLANA_SYSTEM_PROGRAM_IDS
+                    and m not in invoked_programs
+                    and not m.startswith("11111111")
+                ]
+                if valid:
+                    bonding_curve = valid[-1]
 
     if not is_create:
         return None
 
-    # If mint address wasn't explicitly prefixed, look for all base58 tokens excluding program IDs
+    # 3. Tertiary fallback: inspect only "Program log:" lines, strictly ignoring program invocation headers
     if not mint_address:
         found_tokens: list[str] = []
         for line in logs:
+            if not line.startswith("Program log:"):
+                continue
             for token in b58_re.findall(line):
                 if (
                     token not in SOLANA_SYSTEM_PROGRAM_IDS
+                    and token not in invoked_programs
                     and not token.startswith("11111111")
                     and len(token) >= 32
                 ):
@@ -424,7 +485,12 @@ def _parse_pump_fun_logs(logs: list[str], tx_sig: str = "") -> dict[str, Any] | 
             if len(found_tokens) > 1:
                 bonding_curve = found_tokens[1]
 
-    if not mint_address or mint_address in SOLANA_SYSTEM_PROGRAM_IDS:
+    if (
+        not mint_address
+        or mint_address in SOLANA_SYSTEM_PROGRAM_IDS
+        or mint_address in invoked_programs
+        or mint_address.startswith("11111111")
+    ):
         return None
 
     # Pump.fun standard bonding curve initial reserves:

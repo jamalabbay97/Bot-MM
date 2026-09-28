@@ -4,6 +4,15 @@ alpha_engine — Multi-Chain Paper Trading & Alpha Analytics Engine
 Deterministic Realism | Zero-Capital Simulation | Pure Python 3.11+
 """
 
+import sys
+from pathlib import Path
+
+# Auto-bootstrap local .venv site-packages if running outside virtual environment
+_ROOT = Path(__file__).resolve().parent.parent
+for _p in (_ROOT / ".venv" / "lib").glob("python*/site-packages"):
+    if str(_p) not in sys.path:
+        sys.path.insert(0, str(_p))
+
 from alpha_engine.dns_resolver import patch_dns_resolvers
 
 patch_dns_resolvers()

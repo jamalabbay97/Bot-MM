@@ -497,7 +497,8 @@ class PaperTradingEngine:
 
     async def _snapshot_scheduler(self) -> None:
         ledger = self._ledger
-        assert ledger is not None
+        if ledger is None:
+            return
 
         while not self._shutdown_event.is_set():
             try:
@@ -508,6 +509,11 @@ class PaperTradingEngine:
                 break
             except asyncio.TimeoutError:
                 pass
+            except asyncio.CancelledError:
+                break
+
+            if self._shutdown_event.is_set():
+                break
 
             equity = self._current_equity_usd()
             snapshot = PortfolioSnapshot(
@@ -523,14 +529,20 @@ class PaperTradingEngine:
                 profit_factor=self._metrics.profit_factor,
                 total_gas_spent_usd=self._metrics.total_gas_usd,
             )
-            await ledger.record_snapshot(snapshot)
-            logger.info(
-                "Snapshot | equity=$%.2f | MDD=%.2f%% | PF=%.2f | WR=%.1f%%",
-                float(equity),
-                self._metrics.max_drawdown_pct,
-                self._metrics.profit_factor,
-                self._metrics.win_rate_pct,
-            )
+            try:
+                await ledger.record_snapshot(snapshot)
+                logger.info(
+                    "Snapshot | equity=$%.2f | MDD=%.2f%% | PF=%.2f | WR=%.1f%%",
+                    float(equity),
+                    self._metrics.max_drawdown_pct,
+                    self._metrics.profit_factor,
+                    self._metrics.win_rate_pct,
+                )
+            except asyncio.CancelledError:
+                break
+            except Exception as exc:
+                logger.debug("Snapshot recording skipped during shutdown: %s", exc)
+                break
 
     async def _heartbeat_task(self) -> None:
         """
@@ -546,6 +558,11 @@ class PaperTradingEngine:
                 break
             except asyncio.TimeoutError:
                 pass
+            except asyncio.CancelledError:
+                break
+
+            if self._shutdown_event.is_set():
+                break
 
             uptime_s = time.time() - self._start_time
             hrs, rem = divmod(int(uptime_s), 3600)
@@ -679,6 +696,7 @@ class PaperTradingEngine:
                 evm_router_address=cfg.aerodrome_router,
                 weth_address=cfg.weth_address,
                 enable_tier2=True,
+                solana_rpc_url=cfg.solana_rpc_http or cfg.helius_http_url,
             )
 
             self._executor = PaperExecutor(

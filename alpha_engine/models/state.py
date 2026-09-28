@@ -60,6 +60,7 @@ class PoolState(BaseModel):
     last_updated_block: Annotated[int, Field(ge=0)]
     token_decimals: Annotated[int, Field(ge=0, le=18)] = 18
     native_decimals: Annotated[int, Field(ge=0, le=18)] = 18
+    token_address: Optional[str] = None
 
     @model_validator(mode="after")
     def fee_fraction_sane(self) -> "PoolState":

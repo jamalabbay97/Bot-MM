@@ -14,9 +14,20 @@ from __future__ import annotations
 
 import asyncio
 import os
+import sys
 import time
 from decimal import Decimal
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
+
+# Ensure project root and virtual environment site-packages are always in sys.path
+_ROOT = Path(__file__).resolve().parent.parent
+if str(_ROOT) not in sys.path:
+    sys.path.insert(0, str(_ROOT))
+
+for _p in (_ROOT / ".venv" / "lib").glob("python*/site-packages"):
+    if str(_p) not in sys.path:
+        sys.path.insert(0, str(_p))
 
 import pytest
 

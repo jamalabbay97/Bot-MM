@@ -43,7 +43,8 @@ class PoolRegistry:
             return self._pools[pool_or_token_address]
         target_lower = pool_or_token_address.lower()
         for p in self._pools.values():
-            if p.pool_address.lower() == target_lower or p.token_address.lower() == target_lower:
+            tok = getattr(p, "token_address", None)
+            if p.pool_address.lower() == target_lower or (tok and tok.lower() == target_lower):
                 return p
         return None
 

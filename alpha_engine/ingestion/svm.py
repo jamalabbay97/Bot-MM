@@ -237,6 +237,7 @@ class SVMIngester:
                         pool_state = PoolState(
                             pool_address=curve_addr,
                             chain=ChainIdentifier.SOLANA_MAINNET,
+                            token_address=mint_addr,
                             native_reserve=pump_info["virtual_sol_reserves"],
                             token_reserve=pump_info["virtual_token_reserves"],
                             fee_numerator=10,

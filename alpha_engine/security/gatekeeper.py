@@ -14,7 +14,11 @@ import aiohttp
 from alpha_engine.models.enums import ChainIdentifier, SecurityTier
 from alpha_engine.models.state import SecurityReport
 from alpha_engine.rate_limiter.registry import RateLimiterRegistry
-from alpha_engine.security.constants import EVM_SYSTEM_ADDRESSES, SOLANA_SYSTEM_PROGRAM_IDS
+from alpha_engine.security.constants import (
+    EVM_SYSTEM_ADDRESSES,
+    SOLANA_SYSTEM_PROGRAM_IDS,
+    is_blacklisted_token,
+)
 from alpha_engine.security.goplus import _fetch_goplus_report, _parse_goplus_report
 from alpha_engine.security.preflight import _tier2_evm_preflight
 from alpha_engine.security.rugcheck import _fetch_rugcheck_report, _parse_rugcheck_report
@@ -48,6 +52,8 @@ class SecurityGatekeeper:
     Orchestrates the two-tier security screening pipeline.
     """
 
+    is_blacklisted = staticmethod(is_blacklisted_token)
+
     def __init__(
         self,
         session: aiohttp.ClientSession,
@@ -56,6 +62,7 @@ class SecurityGatekeeper:
         evm_router_address: str,
         weth_address: str,
         enable_tier2: bool = True,
+        solana_rpc_url: str = "",
     ) -> None:
         self._session = session
         self._limiter = limiter
@@ -63,6 +70,7 @@ class SecurityGatekeeper:
         self._evm_router = evm_router_address
         self._weth = weth_address
         self._enable_tier2 = enable_tier2
+        self._solana_rpc_url = solana_rpc_url
 
     async def screen_token(
         self,
@@ -71,16 +79,13 @@ class SecurityGatekeeper:
         pool_address: str = "",
     ) -> SecurityReport:
         """Run the full dual-tier screening pipeline for a token."""
-        if chain == ChainIdentifier.SOLANA_MAINNET and (
-            token_address in SOLANA_SYSTEM_PROGRAM_IDS or token_address.startswith("11111111")
-        ):
-            logger.debug("Token %s is a known Solana system/infrastructure program; rejecting.", token_address)
-            return _build_fallback_report(token_address, chain, SecurityTier.TIER1_REJECTED)
-
-        if chain == ChainIdentifier.BASE_MAINNET and (
-            token_address in EVM_SYSTEM_ADDRESSES or token_address.lower() in EVM_SYSTEM_ADDRESSES
-        ):
-            logger.debug("Token %s is a known EVM system/router address; rejecting.", token_address)
+        # Static fast-path blacklist lookup: ignore WSOL, native base/quote and system tokens
+        if self.is_blacklisted(token_address, chain):
+            logger.debug(
+                "Fast-path filter: token %s is a blacklisted/quote/system token on %s; skipping evaluation.",
+                token_address,
+                chain.value,
+            )
             return _build_fallback_report(token_address, chain, SecurityTier.TIER1_REJECTED)
 
         tier1_report = await self._run_tier1(token_address, chain, pool_address)
@@ -137,7 +142,10 @@ class SecurityGatekeeper:
 
         elif chain == ChainIdentifier.SOLANA_MAINNET:
             raw = await _fetch_rugcheck_report(
-                self._session, token_address, self._limiter
+                self._session,
+                token_address,
+                self._limiter,
+                rpc_url=self._solana_rpc_url,
             )
             if raw is None:
                 logger.warning(

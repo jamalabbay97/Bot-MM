@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import random
+import time
 from typing import Any, Optional, Sequence
 
 from alpha_engine.ingestion.decoders import SvmPoolMeta
@@ -30,6 +31,7 @@ from alpha_engine.models.events import (
     SwapEvent,
 )
 from alpha_engine.rate_limiter.registry import RateLimiterRegistry
+from alpha_engine.security.constants import is_blacklisted_token
 
 logger = logging.getLogger(__name__)
 
@@ -63,6 +65,62 @@ class ExponentialBackoff:
         self._attempt = 0
 
 
+class TokenTTLCache:
+    """
+    In-memory sliding-window TTL cache for token deduplication.
+    Thread-safe / async-lock protected. Drops duplicate token signals processed
+    within the configured TTL sliding window (default 60 seconds).
+    """
+
+    def __init__(self, ttl_seconds: float = 60.0, maxsize: int = 10_000) -> None:
+        self._ttl = ttl_seconds
+        self._maxsize = maxsize
+        self._cache: dict[str, float] = {}
+        self._lock = asyncio.Lock()
+
+    async def is_duplicate_or_add(self, token_address: str) -> bool:
+        """
+        Check if token_address was registered within the sliding window.
+        Returns True if duplicate (and drops/ignores), otherwise records timestamp and returns False.
+        """
+        if not token_address:
+            return False
+        now = time.monotonic()
+        async with self._lock:
+            # Housekeeping: prune expired entries when approaching capacity
+            if len(self._cache) > self._maxsize:
+                expired = [k for k, exp in self._cache.items() if now >= exp]
+                for k in expired:
+                    del self._cache[k]
+                if len(self._cache) > self._maxsize:
+                    sorted_items = sorted(self._cache.items(), key=lambda kv: kv[1])
+                    for k, _ in sorted_items[: len(self._cache) // 5]:
+                        self._cache.pop(k, None)
+
+            exp = self._cache.get(token_address)
+            if exp is not None and now < exp:
+                return True
+            self._cache[token_address] = now + self._ttl
+            return False
+
+    def is_duplicate_sync(self, token_address: str) -> bool:
+        """Synchronous check for fast-path non-async call sites."""
+        if not token_address:
+            return False
+        now = time.monotonic()
+        exp = self._cache.get(token_address)
+        if exp is not None and now < exp:
+            return True
+        self._cache[token_address] = now + self._ttl
+        return False
+
+    def clear(self) -> None:
+        self._cache.clear()
+
+    def __len__(self) -> int:
+        return len(self._cache)
+
+
 class IngestionCoordinator:
     """
     Manages EVM, SVM, and Telegram ingesters under a single lifecycle coordinator,
@@ -93,6 +151,8 @@ class IngestionCoordinator:
         self._queue: asyncio.Queue[
             SwapEvent | PoolStateUpdateEvent | RawSignalEvent | ShutdownSentinel
         ] = asyncio.Queue(maxsize=queue_maxsize)
+
+        self._dedup_cache = TokenTTLCache(ttl_seconds=60.0)
 
         self._evm = EVMIngester(
             ws_url=evm_ws_url,
@@ -141,6 +201,15 @@ class IngestionCoordinator:
         self,
     ) -> asyncio.Queue[SwapEvent | PoolStateUpdateEvent | RawSignalEvent | ShutdownSentinel]:
         return self._queue
+
+    @property
+    def dedup_cache(self) -> TokenTTLCache:
+        """In-memory sliding-window TTL cache for signal deduplication."""
+        return self._dedup_cache
+
+    async def is_duplicate_token(self, token_address: str) -> bool:
+        """Check and record token address in coordinator deduplication cache."""
+        return await self._dedup_cache.is_duplicate_or_add(token_address)
 
     @property
     def evm_ingester(self) -> EVMIngester:
@@ -196,7 +265,6 @@ class IngestionCoordinator:
         await self._queue.put(ShutdownSentinel())
         logger.info("IngestionCoordinator stopped.")
 
-
     async def __aenter__(self) -> "IngestionCoordinator":
         await self.start()
         return self
@@ -208,7 +276,27 @@ class IngestionCoordinator:
         return self
 
     async def __anext__(self) -> SwapEvent | PoolStateUpdateEvent | RawSignalEvent:
-        item = await self._queue.get()
-        if isinstance(item, ShutdownSentinel):
-            raise StopAsyncIteration
-        return item
+        while True:
+            item = await self._queue.get()
+            if isinstance(item, ShutdownSentinel):
+                raise StopAsyncIteration
+
+            if isinstance(item, RawSignalEvent):
+                # 1. Fast-path blacklist filter: drop WSOL, native base/quote and system tokens
+                if is_blacklisted_token(item.token_address, item.chain):
+                    logger.debug(
+                        "IngestionCoordinator: Dropping RawSignalEvent for blacklisted/quote token %s (%s)",
+                        item.token_address,
+                        item.chain.value,
+                    )
+                    continue
+
+                # 2. In-memory sliding-window TTL cache deduplication (60s window)
+                if await self._dedup_cache.is_duplicate_or_add(item.token_address):
+                    logger.debug(
+                        "IngestionCoordinator: Dropping duplicate RawSignalEvent for token %s within 60s TTL window",
+                        item.token_address,
+                    )
+                    continue
+
+            return item
