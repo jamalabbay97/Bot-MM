@@ -14,11 +14,7 @@ import aiohttp
 from alpha_engine.models.enums import ChainIdentifier, SecurityTier
 from alpha_engine.models.state import SecurityReport
 from alpha_engine.rate_limiter.registry import RateLimiterRegistry
-from alpha_engine.security.constants import (
-    EVM_SYSTEM_ADDRESSES,
-    SOLANA_SYSTEM_PROGRAM_IDS,
-    is_blacklisted_token,
-)
+from alpha_engine.security.constants import is_blacklisted_token
 from alpha_engine.security.goplus import _fetch_goplus_report, _parse_goplus_report
 from alpha_engine.security.preflight import _tier2_evm_preflight
 from alpha_engine.security.rugcheck import _fetch_rugcheck_report, _parse_rugcheck_report
@@ -30,8 +26,9 @@ def _build_fallback_report(
     token_address: str,
     chain: ChainIdentifier,
     tier: SecurityTier,
+    reason: str | None = None,
 ) -> SecurityReport:
-    """Construct a conservative fallback SecurityReport when external API is unavailable."""
+    """Construct a conservative fallback SecurityReport when external API is unavailable or token is blacklisted."""
     return SecurityReport(
         token_address=token_address,
         chain=chain,
@@ -43,7 +40,7 @@ def _build_fallback_report(
         top10_concentration=1.0,
         mint_authority_disabled=False,
         verified_source_code=False,
-        external_api_raw=None,
+        external_api_raw=reason,
     )
 
 
@@ -86,7 +83,12 @@ class SecurityGatekeeper:
                 token_address,
                 chain.value,
             )
-            return _build_fallback_report(token_address, chain, SecurityTier.TIER1_REJECTED)
+            return _build_fallback_report(
+                token_address,
+                chain,
+                SecurityTier.TIER1_REJECTED,
+                reason="Blacklisted native/wrapped token",
+            )
 
         tier1_report = await self._run_tier1(token_address, chain, pool_address)
 
@@ -129,6 +131,12 @@ class SecurityGatekeeper:
         chain: ChainIdentifier,
         pool_address: str = "",
     ) -> SecurityReport:
+        logger.debug(
+            "Running Tier 1 security check for %s (pool: %s) on %s",
+            token_address,
+            pool_address or "n/a",
+            chain.value,
+        )
         if chain == ChainIdentifier.BASE_MAINNET:
             raw = await _fetch_goplus_report(
                 self._session, token_address, chain, self._limiter

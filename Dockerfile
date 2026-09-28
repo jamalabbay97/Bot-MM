@@ -64,7 +64,7 @@ USER botmm
 
 # Healthcheck validating basic Python runtime and engine module health
 HEALTHCHECK --interval=60s --timeout=10s --start-period=10s --retries=3 \
-    CMD python -c "import alpha_engine; sys.exit(0)" || exit 1
+    CMD python -c "import sys, alpha_engine; sys.exit(0)" || exit 1
 
 # Default execution entrypoint (24/7 Self-Healing Supervisor)
 CMD ["python", "-m", "alpha_engine.engine.runner"]

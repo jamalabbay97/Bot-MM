@@ -15,7 +15,7 @@ import logging
 from decimal import ROUND_DOWN, Decimal, InvalidOperation
 from typing import NamedTuple
 
-from alpha_engine.models.enums import OrderSide
+from alpha_engine.models.enums import ChainIdentifier, OrderSide
 from alpha_engine.models.state import PoolState
 
 logger = logging.getLogger(__name__)
@@ -202,3 +202,43 @@ def price_impact_bps(
         side.value, spot, exec_price, bps,
     )
     return bps
+
+
+def get_initial_bonding_curve_pool(
+    token_address: str,
+    chain: ChainIdentifier = ChainIdentifier.SOLANA_MAINNET,
+    pool_address: str = "",
+) -> PoolState:
+    """
+    Establish legitimate initial bonding curve reserves when pool state has not yet arrived.
+    For Solana pump.fun tokens, applies standard initial virtual reserves:
+      - 30 SOL virtual reserve
+      - 1,073,000,000 virtual tokens
+      - Spot price = 30 / 1,073,000,000 ≈ 2.7959e-8 SOL/token
+    For Base/EVM, seeds default initial liquidity.
+    """
+    if chain == ChainIdentifier.SOLANA_MAINNET:
+        return PoolState(
+            pool_address=pool_address or token_address,
+            chain=chain,
+            token_address=token_address,
+            native_reserve=Decimal("30.0"),
+            token_reserve=Decimal("1073000000.0"),
+            fee_numerator=10,
+            fee_denominator=1000,
+            last_updated_block=0,
+            token_decimals=6,
+            native_decimals=9,
+        )
+    return PoolState(
+        pool_address=pool_address or token_address,
+        chain=chain,
+        token_address=token_address,
+        native_reserve=Decimal("1.0"),
+        token_reserve=Decimal("1000000000.0"),
+        fee_numerator=3,
+        fee_denominator=1000,
+        last_updated_block=0,
+        token_decimals=18,
+        native_decimals=18,
+    )

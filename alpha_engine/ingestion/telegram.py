@@ -472,6 +472,10 @@ class TelegramIngester:
             await self._cmd_status(event)
         elif first_token == "/trades":
             await self._cmd_trades(event)
+        elif first_token == "/news":
+            await self._cmd_news(event)
+        elif first_token == "/signals":
+            await self._cmd_signals(event)
         elif first_token == "/scan":
             args = text[len(text.split()[0]):].strip()
             await self._cmd_scan(event, args, sender_id)
@@ -486,8 +490,10 @@ class TelegramIngester:
             "**Engine Mode:** Paper Trading (Zero-Capital Simulation)\n\n"
             "**Available Commands:**\n"
             "• `/status` — View real-time system uptime, memory RSS, portfolio equity, PnL, and queue telemetry.\n"
-            "• `/scan <CA>` — Submit a Solana or Base token CA for immediate security audit & AMM execution.\n"
-            "• `/trades` — View the last 5 executed paper trades with entry price, side, and PnL.\n"
+            "• `/scan` — Submit a Solana or Base token CA for immediate security audit & AMM execution.\n"
+            "• `/trades` — View active OPEN positions and executed CLOSED paper trades with entry/current prices and PnL.\n"
+            "• `/news` — View the last 5 ingested news headlines, sources, and calculated sentiment scores.\n"
+            "• `/signals` — View the last 5 tokens evaluated by the gatekeeper and exact pass/reject reasons.\n"
             "• `/help` — Display this command reference.\n\n"
             "💡 *Tip:* You can also directly paste a contract address (EVM `0x...` or Solana Base58) in this chat to trigger an immediate scan."
         )
@@ -672,48 +678,166 @@ class TelegramIngester:
                     f"❓ Unknown command: `{text.split()[0]}`. Use `/help` to see available commands.",
                 )
 
-    async def _cmd_trades(self, event: Any) -> None:
-        """Handle /trades command in DMs."""
-        if not AIOSQLITE_AVAILABLE or aiosqlite is None:
-            await self._safe_reply(event, "⚠️ SQLite async driver unavailable.")
+    @staticmethod
+    def _format_price(val: Any) -> str:
+        try:
+            f = float(val)
+            if f <= 0.0:
+                return "0.0"
+            if f >= 1.0:
+                return f"{f:.4f}"
+            if f >= 0.0001:
+                return f"{f:.6f}"
+            return f"{f:.3e}"
+        except Exception:
+            return str(val)[:10]
+
+    async def _cmd_news(self, event: Any) -> None:
+        """Handle /news command in DMs: returns last 5 ingested news headlines, source, and sentiment score."""
+        metrics: dict[str, Any] = {}
+        if self._status_provider is not None:
+            try:
+                res = self._status_provider()
+                if asyncio.iscoroutine(res):
+                    res = await res
+                if isinstance(res, dict):
+                    metrics = res
+            except Exception as exc:
+                logger.warning("[TelegramIngester] status_provider error in /news: %s", exc)
+
+        recent_news = metrics.get("recent_news", [])
+        if not recent_news:
+            await self._safe_reply(event, "📰 No news items ingested yet. Awaiting live RSS / X / Telegram news feeds.")
             return
 
-        try:
-            async with aiosqlite.connect(self._db_path) as db:
-                cursor = await db.execute(
-                    "SELECT name FROM sqlite_master WHERE type='table' AND name IN ('trades', 'paper_trades')"
+        items = list(reversed(recent_news))[:5]
+        lines = [
+            "📰 **Last 5 Ingested News Headlines & Sentiment**\n",
+            "```",
+            f"{'TIME':<8} | {'SRC':<7} | {'SENT':<6} | {'HEADLINE'}",
+            "-" * 65,
+        ]
+        for item in items:
+            t_s = time.strftime("%H:%M:%S", time.localtime(item.get("timestamp", time.time())))
+            src = str(item.get("source", "NEWS"))[:7]
+            score = float(item.get("sentiment", 0.0))
+            sent_str = f"{score:+.2f}"
+            headline = str(item.get("headline", "")).replace("\n", " ")[:35]
+            lines.append(f"{t_s:<8} | {src:<7} | {sent_str:<6} | {headline}")
+        lines.append("```")
+        await self._safe_reply(event, "\n".join(lines))
+
+    async def _cmd_signals(self, event: Any) -> None:
+        """Handle /signals command in DMs: shows last 5 tokens evaluated by gatekeeper and exact reason."""
+        metrics: dict[str, Any] = {}
+        if self._status_provider is not None:
+            try:
+                res = self._status_provider()
+                if asyncio.iscoroutine(res):
+                    res = await res
+                if isinstance(res, dict):
+                    metrics = res
+            except Exception as exc:
+                logger.warning("[TelegramIngester] status_provider error in /signals: %s", exc)
+
+        recent_signals = metrics.get("recent_signals", [])
+        if not recent_signals:
+            await self._safe_reply(event, "🎯 No security evaluations recorded yet. Awaiting incoming token signals.")
+            return
+
+        items = list(reversed(recent_signals))[:5]
+        lines = [
+            "🎯 **Last 5 Token Security Screenings**\n",
+            "```",
+            f"{'TOKEN':<12} | {'CHAIN':<6} | {'STATUS':<6} | {'REASON'}",
+            "-" * 65,
+        ]
+        for item in items:
+            token_str = str(item.get("token_address", ""))
+            short_token = f"{token_str[:4]}..{token_str[-4:]}" if len(token_str) > 10 else token_str
+            chain = str(item.get("chain", "")).replace("ChainIdentifier.", "").replace("_mainnet", "")[:6]
+            passed = item.get("passed", False)
+            status_str = "PASS 🟢" if passed else "REJ 🔴"
+            reason = str(item.get("reason", "N/A"))[:32]
+            lines.append(f"{short_token:<12} | {chain:<6} | {status_str:<6} | {reason}")
+        lines.append("```")
+        await self._safe_reply(event, "\n".join(lines))
+
+    async def _cmd_trades(self, event: Any) -> None:
+        """Handle /trades command in DMs: displays entry price, current price, unrealized PnL for OPEN trades, and realized PnL for CLOSED trades."""
+        metrics: dict[str, Any] = {}
+        if self._status_provider is not None:
+            try:
+                res = self._status_provider()
+                if asyncio.iscoroutine(res):
+                    res = await res
+                if isinstance(res, dict):
+                    metrics = res
+            except Exception as exc:
+                logger.warning("[TelegramIngester] status_provider error in /trades: %s", exc)
+
+        open_trades = metrics.get("open_trades", [])
+
+        # Fetch executed trades from DB
+        trade_rows: list[Any] = []
+        if AIOSQLITE_AVAILABLE and aiosqlite is not None:
+            try:
+                async with aiosqlite.connect(self._db_path) as db:
+                    cursor = await db.execute(
+                        "SELECT name FROM sqlite_master WHERE type='table' AND name IN ('trades', 'paper_trades')"
+                    )
+                    table_row = await cursor.fetchone()
+                    if table_row:
+                        table_name = table_row[0]
+                        async with db.execute(
+                            f"SELECT chain, token_address, side, effective_price, realized_pnl_usd "
+                            f"FROM {table_name} "
+                            f"ORDER BY created_at DESC LIMIT 5"
+                        ) as cur:
+                            trade_rows = await cur.fetchall()
+            except Exception as exc:
+                logger.debug("[TelegramIngester] DB trades query error: %s", exc)
+
+        if not open_trades and not trade_rows:
+            await self._safe_reply(event, "📋 No executed paper trades recorded in ledger yet.")
+            return
+
+        response_sections = []
+
+        if open_trades:
+            open_lines = [
+                f"🟢 **Active Open Positions ({len(open_trades)})**\n",
+                "```",
+                f"{'TOKEN':<12} | {'CHAIN':<6} | {'ENTRY':<10} | {'CURRENT':<10} | {'UNREALIZED'}",
+                "-" * 60,
+            ]
+            for t in open_trades[:5]:
+                token_str = str(t.get("token_address", ""))
+                short_token = f"{token_str[:4]}..{token_str[-4:]}" if len(token_str) > 10 else token_str
+                chain_str = str(t.get("chain", "")).replace("ChainIdentifier.", "").replace("_mainnet", "")[:6]
+                entry_p = self._format_price(t.get("entry_price", 0))
+                curr_p = self._format_price(t.get("current_price", 0))
+                pnl_f = float(t.get("unrealized_pnl_usd", 0.0))
+                pnl_str = f"+${pnl_f:.2f}" if pnl_f > 0 else f"-${abs(pnl_f):.2f}" if pnl_f < 0 else "$0.00"
+                open_lines.append(
+                    f"{short_token:<12} | {chain_str:<6} | {entry_p:<10} | {curr_p:<10} | {pnl_str}"
                 )
-                table_row = await cursor.fetchone()
-                if not table_row:
-                    await self._safe_reply(event, "📋 No executed paper trades recorded in ledger yet.")
-                    return
+            open_lines.append("```")
+            response_sections.append("\n".join(open_lines))
 
-                table_name = table_row[0]
-                async with db.execute(
-                    f"SELECT chain, token_address, side, effective_price, realized_pnl_usd "
-                    f"FROM {table_name} ORDER BY created_at DESC LIMIT 5"
-                ) as cur:
-                    rows = await cur.fetchall()
-
-            if not rows:
-                await self._safe_reply(event, "📋 No executed paper trades recorded in ledger yet.")
-                return
-
+        if trade_rows:
             lines = [
                 "📋 **Last 5 Executed Paper Trades**\n",
                 "```",
                 f"{'TOKEN':<12} | {'CHAIN':<6} | {'SIDE':<4} | {'FILL PRICE':<12} | {'PNL':<9}",
                 "-" * 53,
             ]
-            for r in rows:
+            for r in trade_rows:
                 chain_str = str(r[0]).replace("_mainnet", "")[:6]
                 token_str = str(r[1])
                 short_token = f"{token_str[:4]}..{token_str[-4:]}" if len(token_str) > 10 else token_str
                 side_str = str(r[2]).upper()
-                try:
-                    fill_p = f"{float(r[3]):.6f}"
-                except Exception:
-                    fill_p = str(r[3])[:10]
+                fill_p = self._format_price(r[3])
                 pnl_raw = r[4]
                 if pnl_raw is not None and str(pnl_raw) != "":
                     try:
@@ -728,10 +852,9 @@ class TelegramIngester:
                     f"{short_token:<12} | {chain_str:<6} | {side_str:<4} | {fill_p:<12} | {pnl_str:<9}"
                 )
             lines.append("```")
-            await self._safe_reply(event, "\n".join(lines))
-        except Exception as exc:
-            logger.error("[TelegramIngester] Failed to query trades: %s", exc)
-            await self._safe_reply(event, f"⚠️ Error querying trade history: {exc}")
+            response_sections.append("\n".join(lines))
+
+        await self._safe_reply(event, "\n\n".join(response_sections))
 
     # -------------------------------------------------------------------------
     # 3. Lifecycle & Connection Management

@@ -110,6 +110,7 @@ SOLANA_SYSTEM_PROGRAM_IDS: frozenset[str] = frozenset({
 # EVM well-known system / router / zero addresses to exclude
 EVM_SYSTEM_ADDRESSES: CaseInsensitiveFrozenSet = CaseInsensitiveFrozenSet({
     "0x0000000000000000000000000000000000000000",
+    "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2",          # Mainnet WETH
     "0x4200000000000000000000000000000000000006",          # Base WETH
     "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913",          # Base USDC
     "0xcf77a3ba9a5ca399b7c97c749566343833341fdc",          # Aerodrome Router
@@ -129,6 +130,7 @@ SOLANA_BLACKLIST_TOKENS: frozenset[str] = SOLANA_SYSTEM_PROGRAM_IDS | frozenset(
 EVM_BLACKLIST_TOKENS: CaseInsensitiveFrozenSet = CaseInsensitiveFrozenSet(
     EVM_SYSTEM_ADDRESSES | {
         "0x0000000000000000000000000000000000000000",
+        "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2",      # Mainnet WETH
         "0x4200000000000000000000000000000000000006",      # Base WETH
         "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913",      # Base USDC
         "0xd9aAEc86B65D86f6A7B5B1b0c42FFA531710b6CA",      # Base USDbC

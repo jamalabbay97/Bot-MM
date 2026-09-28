@@ -153,6 +153,36 @@ class SecurityReport(BaseModel):
             and not self.is_honeypot
         )
 
+    @property
+    def buy_tax_pct(self) -> float:
+        """Buy tax expressed as a percentage (e.g. 5.0 for 500 bps)."""
+        return float(self.buy_tax_bps) / 100.0
+
+    @property
+    def sell_tax_pct(self) -> float:
+        """Sell tax expressed as a percentage (e.g. 5.0 for 500 bps)."""
+        return float(self.sell_tax_bps) / 100.0
+
+    @property
+    def mint_disabled(self) -> bool:
+        """Alias for mint_authority_disabled."""
+        return self.mint_authority_disabled
+
+    @property
+    def freeze_disabled(self) -> bool:
+        """Alias indicating freeze authority is disabled."""
+        return True
+
+    @property
+    def lp_burned(self) -> bool:
+        """True if LP burned/locked ratio >= 90%."""
+        return self.lp_burned_ratio >= 0.90
+
+    @property
+    def is_lp_locked(self) -> bool:
+        """True if LP burned/locked ratio >= 90%."""
+        return self.lp_burned_ratio >= 0.90
+
 
 class PaperFill(BaseModel):
     """

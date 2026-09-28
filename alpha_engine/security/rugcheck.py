@@ -27,10 +27,11 @@ from alpha_engine.security.constants import (
     _RUGCHECK_URL,
     is_blacklisted_token,
 )
+from alpha_engine.security.preflight import verify_solana_mint_preflight
 
 logger = logging.getLogger(__name__)
 
-# Retry backoff delays for unindexed new mints (400ms, 800ms, 1200ms)
+# Retry backoff delays for server errors (400ms, 800ms, 1200ms)
 _RUGCHECK_RETRY_DELAYS_S: tuple[float, ...] = (0.4, 0.8, 1.2)
 
 
@@ -43,62 +44,7 @@ async def _verify_solana_mint_on_chain(
     Fallback local Solana JSON-RPC check (getAccountInfo) to verify if an unindexed
     token mint account physically exists on-chain as a valid SPL / Token-2022 mint.
     """
-    payload = {
-        "jsonrpc": "2.0",
-        "id": 1,
-        "method": "getAccountInfo",
-        "params": [
-            mint_address,
-            {"encoding": "jsonParsed", "commitment": "confirmed"},
-        ],
-    }
-    try:
-        async with session.post(
-            rpc_url,
-            json=payload,
-            timeout=aiohttp.ClientTimeout(total=2.0),
-        ) as resp:
-            if resp.status != 200:
-                return None
-            body = await resp.json()
-            val = (body.get("result") or {}).get("value")
-            if not val:
-                return None
-
-            owner = val.get("owner", "")
-            # Verify mint is owned by standard SPL Token or Token-2022 program
-            if owner not in (
-                "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
-                "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb",
-            ):
-                return None
-
-            mint_auth = None
-            freeze_auth = None
-            decimals = 6
-            data_field = val.get("data")
-            if isinstance(data_field, dict):
-                parsed = data_field.get("parsed") or {}
-                if parsed.get("type") == "mint":
-                    info = parsed.get("info") or {}
-                    mint_auth = info.get("mintAuthority")
-                    freeze_auth = info.get("freezeAuthority")
-                    decimals = info.get("decimals", 6)
-
-            return {
-                "on_chain_fallback": True,
-                "mint": mint_address,
-                "mintAuthority": mint_auth,
-                "freezeAuthority": freeze_auth,
-                "decimals": decimals,
-                "risks": [],
-                "tokenMeta": {"mutable": False},
-                "markets": [{"lp": {"lpLockedPct": 100.0}}],
-                "topHolders": [],
-            }
-    except Exception as exc:  # noqa: BLE001
-        logger.debug("Solana RPC getAccountInfo check failed for %s: %s", mint_address[:10], exc)
-        return None
+    return await verify_solana_mint_preflight(session, mint_address, rpc_url)
 
 
 async def _fetch_rugcheck_report(
@@ -109,8 +55,8 @@ async def _fetch_rugcheck_report(
 ) -> dict[str, Any] | None:
     """
     Fetch token report from RugCheck API for a Solana token mint.
-    Includes an async retry loop with exponential backoff on HTTP 400 (unindexed mints)
-    and fallback to local RPC verification before declaring the token invalid.
+    If RugCheck returns HTTP 400 or 404 (unindexed mint / not found), immediately falls back
+    to local RPC preflight validation without blocking sleep retries.
     """
     if is_blacklisted_token(mint_address, ChainIdentifier.SOLANA_MAINNET):
         logger.debug("Skipping RugCheck for blacklisted/system Solana address %s", mint_address)
@@ -130,26 +76,12 @@ async def _fetch_rugcheck_report(
                     return await resp.json()
 
                 if resp.status in (400, 404):
-                    if attempt < len(_RUGCHECK_RETRY_DELAYS_S):
-                        delay = _RUGCHECK_RETRY_DELAYS_S[attempt]
-                        logger.info(
-                            "RugCheck returned HTTP %d for unindexed mint %s (attempt %d/%d). Retrying in %.1fs...",
-                            resp.status,
-                            mint_address[:10],
-                            attempt + 1,
-                            max_attempts,
-                            delay,
-                        )
-                        await asyncio.sleep(delay)
-                        continue
-                    else:
-                        logger.warning(
-                            "RugCheck HTTP %d persists for %s after %d attempts; attempting local RPC validation.",
-                            resp.status,
-                            mint_address[:10],
-                            max_attempts,
-                        )
-                        break
+                    logger.info(
+                        "RugCheck returned HTTP %d for unindexed mint %s. Bypassing sleep retries; falling back immediately to local RPC preflight.",
+                        resp.status,
+                        mint_address[:10],
+                    )
+                    break
 
                 if resp.status != 200:
                     logger.warning(
@@ -180,10 +112,10 @@ async def _fetch_rugcheck_report(
     # Fallback to local RPC account validation before declaring token invalid
     fallback_rpc = rpc_url or os.getenv("SOLANA_RPC_HTTP", "")
     if fallback_rpc:
-        on_chain_info = await _verify_solana_mint_on_chain(session, mint_address, fallback_rpc)
+        on_chain_info = await verify_solana_mint_preflight(session, mint_address, fallback_rpc)
         if on_chain_info is not None:
             logger.info(
-                "Local RPC validation verified unindexed mint %s on-chain.",
+                "Local RPC preflight validation verified unindexed mint %s on-chain.",
                 mint_address[:10],
             )
             return on_chain_info
@@ -214,10 +146,21 @@ def _parse_rugcheck_report(
 
     if raw.get("on_chain_fallback"):
         mint_authority = raw.get("mintAuthority")
-        mint_disabled = mint_authority is None or str(mint_authority).lower() == "null"
+        mint_disabled = raw.get(
+            "mint_authority_disabled",
+            mint_authority is None or str(mint_authority).lower() == "null",
+        )
         freeze_authority = raw.get("freezeAuthority")
-        freeze_disabled = freeze_authority is None or str(freeze_authority).lower() == "null"
-        tier = SecurityTier.CLEAN if (mint_disabled and freeze_disabled) else SecurityTier.TIER1_REJECTED
+        freeze_disabled = raw.get(
+            "freeze_authority_disabled",
+            freeze_authority is None or str(freeze_authority).lower() == "null",
+        )
+        top10_conc = float(raw.get("top10_concentration", 0.0) or 0.0)
+        tier = (
+            SecurityTier.CLEAN
+            if (mint_disabled and freeze_disabled and top10_conc <= _MAX_TOP10_CONCENTRATION)
+            else SecurityTier.TIER1_REJECTED
+        )
 
         return SecurityReport(
             token_address=mint_address,
@@ -227,7 +170,7 @@ def _parse_rugcheck_report(
             buy_tax_bps=0,
             sell_tax_bps=0,
             lp_burned_ratio=1.0,
-            top10_concentration=0.0,
+            top10_concentration=top10_conc,
             mint_authority_disabled=mint_disabled,
             verified_source_code=True,
             external_api_raw=json.dumps(raw, default=str),

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import re
 import time
 from dataclasses import dataclass
@@ -196,7 +197,7 @@ class XStreamIngester:
         session: Optional[aiohttp.ClientSession] = None,
     ) -> None:
         self._queue = event_queue
-        self._bearer_token = bearer_token
+        self._bearer_token = bearer_token if bearer_token is not None else os.getenv("X_BEARER_TOKEN", "")
         self._proxy_pool = list(proxy_pool) if proxy_pool else []
         self._proxy_index = 0
         self._limiter = limiter
@@ -206,6 +207,18 @@ class XStreamIngester:
         self._blacklisted_symbols: Set[str] = set()
         self._seen_tweet_ids: Set[str] = set()
         self._backoff = ExponentialBackoff()
+
+    def verify_token_validity(self) -> bool:
+        """Verify API token presence and format sanity at startup."""
+        token = self._bearer_token
+        if not token or not isinstance(token, str):
+            return False
+        cleaned = token.strip()
+        if not cleaned or cleaned.lower() in ("none", "null", "unset", "mock_bearer_token", "your_bearer_token"):
+            return False
+        if len(cleaned) < 20:
+            return False
+        return True
 
     def to_news_signal_event(
         self,
@@ -410,8 +423,21 @@ class XStreamIngester:
         return generated_signals
 
     async def run(self) -> None:
-        """Continuous execution loop with exponential backoff and proxy failover."""
+        """Continuous execution loop with startup token verification and graceful fallback."""
         self._running = True
+        token_valid = self.verify_token_validity()
+        if not token_valid:
+            logger.warning(
+                "X_BEARER_TOKEN is unset or invalid. X-Stream falling back gracefully to dormant mode; "
+                "sentiment and discovery signals will be ingested via RSS/Telegram scraping."
+            )
+            while self._running:
+                try:
+                    await asyncio.sleep(self._poll_interval)
+                except asyncio.CancelledError:
+                    break
+            return
+
         logger.info("XStreamIngester started with Anti-Sybil and Engagement Velocity filters.")
 
         while self._running:

@@ -40,6 +40,38 @@ from alpha_engine.security.constants import SOLANA_SYSTEM_PROGRAM_IDS
 
 logger = logging.getLogger(__name__)
 
+_B58_ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
+_B58_MAP = {c: i for i, c in enumerate(_B58_ALPHABET)}
+
+
+def _b58decode(s: str) -> bytes:
+    if not s or not isinstance(s, str):
+        raise ValueError("Invalid Base58 string")
+    n = 0
+    for c in s:
+        if c not in _B58_MAP:
+            raise ValueError(f"Invalid character in Base58: {c}")
+        n = n * 58 + _B58_MAP[c]
+    b = n.to_bytes((n.bit_length() + 7) // 8, "big") if n > 0 else b""
+    pad = 0
+    for c in s:
+        if c == "1":
+            pad += 1
+        else:
+            break
+    return b"\x00" * pad + b
+
+
+def is_valid_solana_pubkey(addr: str) -> bool:
+    """Validate that an address is a genuine 32-byte Base58 Solana public key."""
+    if not isinstance(addr, str) or len(addr) < 32 or len(addr) > 44:
+        return False
+    try:
+        decoded = _b58decode(addr)
+        return len(decoded) == 32
+    except Exception:
+        return False
+
 
 class SVMIngester:
     """
@@ -117,7 +149,8 @@ class SVMIngester:
             self._ws_url,
             ssl=ssl_ctx,
             ping_interval=20,
-            ping_timeout=30,
+            ping_timeout=20,
+            close_timeout=10,
         ) as ws:
             logger.info("SVM WebSocket connected to Helius")
             self._backoff.reset()
@@ -126,13 +159,30 @@ class SVMIngester:
             req_id = 1
             pending_ids: dict[int, str] = {}
 
-            targets = list(self._pool_registry.keys())
-            if PUMP_FUN_PROGRAM_ID not in targets:
-                targets.append(PUMP_FUN_PROGRAM_ID)
-            if RAYDIUM_AMM_PROGRAM_ID not in targets:
-                targets.append(RAYDIUM_AMM_PROGRAM_ID)
+            raw_targets = list(self._pool_registry.keys())
+            if PUMP_FUN_PROGRAM_ID not in raw_targets:
+                raw_targets.append(PUMP_FUN_PROGRAM_ID)
+            if RAYDIUM_AMM_PROGRAM_ID not in raw_targets:
+                raw_targets.append(RAYDIUM_AMM_PROGRAM_ID)
 
-            for target_pubkey in targets:
+            valid_targets: list[str] = []
+            for target in raw_targets:
+                if not target or not isinstance(target, str):
+                    continue
+                clean = target.strip()
+                if is_valid_solana_pubkey(clean):
+                    if clean not in valid_targets:
+                        valid_targets.append(clean)
+                else:
+                    logger.warning(
+                        "Rejecting malformed or non-32-byte Solana address for mentions filter: '%s'",
+                        target,
+                    )
+
+            if not valid_targets:
+                valid_targets = [PUMP_FUN_PROGRAM_ID, RAYDIUM_AMM_PROGRAM_ID]
+
+            for target_pubkey in valid_targets:
                 msg = json.dumps({
                     "jsonrpc": "2.0",
                     "id": req_id,

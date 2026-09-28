@@ -222,6 +222,9 @@ class PrivateTxRouter:
         if not transactions:
             return None
 
+        if target_block is not None:
+            logger.debug("Simulating bundle on %s targeting block %s", chain.value, target_block)
+
         tx_strings: list[str] = [
             tx.hex() if isinstance(tx, bytes) else str(tx)
             for tx in transactions

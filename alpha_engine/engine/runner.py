@@ -24,6 +24,8 @@ except ImportError:  # pragma: no cover
     psutil = None
     PSUTIL_AVAILABLE = False
 
+from collections import deque
+
 from alpha_engine.config import EngineConfig
 from alpha_engine.engine.feedback import AdaptiveFeedbackEngine, TradeReflection
 from alpha_engine.engine.registry import PoolRegistry
@@ -34,6 +36,7 @@ from alpha_engine.execution.executor import PaperExecutor
 from alpha_engine.execution.ledger import SQLiteLedger
 from alpha_engine.ingestion.coordinator import IngestionCoordinator
 from alpha_engine.logging_config import setup_production_logging
+from alpha_engine.math.cpmm import get_initial_bonding_curve_pool
 from alpha_engine.models.enums import (
     ChainIdentifier,
     OrderSide,
@@ -47,9 +50,10 @@ from alpha_engine.models.events import (
     SignalEvent,
     SwapEvent,
 )
-from alpha_engine.models.state import PoolState, PortfolioSnapshot, TradeRecord
+from alpha_engine.models.news import NewsSignalEvent
+from alpha_engine.models.state import PoolState, PortfolioSnapshot, SecurityReport, TradeRecord
 from alpha_engine.rate_limiter.registry import RateLimiterRegistry
-from alpha_engine.security.constants import EVM_SYSTEM_ADDRESSES, SOLANA_SYSTEM_PROGRAM_IDS
+from alpha_engine.security.constants import is_blacklisted_token
 from alpha_engine.security.gatekeeper import SecurityGatekeeper
 
 logger = logging.getLogger(__name__)
@@ -78,11 +82,14 @@ class PaperTradingEngine:
 
         max_q = getattr(config, "max_queue_size", 100)
         self._ingestion_q: asyncio.Queue[
-            SwapEvent | PoolStateUpdateEvent | RawSignalEvent | ShutdownSentinel
+            SwapEvent | PoolStateUpdateEvent | RawSignalEvent | NewsSignalEvent | ShutdownSentinel
         ] = asyncio.Queue(maxsize=max_q)
         self._signal_q: asyncio.Queue[SignalEvent | ShutdownSentinel] = (
             asyncio.Queue(maxsize=max_q)
         )
+
+        self._recent_gatekeeper_evaluations: deque[dict[str, Any]] = deque(maxlen=20)
+        self._recent_news_events: deque[dict[str, Any]] = deque(maxlen=20)
 
         self._signal_gen = SignalGenerator(hold_seconds=300.0)
         self._executor: PaperExecutor | None = None
@@ -157,6 +164,109 @@ class PaperTradingEngine:
         unrealized = self._metrics.cumulative_realized_usd
         return cash_usd + unrealized
 
+    def is_position_open(
+        self,
+        token_address: str,
+        chain: ChainIdentifier | None = None,
+    ) -> bool:
+        return self._position_book.is_position_open(token_address, chain=chain)
+
+    def _extract_gatekeeper_rejection_reason(self, report: SecurityReport) -> str:
+        if getattr(report, "passes_hard_gates", False):
+            return "Passed all security filters"
+        reasons = []
+        if getattr(report, "is_honeypot", False):
+            reasons.append("Honeypot detected")
+        buy_tax = (
+            float(report.buy_tax_bps) / 100.0
+            if hasattr(report, "buy_tax_bps")
+            else float(getattr(report, "buy_tax_pct", 0.0))
+        )
+        sell_tax = (
+            float(report.sell_tax_bps) / 100.0
+            if hasattr(report, "sell_tax_bps")
+            else float(getattr(report, "sell_tax_pct", 0.0))
+        )
+        if buy_tax > 5.0 or sell_tax > 5.0:
+            reasons.append(f"Excessive tax (B:{buy_tax:.1f}%/S:{sell_tax:.1f}%)")
+        mint_ok = getattr(report, "mint_authority_disabled", None)
+        if mint_ok is None:
+            mint_ok = getattr(report, "mint_disabled", True)
+        if not mint_ok:
+            reasons.append("Mint authority active")
+        top10 = float(getattr(report, "top10_concentration", 0.0) or 0.0)
+        if top10 > 0.50:
+            reasons.append(f"Top 10 concentration > 50% ({top10 * 100:.1f}%)")
+        elif top10 > 0.20:
+            reasons.append(f"Top 10 concentration > 20% ({top10 * 100:.1f}%)")
+        lp_burned = float(getattr(report, "lp_burned_ratio", 1.0) or 0.0)
+        if lp_burned < 0.90:
+            reasons.append(f"LP not burned or locked ({lp_burned * 100:.1f}% < 90%)")
+        return "; ".join(reasons) if reasons else "Failed hard security gates"
+
+    def _record_gatekeeper_eval(
+        self,
+        token_address: str,
+        chain: ChainIdentifier,
+        reason: str,
+        passed: bool,
+    ) -> None:
+        self._recent_gatekeeper_evaluations.append({
+            "token_address": token_address,
+            "chain": chain,
+            "reason": reason,
+            "passed": passed,
+            "timestamp": time.time(),
+        })
+
+    def _calculate_news_sentiment(self, text: str) -> float:
+        bullish_words = {"bull", "bullish", "moon", "pump", "surge", "breakout", "listing", "ath", "launch", "rally", "partnership", "buy", "up"}
+        bearish_words = {"bear", "bearish", "dump", "rug", "scam", "hack", "exploit", "crash", "drain", "down", "sell", "liquidation", "fud"}
+        tokens = text.lower().split()
+        bull_count = sum(1 for w in tokens if any(b in w for b in bullish_words))
+        bear_count = sum(1 for w in tokens if any(b in w for b in bearish_words))
+        total = bull_count + bear_count
+        if total == 0:
+            return 0.0
+        return (bull_count - bear_count) / total
+
+    def _record_news_event(
+        self,
+        token_address: str,
+        chain: ChainIdentifier,
+        source: str,
+        headline: str,
+        sentiment: float,
+    ) -> None:
+        self._recent_news_events.append({
+            "token_address": token_address,
+            "chain": chain,
+            "source": source,
+            "headline": headline,
+            "sentiment": sentiment,
+            "timestamp": time.time(),
+        })
+
+    def get_or_create_initial_pool_state(
+        self,
+        chain: ChainIdentifier,
+        token_address: str,
+        pool_address: str = "",
+    ) -> PoolState:
+        pool = self._pool_registry.get(token_address)
+        if pool is None and pool_address:
+            pool = self._pool_registry.get(pool_address)
+        if pool is None:
+            pool = get_initial_bonding_curve_pool(
+                chain=chain,
+                token_address=token_address,
+                pool_address=pool_address,
+            )
+            self._pool_registry.set(token_address, pool)
+            if pool_address:
+                self._pool_registry.set(pool_address, pool)
+        return pool
+
     async def _process_ingestion_queue(self) -> None:
         gk = self._gatekeeper
         assert gk is not None
@@ -178,20 +288,79 @@ class PaperTradingEngine:
                 )
                 continue
 
-            if isinstance(item, RawSignalEvent):
-                raw_sig: RawSignalEvent = item
-                if raw_sig.chain == ChainIdentifier.SOLANA_MAINNET and (
-                    raw_sig.token_address in SOLANA_SYSTEM_PROGRAM_IDS
-                    or raw_sig.token_address.startswith("11111111")
-                ):
-                    logger.debug("Skipping system program token: %s", raw_sig.token_address)
+            if isinstance(item, NewsSignalEvent):
+                news_event: NewsSignalEvent = item
+                token_addr = news_event.token_address
+                chain = news_event.chain
+
+                # Blacklist filter
+                if is_blacklisted_token(token_addr, chain):
+                    self._record_gatekeeper_eval(token_addr, chain, "Blacklisted native/wrapped token", passed=False)
+                    logger.debug("Skipping blacklisted token from news: %s", token_addr)
                     continue
 
-                if raw_sig.chain == ChainIdentifier.BASE_MAINNET and (
-                    raw_sig.token_address in EVM_SYSTEM_ADDRESSES
-                    or raw_sig.token_address.lower() in EVM_SYSTEM_ADDRESSES
-                ):
-                    logger.debug("Skipping system address token: %s", raw_sig.token_address)
+                # Deduplication check
+                if self.is_position_open(token_addr, chain):
+                    logger.debug("Position already open for news token %s; skipping signal generation", token_addr[:10])
+                    continue
+
+                try:
+                    report = await gk.screen_token(
+                        token_address=token_addr,
+                        chain=chain,
+                        pool_address="",
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    logger.error("Security gatekeeper raised for news signal %s: %s", token_addr[:10], exc)
+                    continue
+
+                reason = self._extract_gatekeeper_rejection_reason(report)
+                self._record_gatekeeper_eval(token_addr, chain, reason, passed=report.passes_hard_gates)
+
+                headline = news_event.headline or news_event.content[:80]
+                sentiment = (
+                    news_event.sentiment_score
+                    if news_event.sentiment_score != 0.0
+                    else self._calculate_news_sentiment(news_event.content)
+                )
+                self._record_news_event(token_addr, chain, news_event.source.value, headline, sentiment)
+
+                if not report.passes_hard_gates:
+                    logger.info("News token %s rejected by gatekeeper: %s", token_addr[:10], reason)
+                    continue
+
+                pool = self.get_or_create_initial_pool_state(chain, token_addr)
+                social_weight = self._feedback.get_social_weight()
+                raw_sig = RawSignalEvent(
+                    timestamp_ns=time.time_ns(),
+                    chain=chain,
+                    token_address=token_addr,
+                    source=news_event.source,
+                    raw_text=news_event.content,
+                    sybil_channel_count=1,
+                )
+                signal_event = self._signal_gen.generate_social_signal(
+                    raw_signal=raw_sig,
+                    pool=pool,
+                    report=report,
+                    social_weight=social_weight,
+                )
+                if signal_event is not None:
+                    if self._ledger:
+                        await self._ledger.record_signal(signal_event)
+                    await self._signal_q.put(signal_event)
+                    logger.info("News Social Signal [%s] queued: %s", signal_event.signal_id[:8], token_addr[:10])
+                continue
+
+            if isinstance(item, RawSignalEvent):
+                raw_sig: RawSignalEvent = item
+                if is_blacklisted_token(raw_sig.token_address, raw_sig.chain):
+                    self._record_gatekeeper_eval(raw_sig.token_address, raw_sig.chain, "Blacklisted native/wrapped token", passed=False)
+                    logger.debug("Skipping blacklisted token: %s", raw_sig.token_address)
+                    continue
+
+                if self.is_position_open(raw_sig.token_address, raw_sig.chain):
+                    logger.debug("Position already open for %s; skipping raw signal", raw_sig.token_address[:10])
                     continue
 
                 try:
@@ -208,11 +377,14 @@ class PaperTradingEngine:
                     )
                     continue
 
+                reason = self._extract_gatekeeper_rejection_reason(report)
+                self._record_gatekeeper_eval(raw_sig.token_address, raw_sig.chain, reason, passed=report.passes_hard_gates)
+
                 if not report.passes_hard_gates:
                     logger.info(
-                        "Raw signal token %s rejected by gatekeeper (tier=%s).",
+                        "Raw signal token %s rejected by gatekeeper (reason=%s).",
                         raw_sig.token_address[:10],
-                        report.tier.value,
+                        reason,
                     )
                     continue
 
@@ -220,11 +392,9 @@ class PaperTradingEngine:
                 if pool is None and raw_sig.pool_address:
                     pool = self._pool_registry.get(raw_sig.pool_address)
                 if pool is None:
-                    logger.debug(
-                        "Token %s from Telegram feed passed security; awaiting liquidity pool seeding.",
-                        raw_sig.token_address[:10],
+                    pool = self.get_or_create_initial_pool_state(
+                        raw_sig.chain, raw_sig.token_address, raw_sig.pool_address or ""
                     )
-                    continue
 
                 social_weight = self._feedback.get_social_weight()
                 signal_event = self._signal_gen.generate_social_signal(
@@ -252,6 +422,10 @@ class PaperTradingEngine:
 
             swap: SwapEvent = item
 
+            if is_blacklisted_token(swap.token_out, swap.chain):
+                self._record_gatekeeper_eval(swap.token_out, swap.chain, "Blacklisted native/wrapped token", passed=False)
+                continue
+
             pool = self._pool_registry.get(swap.pool_address)
             if pool is None:
                 logger.debug(
@@ -274,11 +448,14 @@ class PaperTradingEngine:
                 )
                 continue
 
+            reason = self._extract_gatekeeper_rejection_reason(report)
+            self._record_gatekeeper_eval(swap.token_out, swap.chain, reason, passed=report.passes_hard_gates)
+
             if not report.passes_hard_gates:
                 logger.info(
-                    "Token %s rejected by gatekeeper (tier=%s).",
+                    "Token %s rejected by gatekeeper (reason=%s).",
                     swap.token_out[:10],
-                    report.tier.value,
+                    reason,
                 )
                 continue
 
@@ -286,6 +463,11 @@ class PaperTradingEngine:
 
             # Check dynamic exits (TP ladder, trailing stop-loss, emergency liquidity drain)
             await self._check_dynamic_exits_for_swap(swap, updated_pool)
+
+            # Deduplication check for BUY
+            if self.is_position_open(swap.token_out, swap.chain):
+                logger.debug("Position already open for token %s; skipping buy signal from swap", swap.token_out[:10])
+                continue
 
             signal_event = self._signal_gen.generate_buy_signal(swap, updated_pool, report)
             if signal_event is None:
@@ -408,6 +590,15 @@ class PaperTradingEngine:
 
             signal_item: SignalEvent = item
 
+            if signal_item.suggested_side == OrderSide.BUY and self.is_position_open(
+                signal_item.token_address, signal_item.chain
+            ):
+                logger.info(
+                    "Dropping duplicate BUY signal for %s: position already open in book",
+                    signal_item.token_address[:10],
+                )
+                continue
+
             if not self.validate_signal_strength(signal_item):
                 logger.info(
                     "Signal for %s dropped: strength %s does not meet required threshold",
@@ -416,9 +607,22 @@ class PaperTradingEngine:
                 )
                 continue
 
+            if signal_item.pool_state is None or signal_item.pool_state.spot_price_native_per_token <= Decimal(0):
+                signal_item.pool_state = self.get_or_create_initial_pool_state(
+                    chain=signal_item.chain,
+                    token_address=signal_item.token_address,
+                    pool_address=getattr(signal_item, "pool_address", "") or "",
+                )
+
             equity = self._current_equity_usd()
             fill = await executor.execute_signal(signal_item, portfolio_equity_usd=equity)
-            if fill is None:
+            if fill is None or fill.effective_price <= Decimal(0):
+                if fill is not None and fill.effective_price <= Decimal(0):
+                    logger.warning(
+                        "Fill rejected for %s: zero or negative effective price: %s",
+                        signal_item.token_address[:10],
+                        fill.effective_price,
+                    )
                 continue
 
             realized_pnl_usd: Decimal | None = None
@@ -629,6 +833,21 @@ class PaperTradingEngine:
             except Exception:
                 pass
 
+        open_trades_info = []
+        for lot in self._position_book.get_open_lots():
+            pool = self._pool_registry.get(lot.token_address)
+            curr_p = pool.spot_price_native_per_token if pool else lot.entry_price
+            native_p = self._eth_price if lot.chain == ChainIdentifier.BASE_MAINNET else self._sol_price
+            unrealized_usd = (lot.tokens_held * (curr_p - lot.entry_price)) * native_p
+            open_trades_info.append({
+                "token_address": lot.token_address,
+                "chain": lot.chain,
+                "entry_price": lot.entry_price,
+                "current_price": curr_p,
+                "unrealized_pnl_usd": unrealized_usd,
+                "tokens_held": lot.tokens_held,
+            })
+
         return {
             "uptime_str": uptime_str,
             "rss_mb": rss_mb,
@@ -641,7 +860,104 @@ class PaperTradingEngine:
             "ingest_q_max": self._ingestion_q.maxsize,
             "signal_q_size": self._signal_q.qsize(),
             "signal_q_max": self._signal_q.maxsize,
+            "recent_signals": list(self._recent_gatekeeper_evaluations),
+            "recent_news": list(self._recent_news_events),
+            "open_trades": open_trades_info,
         }
+
+    async def _position_price_poller(self) -> None:
+        """
+        Active position price poller / tick listener.
+        Periodically checks all open lots in PositionBook, fetches latest pool state
+        or bonding curve price, evaluates dynamic exits (TP ladder, hard SL, trailing SL),
+        and executes exits.
+        """
+        logger.info("Position price poller started.")
+        while not self._shutdown_event.is_set():
+            try:
+                await asyncio.sleep(2.0)
+                if self._executor is None:
+                    continue
+
+                open_lots = self._position_book.get_open_lots()
+                if not open_lots:
+                    continue
+
+                for lot in open_lots:
+                    pool = self._pool_registry.get(lot.token_address)
+                    if pool is None:
+                        pool = self.get_or_create_initial_pool_state(lot.chain, lot.token_address)
+
+                    current_price = pool.spot_price_native_per_token
+                    decision = self._position_book.evaluate_lot_exit(
+                        lot=lot,
+                        current_price=current_price,
+                        current_pool_reserve_native=pool.native_reserve,
+                    )
+                    if decision is not None and decision.should_exit:
+                        exit_fill = await self._executor.execute_exit(
+                            chain=decision.chain,
+                            token_address=decision.token_address,
+                            pool=pool,
+                            tokens_to_sell=decision.tokens_to_sell,
+                            reason=decision.exit_reason,
+                            apply_drag=True,
+                        )
+                        if exit_fill is not None and exit_fill.effective_price > Decimal(0):
+                            native_price = (
+                                self._eth_price
+                                if decision.chain == ChainIdentifier.BASE_MAINNET
+                                else self._sol_price
+                            )
+                            pnl_native, _ = self._position_book.apply_exit_decision(
+                                decision, sell_price=exit_fill.effective_price
+                            )
+                            exit_pnl_usd = pnl_native * native_price
+                            if decision.chain == ChainIdentifier.BASE_MAINNET:
+                                self._cash_eth += exit_fill.simulated_native_spent
+                            else:
+                                self._cash_sol += exit_fill.simulated_native_spent
+
+                            new_equity = self._current_equity_usd()
+                            self._metrics.record_closed_trade(
+                                realized_pnl_usd=exit_pnl_usd,
+                                gas_cost_usd=exit_fill.simulated_gas_cost_usd,
+                                current_equity_usd=new_equity,
+                            )
+                            rec = TradeRecord.from_fill(
+                                fill=exit_fill,
+                                signal_id=lot.signal_id,
+                                realized_pnl_usd=exit_pnl_usd,
+                            )
+                            if self._ledger:
+                                await self._ledger.record_trade(rec)
+
+                            reflection = TradeReflection.from_trade(
+                                trade_id=exit_fill.order_id,
+                                token_address=exit_fill.token_address,
+                                chain=exit_fill.chain,
+                                signal_source=SignalSource.DYNAMIC_EXIT,
+                                entry_price=lot.entry_price,
+                                exit_price=exit_fill.effective_price,
+                                realized_pnl_usd=exit_pnl_usd,
+                                realized_pnl_native=pnl_native,
+                                time_to_fill_ms=exit_fill.fill_latency_ms,
+                            )
+                            await self._feedback.record_closed_trade(reflection)
+                            logger.info(
+                                "DYNAMIC EXIT executed | %s %s | reason=%s | exit_price=%s | PnL=%.4f USD | WR=%.1f%%",
+                                decision.chain.value,
+                                decision.token_address[:10],
+                                decision.exit_reason.value,
+                                exit_fill.effective_price,
+                                float(exit_pnl_usd),
+                                self._metrics.win_rate_pct,
+                            )
+            except asyncio.CancelledError:
+                break
+            except Exception as exc:
+                logger.error("Error in position price poller: %s", exc, exc_info=True)
+                await asyncio.sleep(1.0)
 
     async def _refresh_kelly(
         self,
@@ -737,6 +1053,9 @@ class PaperTradingEngine:
                 signal_task = asyncio.create_task(
                     self._process_signal_queue(), name="signal_processor"
                 )
+                poller_task = asyncio.create_task(
+                    self._position_price_poller(), name="price_poller"
+                )
                 snapshot_task = asyncio.create_task(
                     self._snapshot_scheduler(), name="snapshot_scheduler"
                 )
@@ -744,7 +1063,7 @@ class PaperTradingEngine:
                     self._heartbeat_task(), name="heartbeat_watchdog"
                 )
 
-                worker_tasks = [bridge_task, ingest_task, signal_task, snapshot_task, heartbeat_task]
+                worker_tasks = [bridge_task, ingest_task, signal_task, poller_task, snapshot_task, heartbeat_task]
                 logger.info("All engine pipelines active. Awaiting market and social signals...")
 
                 # Monitor tasks: wait for either graceful shutdown or unexpected worker crash
@@ -785,10 +1104,11 @@ class PaperTradingEngine:
                         signal_task.cancel()
 
                     # 3. Cancel background monitoring tasks
+                    poller_task.cancel()
                     snapshot_task.cancel()
                     heartbeat_task.cancel()
                     shutdown_waiter.cancel()
-                    await asyncio.gather(snapshot_task, heartbeat_task, return_exceptions=True)
+                    await asyncio.gather(poller_task, snapshot_task, heartbeat_task, return_exceptions=True)
 
                     # 4. Flush and checkpoint SQLite database
                     await ledger.checkpoint()

@@ -84,42 +84,17 @@ def test_fast_path_token_blacklist_filtering():
 
 
 def test_rugcheck_retry_loop_on_http_400():
-    """Verify that unindexed mints returning HTTP 400 are retried with backoff before resolving."""
+    """Verify that unindexed mints returning HTTP 400 do not perform progressive sleep retries, falling back immediately."""
     async def _run():
         limiter = RateLimiterRegistry.default()
         mint = "PumpFunNewMint1111111111111111111111111111"
 
-        # Mock responses: 400 on attempt 1, 400 on attempt 2, 200 on attempt 3
-        resp_400_1 = AsyncMock()
-        resp_400_1.status = 400
-
-        resp_400_2 = AsyncMock()
-        resp_400_2.status = 400
-
-        resp_200 = AsyncMock()
-        resp_200.status = 200
-        resp_200.json = AsyncMock(
-            return_value={
-                "mintAuthority": None,
-                "freezeAuthority": None,
-                "risks": [],
-                "markets": [{"lp": {"lpLockedPct": 100.0}}],
-                "topHolders": [],
-                "tokenMeta": {"mutable": False},
-            }
-        )
-
-        call_count = 0
+        resp_400 = AsyncMock()
+        resp_400.status = 400
 
         class MockContextManager:
             async def __aenter__(self):
-                nonlocal call_count
-                call_count += 1
-                if call_count == 1:
-                    return resp_400_1
-                elif call_count == 2:
-                    return resp_400_2
-                return resp_200
+                return resp_400
 
             async def __aexit__(self, *args):
                 pass
@@ -127,14 +102,21 @@ def test_rugcheck_retry_loop_on_http_400():
         session = MagicMock()
         session.get = MagicMock(side_effect=lambda *args, **kwargs: MockContextManager())
 
-        with patch("asyncio.sleep", new_callable=AsyncMock) as mock_sleep:
-            report = await _fetch_rugcheck_report(session, mint, limiter)
+        with patch("asyncio.sleep", new_callable=AsyncMock) as mock_sleep, \
+             patch("alpha_engine.security.rugcheck.verify_solana_mint_preflight", new_callable=AsyncMock) as mock_preflight:
+            mock_preflight.return_value = {
+                "mint_authority": None,
+                "freeze_authority": None,
+                "top10_concentration": 0.15,
+                "rpc_fallback": True,
+            }
+            report = await _fetch_rugcheck_report(session, mint, limiter, rpc_url="https://api.mainnet-beta.solana.com")
             assert report is not None
             assert report.get("mintAuthority") is None
-            assert call_count == 3
-            assert mock_sleep.await_count == 2
-            assert mock_sleep.await_args_list[0].args[0] == 0.4
-            assert mock_sleep.await_args_list[1].args[0] == 0.8
+            assert report.get("rpc_fallback") is True
+            # Zero progressive sleep retries on HTTP 400
+            assert mock_sleep.await_count == 0
+            mock_preflight.assert_awaited_once()
 
     asyncio.run(_run())
 

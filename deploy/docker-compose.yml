@@ -12,6 +12,9 @@ services:
     container_name: bot-mm-engine
     restart: unless-stopped
     user: "10001:10001"
+    dns:
+      - 1.1.1.1
+      - 8.8.8.8
     
     # Secret & Environment Management
     # Centralized .env file loaded into container environment

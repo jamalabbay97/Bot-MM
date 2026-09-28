@@ -12,7 +12,11 @@ import time
 from decimal import Decimal
 
 from alpha_engine.execution.book import PositionBook
-from alpha_engine.math.cpmm import cpmm_buy_quote, cpmm_sell_quote
+from alpha_engine.math.cpmm import (
+    cpmm_buy_quote,
+    cpmm_sell_quote,
+    get_initial_bonding_curve_pool,
+)
 from alpha_engine.math.mev import simulate_latency
 from alpha_engine.math.sizing import (
     apply_paper_trading_drag,
@@ -74,6 +78,12 @@ class PaperExecutor:
         """
         side = signal.suggested_side
         pool = signal.pool_state
+        if pool is None or pool.token_reserve <= Decimal(0) or pool.native_reserve <= Decimal(0):
+            pool = get_initial_bonding_curve_pool(
+                token_address=signal.token_address,
+                chain=signal.chain,
+                pool_address=signal.pool_address,
+            )
 
         latency_result = simulate_latency(
             pool=pool,
@@ -119,6 +129,9 @@ class PaperExecutor:
 
             simulated_native_spent = native_in
             tokens_acquired = quote.amount_out
+            if tokens_acquired <= Decimal(0):
+                logger.warning("CPMM output 0 tokens for %s — skipping.", signal.signal_id[:8])
+                return None
             effective_price = native_in / tokens_acquired
             price_impact_bps = quote.price_impact_bps
 
@@ -128,6 +141,10 @@ class PaperExecutor:
                     execution_price=effective_price,
                     side=OrderSide.BUY,
                 )
+
+            if effective_price <= Decimal(0):
+                logger.warning("Effective price <= 0 for %s — skipping.", signal.signal_id[:8])
+                return None
 
         else:  # SELL
             tokens_held = self._positions.get_holdings(

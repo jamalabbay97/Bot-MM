@@ -53,3 +53,5 @@ class NewsSignalEvent(BaseModel):
     raw_text: str
     is_edit_honeypot: bool = False
     rejection_reason: Optional[str] = None
+    sentiment_score: float = 0.0
+    headline: Optional[str] = None

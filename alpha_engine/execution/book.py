@@ -77,6 +77,10 @@ class PositionBook:
         signal_id: str,
         initial_pool_reserve_native: Decimal = Decimal(0),
     ) -> OpenLot:
+        if fill.effective_price <= Decimal(0):
+            raise ValueError(
+                f"Cannot open lot for {fill.token_address} with non-positive fill price: {fill.effective_price}"
+            )
         lot = OpenLot(
             token_address=fill.token_address,
             chain=fill.chain,
@@ -188,6 +192,20 @@ class PositionBook:
                 continue
             result.extend(lots)
         return result
+
+    def is_position_open(
+        self,
+        token_address: str,
+        chain: ChainIdentifier | None = None,
+    ) -> bool:
+        """
+        Check whether an active open position lot exists for this token.
+        Performs case-insensitive token address matching.
+        """
+        if not token_address:
+            return False
+        lots = self.get_open_lots(chain=chain, token_address=token_address)
+        return any(lot.tokens_held > Decimal(0) for lot in lots)
 
     def evaluate_lot_exit(
         self,
