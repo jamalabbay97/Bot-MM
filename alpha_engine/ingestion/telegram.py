@@ -22,9 +22,10 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import re
 import time
-from collections import defaultdict
+from collections import defaultdict, deque
 from decimal import Decimal
 from typing import Any, Awaitable, Callable, Optional, Sequence, Set
 
@@ -45,6 +46,7 @@ except ImportError:
 try:
     from telethon import TelegramClient, events, utils
     from telethon.errors import FloodWaitError, RPCError
+    from telethon.sessions import StringSession
     TELETHON_AVAILABLE = True
 except ImportError:  # pragma: no cover
     TELETHON_AVAILABLE = False
@@ -57,6 +59,7 @@ except ImportError:  # pragma: no cover
 
     events = None  # type: ignore
     utils = None   # type: ignore
+    StringSession = None  # type: ignore
 
     class FloodWaitError(Exception):  # type: ignore
         seconds: int = 0
@@ -66,6 +69,7 @@ except ImportError:  # pragma: no cover
 
 from alpha_engine.models.enums import ChainIdentifier, NewsSignalStatus, SignalSource
 from alpha_engine.models.events import RawSignalEvent, ShutdownSentinel
+from alpha_engine.models.news import NewsEvent
 from alpha_engine.rate_limiter.registry import RateLimiterRegistry
 
 logger = logging.getLogger(__name__)
@@ -75,6 +79,72 @@ EVM_CA_REGEX = re.compile(r"\b(0x[a-fA-F0-9]{40})\b")
 
 # Solana (SVM) base58 32-44 character address regex
 SVM_CA_REGEX = re.compile(r"\b([1-9A-HJ-NP-za-km-z]{32,44})\b")
+
+# Default public channels for macro news & whale intel
+DEFAULT_TELEGRAM_CHANNELS: list[str] = [
+    "insiderpaper",
+    "disclosetv",
+    "financialjuice",
+    "TreeNewsFeed",
+    "lookonchain",
+    "WatcherGuru",
+    "bubblemaps",
+]
+
+# High-impact news keywords & narrative triggers
+HIGH_IMPACT_KEYWORDS: list[str] = [
+    "break",
+    "urgent",
+    "launch",
+    "pump",
+    "listing",
+    "sec",
+    "trump",
+    "elon",
+    "hack",
+    "whale",
+    "bought",
+]
+
+# Polarity scoring weights (+0.4 to +0.9)
+POSITIVE_TRIGGERS: dict[str, float] = {
+    "bought": 0.6,
+    "accumulating": 0.7,
+    "accumulated": 0.7,
+    "approved": 0.8,
+    "approval": 0.8,
+    "listing": 0.6,
+    "listed": 0.6,
+    "pump": 0.5,
+    "launch": 0.5,
+    "partnership": 0.6,
+    "breakout": 0.5,
+}
+
+# Polarity scoring weights (-0.5 to -1.0)
+NEGATIVE_TRIGGERS: dict[str, float] = {
+    "dumped": -0.6,
+    "dump": -0.6,
+    "rug": -0.9,
+    "rugged": -0.9,
+    "hack": -0.8,
+    "hacked": -0.8,
+    "exploit": -0.8,
+    "exploited": -0.8,
+    "investigation": -0.5,
+    "scam": -0.8,
+    "drained": -0.8,
+}
+
+# Urgency keywords
+URGENCY_KEYWORDS: list[str] = [
+    "urgent",
+    "break",
+    "breaking",
+    "alert",
+    "emergency",
+    "just in",
+]
 
 # Well-known system program IDs and base infrastructure to exclude from Solana token extraction
 SOLANA_SYSTEM_PROGRAM_IDS: Set[str] = {
@@ -120,7 +190,7 @@ class TelegramIngester:
       - Dual-chain CA extraction (EVM Base & SVM Solana) with system router filtering
       - Anti-sybil coordinated dump detection (sliding window: 60s, burst: >=3 channels in <=15s)
       - Anti bait-and-switch protection (events.MessageEdited rejection)
-      - Interactive slash commands (/start, /help, /status, /scan, /trades) with admin check
+      - Interactive slash commands (/start, /help, /status, /scan, /trades, /news, /whales)
       - Direct CA pasting in DM for instant screening
       - Non-blocking SQLite queries (aiosqlite)
       - FloodWaitError backoff and rate limiter integration
@@ -134,9 +204,11 @@ class TelegramIngester:
     def __init__(
         self,
         event_queue: asyncio.Queue[Any],
+        signal_queue: Optional[asyncio.Queue[Any]] = None,
         api_id: Optional[int] = None,
         api_hash: Optional[str] = None,
         session_name: str = "bot_mm_session",
+        session_string: Optional[str] = None,
         bot_token: Optional[str] = None,
         target_channels: Optional[Sequence[str | int]] = None,
         admin_ids: Optional[Sequence[int]] = None,
@@ -146,6 +218,7 @@ class TelegramIngester:
         client: Optional[TelegramClient] = None,
     ) -> None:
         self._queue = event_queue
+        self._signal_queue = signal_queue
         self._api_id = api_id
         self._api_hash = api_hash
         self._bot_token = bot_token
@@ -157,7 +230,13 @@ class TelegramIngester:
             session_name = "bot_mm_session"
 
         self._session_name = session_name
-        self._target_channels = list(target_channels) if target_channels else []
+        self._session_string = session_string or os.getenv("TELEGRAM_SESSION_STRING")
+
+        if target_channels:
+            self._target_channels = list(target_channels)
+        else:
+            self._target_channels = list(DEFAULT_TELEGRAM_CHANNELS)
+
         self._admin_ids: Set[int] = {int(x) for x in admin_ids} if admin_ids else set()
         self._db_path = db_path
         self._status_provider = status_provider
@@ -173,6 +252,10 @@ class TelegramIngester:
 
         # Anti bait-and-switch tracking: (channel_id, message_id) -> initial extracted CAs (lower)
         self._seen_messages: dict[tuple[int, int], Set[str]] = {}
+
+        # Real-time telemetry deques for /news and /whales
+        self._recent_news: deque[dict[str, Any]] = deque(maxlen=50)
+        self._recent_whales: deque[dict[str, Any]] = deque(maxlen=50)
 
         # Determine if running in dormant/mock mode
         self._is_dormant = False
@@ -229,6 +312,57 @@ class TelegramIngester:
                 results.append((ChainIdentifier.SOLANA_MAINNET, ca))
 
         return results
+
+    @classmethod
+    def parse_news_content(cls, text: str) -> tuple[float, float, list[str]]:
+        """
+        Analyze raw message text for sentiment score (-1.0 to +1.0), urgency (0.0 to 1.0),
+        and matched high-impact keywords.
+        """
+        if not text:
+            return 0.0, 0.5, []
+
+        lower = text.lower()
+        matched_kw: list[str] = [kw for kw in HIGH_IMPACT_KEYWORDS if kw in lower]
+
+        score = 0.0
+        pos_hits = 0
+        neg_hits = 0
+
+        for word, val in POSITIVE_TRIGGERS.items():
+            if re.search(r"\b" + re.escape(word) + r"\b", lower):
+                score += val
+                pos_hits += 1
+
+        for word, val in NEGATIVE_TRIGGERS.items():
+            if re.search(r"\b" + re.escape(word) + r"\b", lower):
+                score += val
+                neg_hits += 1
+
+        total_hits = pos_hits + neg_hits
+        if total_hits > 0:
+            score = score / total_hits
+        score = max(-1.0, min(1.0, score))
+
+        urgency = 0.5
+        for u in URGENCY_KEYWORDS:
+            if re.search(r"\b" + re.escape(u) + r"\b", lower):
+                urgency = 0.9
+                break
+
+        return score, urgency, matched_kw
+
+    @staticmethod
+    def _format_time_elapsed(ts: float) -> str:
+        """Format a timestamp into a human-readable elapsed time string (e.g. 15s ago, 2m ago)."""
+        elapsed = max(0.0, time.time() - ts)
+        if elapsed < 60:
+            return f"{int(elapsed)}s ago"
+        elif elapsed < 3600:
+            return f"{int(elapsed // 60)}m ago"
+        elif elapsed < 86400:
+            return f"{int(elapsed // 3600)}h ago"
+        return f"{int(elapsed // 86400)}d ago"
 
     def check_anti_sybil(self, token_address: str, channel_id_str: str) -> tuple[bool, int]:
         """
@@ -353,6 +487,53 @@ class TelegramIngester:
 
         channel_id, message_id, channel_title, text = self._extract_event_metadata(event)
         cas = self.extract_contract_addresses(text)
+        sentiment, urgency, matched_kw = self.parse_news_content(text)
+        detected_mints = [ca for _, ca in cas]
+
+        news_event = NewsEvent(
+            timestamp=time.time(),
+            source_channel=channel_title or str(channel_id),
+            raw_text=text,
+            detected_mints=detected_mints,
+            sentiment_score=sentiment,
+            urgency=urgency,
+            keywords=matched_kw,
+            chain=cas[0][0] if cas else None,
+        )
+
+        # Store in recent news for telemetry & inspection commands
+        self._recent_news.append({
+            "timestamp": news_event.timestamp,
+            "source": news_event.source_channel,
+            "headline": text.replace("\n", " ").strip()[:100],
+            "sentiment": sentiment,
+            "urgency": urgency,
+            "detected_mints": detected_mints,
+            "keywords": matched_kw,
+        })
+
+        # Whale tracking for @lookonchain, @bubblemaps, or whale narrative posts
+        src_lower = (channel_title or "").lower()
+        if "lookonchain" in src_lower or "bubblemaps" in src_lower or "whale" in matched_kw:
+            action = "WHALE ALERT"
+            for kw in ("bought", "accumulating", "accumulated", "dumped", "sold", "transferred", "exploit"):
+                if kw in text.lower():
+                    action = kw.upper()
+                    break
+            self._recent_whales.append({
+                "timestamp": news_event.timestamp,
+                "source": news_event.source_channel,
+                "token": detected_mints[0] if detected_mints else "N/A",
+                "action": action,
+                "summary": text.replace("\n", " ").strip()[:120],
+            })
+
+        # Push every valid NewsEvent onto coordinator.signal_queue
+        if self._signal_queue is not None:
+            try:
+                self._signal_queue.put_nowait(news_event)
+            except asyncio.QueueFull:
+                pass
 
         # Store message history for bait-and-switch detection
         msg_key = (channel_id, message_id)
@@ -474,6 +655,8 @@ class TelegramIngester:
             await self._cmd_trades(event)
         elif first_token == "/news":
             await self._cmd_news(event)
+        elif first_token == "/whales":
+            await self._cmd_whales(event)
         elif first_token == "/signals":
             await self._cmd_signals(event)
         elif first_token == "/scan":
@@ -492,7 +675,8 @@ class TelegramIngester:
             "• `/status` — View real-time system uptime, memory RSS, portfolio equity, PnL, and queue telemetry.\n"
             "• `/scan` — Submit a Solana or Base token CA for immediate security audit & AMM execution.\n"
             "• `/trades` — View active OPEN positions and executed CLOSED paper trades with entry/current prices and PnL.\n"
-            "• `/news` — View the last 5 ingested news headlines, sources, and calculated sentiment scores.\n"
+            "• `/news` — View the last 5 ingested news headlines, sources, time elapsed, and sentiment scores.\n"
+            "• `/whales` — View the last 3 on-chain whale alerts from @lookonchain or @bubblemaps.\n"
             "• `/signals` — View the last 5 tokens evaluated by the gatekeeper and exact pass/reject reasons.\n"
             "• `/help` — Display this command reference.\n\n"
             "💡 *Tip:* You can also directly paste a contract address (EVM `0x...` or Solana Base58) in this chat to trigger an immediate scan."
@@ -693,7 +877,7 @@ class TelegramIngester:
             return str(val)[:10]
 
     async def _cmd_news(self, event: Any) -> None:
-        """Handle /news command in DMs: returns last 5 ingested news headlines, source, and sentiment score."""
+        """Handle /news command in DMs: returns last 5 ingested news headlines, channel name, elapsed time, and sentiment score."""
         metrics: dict[str, Any] = {}
         if self._status_provider is not None:
             try:
@@ -705,7 +889,7 @@ class TelegramIngester:
             except Exception as exc:
                 logger.warning("[TelegramIngester] status_provider error in /news: %s", exc)
 
-        recent_news = metrics.get("recent_news", [])
+        recent_news = metrics.get("recent_news") or list(self._recent_news)
         if not recent_news:
             await self._safe_reply(event, "📰 No news items ingested yet. Awaiting live RSS / X / Telegram news feeds.")
             return
@@ -714,17 +898,58 @@ class TelegramIngester:
         lines = [
             "📰 **Last 5 Ingested News Headlines & Sentiment**\n",
             "```",
-            f"{'TIME':<8} | {'SRC':<7} | {'SENT':<6} | {'HEADLINE'}",
+            f"{'TIME':<8} | {'SRC':<14} | {'SENT':<6} | {'HEADLINE'}",
             "-" * 65,
         ]
         for item in items:
-            t_s = time.strftime("%H:%M:%S", time.localtime(item.get("timestamp", time.time())))
-            src = str(item.get("source", "NEWS"))[:7]
+            t_s = self._format_time_elapsed(item.get("timestamp", time.time()))
+            src = str(item.get("source", "NEWS"))[:14]
             score = float(item.get("sentiment", 0.0))
             sent_str = f"{score:+.2f}"
-            headline = str(item.get("headline", "")).replace("\n", " ")[:35]
-            lines.append(f"{t_s:<8} | {src:<7} | {sent_str:<6} | {headline}")
+            headline = str(item.get("headline", "")).replace("\n", " ")[:32]
+            lines.append(f"{t_s:<8} | {src:<14} | {sent_str:<6} | {headline}")
         lines.append("```")
+        await self._safe_reply(event, "\n".join(lines))
+
+    async def _cmd_whales(self, event: Any) -> None:
+        """Handle /whales command in DMs: displays last 3 on-chain alerts parsed from @lookonchain or @bubblemaps."""
+        metrics: dict[str, Any] = {}
+        if self._status_provider is not None:
+            try:
+                res = self._status_provider()
+                if asyncio.iscoroutine(res):
+                    res = await res
+                if isinstance(res, dict):
+                    metrics = res
+            except Exception as exc:
+                logger.warning("[TelegramIngester] status_provider error in /whales: %s", exc)
+
+        recent_whales = metrics.get("recent_whales") or list(self._recent_whales)
+        if not recent_whales:
+            await self._safe_reply(event, "🐋 No on-chain whale alerts recorded yet from @lookonchain or @bubblemaps.")
+            return
+
+        items = list(reversed(recent_whales))[:3]
+        lines = [
+            "🐋 **Last 3 On-Chain Whale & Smart Money Alerts**\n",
+            "```",
+            f"{'TIME':<8} | {'SOURCE':<14} | {'TOKEN':<12} | {'ACTION'}",
+            "-" * 55,
+        ]
+        for item in items:
+            t_s = self._format_time_elapsed(item.get("timestamp", time.time()))
+            src = str(item.get("source", "@lookonchain"))[:14]
+            tok = str(item.get("token", "N/A"))
+            short_tok = f"{tok[:4]}..{tok[-4:]}" if len(tok) > 10 else tok
+            action = str(item.get("action", "ALERT"))[:15]
+            lines.append(f"{t_s:<8} | {src:<14} | {short_tok:<12} | {action}")
+        lines.append("```")
+
+        for idx, item in enumerate(items, 1):
+            summary = item.get("summary") or item.get("headline", "")
+            if summary:
+                lines.append(f"\n*{idx}.* `{item.get('source', '')}`: {summary}")
+
         await self._safe_reply(event, "\n".join(lines))
 
     async def _cmd_signals(self, event: Any) -> None:
@@ -872,18 +1097,43 @@ class TelegramIngester:
 
         if self._client is None and TELETHON_AVAILABLE:
             assert self._api_id is not None and self._api_hash is not None
-            session_name = self._session_name
-            self._client = TelegramClient(session_name, self._api_id, self._api_hash)
+            session: Any = self._session_name
+            if self._session_string:
+                session = StringSession(self._session_string)
+            self._client = TelegramClient(session, self._api_id, self._api_hash)
 
         if self._client is not None:
-            # 1. Start and authenticate client first
-            if hasattr(self._client, "start"):
-                start_kwargs = {}
-                if self._bot_token:
-                    start_kwargs["bot_token"] = self._bot_token
-                start_res = self._client.start(**start_kwargs)
-                if asyncio.iscoroutine(start_res):
-                    await start_res
+            # 1. Start and authenticate client with exponential backoff on FloodWaitError / disconnect
+            max_retries = 5
+            backoff = 2.0
+            for attempt in range(max_retries):
+                try:
+                    if hasattr(self._client, "start"):
+                        start_kwargs = {}
+                        if self._bot_token:
+                            start_kwargs["bot_token"] = self._bot_token
+                        start_res = self._client.start(**start_kwargs)
+                        if asyncio.iscoroutine(start_res):
+                            await start_res
+                    break
+                except FloodWaitError as exc:
+                    wait_sec = getattr(exc, "seconds", backoff)
+                    logger.warning(
+                        "[TelegramIngester] FloodWaitError during start. Waiting %s seconds (attempt %d/%d).",
+                        wait_sec, attempt + 1, max_retries
+                    )
+                    await asyncio.sleep(wait_sec)
+                    backoff = min(backoff * 2, 60.0)
+                except (ConnectionError, OSError, RPCError) as exc:
+                    logger.warning(
+                        "[TelegramIngester] Connection error during start: %s. Retrying in %.1fs (attempt %d/%d).",
+                        exc, backoff, attempt + 1, max_retries
+                    )
+                    await asyncio.sleep(backoff)
+                    backoff = min(backoff * 2, 60.0)
+                except Exception as exc:
+                    logger.error("[TelegramIngester] Unexpected error starting TelegramClient: %s", exc)
+                    raise
 
             # 2. Resolve target channels safely
             chats_arg: Optional[list[Any]] = None
@@ -896,6 +1146,7 @@ class TelegramIngester:
                         continue
 
                     # String username or channel link: resolve safely via Telethon
+                    clean_ch = ch
                     if hasattr(self._client, "get_input_entity"):
                         try:
                             entity_res = self._client.get_input_entity(ch)
@@ -905,6 +1156,11 @@ class TelegramIngester:
                                 entity = entity_res
                             resolved_chats.append(entity)
                             logger.info("[TelegramIngester] Target channel '%s' resolved successfully.", ch)
+                        except FloodWaitError as exc:
+                            logger.warning(
+                                "[TelegramIngester] FloodWaitError resolving channel '%s' (%s s). Skipping.",
+                                ch, getattr(exc, "seconds", "?")
+                            )
                         except Exception as exc:
                             logger.warning(
                                 "[TelegramIngester] Target channel '%s' could not be resolved (%s). Skipping.",

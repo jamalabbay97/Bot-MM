@@ -113,15 +113,25 @@ class EngineConfig(BaseSettings):
         description="Telegram API Hash from my.telegram.org",
     )
     telegram_session_name: str = Field(
-        default="bot_mm_session",
+        default="alpha_engine_listener",
         description="Telethon session identifier file name",
+    )
+    telegram_session_string: Optional[str] = Field(
+        default=None,
+        description="Telethon StringSession for persistent authentication without session file",
     )
     telegram_bot_token: Optional[str] = Field(
         default=None,
         description="Optional Telegram Bot Token (from @BotFather) for bot-mode authentication",
     )
     telegram_channels: list[str] | str = Field(
-        default_factory=list,
+        default_factory=lambda: [
+            "insiderpaper",
+            "disclosetv",
+            "TreeNewsFeed",
+            "lookonchain",
+            "WatcherGuru",
+        ],
         description="Target alpha channels/groups to scrape (comma-separated or JSON array)",
     )
     telegram_admin_ids: list[int] = Field(
@@ -205,16 +215,24 @@ class EngineConfig(BaseSettings):
     @classmethod
     def parse_telegram_channels(cls, v: Any) -> list[str]:
         """Convert comma-separated strings or empty strings into list[str]."""
+        default_channels = [
+            "insiderpaper",
+            "disclosetv",
+            "TreeNewsFeed",
+            "lookonchain",
+            "WatcherGuru",
+        ]
         if v is None:
-            return []
+            return list(default_channels)
         if isinstance(v, str):
             clean = v.strip()
             if not clean:
-                return []
+                return list(default_channels)
             return [ch.strip() for ch in clean.split(",") if ch.strip()]
         if isinstance(v, (list, tuple, set, Sequence)):
-            return [str(ch).strip() for ch in v if str(ch).strip()]
-        return []
+            cleaned = [str(ch).strip() for ch in v if str(ch).strip()]
+            return cleaned if cleaned else list(default_channels)
+        return list(default_channels)
 
     @field_validator("telegram_admin_ids", mode="before")
     @classmethod
@@ -282,9 +300,10 @@ class EngineConfig(BaseSettings):
 
             # Bot token detection if inadvertently placed in session name
             sess = data.get("telegram_session_name") or os.getenv("TELEGRAM_SESSION_NAME")
-            if sess and ":" in str(sess) and not data.get("telegram_bot_token"):
-                data["telegram_bot_token"] = str(sess).strip()
-                data["telegram_session_name"] = "bot_mm_session"
+            if sess and ":" in str(sess):
+                if not data.get("telegram_bot_token"):
+                    data["telegram_bot_token"] = str(sess).strip()
+                data["telegram_session_name"] = "alpha_engine_listener"
         return data
 
     # -------------------------------------------------------------------------

@@ -44,6 +44,11 @@ def main(args: list[str] | None = None) -> int:
         action="store_true",
         help="Display recent news ingestion and sentiment logs",
     )
+    parser.add_argument(
+        "--whales",
+        action="store_true",
+        help="Display recent on-chain whale alerts",
+    )
     parsed = parser.parse_args(args)
 
     try:

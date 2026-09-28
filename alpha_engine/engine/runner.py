@@ -50,7 +50,7 @@ from alpha_engine.models.events import (
     SignalEvent,
     SwapEvent,
 )
-from alpha_engine.models.news import NewsSignalEvent
+from alpha_engine.models.news import NewsEvent, NewsSignalEvent
 from alpha_engine.models.state import PoolState, PortfolioSnapshot, SecurityReport, TradeRecord
 from alpha_engine.rate_limiter.registry import RateLimiterRegistry
 from alpha_engine.security.constants import is_blacklisted_token
@@ -84,12 +84,13 @@ class PaperTradingEngine:
         self._ingestion_q: asyncio.Queue[
             SwapEvent | PoolStateUpdateEvent | RawSignalEvent | NewsSignalEvent | ShutdownSentinel
         ] = asyncio.Queue(maxsize=max_q)
-        self._signal_q: asyncio.Queue[SignalEvent | ShutdownSentinel] = (
+        self._signal_q: asyncio.Queue[SignalEvent | NewsEvent | ShutdownSentinel] = (
             asyncio.Queue(maxsize=max_q)
         )
 
         self._recent_gatekeeper_evaluations: deque[dict[str, Any]] = deque(maxlen=20)
         self._recent_news_events: deque[dict[str, Any]] = deque(maxlen=20)
+        self._recent_whale_alerts: deque[dict[str, Any]] = deque(maxlen=20)
 
         self._signal_gen = SignalGenerator(hold_seconds=300.0)
         self._executor: PaperExecutor | None = None
@@ -588,6 +589,123 @@ class PaperTradingEngine:
                 logger.info("Signal processor received shutdown sentinel. Terminating queue.")
                 return
 
+            if isinstance(item, NewsEvent):
+                # 1. Record recent news headline
+                news_headline = item.raw_text.replace("\n", " ").strip()
+                if len(news_headline) > 80:
+                    news_headline = news_headline[:77] + "..."
+                self._recent_news_events.append({
+                    "source": item.source_channel,
+                    "headline": news_headline,
+                    "sentiment": item.sentiment_score,
+                    "timestamp": item.timestamp,
+                    "detected_mints": list(item.detected_mints),
+                })
+
+                # 2. Track whale alert if lookonchain, bubblemaps, or whale keyword
+                lower_src = item.source_channel.lower()
+                lower_text = item.raw_text.lower()
+                if "lookonchain" in lower_src or "bubblemaps" in lower_src or "whale" in lower_text:
+                    action_match = "BUY/ACCUMULATE" if item.sentiment_score > 0 else "SELL/DUMP" if item.sentiment_score < 0 else "ALERT"
+                    for kw in ["bought", "accumulating", "sold", "dumped", "transferred", "swap"]:
+                        if kw in lower_text:
+                            action_match = kw.upper()
+                            break
+                    primary_tok = item.detected_mints[0] if item.detected_mints else "N/A"
+                    self._recent_whale_alerts.append({
+                        "source": item.source_channel,
+                        "token": primary_tok,
+                        "action": action_match,
+                        "summary": news_headline[:80],
+                        "timestamp": item.timestamp,
+                    })
+
+                # 3. Actionable check: contains detected mint and sentiment_score > 0.4
+                if not item.is_actionable or not item.detected_mints:
+                    continue
+
+                gk = self._gatekeeper
+                for mint in item.detected_mints:
+                    chain = (
+                        ChainIdentifier.SOLANA_MAINNET
+                        if len(mint) > 42 or not mint.startswith("0x")
+                        else ChainIdentifier.BASE_MAINNET
+                    )
+
+                    # Blacklist filter
+                    if is_blacklisted_token(mint, chain):
+                        self._record_gatekeeper_eval(mint, chain, "Blacklisted native/wrapped token", passed=False)
+                        logger.debug("Skipping blacklisted token from news: %s", mint)
+                        continue
+
+                    # Deduplication check
+                    if self.is_position_open(mint, chain):
+                        logger.debug("Position already open for news token %s; skipping", mint[:10])
+                        continue
+
+                    # Preflight validation by Gatekeeper
+                    report = None
+                    if gk is not None:
+                        try:
+                            report = await gk.screen_token(
+                                token_address=mint,
+                                chain=chain,
+                                pool_address="",
+                            )
+                        except Exception as exc:  # noqa: BLE001
+                            logger.error("Security gatekeeper raised for news token %s: %s", mint[:10], exc)
+                            continue
+
+                        reason = self._extract_gatekeeper_rejection_reason(report)
+                        self._record_gatekeeper_eval(mint, chain, reason, passed=report.passes_hard_gates)
+
+                        if not report.passes_hard_gates:
+                            logger.info("News token %s rejected by gatekeeper: %s", mint[:10], reason)
+                            continue
+
+                    if report is None:
+                        from alpha_engine.models.enums import SecurityTier
+                        report = SecurityReport(
+                            token_address=mint,
+                            chain=chain,
+                            tier=SecurityTier.CLEAN,
+                            is_honeypot=False,
+                            buy_tax_bps=0,
+                            sell_tax_bps=0,
+                            lp_burned_ratio=1.0,
+                            top10_concentration=0.1,
+                            mint_authority_disabled=True,
+                            verified_source_code=True,
+                        )
+
+                    pool = self.get_or_create_initial_pool_state(chain, mint)
+                    social_weight = self._feedback.get_social_weight() if hasattr(self, "_feedback") else 1.0
+                    raw_sig = RawSignalEvent(
+                        timestamp_ns=int(item.timestamp * 1e9) if item.timestamp else time.time_ns(),
+                        chain=chain,
+                        token_address=mint,
+                        source=SignalSource.TELEGRAM_SCRAPER,
+                        raw_text=item.raw_text,
+                        sybil_channel_count=1,
+                    )
+                    packaged_signal = self._signal_gen.generate_social_signal(
+                        raw_signal=raw_sig,
+                        pool=pool,
+                        report=report,
+                        social_weight=social_weight,
+                    )
+                    if packaged_signal is not None:
+                        if ledger is not None:
+                            await ledger.record_signal(packaged_signal)
+                        logger.info(
+                            "Actionable News Signal generated [%s]: %s (sentiment: %.2f)",
+                            packaged_signal.signal_id[:8],
+                            mint[:10],
+                            item.sentiment_score,
+                        )
+                        await self._signal_q.put(packaged_signal)
+                continue
+
             signal_item: SignalEvent = item
 
             if signal_item.suggested_side == OrderSide.BUY and self.is_position_open(
@@ -862,6 +980,7 @@ class PaperTradingEngine:
             "signal_q_max": self._signal_q.maxsize,
             "recent_signals": list(self._recent_gatekeeper_evaluations),
             "recent_news": list(self._recent_news_events),
+            "recent_whales": list(self._recent_whale_alerts),
             "open_trades": open_trades_info,
         }
 
@@ -1026,9 +1145,11 @@ class PaperTradingEngine:
                 pool_watchlist=pool_watchlist,
                 pool_registry=svm_pool_registry,
                 limiter=self._limiter,
+                signal_queue=self._signal_q,
                 telegram_api_id=cfg.telegram_api_id,
                 telegram_api_hash=cfg.telegram_api_hash,
                 telegram_session_name=cfg.telegram_session_name,
+                telegram_session_string=getattr(cfg, "telegram_session_string", None),
                 telegram_bot_token=cfg.telegram_bot_token,
                 telegram_channels=cfg.telegram_channels,
                 telegram_admin_ids=cfg.telegram_admin_ids,

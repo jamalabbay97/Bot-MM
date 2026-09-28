@@ -135,9 +135,11 @@ class IngestionCoordinator:
         pool_registry: dict[str, SvmPoolMeta],
         limiter: RateLimiterRegistry,
         queue_maxsize: int = 256,
+        signal_queue: Optional[asyncio.Queue[Any]] = None,
         telegram_api_id: Optional[int] = None,
         telegram_api_hash: Optional[str] = None,
         telegram_session_name: str = "bot_mm_session",
+        telegram_session_string: Optional[str] = None,
         telegram_bot_token: Optional[str] = None,
         telegram_channels: Optional[Sequence[str | int]] = None,
         telegram_admin_ids: Optional[Sequence[int]] = None,
@@ -151,6 +153,9 @@ class IngestionCoordinator:
         self._queue: asyncio.Queue[
             SwapEvent | PoolStateUpdateEvent | RawSignalEvent | ShutdownSentinel
         ] = asyncio.Queue(maxsize=queue_maxsize)
+        self._signal_queue: asyncio.Queue[Any] = (
+            signal_queue if signal_queue is not None else asyncio.Queue(maxsize=queue_maxsize)
+        )
 
         self._dedup_cache = TokenTTLCache(ttl_seconds=60.0)
 
@@ -169,12 +174,16 @@ class IngestionCoordinator:
 
         if telegram_ingester is not None:
             self._telegram = telegram_ingester
+            if signal_queue is not None and getattr(self._telegram, "_signal_queue", None) is None:
+                self._telegram._signal_queue = self._signal_queue
         else:
             self._telegram = TelegramIngester(
                 event_queue=self._queue,
+                signal_queue=self._signal_queue,
                 api_id=telegram_api_id,
                 api_hash=telegram_api_hash,
                 session_name=telegram_session_name,
+                session_string=telegram_session_string,
                 bot_token=telegram_bot_token,
                 target_channels=telegram_channels,
                 admin_ids=telegram_admin_ids,
@@ -201,6 +210,10 @@ class IngestionCoordinator:
         self,
     ) -> asyncio.Queue[SwapEvent | PoolStateUpdateEvent | RawSignalEvent | ShutdownSentinel]:
         return self._queue
+
+    @property
+    def signal_queue(self) -> asyncio.Queue[Any]:
+        return self._signal_queue
 
     @property
     def dedup_cache(self) -> TokenTTLCache:
