@@ -253,9 +253,9 @@ class TelegramIngester:
         # Anti bait-and-switch tracking: (channel_id, message_id) -> initial extracted CAs (lower)
         self._seen_messages: dict[tuple[int, int], Set[str]] = {}
 
-        # Real-time telemetry deques for /news and /whales
-        self._recent_news: deque[dict[str, Any]] = deque(maxlen=50)
-        self._recent_whales: deque[dict[str, Any]] = deque(maxlen=50)
+        # Real-time telemetry deques for /news and /whales (rolling buffer of last 20 verified signals)
+        self._recent_news: deque[dict[str, Any]] = deque(maxlen=20)
+        self._recent_whales: deque[dict[str, Any]] = deque(maxlen=20)
 
         # Determine if running in dormant/mock mode
         self._is_dormant = False
@@ -877,7 +877,7 @@ class TelegramIngester:
             return str(val)[:10]
 
     async def _cmd_news(self, event: Any) -> None:
-        """Handle /news command in DMs: returns last 5 ingested news headlines, channel name, elapsed time, and sentiment score."""
+        """Handle /news command in DMs: returns rolling buffer of verified ingested news headlines, channel name, elapsed time, and sentiment score."""
         metrics: dict[str, Any] = {}
         if self._status_provider is not None:
             try:
@@ -894,7 +894,7 @@ class TelegramIngester:
             await self._safe_reply(event, "📰 No news items ingested yet. Awaiting live RSS / X / Telegram news feeds.")
             return
 
-        items = list(reversed(recent_news))[:5]
+        items = list(reversed(recent_news))[:20]
         lines = [
             "📰 **Last 5 Ingested News Headlines & Sentiment**\n",
             "```",
@@ -912,7 +912,7 @@ class TelegramIngester:
         await self._safe_reply(event, "\n".join(lines))
 
     async def _cmd_whales(self, event: Any) -> None:
-        """Handle /whales command in DMs: displays last 3 on-chain alerts parsed from @lookonchain or @bubblemaps."""
+        """Handle /whales command in DMs: displays rolling buffer of verified on-chain alerts parsed from @lookonchain or @bubblemaps."""
         metrics: dict[str, Any] = {}
         if self._status_provider is not None:
             try:
@@ -929,7 +929,7 @@ class TelegramIngester:
             await self._safe_reply(event, "🐋 No on-chain whale alerts recorded yet from @lookonchain or @bubblemaps.")
             return
 
-        items = list(reversed(recent_whales))[:3]
+        items = list(reversed(recent_whales))[:20]
         lines = [
             "🐋 **Last 3 On-Chain Whale & Smart Money Alerts**\n",
             "```",
@@ -945,7 +945,7 @@ class TelegramIngester:
             lines.append(f"{t_s:<8} | {src:<14} | {short_tok:<12} | {action}")
         lines.append("```")
 
-        for idx, item in enumerate(items, 1):
+        for idx, item in enumerate(items[:5], 1):
             summary = item.get("summary") or item.get("headline", "")
             if summary:
                 lines.append(f"\n*{idx}.* `{item.get('source', '')}`: {summary}")
@@ -989,7 +989,7 @@ class TelegramIngester:
         await self._safe_reply(event, "\n".join(lines))
 
     async def _cmd_trades(self, event: Any) -> None:
-        """Handle /trades command in DMs: displays entry price, current price, unrealized PnL for OPEN trades, and realized PnL for CLOSED trades."""
+        """Handle /trades command in DMs: displays Entry, Current Price, Unrealized PnL %, Duration (s), and Trailing Stop status for OPEN trades."""
         metrics: dict[str, Any] = {}
         if self._status_provider is not None:
             try:
@@ -1033,20 +1033,35 @@ class TelegramIngester:
             open_lines = [
                 f"🟢 **Active Open Positions ({len(open_trades)})**\n",
                 "```",
-                f"{'TOKEN':<12} | {'CHAIN':<6} | {'ENTRY':<10} | {'CURRENT':<10} | {'UNREALIZED'}",
-                "-" * 60,
             ]
-            for t in open_trades[:5]:
+            for t in open_trades[:10]:
                 token_str = str(t.get("token_address", ""))
                 short_token = f"{token_str[:4]}..{token_str[-4:]}" if len(token_str) > 10 else token_str
-                chain_str = str(t.get("chain", "")).replace("ChainIdentifier.", "").replace("_mainnet", "")[:6]
+                chain_str = str(t.get("chain", "")).replace("ChainIdentifier.", "").replace("_mainnet", "")[:5]
                 entry_p = self._format_price(t.get("entry_price", 0))
                 curr_p = self._format_price(t.get("current_price", 0))
                 pnl_f = float(t.get("unrealized_pnl_usd", 0.0))
-                pnl_str = f"+${pnl_f:.2f}" if pnl_f > 0 else f"-${abs(pnl_f):.2f}" if pnl_f < 0 else "$0.00"
-                open_lines.append(
-                    f"{short_token:<12} | {chain_str:<6} | {entry_p:<10} | {curr_p:<10} | {pnl_str}"
-                )
+                usd_str = f"+${pnl_f:.2f}" if pnl_f > 0 else f"-${abs(pnl_f):.2f}" if pnl_f < 0 else "$0.00"
+                pnl_pct = float(t.get("unrealized_pnl_pct", 0.0))
+                if pnl_pct == 0.0 and t.get("entry_price") and t.get("current_price"):
+                    try:
+                        ep = float(t.get("entry_price"))
+                        cp = float(t.get("current_price"))
+                        if ep > 0:
+                            pnl_pct = ((cp - ep) / ep) * 100.0
+                    except Exception:
+                        pass
+                pnl_pct_str = f"{pnl_pct:+.2f}%"
+                pnl_display = f"{pnl_pct_str} ({usd_str})" if pnl_f != 0.0 else pnl_pct_str
+                dur_s = int(float(t.get("duration_s", 0.0)))
+                dur_str = f"{dur_s}s"
+                ts_status = str(t.get("trailing_stop_status", "OFF"))[:12]
+                open_lines.append(f"• {short_token} ({chain_str})")
+                open_lines.append(f"  ENTRY: {entry_p} | CURRENT: {curr_p}")
+                open_lines.append(f"  PNL %: {pnl_display} | DUR: {dur_str} | TRAILING: {ts_status}")
+                open_lines.append("-" * 40)
+            if open_lines and open_lines[-1] == "-" * 40:
+                open_lines.pop()
             open_lines.append("```")
             response_sections.append("\n".join(open_lines))
 

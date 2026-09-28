@@ -214,12 +214,16 @@ class PaperExecutor:
         tokens_to_sell: Decimal,
         reason: TradeExitReason | None = None,
         apply_drag: bool = False,
+        portfolio_equity_usd: Decimal = Decimal("10000.0"),
     ) -> PaperFill | None:
         """
         Produce a PaperFill for a dynamic exit SELL order (TP ladder, trailing stop, emergency drain).
         """
         if tokens_to_sell <= 0:
             return None
+
+        if portfolio_equity_usd <= Decimal(0):
+            portfolio_equity_usd = Decimal("10000.0")
 
         now_ns = time.time_ns()
         latency_result = simulate_latency(
@@ -266,7 +270,7 @@ class PaperExecutor:
             signal_timestamp_ns=now_ns,
             fill_timestamp_ns=latency_result.fill_timestamp_ns,
             kelly_fraction=0.0,
-            portfolio_equity_usd=Decimal(0),
+            portfolio_equity_usd=portfolio_equity_usd,
         )
         logger.info(
             "Exit PaperFill [%s] %s: %s tokens @ %s native | reason=%s | impact=%d bps",

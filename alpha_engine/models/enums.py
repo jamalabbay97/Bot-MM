@@ -84,33 +84,48 @@ class SignalSource(str, Enum):
     PAIR_CREATED = "pair_created"
 
 
+class LotStatus(str, Enum):
+    """Monotonic position lifecycle state transitions."""
+
+    PENDING_BUY = "pending_buy"
+    OPEN = "open"
+    PENDING_SELL = "pending_sell"
+    CLOSED = "closed"
+    SETTLED = "settled"
+
+
 class ExitStage(str, Enum):
     """Lifecycle stages for staged exit execution."""
 
     NONE = "none"
-    TP1 = "tp1"             # 50% sold at +100% gain (2x)
-    TP2 = "tp2"             # 25% sold at +200% gain (3x)
+    TP1 = "tp1"             # Scale out 50% (+25% gain or 2x)
+    TP2 = "tp2"             # Sell remaining 50% (+50% gain or 3x)
     TP3 = "tp3"             # Incremental sell at 5x
     TP4 = "tp4"             # Incremental sell at 10x
     MOONBAG = "moonbag"     # Running moonbag position
-    SL = "sl"               # Stop loss triggered (-15%)
-    TRAILING_SL = "trailing_sl"  # Trailing stop locked (+20% after +50%)
+    SL = "sl"               # Stop loss triggered (-8% or -15%)
+    TRAILING_SL = "trailing_sl"  # Trailing stop locked
     RUGPULL = "rugpull"     # Liquidity drain rug (<$500 pool or >30% drop)
+    TIMEOUT = "timeout"     # Velocity decay timeout
 
 
 class TradeExitReason(str, Enum):
     """Specific exit condition triggering a sell order."""
 
-    TP_50 = "tp_50"                   # Staged Take-Profit 1 (+100% gain / 2x)
-    TP_25 = "tp_25"                   # Staged Take-Profit 2 (+200% gain / 3x)
-    TP_2X = "tp_2x"                   # Take Profit Ladder: 50% sold at 2x (+100%)
-    TP_3X = "tp_3x"                   # Take Profit Ladder: Incremental sold at 3x
-    TP_5X = "tp_5x"                   # Take Profit Ladder: Incremental sold at 5x
-    TP_10X = "tp_10x"                 # Take Profit Ladder: Incremental sold at 10x
-    SL_INITIAL = "sl_initial"         # Initial hard stop-loss (-15%)
-    SL_TRAILING = "sl_trailing"       # Trailing stop (+20% lock once up +50%)
-    RUG_LIQUIDITY_DRAIN = "rug_liquidity_drain"  # Pool reserves drop below $500
-    EMERGENCY_DRAIN = "emergency_drain"          # Pool reserves dropped >30% in single block
+    TP_25 = "tp_25"                                # Take-Profit: +25% (Scale out 50%)
+    TP_50 = "tp_50"                                # Take-Profit: +50% (Sell remaining 50%)
+    TP_2X = "tp_2x"                                # Take Profit Ladder: 50% sold at 2x (+100%)
+    TP_3X = "tp_3x"                                # Take Profit Ladder: Incremental sold at 3x
+    TP_5X = "tp_5x"                                # Take Profit Ladder: Incremental sold at 5x
+    TP_10X = "tp_10x"                              # Take Profit Ladder: Incremental sold at 10x
+    SL_INITIAL = "sl_initial"                      # Hard stop-loss (-8% / -15%)
+    SL_HARD = "sl_hard"                            # Alias for hard stop-loss
+    SL_TRAILING = "sl_trailing"                    # Trailing stop
+    TIMEOUT_VELOCITY_DECAY = "timeout_velocity_decay"  # Duration > 120s and PnL < +3%
+    TIMEOUT = "timeout"                            # Alias for timeout decay
+    SLIPPAGE_INSOLVENCY = "slippage_insolvency"    # Curve cannot absorb without > 15% price collapse
+    RUG_LIQUIDITY_DRAIN = "rug_liquidity_drain"    # Pool reserves drop below $500
+    EMERGENCY_DRAIN = "emergency_drain"            # Pool reserves dropped >30% or insolvency collapse
     MANUAL_CLOSE = "manual_close"
 
 

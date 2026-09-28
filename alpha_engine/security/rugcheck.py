@@ -11,6 +11,7 @@ import asyncio
 import json
 import logging
 import os
+import time
 from typing import Any
 
 import aiohttp
@@ -35,6 +36,41 @@ logger = logging.getLogger(__name__)
 _RUGCHECK_RETRY_DELAYS_S: tuple[float, ...] = (0.4, 0.8, 1.2)
 
 
+class UnindexedMintLRUCache:
+    """
+    In-memory LRU Cache with TTL = 60s for HTTP 400 / unindexed token responses.
+    Prevents thread starvation and redundant RPC/HTTP round-trips for new mints.
+    """
+
+    def __init__(self, maxsize: int = 1000, ttl_seconds: float = 60.0) -> None:
+        self._maxsize = maxsize
+        self._ttl = ttl_seconds
+        self._cache: dict[str, float] = {}
+
+    def is_cached(self, mint: str) -> bool:
+        now = time.time()
+        k = mint.lower()
+        if k in self._cache:
+            if now - self._cache[k] <= self._ttl:
+                return True
+            del self._cache[k]
+        return False
+
+    def put(self, mint: str) -> None:
+        now = time.time()
+        k = mint.lower()
+        if len(self._cache) >= self._maxsize:
+            oldest_key = min(self._cache, key=self._cache.get)
+            del self._cache[oldest_key]
+        self._cache[k] = now
+
+    def clear(self) -> None:
+        self._cache.clear()
+
+
+UNINDEXED_MINT_CACHE = UnindexedMintLRUCache(maxsize=1000, ttl_seconds=60.0)
+
+
 async def _verify_solana_mint_on_chain(
     session: aiohttp.ClientSession,
     mint_address: str,
@@ -52,14 +88,45 @@ async def _fetch_rugcheck_report(
     mint_address: str,
     limiter: RateLimiterRegistry,
     rpc_url: str = "",
+    token_age_s: float | None = None,
 ) -> dict[str, Any] | None:
     """
     Fetch token report from RugCheck API for a Solana token mint.
-    If RugCheck returns HTTP 400 or 404 (unindexed mint / not found), immediately falls back
-    to local RPC preflight validation without blocking sleep retries.
+    - For tokens detected with age < 90 seconds, skips RugCheck API completely and relies
+      exclusively on local RPC preflight validation.
+    - If mint is in the unindexed LRU cache (TTL=60s), bypasses RugCheck directly.
+    - If RugCheck returns HTTP 400 or 404 (unindexed mint), caches response in LRU and falls back
+      immediately to local RPC preflight validation without blocking sleep retries.
     """
     if is_blacklisted_token(mint_address, ChainIdentifier.SOLANA_MAINNET):
         logger.debug("Skipping RugCheck for blacklisted/system Solana address %s", mint_address)
+        return {"invalid_mint": True}
+
+    fallback_rpc = rpc_url or os.getenv("SOLANA_RPC_HTTP", "")
+
+    # Directive 3: Bypass RugCheck if token age < 90 seconds
+    if token_age_s is not None and token_age_s < 90.0:
+        logger.info(
+            "Token %s age is %.1fs (< 90s). Skipping RugCheck API completely; relying exclusively on local RPC preflight.",
+            mint_address[:10],
+            token_age_s,
+        )
+        if fallback_rpc:
+            on_chain_info = await verify_solana_mint_preflight(session, mint_address, fallback_rpc)
+            if on_chain_info is not None:
+                return on_chain_info
+        return {"invalid_mint": True}
+
+    # Directive 3: Check in-memory LRU Cache (TTL = 60s)
+    if UNINDEXED_MINT_CACHE.is_cached(mint_address):
+        logger.info(
+            "Token %s hit unindexed LRU cache. Skipping RugCheck API; falling back directly to local RPC preflight.",
+            mint_address[:10],
+        )
+        if fallback_rpc:
+            on_chain_info = await verify_solana_mint_preflight(session, mint_address, fallback_rpc)
+            if on_chain_info is not None:
+                return on_chain_info
         return {"invalid_mint": True}
 
     url = _RUGCHECK_URL.format(mint=mint_address)
@@ -76,8 +143,9 @@ async def _fetch_rugcheck_report(
                     return await resp.json()
 
                 if resp.status in (400, 404):
+                    UNINDEXED_MINT_CACHE.put(mint_address)
                     logger.info(
-                        "RugCheck returned HTTP %d for unindexed mint %s. Bypassing sleep retries; falling back immediately to local RPC preflight.",
+                        "RugCheck returned HTTP %d for unindexed mint %s. Cached in LRU (TTL=60s); falling back immediately to local RPC preflight.",
                         resp.status,
                         mint_address[:10],
                     )
@@ -110,7 +178,6 @@ async def _fetch_rugcheck_report(
             return None
 
     # Fallback to local RPC account validation before declaring token invalid
-    fallback_rpc = rpc_url or os.getenv("SOLANA_RPC_HTTP", "")
     if fallback_rpc:
         on_chain_info = await verify_solana_mint_preflight(session, mint_address, fallback_rpc)
         if on_chain_info is not None:
@@ -156,11 +223,23 @@ def _parse_rugcheck_report(
             freeze_authority is None or str(freeze_authority).lower() == "null",
         )
         top10_conc = float(raw.get("top10_concentration", 0.0) or 0.0)
-        tier = (
-            SecurityTier.CLEAN
-            if (mint_disabled and freeze_disabled and top10_conc <= _MAX_TOP10_CONCENTRATION)
-            else SecurityTier.TIER1_REJECTED
-        )
+        sniper_bundle = bool(raw.get("developer_sniper_bundle", False))
+        max_holder_pct = float(raw.get("max_single_holder_pct", 0.0) or 0.0)
+
+        # Directive 3: Reject if > 20% scooped within block 0 (developer sniper bundle)
+        if sniper_bundle or max_holder_pct > 0.20:
+            logger.warning(
+                "Rejecting mint %s: developer sniper bundle detected (>20%% of supply: %.1f%%)",
+                mint_address[:10],
+                max_holder_pct * 100,
+            )
+            tier = SecurityTier.TIER1_REJECTED
+        else:
+            tier = (
+                SecurityTier.CLEAN
+                if (mint_disabled and freeze_disabled and top10_conc <= _MAX_TOP10_CONCENTRATION)
+                else SecurityTier.TIER1_REJECTED
+            )
 
         return SecurityReport(
             token_address=mint_address,

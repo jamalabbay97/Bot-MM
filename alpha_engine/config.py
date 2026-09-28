@@ -14,6 +14,11 @@ from typing import Any, Optional, Sequence
 from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+# Risk and Portfolio State Machine Constants
+MAX_ACTIVE_POSITIONS: int = 3
+MAX_PORTFOLIO_EXPOSURE_PCT: float = 0.05
+MAX_PER_TOKEN_RISK_PCT: float = 0.015
+
 
 class EngineConfig(BaseSettings):
     """
@@ -165,6 +170,40 @@ class EngineConfig(BaseSettings):
     # -------------------------------------------------------------------------
     # 5. Quantitative Risk & Sizing Parameters
     # -------------------------------------------------------------------------
+    max_active_positions: int = Field(
+        default=3,
+        ge=1,
+        le=50,
+        description="Hard cap on concurrent active positions across all chains (default: 3)",
+    )
+    max_portfolio_exposure_pct: float = Field(
+        default=0.05,
+        ge=0.001,
+        le=1.0,
+        description="Maximum total portfolio exposure across all open lots (5%)",
+    )
+    max_per_token_risk_pct: float = Field(
+        default=0.015,
+        ge=0.001,
+        le=0.20,
+        description="Maximum capital allocated per signal/token (1.5%)",
+    )
+    circuit_breaker_max_losses: int = Field(
+        default=3,
+        ge=1,
+        description="Consecutive losses triggering circuit breaker freeze (default: 3)",
+    )
+    circuit_breaker_drawdown_pct: float = Field(
+        default=0.08,
+        ge=0.01,
+        le=0.50,
+        description="Rolling daily drawdown triggering circuit breaker (default: 8%)",
+    )
+    circuit_breaker_freeze_duration_s: float = Field(
+        default=3600.0,
+        ge=60.0,
+        description="Duration in seconds to freeze new buys when circuit breaker trips (60 mins)",
+    )
     max_portfolio_risk_pct: float = Field(
         default=0.01,
         ge=0.0001,
@@ -178,10 +217,10 @@ class EngineConfig(BaseSettings):
         description="Maximum autonomous portfolio risk allocation per trade (2% to 5%)",
     )
     stop_loss_pct: float = Field(
-        default=-0.15,
+        default=-0.08,
         le=-0.01,
         ge=-0.50,
-        description="Initial hard stop-loss threshold (default: -15%)",
+        description="Initial hard stop-loss threshold (default: -8%)",
     )
 
     # -------------------------------------------------------------------------

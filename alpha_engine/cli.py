@@ -57,7 +57,7 @@ def main(args: list[str] | None = None) -> int:
         print(f"Configuration error: {e}", file=sys.stderr)
         return 1
 
-    if parsed.status or parsed.trades or parsed.signals or parsed.news:
+    if parsed.status or parsed.trades or parsed.signals or parsed.news or parsed.whales:
         import sqlite3
         try:
             conn = sqlite3.connect(config.db_path)
@@ -82,6 +82,12 @@ def main(args: list[str] | None = None) -> int:
                 print(f"\n=== Last {len(rows)} Signals ===")
                 for r in rows:
                     print(f"{r['created_at']} | {r['chain']} | {r['suggested_side']} | {r['token_address'][:12]}.. | Alpha: {r['alpha_score']:.2f} ({r['strength']})")
+            if parsed.news or parsed.status:
+                print("\n=== News Feed & Sentiment Buffer ===")
+                print("Telemetry buffer accessible via active Telegram DM interface (/news)")
+            if parsed.whales or parsed.status:
+                print("\n=== Whale Signals Buffer ===")
+                print("Telemetry buffer accessible via active Telegram DM interface (/whales)")
             conn.close()
         except Exception as exc:
             print(f"Database query error: {exc}", file=sys.stderr)

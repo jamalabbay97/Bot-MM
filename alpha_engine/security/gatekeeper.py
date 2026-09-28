@@ -74,6 +74,7 @@ class SecurityGatekeeper:
         token_address: str,
         chain: ChainIdentifier,
         pool_address: str = "",
+        token_age_s: float | None = None,
     ) -> SecurityReport:
         """Run the full dual-tier screening pipeline for a token."""
         # Static fast-path blacklist lookup: ignore WSOL, native base/quote and system tokens
@@ -90,7 +91,9 @@ class SecurityGatekeeper:
                 reason="Blacklisted native/wrapped token",
             )
 
-        tier1_report = await self._run_tier1(token_address, chain, pool_address)
+        tier1_report = await self._run_tier1(
+            token_address, chain, pool_address, token_age_s=token_age_s
+        )
 
         if tier1_report.tier == SecurityTier.TIER1_REJECTED:
             logger.info(
@@ -130,12 +133,14 @@ class SecurityGatekeeper:
         token_address: str,
         chain: ChainIdentifier,
         pool_address: str = "",
+        token_age_s: float | None = None,
     ) -> SecurityReport:
         logger.debug(
-            "Running Tier 1 security check for %s (pool: %s) on %s",
+            "Running Tier 1 security check for %s (pool: %s) on %s (age=%s)",
             token_address,
             pool_address or "n/a",
             chain.value,
+            f"{token_age_s:.1f}s" if token_age_s is not None else "unknown",
         )
         if chain == ChainIdentifier.BASE_MAINNET:
             raw = await _fetch_goplus_report(
@@ -154,6 +159,7 @@ class SecurityGatekeeper:
                 token_address,
                 self._limiter,
                 rpc_url=self._solana_rpc_url,
+                token_age_s=token_age_s,
             )
             if raw is None:
                 logger.warning(

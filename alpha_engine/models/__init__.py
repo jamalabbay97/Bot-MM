@@ -9,6 +9,7 @@ from alpha_engine.models.base import _STRICT_MODEL_CFG
 from alpha_engine.models.enums import (
     ChainIdentifier,
     ExitStage,
+    LotStatus,
     NewsSignalStatus,
     OrderSide,
     SecurityTier,
@@ -59,6 +60,7 @@ __all__ = [
     "NewsSignalStatus",
     "SignalSource",
     "ExitStage",
+    "LotStatus",
     "TradeExitReason",
     # Ingestion & Pipeline Events
     "SwapEvent",

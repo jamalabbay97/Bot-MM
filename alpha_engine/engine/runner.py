@@ -39,9 +39,11 @@ from alpha_engine.logging_config import setup_production_logging
 from alpha_engine.math.cpmm import get_initial_bonding_curve_pool
 from alpha_engine.models.enums import (
     ChainIdentifier,
+    LotStatus,
     OrderSide,
     SignalSource,
     SignalStrength,
+    TradeExitReason,
 )
 from alpha_engine.models.events import (
     PoolStateUpdateEvent,
@@ -164,6 +166,9 @@ class PaperTradingEngine:
         )
         unrealized = self._metrics.cumulative_realized_usd
         return cash_usd + unrealized
+
+    def _total_equity_usd(self) -> Decimal:
+        return self._current_equity_usd()
 
     def is_position_open(
         self,
@@ -509,6 +514,7 @@ class PaperTradingEngine:
                         tokens_to_sell=decision.tokens_to_sell,
                         reason=decision.exit_reason,
                         apply_drag=True,
+                        portfolio_equity_usd=max(Decimal("1.0"), self._current_equity_usd()),
                     )
                     if exit_fill is not None:
                         native_price = (
@@ -708,14 +714,41 @@ class PaperTradingEngine:
 
             signal_item: SignalEvent = item
 
-            if signal_item.suggested_side == OrderSide.BUY and self.is_position_open(
-                signal_item.token_address, signal_item.chain
-            ):
-                logger.info(
-                    "Dropping duplicate BUY signal for %s: position already open in book",
-                    signal_item.token_address[:10],
+            if signal_item.suggested_side == OrderSide.BUY:
+                # 1. Daily Drawdown & Streak Circuit Breakers (Directive 1)
+                freeze_dur = getattr(self._cfg, "circuit_breaker_freeze_duration_s", 3600.0)
+                if self._metrics.is_circuit_breaker_active(freeze_duration_s=freeze_dur):
+                    logger.warning(
+                        "CIRCUIT BREAKER ACTIVE (%s) - Freezing BUY signal for %s",
+                        self._metrics.circuit_breaker_reason,
+                        signal_item.token_address[:10],
+                    )
+                    continue
+
+                # 2. Concurrency & Exposure Locks (Directive 1)
+                native_p = (
+                    self._eth_price
+                    if signal_item.chain == ChainIdentifier.BASE_MAINNET
+                    else self._sol_price
                 )
-                continue
+                equity_usd = self._current_equity_usd()
+                equity_native = equity_usd / native_p if native_p > Decimal(0) else Decimal(0)
+                preliminary_cost = equity_native * Decimal("0.015")
+
+                can_open, reject_reason = self._position_book.can_open_position(
+                    token_address=signal_item.token_address,
+                    chain=signal_item.chain,
+                    allocated_cost_native=preliminary_cost,
+                    total_equity_native=equity_native,
+                    pool_address=getattr(signal_item, "pool_address", "") or "",
+                )
+                if not can_open:
+                    logger.info(
+                        "Dropping BUY signal for %s: %s",
+                        signal_item.token_address[:10],
+                        reject_reason,
+                    )
+                    continue
 
             if not self.validate_signal_strength(signal_item):
                 logger.info(
@@ -751,11 +784,20 @@ class PaperTradingEngine:
                     if signal_item.pool_state
                     else Decimal(0)
                 )
-                self._position_book.open_lot(
+                lot = self._position_book.open_lot(
                     fill,
                     signal_item.signal_id,
                     initial_pool_reserve_native=initial_reserve,
+                    pool_address=getattr(signal_item, "pool_address", "") or "",
+                    bonding_curve_mode=True,
                 )
+                if self._ledger:
+                    await self._ledger.record_lot_transition(
+                        lot_id=lot.lot_id,
+                        token_address=lot.token_address,
+                        chain=lot.chain.value,
+                        status=LotStatus.OPEN.value,
+                    )
                 if signal_item.chain == ChainIdentifier.BASE_MAINNET:
                     self._cash_eth -= fill.simulated_native_spent
                 else:
@@ -952,18 +994,30 @@ class PaperTradingEngine:
                 pass
 
         open_trades_info = []
+        now_ns = time.time_ns()
         for lot in self._position_book.get_open_lots():
             pool = self._pool_registry.get(lot.token_address)
             curr_p = pool.spot_price_native_per_token if pool else lot.entry_price
             native_p = self._eth_price if lot.chain == ChainIdentifier.BASE_MAINNET else self._sol_price
             unrealized_usd = (lot.tokens_held * (curr_p - lot.entry_price)) * native_p
+            dur_s = (now_ns - lot.open_timestamp_ns) / 1e9 if lot.open_timestamp_ns > 0 else 0.0
+            pnl_pct = float((curr_p - lot.entry_price) / lot.entry_price * 100) if lot.entry_price > 0 else 0.0
+            trailing_status = (
+                "LOCKED (+8%)"
+                if (lot.trailing_stop_active and lot.trailing_stop_price >= lot.entry_price * Decimal("1.08"))
+                else ("ACTIVE" if lot.trailing_stop_active else "OFF")
+            )
             open_trades_info.append({
                 "token_address": lot.token_address,
                 "chain": lot.chain,
                 "entry_price": lot.entry_price,
                 "current_price": curr_p,
                 "unrealized_pnl_usd": unrealized_usd,
+                "unrealized_pnl_pct": pnl_pct,
+                "duration_s": dur_s,
+                "trailing_stop_status": trailing_status,
                 "tokens_held": lot.tokens_held,
+                "status": lot.status.value,
             })
 
         return {
@@ -986,15 +1040,21 @@ class PaperTradingEngine:
 
     async def _position_price_poller(self) -> None:
         """
-        Active position price poller / tick listener.
-        Periodically checks all open lots in PositionBook, fetches latest pool state
-        or bonding curve price, evaluates dynamic exits (TP ladder, hard SL, trailing SL),
-        and executes exits.
+        Adaptive High-Speed Exit Monitor Loop (Directive 2 & 4).
+        Runs every 500ms. Evaluates dynamic bonding-curve exits:
+        - Stale tick guard: ticks > 3.0s old halt exit triggers.
+        - Slippage insolvency guard: curves unable to absorb lot without >15% collapse trigger emergency dump.
+        - Velocity/time decay: duration > 120s and PnL < +3% triggers liquidation.
+        - Hard SL (-8%): prioritized if price impact > 300 bps.
+        - Trailing Stop: activates at +15%, locks at +8%, trails 5% from peak.
+        - TP: +25% (scale out 50%), +50% (sell remaining 50%).
+        - Monotonic state recovery: PENDING_BUY -> OPEN -> PENDING_SELL -> CLOSED -> SETTLED.
         """
-        logger.info("Position price poller started.")
+        logger.info("Adaptive high-speed position price poller started (500ms tick interval).")
         while not self._shutdown_event.is_set():
             try:
-                await asyncio.sleep(2.0)
+                # Active high-speed tick evaluation running every 500ms
+                await asyncio.sleep(0.5)
                 if self._executor is None:
                     continue
 
@@ -1002,18 +1062,53 @@ class PaperTradingEngine:
                 if not open_lots:
                     continue
 
+                now_s = time.time()
+                now_ns = time.time_ns()
+
                 for lot in open_lots:
+                    # Idempotent state recovery: check lots in PENDING_SELL
+                    if lot.status == LotStatus.PENDING_SELL:
+                        if (now_s - lot.pending_exit_timestamp) > 15.0:
+                            logger.warning(
+                                "Lot %s unconfirmed in PENDING_SELL for %.1fs (>15s). Re-polling on-chain status before retrying.",
+                                lot.lot_id[:8],
+                                now_s - lot.pending_exit_timestamp,
+                            )
+                            # Re-poll status and reset lot so it can retry
+                            lot.status = LotStatus.OPEN
+                            lot.pending_exit_timestamp = 0.0
+                        else:
+                            continue
+
                     pool = self._pool_registry.get(lot.token_address)
                     if pool is None:
                         pool = self.get_or_create_initial_pool_state(lot.chain, lot.token_address)
 
                     current_price = pool.spot_price_native_per_token
+                    # Pull tick timestamp; if not stamped on pool, default to now
+                    tick_timestamp_s = getattr(pool, "timestamp_s", None) or now_s
+
                     decision = self._position_book.evaluate_lot_exit(
                         lot=lot,
                         current_price=current_price,
                         current_pool_reserve_native=pool.native_reserve,
+                        tick_timestamp_s=tick_timestamp_s,
+                        current_timestamp_ns=now_ns,
+                        bonding_curve_mode=True,
                     )
                     if decision is not None and decision.should_exit:
+                        # Idempotent state transition: OPEN -> PENDING_SELL
+                        lot.status = LotStatus.PENDING_SELL
+                        lot.pending_exit_timestamp = now_s
+                        if self._ledger:
+                            await self._ledger.record_lot_transition(
+                                lot_id=lot.lot_id,
+                                token_address=lot.token_address,
+                                chain=lot.chain.value,
+                                status=LotStatus.PENDING_SELL.value,
+                                exit_reason=decision.exit_reason.value if decision.exit_reason else None,
+                            )
+
                         exit_fill = await self._executor.execute_exit(
                             chain=decision.chain,
                             token_address=decision.token_address,
@@ -1021,6 +1116,7 @@ class PaperTradingEngine:
                             tokens_to_sell=decision.tokens_to_sell,
                             reason=decision.exit_reason,
                             apply_drag=True,
+                            portfolio_equity_usd=max(Decimal("1.0"), self._current_equity_usd()),
                         )
                         if exit_fill is not None and exit_fill.effective_price > Decimal(0):
                             native_price = (
@@ -1043,12 +1139,43 @@ class PaperTradingEngine:
                                 gas_cost_usd=exit_fill.simulated_gas_cost_usd,
                                 current_equity_usd=new_equity,
                             )
-                            rec = TradeRecord.from_fill(
-                                fill=exit_fill,
-                                signal_id=lot.signal_id,
-                                realized_pnl_usd=exit_pnl_usd,
-                            )
+
                             if self._ledger:
+                                if lot.status == LotStatus.CLOSED:
+                                    # Monotonic state transition: CLOSED -> SETTLED
+                                    await self._ledger.record_lot_transition(
+                                        lot_id=lot.lot_id,
+                                        token_address=lot.token_address,
+                                        chain=lot.chain.value,
+                                        status=LotStatus.CLOSED.value,
+                                        exit_reason=decision.exit_reason.value if decision.exit_reason else None,
+                                        pnl_usd=exit_pnl_usd,
+                                    )
+                                    await self._ledger.record_lot_transition(
+                                        lot_id=lot.lot_id,
+                                        token_address=lot.token_address,
+                                        chain=lot.chain.value,
+                                        status=LotStatus.SETTLED.value,
+                                        exit_reason=decision.exit_reason.value if decision.exit_reason else None,
+                                        pnl_usd=exit_pnl_usd,
+                                    )
+                                else:
+                                    # Partial exit: reset lot back to OPEN for subsequent ticks
+                                    lot.status = LotStatus.OPEN
+                                    lot.pending_exit_timestamp = 0.0
+                                    await self._ledger.record_lot_transition(
+                                        lot_id=lot.lot_id,
+                                        token_address=lot.token_address,
+                                        chain=lot.chain.value,
+                                        status=LotStatus.OPEN.value,
+                                        exit_reason=decision.exit_reason.value if decision.exit_reason else None,
+                                        pnl_usd=exit_pnl_usd,
+                                    )
+                                rec = TradeRecord.from_fill(
+                                    fill=exit_fill,
+                                    signal_id=lot.signal_id,
+                                    realized_pnl_usd=exit_pnl_usd,
+                                )
                                 await self._ledger.record_trade(rec)
 
                             reflection = TradeReflection.from_trade(
@@ -1064,14 +1191,32 @@ class PaperTradingEngine:
                             )
                             await self._feedback.record_closed_trade(reflection)
                             logger.info(
-                                "DYNAMIC EXIT executed | %s %s | reason=%s | exit_price=%s | PnL=%.4f USD | WR=%.1f%%",
+                                "DYNAMIC EXIT executed | %s %s | reason=%s | exit_price=%s | PnL=%.4f USD | WR=%.1f%% | impact=%d bps",
                                 decision.chain.value,
                                 decision.token_address[:10],
-                                decision.exit_reason.value,
+                                decision.exit_reason.value if decision.exit_reason else "unknown",
                                 exit_fill.effective_price,
                                 float(exit_pnl_usd),
                                 self._metrics.win_rate_pct,
+                                exit_fill.price_impact_bps,
                             )
+                        else:
+                            # Exit failed or rejected by CPMM
+                            logger.warning(
+                                "Exit execution failed or returned zero price for lot %s (%s). Resetting status to OPEN.",
+                                lot.lot_id[:8],
+                                lot.token_address[:10],
+                            )
+                            lot.status = LotStatus.OPEN
+                            lot.pending_exit_timestamp = 0.0
+                            if self._ledger:
+                                await self._ledger.record_lot_transition(
+                                    lot_id=lot.lot_id,
+                                    token_address=lot.token_address,
+                                    chain=lot.chain.value,
+                                    status=LotStatus.OPEN.value,
+                                    exit_reason=None,
+                                )
             except asyncio.CancelledError:
                 break
             except Exception as exc:

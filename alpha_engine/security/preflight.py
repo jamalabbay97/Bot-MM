@@ -305,8 +305,10 @@ async def verify_solana_mint_preflight(
                     freeze_auth = info.get("freezeAuthority")
                     decimals = info.get("decimals", 6)
 
-        # 2. Fetch top largest token accounts & supply to calculate concentration
+        # 2. Fetch top largest token accounts & supply to calculate concentration & detect sniper bundles
         top10_concentration = 0.0
+        developer_sniper_bundle = False
+        max_holder_pct = 0.0
         try:
             payload_largest = {
                 "jsonrpc": "2.0",
@@ -346,6 +348,21 @@ async def verify_solana_mint_preflight(
                             if isinstance(acc, dict)
                         )
                         top10_concentration = float(min(Decimal(1), top10_sum / total_supply))
+
+                        # Sybil & Bundled Mint Detection: Reject tokens where > 20% of supply scooped in block 0/single account
+                        for acc in accounts:
+                            if isinstance(acc, dict):
+                                acc_amt = Decimal(str(acc.get("amount", 0)))
+                                pct = float(acc_amt / total_supply)
+                                if pct > max_holder_pct:
+                                    max_holder_pct = pct
+                                if pct > 0.20:
+                                    developer_sniper_bundle = True
+                                    logger.warning(
+                                        "Developer sniper bundle detected for %s: account holds %.2f%% of supply (>20%%)",
+                                        mint_address[:10],
+                                        pct * 100,
+                                    )
         except Exception as exc:
             logger.debug("Failed fetching top holders for %s: %s", mint_address[:10], exc)
 
@@ -361,6 +378,8 @@ async def verify_solana_mint_preflight(
             "freeze_authority_disabled": freeze_disabled,
             "decimals": decimals,
             "top10_concentration": top10_concentration,
+            "developer_sniper_bundle": developer_sniper_bundle,
+            "max_single_holder_pct": max_holder_pct,
             "risks": [],
             "tokenMeta": {"mutable": False},
             "markets": [{"lp": {"lpLockedPct": 100.0}}],
