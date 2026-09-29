@@ -106,28 +106,30 @@ async def _fetch_rugcheck_report(
 
     # Directive 3: Bypass RugCheck if token age < 90 seconds
     if token_age_s is not None and token_age_s < 90.0:
-        logger.info(
-            "Token %s age is %.1fs (< 90s). Skipping RugCheck API completely; relying exclusively on local RPC preflight.",
+        logger.debug(
+            "Token %s age is %.1fs (< 90s). Skipping RugCheck API; relying on local RPC preflight (UNINDEXED_NEW_BONDING_CURVE).",
             mint_address[:10],
             token_age_s,
         )
         if fallback_rpc:
             on_chain_info = await verify_solana_mint_preflight(session, mint_address, fallback_rpc)
             if on_chain_info is not None:
+                on_chain_info["state"] = "UNINDEXED_NEW_BONDING_CURVE"
                 return on_chain_info
-        return {"invalid_mint": True}
+        return {"invalid_mint": True, "state": "UNINDEXED_NEW_BONDING_CURVE"}
 
     # Directive 3: Check in-memory LRU Cache (TTL = 60s)
     if UNINDEXED_MINT_CACHE.is_cached(mint_address):
-        logger.info(
-            "Token %s hit unindexed LRU cache. Skipping RugCheck API; falling back directly to local RPC preflight.",
+        logger.debug(
+            "Token %s hit unindexed LRU cache. Silently routing to local RPC preflight (UNINDEXED_NEW_BONDING_CURVE).",
             mint_address[:10],
         )
         if fallback_rpc:
             on_chain_info = await verify_solana_mint_preflight(session, mint_address, fallback_rpc)
             if on_chain_info is not None:
+                on_chain_info["state"] = "UNINDEXED_NEW_BONDING_CURVE"
                 return on_chain_info
-        return {"invalid_mint": True}
+        return {"invalid_mint": True, "state": "UNINDEXED_NEW_BONDING_CURVE"}
 
     url = _RUGCHECK_URL.format(mint=mint_address)
     max_attempts = len(_RUGCHECK_RETRY_DELAYS_S) + 1
@@ -142,14 +144,21 @@ async def _fetch_rugcheck_report(
                 if resp.status == 200:
                     return await resp.json()
 
+                # Reclassify HTTP 400/404 as expected unindexed state
                 if resp.status in (400, 404):
                     UNINDEXED_MINT_CACHE.put(mint_address)
-                    logger.info(
-                        "RugCheck returned HTTP %d for unindexed mint %s. Cached in LRU (TTL=60s); falling back immediately to local RPC preflight.",
+                    logger.debug(
+                        "RugCheck returned expected HTTP %d for new mint %s (UNINDEXED_NEW_BONDING_CURVE). "
+                        "Silently falling back to local RPC preflight evaluation.",
                         resp.status,
                         mint_address[:10],
                     )
-                    break
+                    if fallback_rpc:
+                        on_chain_info = await verify_solana_mint_preflight(session, mint_address, fallback_rpc)
+                        if on_chain_info is not None:
+                            on_chain_info["state"] = "UNINDEXED_NEW_BONDING_CURVE"
+                            return on_chain_info
+                    return {"invalid_mint": True, "state": "UNINDEXED_NEW_BONDING_CURVE"}
 
                 if resp.status != 200:
                     logger.warning(
@@ -181,14 +190,15 @@ async def _fetch_rugcheck_report(
     if fallback_rpc:
         on_chain_info = await verify_solana_mint_preflight(session, mint_address, fallback_rpc)
         if on_chain_info is not None:
-            logger.info(
+            logger.debug(
                 "Local RPC preflight validation verified unindexed mint %s on-chain.",
                 mint_address[:10],
             )
+            on_chain_info["state"] = "UNINDEXED_NEW_BONDING_CURVE"
             return on_chain_info
 
-    logger.info("RugCheck indicated invalid/non-existent token mint %s", mint_address[:10])
-    return {"invalid_mint": True}
+    logger.debug("RugCheck indicated invalid/non-existent token mint %s", mint_address[:10])
+    return {"invalid_mint": True, "state": "UNINDEXED_NEW_BONDING_CURVE"}
 
 
 def _parse_rugcheck_report(

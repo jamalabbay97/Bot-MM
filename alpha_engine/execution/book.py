@@ -54,6 +54,75 @@ class OpenLot:
     bonding_curve_mode: bool = False
     peak_pnl: Decimal = Decimal(0)
     trailing_profit_lock_pct: Decimal | None = None
+    price_history: list[tuple[float, Decimal, Decimal]] = field(default_factory=list)
+    cumulative_sell_vol: Decimal = Decimal(0)
+    cumulative_buy_vol: Decimal = Decimal(0)
+    peak_pool_reserve_native: Decimal = Decimal(0)
+    initial_pool_reserve_native: Decimal = Decimal(0)
+
+    def record_tick(
+        self,
+        price: Decimal,
+        volume_native: Decimal = Decimal("0.1"),
+        timestamp_s: float = 0.0,
+        is_sell: bool = False,
+    ) -> None:
+        """Record price and volume into the moving window (pruning older than 30s)."""
+        import time
+        ts = timestamp_s if timestamp_s > 0 else time.time()
+        self.price_history.append((ts, price, volume_native))
+        if is_sell:
+            self.cumulative_sell_vol += volume_native
+        else:
+            self.cumulative_buy_vol += volume_native
+        if len(self.price_history) > 20:
+            cutoff = ts - 30.0
+            filtered = [entry for entry in self.price_history if entry[0] >= cutoff]
+            self.price_history = filtered if len(filtered) >= 5 else self.price_history[-20:]
+
+    def get_moving_vwap(self) -> Decimal:
+        """Calculate Volume-Weighted Average Price across recent moving window."""
+        if not self.price_history:
+            return self.peak_price if self.peak_price > 0 else self.entry_price
+        total_vol = sum(entry[2] for entry in self.price_history)
+        if total_vol <= 0:
+            return sum(entry[1] for entry in self.price_history) / Decimal(len(self.price_history))
+        weighted_sum = sum(entry[1] * entry[2] for entry in self.price_history)
+        return (weighted_sum / total_vol).quantize(Decimal("1e-18"))
+
+    def get_dynamic_atr(self) -> Decimal:
+        """Calculate Average True Range across recent price window."""
+        if len(self.price_history) < 2:
+            return Decimal("0")
+        ranges: list[Decimal] = []
+        for i in range(1, len(self.price_history)):
+            prev_p = self.price_history[i - 1][1]
+            curr_p = self.price_history[i][1]
+            ranges.append(abs(curr_p - prev_p))
+        return (sum(ranges) / Decimal(len(ranges))).quantize(Decimal("1e-18"))
+
+    def confirms_downward_momentum(self, stop_price: Decimal) -> bool:
+        """
+        Confirm downward momentum or sell volume spike rather than a single liquidity fill drop.
+        """
+        if len(self.price_history) < 2:
+            return True
+        vwap = self.get_moving_vwap()
+        if vwap < stop_price:
+            return True
+        total_vol = sum(entry[2] for entry in self.price_history)
+        if total_vol > 0 and (self.cumulative_sell_vol / total_vol) >= Decimal("0.60") and self.cumulative_sell_vol >= Decimal("1.0"):
+            return True
+        if self.cumulative_sell_vol >= Decimal("1.50"):
+            return True
+        # If significant volume has been traded and VWAP is comfortably above stop, suppress single tick dip
+        if total_vol >= Decimal("5.0") and vwap >= stop_price:
+            return False
+        p_last = self.price_history[-1][1]
+        p_prev = self.price_history[-2][1]
+        if p_last < p_prev and p_last < stop_price:
+            return True
+        return False
 
 
 @dataclass
@@ -176,6 +245,9 @@ class PositionBook:
             bonding_curve_mode=bonding_curve_mode,
             peak_pnl=Decimal(0),
             trailing_profit_lock_pct=trailing_profit_lock_pct,
+            initial_pool_reserve_native=initial_pool_reserve_native,
+            peak_pool_reserve_native=initial_pool_reserve_native,
+            price_history=[(fill.fill_timestamp_ns / 1e9 if fill.fill_timestamp_ns > 0 else 0.0, fill.effective_price, fill.simulated_native_spent)],
         )
         key = (fill.chain.value, fill.token_address)
         self._lots[key].append(lot)
@@ -297,16 +369,22 @@ class PositionBook:
         tick_timestamp_s: float | None = None,
         current_timestamp_ns: int | None = None,
         bonding_curve_mode: bool | None = None,
+        exit_grace_period_sec: float = 15.0,
+        trade_volume_native: Decimal | None = None,
+        is_sell: bool = False,
+        emergency_stop_pct: Decimal = Decimal("-0.25"),
     ) -> ExitDecision | None:
         """
         Evaluate adaptive dynamic exit rules for an open lot:
         If bonding_curve_mode is True:
         1. Stale-Tick Guard: If tick > 3s old, halt triggers.
         2. Slippage Insolvency Guard: If curve reserve cannot absorb without > 15% price collapse, trigger emergency dump.
-        3. Velocity / Time Decay: If duration > 120s and PnL < +3.0%, trigger immediate market exit.
-        4. Hard Stop-Loss (-8%): Hard exit, prioritized if impact > 300 bps.
-        5. Trailing Stop: Activates at +15%, locks at +8%, trails by 5% from peak.
-        6. Take-Profit Ladder: +25% (scale out 50%), +50% (sell remaining 50%).
+        3. Emergency Hard-Stop (-25%): Unconditionally liquidates even in grace period.
+        4. Grace Period / Noise Immunity Window: Suppresses premature trailing stops & tight stop churn in first N seconds.
+        5. VWAP / Dynamic ATR-Based Trailing Stop: Only triggers exit if moving window confirms downward momentum or sell spike.
+        6. Pump.fun Virtual Reserve Verification: Distinguishes between normal curve slippage and actual dumping.
+        7. Velocity / Time Decay: If duration > 120s and PnL < +3.0%, trigger immediate market exit.
+        8. Take-Profit Ladder: +25% (scale out 50%), +50% (sell remaining 50%).
 
         If bonding_curve_mode is False (legacy AMM):
         Maintains backward compatibility with legacy 2x/3x/5x/10x TP ladder and +50% -> +20% trailing stop.
@@ -317,8 +395,19 @@ class PositionBook:
         is_bc = bonding_curve_mode if bonding_curve_mode is not None else lot.bonding_curve_mode
 
         import time
-        now_s = time.time()
-        now_ns = current_timestamp_ns if current_timestamp_ns is not None else time.time_ns()
+        if current_timestamp_ns is not None:
+            now_s = current_timestamp_ns / 1e9
+            now_ns = current_timestamp_ns
+        elif tick_timestamp_s is not None and abs(time.time() - tick_timestamp_s) > 86400:
+            now_s = tick_timestamp_s
+            now_ns = int(tick_timestamp_s * 1e9)
+        else:
+            now_s = time.time()
+            now_ns = time.time_ns()
+
+        # Record tick in moving price/volume history
+        vol = trade_volume_native if trade_volume_native is not None and trade_volume_native > 0 else Decimal("0.1")
+        lot.record_tick(current_price, volume_native=vol, timestamp_s=tick_timestamp_s or now_s, is_sell=is_sell)
 
         # 1. Stale-Tick Guard (Directive 2)
         if tick_timestamp_s is not None:
@@ -339,8 +428,22 @@ class PositionBook:
         if current_pnl > lot.peak_pnl:
             lot.peak_pnl = current_pnl
 
-        # Check pool reserves
+        # Track pool reserves and check for dumps
+        reserve_dump_confirmed = False
         if current_pool_reserve_native is not None and current_pool_reserve_native > 0:
+            if lot.initial_pool_reserve_native <= 0:
+                lot.initial_pool_reserve_native = current_pool_reserve_native
+            if current_pool_reserve_native > lot.peak_pool_reserve_native:
+                lot.peak_pool_reserve_native = current_pool_reserve_native
+
+            # Distinguish normal curve slippage from actual dumping:
+            # In Pump.fun virtual curves (~30 SOL initial), small trades move price by < 1% without reserve drop.
+            # Actual dump causes >= 1.5 SOL decrease or >= 5% drop from peak reserve.
+            if lot.peak_pool_reserve_native > 0:
+                reserve_loss = lot.peak_pool_reserve_native - current_pool_reserve_native
+                if reserve_loss >= Decimal("1.50") or (reserve_loss / lot.peak_pool_reserve_native) >= Decimal("0.05"):
+                    reserve_dump_confirmed = True
+
             # Emergency Liquidity Drain Trigger (> 30% reserve collapse)
             if lot.last_pool_reserve_native > 0 and current_pool_reserve_native < lot.last_pool_reserve_native:
                 drain_pct = (
@@ -398,8 +501,36 @@ class PositionBook:
 
         # --- BONDING-CURVE TUNED EXITS ---
         if is_bc:
-            # Velocity / Time Decay Exit (Crucial for Pump.fun):
             duration_s = (now_ns - lot.open_timestamp_ns) / 1e9 if lot.open_timestamp_ns > 0 else 0.0
+            in_grace_period = (lot.open_timestamp_ns > 0) and (duration_s < exit_grace_period_sec)
+
+            # Emergency Hard-Stop (-25%):
+            # Unconditionally liquidates even during grace period if catastrophic dump occurs
+            emergency_threshold_ratio = Decimal(1) + emergency_stop_pct
+            if gain_ratio <= emergency_threshold_ratio:
+                logger.warning(
+                    "EMERGENCY HARD-STOP (%.0f%%) TRIGGERED for lot %s (%s): price %s <= entry %s * %s (prioritized=True).",
+                    float(emergency_stop_pct * 100),
+                    lot.lot_id[:8],
+                    lot.token_address[:10],
+                    current_price,
+                    lot.entry_price,
+                    emergency_threshold_ratio,
+                )
+                return ExitDecision(
+                    lot_id=lot.lot_id,
+                    token_address=lot.token_address,
+                    chain=lot.chain,
+                    should_exit=True,
+                    exit_reason=TradeExitReason.SL_HARD,
+                    exit_stage=ExitStage.SL,
+                    tokens_to_sell=lot.tokens_held,
+                    current_price=current_price,
+                    pnl_estimate_native=lot.tokens_held * (current_price - lot.entry_price),
+                    prioritized=True,
+                )
+
+            # Velocity / Time Decay Exit (Crucial for Pump.fun):
             pnl_pct = (current_price - lot.entry_price) / lot.entry_price
             if duration_s > 120.0 and pnl_pct < Decimal("0.03"):
                 logger.info(
@@ -423,7 +554,6 @@ class PositionBook:
 
             # Trailing Stop:
             # 1. Trailing Stop Activation at +50% ROI:
-            # Once unrealized PnL reaches or exceeds +50%, lock in at least +30% profit and trail peak by dynamic drawdown
             if gain_ratio >= Decimal("1.50") or current_pnl >= Decimal("0.50") or lot.peak_pnl >= Decimal("0.50"):
                 lot.trailing_stop_active = True
                 baseline_30 = (lot.entry_price * Decimal("1.30")).quantize(Decimal("1e-18"))
@@ -454,53 +584,94 @@ class PositionBook:
                 if trail_price > lot.trailing_stop_price:
                     lot.trailing_stop_price = trail_price
 
+            # Evaluate Trailing Stop Trigger:
             if lot.trailing_stop_active and current_price < lot.trailing_stop_price:
-                logger.info(
-                    "TRAILING STOP TRIGGERED for lot %s (%s): price %s < trailing stop %s.",
-                    lot.lot_id[:8],
-                    lot.token_address[:10],
-                    current_price,
-                    lot.trailing_stop_price,
-                )
-                return ExitDecision(
-                    lot_id=lot.lot_id,
-                    token_address=lot.token_address,
-                    chain=lot.chain,
-                    should_exit=True,
-                    exit_reason=TradeExitReason.SL_TRAILING,
-                    exit_stage=ExitStage.TRAILING_SL,
-                    tokens_to_sell=lot.tokens_held,
-                    current_price=current_price,
-                    pnl_estimate_native=lot.tokens_held * (current_price - lot.entry_price),
-                )
+                if in_grace_period:
+                    logger.debug(
+                        "GRACE PERIOD ACTIVE for lot %s (%s): duration=%.2fs < %.1fs. Suppressing premature trailing stop-out.",
+                        lot.lot_id[:8],
+                        lot.token_address[:10],
+                        duration_s,
+                        exit_grace_period_sec,
+                    )
+                else:
+                    # Transition from single tick drop to Volume-Weighted Average Price (VWAP) / Dynamic ATR-Based Trailing Stop:
+                    # Only trigger an exit if a moving window confirms downward momentum or a cumulative sell-volume spike,
+                    # or if Pump.fun virtual reserve verification confirms an actual dump.
+                    # Normal curve slippage is distinguished by intact reserves + VWAP holding above stop.
+                    is_curve_intact = (current_pool_reserve_native is not None and lot.peak_pool_reserve_native > 0 and not reserve_dump_confirmed)
+                    vwap = lot.get_moving_vwap()
+                    if is_curve_intact and vwap >= lot.trailing_stop_price and lot.cumulative_sell_vol < Decimal("1.50"):
+                        logger.debug(
+                            "Normal curve slippage / micro-tick noise suppressed for lot %s: price %s < stop %s, but reserve %s is intact and VWAP %s holds.",
+                            lot.lot_id[:8],
+                            current_price,
+                            lot.trailing_stop_price,
+                            current_pool_reserve_native,
+                            vwap,
+                        )
+                        confirmed = False
+                    else:
+                        confirmed = lot.confirms_downward_momentum(lot.trailing_stop_price) or reserve_dump_confirmed
+                    if confirmed:
+                        logger.info(
+                            "TRAILING STOP TRIGGERED (confirmed by VWAP/momentum/reserve) for lot %s (%s): price %s < trailing stop %s.",
+                            lot.lot_id[:8],
+                            lot.token_address[:10],
+                            current_price,
+                            lot.trailing_stop_price,
+                        )
+                        return ExitDecision(
+                            lot_id=lot.lot_id,
+                            token_address=lot.token_address,
+                            chain=lot.chain,
+                            should_exit=True,
+                            exit_reason=TradeExitReason.SL_TRAILING,
+                            exit_stage=ExitStage.TRAILING_SL,
+                            tokens_to_sell=lot.tokens_held,
+                            current_price=current_price,
+                            pnl_estimate_native=lot.tokens_held * (current_price - lot.entry_price),
+                        )
+                    else:
+                        logger.debug(
+                            "Trailing stop micro-tick noise suppressed for lot %s: price %s < stop %s, but VWAP %s holds. Awaiting confirmation.",
+                            lot.lot_id[:8],
+                            current_price,
+                            lot.trailing_stop_price,
+                            lot.get_moving_vwap(),
+                        )
 
-            # Hard Stop-Loss: -8% hard stop. Calculate expected slippage; if estimated impact > 300 bps, use prioritized exit routing.
-            if not lot.trailing_stop_active and gain_ratio <= Decimal("0.92"):
-                is_prioritized = False
-                if current_pool_reserve_native is not None and current_pool_reserve_native > 0:
-                    pos_val = lot.tokens_held * current_price
-                    if (pos_val / current_pool_reserve_native) > Decimal("0.03"):
-                        is_prioritized = True
-                logger.info(
-                    "HARD STOP-LOSS (-8%%) TRIGGERED for lot %s (%s): price %s <= entry %s * 0.92 (prioritized=%s).",
-                    lot.lot_id[:8],
-                    lot.token_address[:10],
-                    current_price,
-                    lot.entry_price,
-                    is_prioritized,
-                )
-                return ExitDecision(
-                    lot_id=lot.lot_id,
-                    token_address=lot.token_address,
-                    chain=lot.chain,
-                    should_exit=True,
-                    exit_reason=TradeExitReason.SL_HARD,
-                    exit_stage=ExitStage.SL,
-                    tokens_to_sell=lot.tokens_held,
-                    current_price=current_price,
-                    pnl_estimate_native=lot.tokens_held * (current_price - lot.entry_price),
-                    prioritized=is_prioritized,
-                )
+            # Hard Stop-Loss: -8% hard stop.
+            # Suppressed during grace period to prevent micro-tick noise on initial bonding curve spreads.
+            if not lot.trailing_stop_active and not in_grace_period and gain_ratio <= Decimal("0.92"):
+                vwap = lot.get_moving_vwap()
+                confirmed_drop = (vwap <= lot.entry_price * Decimal("0.95")) or reserve_dump_confirmed or lot.confirms_downward_momentum(lot.entry_price * Decimal("0.92"))
+                if confirmed_drop:
+                    is_prioritized = False
+                    if current_pool_reserve_native is not None and current_pool_reserve_native > 0:
+                        pos_val = lot.tokens_held * current_price
+                        if (pos_val / current_pool_reserve_native) > Decimal("0.03"):
+                            is_prioritized = True
+                    logger.info(
+                        "HARD STOP-LOSS (-8%%) TRIGGERED for lot %s (%s): price %s <= entry %s * 0.92 (prioritized=%s).",
+                        lot.lot_id[:8],
+                        lot.token_address[:10],
+                        current_price,
+                        lot.entry_price,
+                        is_prioritized,
+                    )
+                    return ExitDecision(
+                        lot_id=lot.lot_id,
+                        token_address=lot.token_address,
+                        chain=lot.chain,
+                        should_exit=True,
+                        exit_reason=TradeExitReason.SL_HARD,
+                        exit_stage=ExitStage.SL,
+                        tokens_to_sell=lot.tokens_held,
+                        current_price=current_price,
+                        pnl_estimate_native=lot.tokens_held * (current_price - lot.entry_price),
+                        prioritized=is_prioritized,
+                    )
 
             # Take-Profit (TP): +25% (Scale out 50% of position size), +50% (Sell remaining 50%)
             # +50% Take Profit
@@ -688,6 +859,7 @@ class PositionBook:
         current_prices: dict[tuple[str, str], Decimal],
         current_reserves: dict[tuple[str, str], Decimal] | None = None,
         bonding_curve_mode: bool = False,
+        exit_grace_period_sec: float = 15.0,
     ) -> list[ExitDecision]:
         """Evaluate exits for all open lots across all tracked pools/tokens."""
         decisions: list[ExitDecision] = []
@@ -706,6 +878,7 @@ class PositionBook:
                     current_price=price,
                     current_pool_reserve_native=reserve,
                     bonding_curve_mode=bonding_curve_mode,
+                    exit_grace_period_sec=exit_grace_period_sec,
                 )
                 if decision is not None and decision.should_exit:
                     decisions.append(decision)

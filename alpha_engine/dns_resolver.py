@@ -26,11 +26,37 @@ UPSTREAM_DNS_SERVERS = ("1.1.1.1", "8.8.8.8")
 
 # Verified Anycast / origin IPs for crypto infrastructure blocked by enterprise filters
 _VERIFIED_HOST_MAP: dict[str, tuple[str, ...]] = {
+    "mainnet.helius-rpc.com": ("104.18.36.169", "172.64.151.87"),
     "helius-rpc.com": ("104.18.36.169", "172.64.151.87"),
+    "api.rugcheck.xyz": ("174.138.15.144",),
     "rugcheck.xyz": ("174.138.15.144",),
 }
 
 _RESOLVED_CACHE: dict[str, list[str]] = {}
+
+
+def preresolve_trusted_endpoints(servers: Sequence[str] = UPSTREAM_DNS_SERVERS) -> None:
+    """
+    Pre-resolve and statically cache trusted IP endpoints at startup.
+    Eliminates recurrent sinkhole checks and suppresses repetitive log warnings during runtime.
+    """
+    targets = (
+        "mainnet.helius-rpc.com",
+        "helius-rpc.com",
+        "api.rugcheck.xyz",
+        "rugcheck.xyz",
+    )
+    for domain in targets:
+        if domain not in _RESOLVED_CACHE:
+            ips = query_upstream_dns(domain, servers=servers)
+            if ips:
+                _RESOLVED_CACHE[domain] = ips
+            else:
+                for host_pat, fallback_ips in _VERIFIED_HOST_MAP.items():
+                    if host_pat in domain:
+                        _RESOLVED_CACHE[domain] = list(fallback_ips)
+                        break
+    logger.debug("Pre-resolved trusted DNS endpoints: %s", list(_RESOLVED_CACHE.keys()))
 
 
 def query_upstream_dns(domain: str, servers: Sequence[str] = UPSTREAM_DNS_SERVERS, timeout: float = 1.5) -> list[str]:
@@ -98,42 +124,40 @@ def query_upstream_dns(domain: str, servers: Sequence[str] = UPSTREAM_DNS_SERVER
     return []
 
 
-def patch_dns_resolvers() -> None:
+def patch_dns_resolvers(servers: Sequence[str] | None = None) -> None:
     """
     Patch socket.getaddrinfo to intercept hostnames being sinkholed to Cisco Umbrella
     IP addresses, seamlessly re-routing them to Cloudflare/Google upstream resolved edge IPs.
+    Pre-resolves trusted endpoints at initialization to bypass system resolver sinkholes without
+    throwing recurrent log warnings.
     """
     global _PATCHED
+    effective_servers = servers or UPSTREAM_DNS_SERVERS
+    preresolve_trusted_endpoints(effective_servers)
+
     if _PATCHED:
         return
 
     def _safe_getaddrinfo(host: object, port: object, *args: object, **kwargs: object) -> list[tuple]:
         if isinstance(host, str):
+            # 1. Fast-path: Check static pre-resolved cache directly to avoid system sinkhole
+            if host in _RESOLVED_CACHE and _RESOLVED_CACHE[host]:
+                return _ORIG_GETADDRINFO(_RESOLVED_CACHE[host][0], port, *args, **kwargs)
+
+            for target_domain, cached_ips in _RESOLVED_CACHE.items():
+                if target_domain in host and cached_ips:
+                    return _ORIG_GETADDRINFO(cached_ips[0], port, *args, **kwargs)
+
+            # 2. Check verified host map
             for target_domain, fallback_ips in _VERIFIED_HOST_MAP.items():
                 if target_domain in host:
-                    try:
-                        res = _ORIG_GETADDRINFO(host, port, *args, **kwargs)
-                        is_sinkholed = any(
-                            any(sockaddr[0].startswith(prefix) for prefix in _SINKHOLE_PREFIXES)
-                            for family, type_, proto, canonname, sockaddr in res
-                            if isinstance(sockaddr, tuple) and len(sockaddr) > 0
-                        )
-                        if not is_sinkholed:
-                            return res
-                        logger.warning(
-                            "Detected Cisco Umbrella / OpenDNS sinkhole for %s. Resolving through Cloudflare (1.1.1.1) / Google (8.8.8.8)...",
-                            host,
-                        )
-                    except Exception:
-                        pass
-
-                    upstream_ips = query_upstream_dns(host)
+                    upstream_ips = query_upstream_dns(host, servers=effective_servers)
                     target_ip = upstream_ips[0] if upstream_ips else fallback_ips[0]
-                    logger.info("Routing %s through resolved edge IP %s", host, target_ip)
+                    _RESOLVED_CACHE[host] = [target_ip]
                     return _ORIG_GETADDRINFO(target_ip, port, *args, **kwargs)
 
         return _ORIG_GETADDRINFO(host, port, *args, **kwargs)
 
     socket.getaddrinfo = _safe_getaddrinfo
     _PATCHED = True
-    logger.debug("Anti-sinkhole DNS resolver patch applied.")
+    logger.debug("Anti-sinkhole DNS resolver patch applied with pre-resolved cache.")

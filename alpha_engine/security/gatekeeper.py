@@ -69,6 +69,28 @@ class SecurityGatekeeper:
         self._enable_tier2 = enable_tier2
         self._solana_rpc_url = solana_rpc_url
 
+    @staticmethod
+    def evaluate_bundle_heuristics(
+        slot_buys: dict[int, int] | None = None,
+        unique_buyers: set[str] | None = None,
+        threshold: float = 0.60,
+        min_unique: int = 8,
+    ) -> tuple[bool, str]:
+        """
+        Evaluate Sybil and Jito slot bundle footprints:
+        1. Unique Buyer Entropy: Ensure buys originate from distinct, non-bundled wallets (>= min_unique).
+        2. Slot Clustering / Bundle Detection: Reject if >= threshold buys cluster in the exact same slot.
+        """
+        if slot_buys:
+            total = sum(slot_buys.values())
+            if total >= 5:
+                max_slot = max(slot_buys.values())
+                if (max_slot / total) >= threshold:
+                    return False, f"DEV_BUNDLED: {max_slot}/{total} ({max_slot/total:.1%}) in single slot"
+        if unique_buyers is not None and len(unique_buyers) < min_unique:
+            return False, f"SYBIL_SUSPECT: unique signers {len(unique_buyers)} < {min_unique}"
+        return True, ""
+
     async def screen_token(
         self,
         token_address: str,

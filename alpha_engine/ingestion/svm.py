@@ -63,7 +63,7 @@ def _b58decode(s: str) -> bytes:
 
 
 try:
-    import base58
+    import base58  # type: ignore[import-not-found]
 except ImportError:
     class _Base58Compat:
         @staticmethod

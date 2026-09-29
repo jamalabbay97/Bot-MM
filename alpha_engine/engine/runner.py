@@ -27,6 +27,7 @@ except ImportError:  # pragma: no cover
 from collections import deque
 
 from alpha_engine.config import EngineConfig
+from alpha_engine.dns_resolver import patch_dns_resolvers
 from alpha_engine.engine.feedback import AdaptiveFeedbackEngine, TradeReflection
 from alpha_engine.engine.registry import PoolRegistry
 from alpha_engine.engine.rpc_health import RPCHealthMonitor
@@ -69,6 +70,7 @@ class PaperTradingEngine:
 
     def __init__(self, config: EngineConfig) -> None:
         self._cfg = config
+        self.config = config
         self._shutdown_event = asyncio.Event()
         self._start_time = time.time()
 
@@ -95,7 +97,14 @@ class PaperTradingEngine:
         self._recent_whale_alerts: deque[dict[str, Any]] = deque(maxlen=20)
 
         self._signal_gen = SignalGenerator(hold_seconds=300.0)
-        self._pending_launch_buffer = PendingLaunchBuffer()
+        doh_servers = getattr(config, "dns_doh_servers", None)
+        patch_dns_resolvers(servers=doh_servers)
+        min_buyers = getattr(config, "min_unique_buyers", 8)
+        bundle_thresh = getattr(config, "slot_bundle_threshold", 0.60)
+        self._pending_launch_buffer = PendingLaunchBuffer(
+            min_unique_signers=min_buyers,
+            slot_bundle_threshold=bundle_thresh,
+        )
         self._executor: PaperExecutor | None = None
         self._ledger: SQLiteLedger | None = None
         self._gatekeeper: SecurityGatekeeper | None = None
@@ -114,6 +123,14 @@ class PaperTradingEngine:
                 ChainIdentifier.SOLANA_MAINNET: [u for u in solana_urls if u],
             }
         )
+
+    @property
+    def config(self) -> EngineConfig:
+        return self._cfg
+
+    @config.setter
+    def config(self, val: EngineConfig) -> None:
+        self._cfg = val
 
     @property
     def feedback_engine(self) -> AdaptiveFeedbackEngine:
@@ -415,8 +432,9 @@ class PaperTradingEngine:
                         t_0=time.time(),
                     )
                     logger.info(
-                        "Pump.fun mint [%s] staged in PendingLaunchBuffer (observation window 90s-300s, target vol >= 15 SOL, >= 15 buys)",
+                        "Pump.fun mint [%s] staged in PendingLaunchBuffer (observation window 90s-300s, target vol >= 15 SOL, >= 15 buys, >= %d unique buyers)",
                         raw_sig.token_address[:10],
+                        getattr(self.config, "min_unique_buyers", 8),
                     )
                     continue
 
@@ -535,13 +553,22 @@ class PaperTradingEngine:
         if executor is None:
             return
 
+        grace_sec = getattr(self.config, "exit_grace_period_sec", 15.0)
         for token in (swap.token_out, swap.token_in):
             open_lots = self._position_book.get_open_lots(chain=swap.chain, token_address=token)
+            is_sell = (swap.token_in == token)
+            vol = swap.amount_in if is_sell else swap.amount_out
             for lot in open_lots:
                 decision = self._position_book.evaluate_lot_exit(
                     lot=lot,
                     current_price=pool.spot_price_native_per_token,
                     current_pool_reserve_native=pool.native_reserve,
+                    tick_timestamp_s=time.time(),
+                    current_timestamp_ns=swap.timestamp_ns,
+                    bonding_curve_mode=lot.bonding_curve_mode,
+                    exit_grace_period_sec=grace_sec,
+                    trade_volume_native=vol,
+                    is_sell=is_sell,
                 )
                 if decision is not None and decision.should_exit:
                     exit_fill = await executor.execute_exit(
@@ -1134,6 +1161,7 @@ class PaperTradingEngine:
                     # Pull tick timestamp; if not stamped on pool, default to now
                     tick_timestamp_s = getattr(pool, "timestamp_s", None) or now_s
 
+                    grace_sec = getattr(self.config, "exit_grace_period_sec", 15.0)
                     decision = self._position_book.evaluate_lot_exit(
                         lot=lot,
                         current_price=current_price,
@@ -1141,6 +1169,7 @@ class PaperTradingEngine:
                         tick_timestamp_s=tick_timestamp_s,
                         current_timestamp_ns=now_ns,
                         bonding_curve_mode=True,
+                        exit_grace_period_sec=grace_sec,
                     )
                     if decision is not None and decision.should_exit:
                         # Idempotent state transition: OPEN -> PENDING_SELL

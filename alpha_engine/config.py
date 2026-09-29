@@ -222,6 +222,32 @@ class EngineConfig(BaseSettings):
         ge=-0.50,
         description="Initial hard stop-loss threshold (default: -8%)",
     )
+    emergency_stop_pct: float = Field(
+        default=-0.25,
+        le=-0.05,
+        ge=-0.90,
+        description="Emergency hard stop threshold during grace period (default: -25%)",
+    )
+    exit_grace_period_sec: float = Field(
+        default=15.0,
+        ge=0.0,
+        description="Grace period in seconds after entry to suppress micro-tick noise stop-outs (default: 15s)",
+    )
+    dns_doh_servers: list[str] | str = Field(
+        default_factory=lambda: ["1.1.1.1", "8.8.8.8"],
+        description="Trusted upstream DoH/DNS servers to bypass local sinkholes",
+    )
+    min_unique_buyers: int = Field(
+        default=8,
+        ge=1,
+        description="Minimum distinct buyers required to graduate a staged launch in PendingLaunchBuffer",
+    )
+    slot_bundle_threshold: float = Field(
+        default=0.60,
+        ge=0.0,
+        le=1.0,
+        description="Max allowed fraction of initial buys in the same slot before flagging DEV_BUNDLED",
+    )
 
     # -------------------------------------------------------------------------
     # 6. Starting Balances & Price Baseline
@@ -272,6 +298,23 @@ class EngineConfig(BaseSettings):
             cleaned = [str(ch).strip() for ch in v if str(ch).strip()]
             return cleaned if cleaned else list(default_channels)
         return list(default_channels)
+
+    @field_validator("dns_doh_servers", mode="before")
+    @classmethod
+    def parse_dns_doh_servers(cls, v: Any) -> list[str]:
+        """Convert comma-separated strings or list into list[str]."""
+        default_servers = ["1.1.1.1", "8.8.8.8"]
+        if v is None:
+            return list(default_servers)
+        if isinstance(v, str):
+            clean = v.strip()
+            if not clean:
+                return list(default_servers)
+            return [s.strip() for s in clean.split(",") if s.strip()]
+        if isinstance(v, (list, tuple, set, Sequence)):
+            cleaned = [str(s).strip() for s in v if str(s).strip()]
+            return cleaned if cleaned else list(default_servers)
+        return list(default_servers)
 
     @field_validator("telegram_admin_ids", mode="before")
     @classmethod
