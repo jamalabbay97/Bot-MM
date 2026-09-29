@@ -62,15 +62,48 @@ def _b58decode(s: str) -> bytes:
     return b"\x00" * pad + b
 
 
+try:
+    import base58
+except ImportError:
+    class _Base58Compat:
+        @staticmethod
+        def b58decode(v: str) -> bytes:
+            return _b58decode(v)
+    base58 = _Base58Compat()
+
+
+def sanitize_solana_pubkey(addr: Any) -> str | None:
+    """
+    Sanitize and validate an address for Solana pubkey compliance.
+    Strips raw byte slices, instruction data, brackets, quotes or padded arrays.
+    Validates that the address is a valid base58 string decoding to exactly 32 bytes:
+    len(base58.b58decode(addr)) == 32.
+    """
+    if not addr:
+        return None
+    if isinstance(addr, (bytes, bytearray)):
+        try:
+            addr = addr.decode("utf-8", errors="ignore")
+        except Exception:
+            return None
+    if not isinstance(addr, str):
+        return None
+    # Strip any raw byte slices, instruction data, brackets, quotes or padded arrays
+    clean = addr.strip().strip("'\"[]()<>,; \t\r\n")
+    if not (32 <= len(clean) <= 44):
+        return None
+    try:
+        decoded = base58.b58decode(clean)
+        if len(decoded) == 32:
+            return clean
+    except Exception:
+        return None
+    return None
+
+
 def is_valid_solana_pubkey(addr: str) -> bool:
     """Validate that an address is a genuine 32-byte Base58 Solana public key."""
-    if not isinstance(addr, str) or len(addr) < 32 or len(addr) > 44:
-        return False
-    try:
-        decoded = _b58decode(addr)
-        return len(decoded) == 32
-    except Exception:
-        return False
+    return sanitize_solana_pubkey(addr) is not None
 
 
 class SVMIngester:
@@ -95,7 +128,8 @@ class SVMIngester:
         patch_dns_resolvers()
 
         from alpha_engine.ingestion.coordinator import ExponentialBackoff
-        self._backoff = ExponentialBackoff()
+        # Exponential backoff starting at 1.0s, capped at 10.0s
+        self._backoff = ExponentialBackoff(initial=1.0, max_delay=10.0)
         self._sub_to_pool: dict[int, str] = {}
         self._ssl_fallback = False
 
@@ -120,7 +154,7 @@ class SVMIngester:
                     continue
 
                 delay = self._backoff.next_delay()
-                logger.warning("SVM WebSocket error: %s — retrying in %.1fs", exc, delay)
+                logger.warning("SVM WebSocket ConnectionClosed/error: %s — retrying with exponential backoff in %.1fs", exc, delay)
                 await asyncio.sleep(delay)
             except asyncio.CancelledError:
                 logger.info("SVMIngester task cancelled.")
@@ -149,7 +183,7 @@ class SVMIngester:
             self._ws_url,
             ssl=ssl_ctx,
             ping_interval=20,
-            ping_timeout=20,
+            ping_timeout=15,
             close_timeout=10,
         ) as ws:
             logger.info("SVM WebSocket connected to Helius")
@@ -167,10 +201,8 @@ class SVMIngester:
 
             valid_targets: list[str] = []
             for target in raw_targets:
-                if not target or not isinstance(target, str):
-                    continue
-                clean = target.strip()
-                if is_valid_solana_pubkey(clean):
+                clean = sanitize_solana_pubkey(target)
+                if clean:
                     if clean not in valid_targets:
                         valid_targets.append(clean)
                 else:
@@ -271,10 +303,11 @@ class SVMIngester:
                 # 2. Check for Pump.fun Mint / Bonding Curve Creation
                 pump_info = _parse_pump_fun_logs(logs, tx_sig)
                 if pump_info is not None:
-                    mint_addr = pump_info["mint"]
-                    curve_addr = pump_info["bonding_curve"]
+                    mint_addr = sanitize_solana_pubkey(pump_info.get("mint"))
+                    curve_addr = sanitize_solana_pubkey(pump_info.get("bonding_curve"))
                     if (
                         mint_addr
+                        and curve_addr
                         and mint_addr not in SOLANA_SYSTEM_PROGRAM_IDS
                         and not mint_addr.startswith("11111111")
                     ):
@@ -319,7 +352,7 @@ class SVMIngester:
                 # 3. Check for Raydium AMM Pool Creation
                 ray_init = _parse_raydium_initialize2_logs(logs, tx_sig)
                 if ray_init is not None:
-                    pool_addr = ray_init.get("pool_address", "")
+                    pool_addr = sanitize_solana_pubkey(ray_init.get("pool_address"))
                     if (
                         pool_addr
                         and pool_addr not in SOLANA_SYSTEM_PROGRAM_IDS

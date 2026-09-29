@@ -632,3 +632,308 @@ async def test_executor_exit_paper_fill_validates_and_succeeds():
     assert fill2 is not None
     assert fill2.portfolio_equity_usd == Decimal("8500.0")
 
+
+def test_solana_address_sanitization_and_ws_backoff():
+    """Task 1: Verify Solana address sanitization strips malformed bytes/instruction slices and WS backoff limits."""
+    from alpha_engine.ingestion.svm import sanitize_solana_pubkey, is_valid_solana_pubkey, SVMIngester
+    from alpha_engine.rate_limiter.registry import RateLimiterRegistry
+
+    # Valid 32-byte Base58 pubkeys
+    valid_pubkey = "So11111111111111111111111111111111111111112"
+    assert is_valid_solana_pubkey(valid_pubkey) is True
+    assert sanitize_solana_pubkey(f"  '{valid_pubkey}'\n") == valid_pubkey
+
+    # Malformed strings: raw byte slices, non-base58, instruction data, invalid lengths
+    assert sanitize_solana_pubkey("0x1234") is None
+    assert sanitize_solana_pubkey("invalid_base58_0OIl") is None
+    assert sanitize_solana_pubkey("short") is None
+    assert sanitize_solana_pubkey(None) is None
+    assert sanitize_solana_pubkey("Program log: Instruction: InitializeMint") is None
+
+    # WS Ingester ExponentialBackoff validation (initial=1.0s, max_delay=10.0s)
+    event_q: asyncio.Queue = asyncio.Queue()
+    limiter = RateLimiterRegistry.default()
+    svm = SVMIngester(ws_url="wss://test.helius.xyz", pool_registry={}, event_queue=event_q, limiter=limiter)
+    assert svm._backoff._initial == 1.0
+    assert svm._backoff._max_delay == 10.0
+    for _ in range(10):
+        d = svm._backoff.next_delay()
+        assert d <= 15.0  # With 50% max jitter, max delay is <= 15.0s (base <= 10.0s)
+
+
+def test_pending_launch_buffer_smart_filters():
+    """Task 2: Verify Smart Launch Filter: staging, 90-300s window, volume spike, and dump drop."""
+    from alpha_engine.engine.signals import PendingLaunchBuffer, SignalGenerator
+    from alpha_engine.models.enums import OrderSide, SecurityTier, SignalSource
+    from alpha_engine.models.events import RawSignalEvent, SwapEvent
+    from alpha_engine.models.state import PoolState, SecurityReport
+
+    buffer = PendingLaunchBuffer(
+        min_age_s=90.0,
+        max_age_s=300.0,
+        min_buys=15,
+        min_volume_native=Decimal("15.0"),
+        max_dump_pct=Decimal("0.30"),
+    )
+    sig_gen = SignalGenerator()
+    token1 = "PumpMint111111111111111111111111111111111"
+    report = SecurityReport(
+        token_address=token1,
+        chain=ChainIdentifier.SOLANA_MAINNET,
+        tier=SecurityTier.CLEAN,
+        is_honeypot=False,
+        buy_tax_bps=0,
+        sell_tax_bps=0,
+        passes_hard_gates=True,
+    )
+    pool_addr1 = "CurveAddr11111111111111111111111111111"
+    raw_sig = RawSignalEvent(
+        chain=ChainIdentifier.SOLANA_MAINNET,
+        token_address=token1,
+        pool_address=pool_addr1,
+        source=SignalSource.PUMP_FUN_MINT,
+    )
+    t_0 = 1000.0
+    init_price = Decimal("0.000000028")
+
+    # 1. Add launch at t_0 -> Staged, not yet graduated
+    staged = buffer.add_launch(
+        token_address=token1,
+        chain=ChainIdentifier.SOLANA_MAINNET,
+        pool_address=pool_addr1,
+        initial_price=init_price,
+        report=report,
+        raw_signal=raw_sig,
+        t_0=t_0,
+    )
+    assert buffer.is_staged(token1) is True
+    assert staged.buy_count == 0
+
+    pool = PoolState(
+        pool_address=pool_addr1,
+        chain=ChainIdentifier.SOLANA_MAINNET,
+        token_address=token1,
+        native_reserve=Decimal("30.0"),
+        token_reserve=Decimal("1073000000.0"),
+        fee_numerator=25,
+        fee_denominator=10000,
+        last_updated_block=1,
+    )
+
+    # 2. Swap arrives at t_0 + 30s (< 90s min age) -> Cannot graduate yet
+    swap_early = SwapEvent(
+        timestamp_ns=int((t_0 + 30.0) * 1e9),
+        block_number=1,
+        chain=ChainIdentifier.SOLANA_MAINNET,
+        pool_address=pool_addr1,
+        token_in="So11111111111111111111111111111111111111112",
+        token_out=token1,
+        amount_in=Decimal("2.0"),
+        amount_out=Decimal("50000000"),
+        sender="Buyer11111111111111111111111111111",
+        tx_hash="txEarly111111111111111111111111111",
+    )
+    sig = buffer.record_swap(swap_early, pool, sig_gen, current_time_s=t_0 + 30.0)
+    assert sig is None
+    assert staged.buy_count == 1
+    assert staged.total_volume_native == Decimal("2.0")
+
+    # 3. Test Dump Filter: price dumps > 30% within first 90s -> Dropped immediately!
+    dumped_pool = PoolState(
+        pool_address=pool_addr1,
+        chain=ChainIdentifier.SOLANA_MAINNET,
+        token_address=token1,
+        native_reserve=Decimal("15.0"),  # Reserve collapsed
+        token_reserve=Decimal("1073000000.0"),
+        fee_numerator=25,
+        fee_denominator=10000,
+        last_updated_block=2,
+    )
+    # price drops from 0.000000028 to 0.000000014 (>30% drop)
+    sig_dump = buffer.record_swap(swap_early, dumped_pool, sig_gen, current_time_s=t_0 + 60.0)
+    assert sig_dump is None
+    assert staged.dropped is True
+    assert buffer.is_staged(token1) is False
+
+    # 4. Fresh Launch: successful graduation after 90s with >= 15 buys and >= 15 SOL
+    token2 = "PumpMint222222222222222222222222222222222"
+    pool_addr2 = "CurveAddr22222222222222222222222222222"
+    report2 = SecurityReport(
+        token_address=token2,
+        chain=ChainIdentifier.SOLANA_MAINNET,
+        tier=SecurityTier.CLEAN,
+        is_honeypot=False,
+        buy_tax_bps=0,
+        sell_tax_bps=0,
+        passes_hard_gates=True,
+    )
+    raw_sig2 = RawSignalEvent(
+        chain=ChainIdentifier.SOLANA_MAINNET,
+        token_address=token2,
+        pool_address=pool_addr2,
+        source=SignalSource.PUMP_FUN_MINT,
+    )
+    buffer.add_launch(
+        token_address=token2,
+        chain=ChainIdentifier.SOLANA_MAINNET,
+        pool_address=pool_addr2,
+        initial_price=init_price,
+        report=report2,
+        raw_signal=raw_sig2,
+        t_0=t_0,
+    )
+    staged2 = buffer.get_staged(token2)
+    assert staged2 is not None
+
+    # Simulate 14 buys of 1.0 SOL
+    for i in range(14):
+        sw = SwapEvent(
+            timestamp_ns=int((t_0 + 95.0) * 1e9),
+            block_number=i + 1,
+            chain=ChainIdentifier.SOLANA_MAINNET,
+            pool_address=pool_addr2,
+            token_in="So11111111111111111111111111111111111111112",
+            token_out=token2,
+            amount_in=Decimal("1.0"),
+            amount_out=Decimal("20000000"),
+            sender=f"Buyer{i:028d}",
+            tx_hash=f"tx_{i:030d}",
+        )
+        buffer.record_swap(sw, pool, sig_gen, current_time_s=t_0 + 95.0)
+
+    assert staged2.buy_count == 14
+    assert staged2.graduated is False
+
+    # 15th buy brings volume to 16.0 SOL (> 15 SOL threshold) at age 100s (>= 90s)
+    sw_15 = SwapEvent(
+        timestamp_ns=int((t_0 + 100.0) * 1e9),
+        block_number=15,
+        chain=ChainIdentifier.SOLANA_MAINNET,
+        pool_address=pool_addr2,
+        token_in="So11111111111111111111111111111111111111112",
+        token_out=token2,
+        amount_in=Decimal("2.0"),
+        amount_out=Decimal("40000000"),
+        sender="Buyer1511111111111111111111111111",
+        tx_hash="tx_15111111111111111111111111111",
+    )
+    grad_sig = buffer.record_swap(sw_15, pool, sig_gen, current_time_s=t_0 + 100.0)
+    assert grad_sig is not None
+    assert grad_sig.suggested_side == OrderSide.BUY
+    assert grad_sig.token_address == token2
+    assert staged2.graduated is True
+
+
+def test_dynamic_trailing_stop_activation_at_50_pct():
+    """Task 3: Verify trailing stop activation at +50% ROI locks stop at +30% and trails peak by dynamic drawdown."""
+    book = PositionBook()
+    lot = OpenLot(
+        token_address="TokenPumpTrail",
+        chain=ChainIdentifier.SOLANA_MAINNET,
+        initial_tokens=Decimal("1000"),
+        tokens_held=Decimal("1000"),
+        entry_price=Decimal("1.0"),
+        peak_price=Decimal("1.0"),
+        cost_basis_native=Decimal("1000"),
+        bonding_curve_mode=True,
+        exit_stage=ExitStage.TP2,  # TP scaled out, trailing stop manages remaining lot
+    )
+    now = time.time()
+
+    # 1. Price climbs to +50% (1.50) -> Activates trailing stop and locks baseline at +30% (1.30)
+    decision = book.evaluate_lot_exit(
+        lot=lot,
+        current_price=Decimal("1.50"),
+        tick_timestamp_s=now,
+        bonding_curve_mode=True,
+    )
+    assert decision is None
+    assert lot.trailing_stop_active is True
+    assert lot.trailing_stop_price >= Decimal("1.30")
+    assert lot.peak_pnl == Decimal("0.50")
+
+    # 2. Price climbs to new peak +80% (1.80) -> Trails 12% drop from peak (1.80 * 0.88 = 1.584)
+    book.evaluate_lot_exit(
+        lot=lot,
+        current_price=Decimal("1.80"),
+        tick_timestamp_s=now,
+        bonding_curve_mode=True,
+    )
+    assert lot.peak_price == Decimal("1.80")
+    assert lot.trailing_stop_price == Decimal("1.584").quantize(Decimal("1e-18"))
+
+    # 3. Price drops below trailing stop to 1.55 (< 1.584) -> Auto-liquidates
+    exit_dec = book.evaluate_lot_exit(
+        lot=lot,
+        current_price=Decimal("1.55"),
+        tick_timestamp_s=now,
+        bonding_curve_mode=True,
+    )
+    assert exit_dec is not None
+    assert exit_dec.should_exit is True
+    assert exit_dec.exit_reason == TradeExitReason.SL_TRAILING
+    assert exit_dec.exit_stage == ExitStage.TRAILING_SL
+
+
+@pytest.mark.anyio
+async def test_telegram_trades_dynamic_pnl_and_state_indicators():
+    """Task 4: Verify Telegram /trades formatting eliminates scientific notation, shows state indicators, and reflects exact duration."""
+    from alpha_engine.ingestion.telegram import TelegramIngester
+
+    event_q: asyncio.Queue = asyncio.Queue()
+    ingester = TelegramIngester(event_queue=event_q, admin_ids=[999])
+
+    entry_price = Decimal("0.00000002865")
+    current_price = Decimal("0.000000042975")  # exact +50% gain
+    now_ns = time.time_ns()
+
+    status_data = {
+        "open_trades": [
+            {
+                "token_address": "TokenMicro11111111111111111111111111111111",
+                "chain": ChainIdentifier.SOLANA_MAINNET,
+                "entry_price": entry_price,
+                "current_price": current_price,
+                "unrealized_pnl_usd": 15.50,
+                "unrealized_pnl_pct": 50.0,
+                "position_value_usd": 42.97,
+                "open_timestamp_ns": now_ns - int(75 * 1e9),  # 75s ago
+                "trailing_stop_status": "LOCKED (+30%)",
+                "tokens_held": Decimal("1000000000"),
+            }
+        ]
+    }
+    ingester.set_status_provider(lambda: status_data)
+
+    mock_event = MagicMock()
+    replies = []
+    async def mock_reply(msg):
+        replies.append(msg)
+    mock_event.reply = AsyncMock(side_effect=mock_reply)
+
+    await ingester._cmd_trades(mock_event)
+
+    assert len(replies) == 1
+    text = replies[0]
+
+    # No exponential notation like e-08
+    assert "e-08" not in text
+    assert "e-" not in text
+
+    # Subscript notation or clean formatting
+    assert "$0.0₇2.865" in text or "0.00000002865" in text
+
+    # Color coded indicator for in profit
+    assert "🟢" in text
+
+    # Exact duration (~75s)
+    assert "75s" in text
+
+    # Dollar valuation of position displayed
+    assert "Value: $42.970" in text
+
+    # PnL % and Trailing status
+    assert "+50.00%" in text
+    assert "LOCKED (+30%)" in text
+
+

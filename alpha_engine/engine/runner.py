@@ -30,7 +30,7 @@ from alpha_engine.config import EngineConfig
 from alpha_engine.engine.feedback import AdaptiveFeedbackEngine, TradeReflection
 from alpha_engine.engine.registry import PoolRegistry
 from alpha_engine.engine.rpc_health import RPCHealthMonitor
-from alpha_engine.engine.signals import SignalGenerator
+from alpha_engine.engine.signals import PendingLaunchBuffer, SignalGenerator
 from alpha_engine.execution.book import PositionBook, RunningMetrics
 from alpha_engine.execution.executor import PaperExecutor
 from alpha_engine.execution.ledger import SQLiteLedger
@@ -95,6 +95,7 @@ class PaperTradingEngine:
         self._recent_whale_alerts: deque[dict[str, Any]] = deque(maxlen=20)
 
         self._signal_gen = SignalGenerator(hold_seconds=300.0)
+        self._pending_launch_buffer = PendingLaunchBuffer()
         self._executor: PaperExecutor | None = None
         self._ledger: SQLiteLedger | None = None
         self._gatekeeper: SecurityGatekeeper | None = None
@@ -402,6 +403,23 @@ class PaperTradingEngine:
                         raw_sig.chain, raw_sig.token_address, raw_sig.pool_address or ""
                     )
 
+                if raw_sig.source == SignalSource.PUMP_FUN_MINT:
+                    init_price = pool.spot_price_native_per_token if pool else Decimal("0.000000028")
+                    self._pending_launch_buffer.add_launch(
+                        token_address=raw_sig.token_address,
+                        chain=raw_sig.chain,
+                        pool_address=raw_sig.pool_address or (pool.pool_address if pool else ""),
+                        initial_price=init_price,
+                        report=report,
+                        raw_signal=raw_sig,
+                        t_0=time.time(),
+                    )
+                    logger.info(
+                        "Pump.fun mint [%s] staged in PendingLaunchBuffer (observation window 90s-300s, target vol >= 15 SOL, >= 15 buys)",
+                        raw_sig.token_address[:10],
+                    )
+                    continue
+
                 social_weight = self._feedback.get_social_weight()
                 signal_event = self._signal_gen.generate_social_signal(
                     raw_signal=raw_sig,
@@ -470,9 +488,28 @@ class PaperTradingEngine:
             # Check dynamic exits (TP ladder, trailing stop-loss, emergency liquidity drain)
             await self._check_dynamic_exits_for_swap(swap, updated_pool)
 
+            # Check smart launch buffer graduations for staged tokens
+            launch_signal = self._pending_launch_buffer.record_swap(swap, updated_pool, self._signal_gen)
+            if launch_signal is not None:
+                if not self.is_position_open(launch_signal.token_address, launch_signal.chain):
+                    if self._ledger:
+                        await self._ledger.record_signal(launch_signal)
+                    await self._signal_q.put(launch_signal)
+                    logger.info(
+                        "Smart Launch Signal [%s] graduated & queued: %s (source=%s)",
+                        launch_signal.signal_id[:8],
+                        launch_signal.token_address[:10],
+                        launch_signal.source.value,
+                    )
+
             # Deduplication check for BUY
             if self.is_position_open(swap.token_out, swap.chain):
                 logger.debug("Position already open for token %s; skipping buy signal from swap", swap.token_out[:10])
+                continue
+
+            # If token is staged in pending launch buffer, do not generate premature swap buy signal
+            if self._pending_launch_buffer.is_staged(swap.token_out):
+                logger.debug("Token %s staged in PendingLaunchBuffer; awaiting graduation before BUY signal", swap.token_out[:10])
                 continue
 
             signal_event = self._signal_gen.generate_buy_signal(swap, updated_pool, report)
@@ -997,16 +1034,23 @@ class PaperTradingEngine:
         now_ns = time.time_ns()
         for lot in self._position_book.get_open_lots():
             pool = self._pool_registry.get(lot.token_address)
+            if pool is None and lot.pool_address:
+                pool = self._pool_registry.get(lot.pool_address)
             curr_p = pool.spot_price_native_per_token if pool else lot.entry_price
             native_p = self._eth_price if lot.chain == ChainIdentifier.BASE_MAINNET else self._sol_price
             unrealized_usd = (lot.tokens_held * (curr_p - lot.entry_price)) * native_p
+            pos_val_usd = float(lot.tokens_held * curr_p * native_p)
             dur_s = (now_ns - lot.open_timestamp_ns) / 1e9 if lot.open_timestamp_ns > 0 else 0.0
             pnl_pct = float((curr_p - lot.entry_price) / lot.entry_price * 100) if lot.entry_price > 0 else 0.0
-            trailing_status = (
-                "LOCKED (+8%)"
-                if (lot.trailing_stop_active and lot.trailing_stop_price >= lot.entry_price * Decimal("1.08"))
-                else ("ACTIVE" if lot.trailing_stop_active else "OFF")
-            )
+            if lot.trailing_stop_active:
+                if lot.trailing_stop_price >= lot.entry_price * Decimal("1.30"):
+                    trailing_status = "LOCKED (+30%)"
+                elif lot.trailing_stop_price >= lot.entry_price * Decimal("1.08"):
+                    trailing_status = "LOCKED (+8%)"
+                else:
+                    trailing_status = "ACTIVE"
+            else:
+                trailing_status = "OFF"
             open_trades_info.append({
                 "token_address": lot.token_address,
                 "chain": lot.chain,
@@ -1014,7 +1058,9 @@ class PaperTradingEngine:
                 "current_price": curr_p,
                 "unrealized_pnl_usd": unrealized_usd,
                 "unrealized_pnl_pct": pnl_pct,
+                "position_value_usd": pos_val_usd,
                 "duration_s": dur_s,
+                "open_timestamp_ns": lot.open_timestamp_ns,
                 "trailing_stop_status": trailing_status,
                 "tokens_held": lot.tokens_held,
                 "status": lot.status.value,

@@ -52,6 +52,8 @@ class OpenLot:
     last_tick_timestamp_s: float = 0.0
     pool_address: str = ""
     bonding_curve_mode: bool = False
+    peak_pnl: Decimal = Decimal(0)
+    trailing_profit_lock_pct: Decimal | None = None
 
 
 @dataclass
@@ -149,6 +151,7 @@ class PositionBook:
         initial_pool_reserve_native: Decimal = Decimal(0),
         pool_address: str = "",
         bonding_curve_mode: bool = False,
+        trailing_profit_lock_pct: Decimal | None = None,
     ) -> OpenLot:
         if fill.effective_price <= Decimal(0):
             raise ValueError(
@@ -171,6 +174,8 @@ class PositionBook:
             status=LotStatus.OPEN,
             pool_address=pool_address or fill.pool_address,
             bonding_curve_mode=bonding_curve_mode,
+            peak_pnl=Decimal(0),
+            trailing_profit_lock_pct=trailing_profit_lock_pct,
         )
         key = (fill.chain.value, fill.token_address)
         self._lots[key].append(lot)
@@ -326,9 +331,13 @@ class PositionBook:
                 )
                 return None
 
-        # Track peak price
+        # Track peak price and peak unrealized PnL
         if current_price > lot.peak_price:
             lot.peak_price = current_price
+
+        current_pnl = (current_price - lot.entry_price) / lot.entry_price if lot.entry_price > 0 else Decimal(0)
+        if current_pnl > lot.peak_pnl:
+            lot.peak_pnl = current_pnl
 
         # Check pool reserves
         if current_pool_reserve_native is not None and current_pool_reserve_native > 0:
@@ -413,11 +422,27 @@ class PositionBook:
                 )
 
             # Trailing Stop:
-            # Activate when unrealized profit reaches +15%; lock stop at +8%. Trail by 5% as price makes new highs.
-            if gain_ratio >= Decimal("1.15"):
+            # 1. Trailing Stop Activation at +50% ROI:
+            # Once unrealized PnL reaches or exceeds +50%, lock in at least +30% profit and trail peak by dynamic drawdown
+            if gain_ratio >= Decimal("1.50") or current_pnl >= Decimal("0.50") or lot.peak_pnl >= Decimal("0.50"):
+                lot.trailing_stop_active = True
+                baseline_30 = (lot.entry_price * Decimal("1.30")).quantize(Decimal("1e-18"))
+                trail_price = (lot.peak_price * Decimal("0.88")).quantize(Decimal("1e-18"))
+                new_stop = max(baseline_30, trail_price)
+                if new_stop > lot.trailing_stop_price:
+                    lot.trailing_stop_price = new_stop
+                    logger.info(
+                        "Lot %s (%s) up +50%% ROI (peak PnL=%.2f%%) -> Trailing stop baseline locked (+30%% min), set to %s",
+                        lot.lot_id[:8],
+                        lot.token_address[:10],
+                        float(lot.peak_pnl * 100),
+                        lot.trailing_stop_price,
+                    )
+            elif gain_ratio >= Decimal("1.15"):
+                # 2. Activate when unrealized profit reaches +15%; lock stop at +8%. Trail by 5% as price makes new highs.
                 if not lot.trailing_stop_active:
                     lot.trailing_stop_active = True
-                    lot.trailing_stop_price = lot.entry_price * Decimal("1.08")
+                    lot.trailing_stop_price = (lot.entry_price * Decimal("1.08")).quantize(Decimal("1e-18"))
                     logger.info(
                         "Lot %s (%s) up +15%% (price=%s) -> Locking trailing stop at +8%% (%s)",
                         lot.lot_id[:8],
@@ -513,18 +538,23 @@ class PositionBook:
 
         # --- LEGACY AMM EXITS (FOR BACKWARD COMPATIBILITY) ---
         # 2. Trailing Stop-Loss Management
-        # Once up +50%, lock trailing stop at +20%
+        # Once up +50%, lock trailing stop at +20% (or lot.trailing_profit_lock_pct if set)
         if gain_ratio >= Decimal("1.50"):
+            lock_pct = lot.trailing_profit_lock_pct if lot.trailing_profit_lock_pct is not None else Decimal("1.20")
+            baseline = lot.entry_price * lock_pct
             if not lot.trailing_stop_active:
                 lot.trailing_stop_active = True
-                lot.trailing_stop_price = lot.entry_price * Decimal("1.20")
+                lot.trailing_stop_price = baseline
                 logger.info(
-                    "Lot %s (%s) up +50%% (price=%.4f native) -> Locking trailing stop-loss at +20%% (stop=%.4f native)",
+                    "Lot %s (%s) up +50%% (price=%.4f native) -> Locking trailing stop-loss at %s%% (stop=%.4f native)",
                     lot.lot_id[:8],
                     lot.token_address[:10],
                     float(current_price),
+                    float((lock_pct - 1) * 100),
                     float(lot.trailing_stop_price),
                 )
+            elif lot.trailing_stop_price < baseline:
+                lot.trailing_stop_price = baseline
 
         # Trailing stop triggered
         if lot.trailing_stop_active and current_price < lot.trailing_stop_price:

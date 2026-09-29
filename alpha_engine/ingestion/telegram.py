@@ -870,9 +870,27 @@ class TelegramIngester:
                 return "0.0"
             if f >= 1.0:
                 return f"{f:.4f}"
+            if f >= 0.01:
+                return f"{f:.4f}"
             if f >= 0.0001:
                 return f"{f:.6f}"
-            return f"{f:.3e}"
+            # Micro-prices: eliminate scientific notation (e.g. 2.865e-08)
+            # Format using subscript notation (e.g. $0.0₇2865 / $0.0₇2.8) or fixed decimals
+            s = f"{f:.14f}".rstrip("0")
+            if "." in s:
+                _, dec_part = s.split(".", 1)
+                leading_zeros = len(dec_part) - len(dec_part.lstrip("0"))
+                sig = dec_part.lstrip("0")
+                if len(sig) > 1:
+                    sig_fmt = f"{sig[0]}.{sig[1:5]}".rstrip("0").rstrip(".")
+                else:
+                    sig_fmt = sig
+                if leading_zeros >= 4:
+                    subscript_map = str.maketrans("0123456789", "₀₁₂₃₄₅₆₇₈₉")
+                    sub = str(leading_zeros).translate(subscript_map)
+                    return f"$0.0{sub}{sig_fmt}"
+                return f"{f:.8f}".rstrip("0")
+            return f"{f:.8f}".rstrip("0")
         except Exception:
             return str(val)[:10]
 
@@ -1038,26 +1056,52 @@ class TelegramIngester:
                 token_str = str(t.get("token_address", ""))
                 short_token = f"{token_str[:4]}..{token_str[-4:]}" if len(token_str) > 10 else token_str
                 chain_str = str(t.get("chain", "")).replace("ChainIdentifier.", "").replace("_mainnet", "")[:5]
-                entry_p = self._format_price(t.get("entry_price", 0))
-                curr_p = self._format_price(t.get("current_price", 0))
+                ep_raw = t.get("entry_price", 0)
+                cp_raw = t.get("current_price", 0)
+                entry_p = self._format_price(ep_raw)
+                curr_p = self._format_price(cp_raw)
+
+                # Dynamic PnL recalculation
                 pnl_f = float(t.get("unrealized_pnl_usd", 0.0))
-                usd_str = f"+${pnl_f:.2f}" if pnl_f > 0 else f"-${abs(pnl_f):.2f}" if pnl_f < 0 else "$0.00"
                 pnl_pct = float(t.get("unrealized_pnl_pct", 0.0))
-                if pnl_pct == 0.0 and t.get("entry_price") and t.get("current_price"):
-                    try:
-                        ep = float(t.get("entry_price"))
-                        cp = float(t.get("current_price"))
-                        if ep > 0:
-                            pnl_pct = ((cp - ep) / ep) * 100.0
-                    except Exception:
-                        pass
+                try:
+                    ep_float = float(ep_raw)
+                    cp_float = float(cp_raw)
+                    if ep_float > 0 and cp_float > 0:
+                        calc_pct = ((cp_float - ep_float) / ep_float) * 100.0
+                        if pnl_pct == 0.0 or abs(calc_pct - pnl_pct) > 0.01:
+                            pnl_pct = calc_pct
+                except Exception:
+                    pass
+
+                usd_str = f"+${pnl_f:.2f}" if pnl_f > 0 else f"-${abs(pnl_f):.2f}" if pnl_f < 0 else "$0.00"
                 pnl_pct_str = f"{pnl_pct:+.2f}%"
                 pnl_display = f"{pnl_pct_str} ({usd_str})" if pnl_f != 0.0 else pnl_pct_str
-                dur_s = int(float(t.get("duration_s", 0.0)))
+
+                # State indicator: 🟢 In Profit, 🔴 In Loss, ⚪ Stagnant/No Move
+                if pnl_pct > 0.05 or pnl_f > 0.01:
+                    state_icon = "🟢"
+                elif pnl_pct < -0.05 or pnl_f < -0.01:
+                    state_icon = "🔴"
+                else:
+                    state_icon = "⚪"
+
+                # Duration: exact elapsed time since fill
+                open_ts_ns = t.get("open_timestamp_ns")
+                if open_ts_ns and open_ts_ns > 0:
+                    dur_s = int((time.time_ns() - open_ts_ns) / 1e9)
+                else:
+                    dur_s = int(float(t.get("duration_s", 0.0)))
                 dur_str = f"{dur_s}s"
-                ts_status = str(t.get("trailing_stop_status", "OFF"))[:12]
-                open_lines.append(f"• {short_token} ({chain_str})")
-                open_lines.append(f"  ENTRY: {entry_p} | CURRENT: {curr_p}")
+
+                ts_status = str(t.get("trailing_stop_status", "OFF"))[:20]
+
+                # Position dollar valuation
+                pos_val = float(t.get("position_value_usd", 0.0))
+                val_str = f" | Value: ${pos_val:.3f}" if pos_val > 0 else ""
+
+                open_lines.append(f"• {state_icon} {short_token} ({chain_str})")
+                open_lines.append(f"  ENTRY: {entry_p} | CURRENT: {curr_p}{val_str}")
                 open_lines.append(f"  PNL %: {pnl_display} | DUR: {dur_str} | TRAILING: {ts_status}")
                 open_lines.append("-" * 40)
             if open_lines and open_lines[-1] == "-" * 40:

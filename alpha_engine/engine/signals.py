@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import logging
 import time
+from dataclasses import dataclass, field
 from decimal import Decimal
 from typing import Any, Optional
 
@@ -20,10 +21,177 @@ from alpha_engine.models.enums import (
     SignalSource,
     SignalStrength,
 )
-from alpha_engine.models.events import SignalEvent, SwapEvent
+from alpha_engine.models.events import RawSignalEvent, SignalEvent, SwapEvent
 from alpha_engine.models.state import PoolState, SecurityReport
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class StagedLaunch:
+    token_address: str
+    chain: ChainIdentifier
+    pool_address: str
+    t_0: float
+    initial_price: Decimal
+    latest_price: Decimal
+    min_price: Decimal
+    report: SecurityReport
+    raw_signal: RawSignalEvent
+    buy_count: int = 0
+    total_volume_native: Decimal = Decimal(0)
+    graduated: bool = False
+    dropped: bool = False
+    drop_reason: str = ""
+
+
+class PendingLaunchBuffer:
+    """
+    In-memory staging buffer for new token launches (e.g. Pump.fun mints).
+    Prevents instant mint sniping and enforces observation window & volume spike criteria:
+      - Minimum age = 90 seconds (1.5 min), Maximum age = 300 seconds (5 min) from mint creation (t_0).
+      - Sustained swap activity: minimum of 15 buy transactions.
+      - Confirmed volume spike: >= 15 SOL (or native) cumulative volume within window.
+      - Dump filter: drops immediately if price dumps > 30% from initial bonding curve within first 90s.
+    """
+
+    def __init__(
+        self,
+        min_age_s: float = 90.0,
+        max_age_s: float = 300.0,
+        min_buys: int = 15,
+        min_volume_native: Decimal = Decimal("15.0"),
+        max_dump_pct: Decimal = Decimal("0.30"),
+    ) -> None:
+        self.min_age_s = min_age_s
+        self.max_age_s = max_age_s
+        self.min_buys = min_buys
+        self.min_volume_native = min_volume_native
+        self.max_dump_pct = max_dump_pct
+        self._staged: dict[str, StagedLaunch] = {}
+
+    def add_launch(
+        self,
+        token_address: str,
+        chain: ChainIdentifier,
+        pool_address: str,
+        initial_price: Decimal,
+        report: SecurityReport,
+        raw_signal: RawSignalEvent,
+        t_0: float | None = None,
+    ) -> StagedLaunch:
+        now_s = t_0 if t_0 is not None else time.time()
+        init_p = initial_price if initial_price > 0 else Decimal("0.000000028")
+        staged = StagedLaunch(
+            token_address=token_address,
+            chain=chain,
+            pool_address=pool_address,
+            t_0=now_s,
+            initial_price=init_p,
+            latest_price=init_p,
+            min_price=init_p,
+            report=report,
+            raw_signal=raw_signal,
+        )
+        self._staged[token_address] = staged
+        logger.info(
+            "PendingLaunchBuffer: Staged launch for %s (t_0=%.1f, initial_price=%s)",
+            token_address[:10],
+            now_s,
+            staged.initial_price,
+        )
+        return staged
+
+    def is_staged(self, token_address: str) -> bool:
+        launch = self._staged.get(token_address)
+        return launch is not None and not launch.dropped and not launch.graduated
+
+    def get_staged(self, token_address: str) -> StagedLaunch | None:
+        return self._staged.get(token_address)
+
+    def record_swap(
+        self,
+        swap: SwapEvent,
+        pool: PoolState,
+        signal_generator: SignalGenerator,
+        current_time_s: float | None = None,
+    ) -> SignalEvent | None:
+        staged = self._staged.get(swap.token_out) or self._staged.get(swap.token_in)
+        if staged is None or staged.dropped or staged.graduated:
+            return None
+
+        now_s = current_time_s if current_time_s is not None else time.time()
+        age = now_s - staged.t_0
+
+        spot_price = pool.spot_price_native_per_token
+        if spot_price > 0:
+            staged.latest_price = spot_price
+            if staged.min_price <= 0 or spot_price < staged.min_price:
+                staged.min_price = spot_price
+
+        # Check buy activity: buyer spent native currency for token
+        is_buy = (swap.token_out == staged.token_address)
+        if is_buy:
+            staged.buy_count += 1
+            staged.total_volume_native += swap.amount_in
+        else:
+            staged.total_volume_native += swap.amount_out
+
+        # Dump filter: drops if price dumps > 30% from initial bonding curve within the first 90s
+        if staged.initial_price > Decimal(0):
+            dump_pct = (staged.initial_price - staged.latest_price) / staged.initial_price
+            if dump_pct > self.max_dump_pct and age <= self.min_age_s:
+                staged.dropped = True
+                staged.drop_reason = f"DUMP > {float(self.max_dump_pct*100):.0f}% ({float(dump_pct*100):.1f}%) within {age:.1f}s"
+                logger.warning(
+                    "PendingLaunchBuffer: DROPPING launch %s — %s (initial=%s, curr=%s)",
+                    staged.token_address[:10],
+                    staged.drop_reason,
+                    staged.initial_price,
+                    staged.latest_price,
+                )
+                return None
+
+        # Expired observation window (> 300s)
+        if age > self.max_age_s:
+            staged.dropped = True
+            staged.drop_reason = f"Observation window expired ({age:.1f}s > {self.max_age_s}s)"
+            logger.info("PendingLaunchBuffer: DROPPING launch %s — %s", staged.token_address[:10], staged.drop_reason)
+            return None
+
+        # Graduation criteria check:
+        # Age between 90s and 300s, buy count >= 15, volume >= 15 SOL, and not dumped > 30%
+        if age >= self.min_age_s:
+            if (
+                staged.buy_count >= self.min_buys
+                and staged.total_volume_native >= self.min_volume_native
+                and staged.latest_price >= staged.initial_price * (Decimal(1) - self.max_dump_pct)
+            ):
+                staged.graduated = True
+                logger.info(
+                    "PendingLaunchBuffer: GRADUATING launch %s! Age=%.1fs, buys=%d, vol=%s native",
+                    staged.token_address[:10],
+                    age,
+                    staged.buy_count,
+                    staged.total_volume_native,
+                )
+                return signal_generator.generate_launch_signal(
+                    staged=staged,
+                    pool=pool,
+                )
+
+        return None
+
+    def sweep_expired(self, current_time_s: float | None = None) -> list[str]:
+        now_s = current_time_s if current_time_s is not None else time.time()
+        expired: list[str] = []
+        for token, staged in list(self._staged.items()):
+            if not staged.dropped and not staged.graduated:
+                if (now_s - staged.t_0) > self.max_age_s:
+                    staged.dropped = True
+                    staged.drop_reason = f"Observation window expired ({(now_s - staged.t_0):.1f}s > {self.max_age_s}s)"
+                    expired.append(token)
+        return expired
 
 
 class SignalGenerator:
@@ -153,6 +321,29 @@ class SignalGenerator:
             strength=strength,
             alpha_score=alpha,
             source=source,
+        )
+
+    def generate_launch_signal(
+        self,
+        staged: StagedLaunch,
+        pool: PoolState,
+    ) -> SignalEvent:
+        """Generate a validated BUY SignalEvent from a graduated smart launch."""
+        tier_multiplier = 1.0 if staged.report.tier == SecurityTier.CLEAN else 0.5
+        alpha = min(1.0, max(0.0, 0.90 * tier_multiplier))
+        strength_str = classify_alpha_score(alpha)
+        strength = SignalStrength(strength_str)
+        return SignalEvent(
+            timestamp_ns=time.time_ns(),
+            chain=staged.chain,
+            pool_address=staged.pool_address or pool.pool_address,
+            token_address=staged.token_address,
+            suggested_side=OrderSide.BUY,
+            pool_state=pool,
+            security_report=staged.report,
+            strength=strength,
+            alpha_score=alpha,
+            source=SignalSource.PUMP_FUN_MINT,
         )
 
     def generate_sell_signal(
