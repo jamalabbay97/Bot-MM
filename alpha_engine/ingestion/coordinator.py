@@ -149,6 +149,7 @@ class IngestionCoordinator:
         x_stream_ingester: Optional[XStreamIngester] = None,
         x_bearer_token: Optional[str] = None,
         enable_x_stream: bool = False,
+        gatekeeper: Optional[Any] = None,
     ) -> None:
         self._queue: asyncio.Queue[
             SwapEvent | PoolStateUpdateEvent | RawSignalEvent | ShutdownSentinel
@@ -156,7 +157,7 @@ class IngestionCoordinator:
         self._signal_queue: asyncio.Queue[Any] = (
             signal_queue if signal_queue is not None else asyncio.Queue(maxsize=queue_maxsize)
         )
-
+        self._gatekeeper = gatekeeper
         self._dedup_cache = TokenTTLCache(ttl_seconds=60.0)
 
         self._evm = EVMIngester(
@@ -304,6 +305,15 @@ class IngestionCoordinator:
                     )
                     continue
 
+                # Fast-path check: drop if already in negative rejection cache
+                if self._gatekeeper is not None and getattr(self._gatekeeper, "is_rejected", None):
+                    if self._gatekeeper.is_rejected(item.token_address, item.chain) is True:
+                        logger.debug(
+                            "IngestionCoordinator: Dropping RawSignalEvent for cached rejected token %s",
+                            item.token_address[:10],
+                        )
+                        continue
+
                 # 2. In-memory sliding-window TTL cache deduplication (60s window)
                 if await self._dedup_cache.is_duplicate_or_add(item.token_address):
                     logger.debug(
@@ -311,5 +321,16 @@ class IngestionCoordinator:
                         item.token_address,
                     )
                     continue
+
+            elif isinstance(item, SwapEvent):
+                # Fast-path check: drop incoming swaps for tokens already rejected in negative cache
+                target_token = item.token_in if is_blacklisted_token(item.token_out, item.chain) else item.token_out
+                if self._gatekeeper is not None and getattr(self._gatekeeper, "is_rejected", None):
+                    if self._gatekeeper.is_rejected(target_token, item.chain) is True:
+                        logger.debug(
+                            "IngestionCoordinator: Dropping SwapEvent for cached rejected token %s with zero latency",
+                            target_token[:10],
+                        )
+                        continue
 
             return item

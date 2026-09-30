@@ -56,11 +56,11 @@ class PendingLaunchBuffer:
     """
     In-memory staging buffer for new token launches (e.g. Pump.fun mints).
     Prevents instant mint sniping and enforces observation window, volume, and anti-bundle criteria:
-      - Minimum age = 30 seconds, Maximum age = 120 seconds from mint creation (t_0).
-      - Sustained swap activity: minimum of 5 buy transactions.
-      - Confirmed volume spike: >= 3.0 SOL (or native) cumulative volume within window.
+      - Minimum age = 30 seconds, Maximum age = 90 seconds from mint creation (t_0).
+      - Sustained swap activity: minimum of 3 buy transactions.
+      - Confirmed volume spike: >= 0.8 SOL (or native) cumulative volume within window.
       - Dump filter: drops immediately if price dumps > 30% from initial bonding curve within first 30s.
-      - Unique Buyer Entropy: >= min_unique_signers (default 3) distinct buyer wallets.
+      - Unique Buyer Entropy: >= min_unique_signers (default 2) distinct buyer wallets.
       - Slot Clustering / Bundle Detection: drops if >= 60% of buys cluster in the exact same slot.
       - Curve Completion Delta: verifies volume growth spans across multiple blocks (>= min_blocks_span).
     """
@@ -68,11 +68,11 @@ class PendingLaunchBuffer:
     def __init__(
         self,
         min_age_s: float = 30.0,
-        max_age_s: float = 120.0,
-        min_buys: int = 5,
-        min_volume_native: Decimal = Decimal("3.0"),
+        max_age_s: float = 90.0,
+        min_buys: int = 3,
+        min_volume_native: Decimal = Decimal("0.8"),
         max_dump_pct: Decimal = Decimal("0.30"),
-        min_unique_signers: int = 3,
+        min_unique_signers: int = 2,
         slot_bundle_threshold: float = 0.60,
         min_blocks_span: int = 3,
     ) -> None:
@@ -176,43 +176,69 @@ class PendingLaunchBuffer:
                             self.min_unique_signers,
                         )
 
-    def record_swap(
+    def record_trade(
         self,
-        swap: SwapEvent,
-        pool: PoolState,
-        signal_generator: SignalGenerator,
+        token_address: str | SwapEvent,
+        sol_amount: Decimal | None = None,
+        buyer: str = "",
+        slot: int = 0,
+        is_buy: bool = True,
         current_time_s: float | None = None,
+        pool: PoolState | None = None,
+        signal_generator: SignalGenerator | None = None,
     ) -> SignalEvent | None:
-        staged = self._staged.get(swap.token_out) or self._staged.get(swap.token_in)
-        if staged is None or staged.dropped or staged.graduated:
-            return None
+        """
+        Record a trade (buy/sell) on the bonding curve or AMM for an actively staged token.
+        Correctly aggregates:
+          - Total SOL volume (native currency).
+          - Total buy count.
+          - Set of unique buyer addresses.
+        Checks slot clustering, dynamic telemetry, dump threshold, and graduation criteria.
+        Supports passing either a SwapEvent instance or explicit trade parameters.
+        """
+        if isinstance(token_address, SwapEvent):
+            swap = token_address
+            staged = self._staged.get(swap.token_out) or self._staged.get(swap.token_in)
+            if staged is None or staged.dropped or staged.graduated:
+                return None
+            tok_addr = staged.token_address
+            is_buy = (swap.token_out == tok_addr)
+            sol_amount = swap.amount_in if is_buy else swap.amount_out
+            buyer = swap.sender if is_buy else ""
+            slot = swap.block_number
+        else:
+            tok_addr = token_address
+            staged = self._staged.get(tok_addr)
+            if staged is None or staged.dropped or staged.graduated:
+                return None
+            if sol_amount is None:
+                sol_amount = Decimal("0")
 
         now_s = current_time_s if current_time_s is not None else time.time()
         age = now_s - staged.t_0
 
-        if not staged.pool_address and pool and pool.pool_address:
-            staged.pool_address = pool.pool_address
+        if pool is not None:
+            if not staged.pool_address and pool.pool_address:
+                staged.pool_address = pool.pool_address
+            spot_price = pool.spot_price_native_per_token
+            if spot_price > 0:
+                staged.latest_price = spot_price
+                if staged.min_price <= 0 or spot_price < staged.min_price:
+                    staged.min_price = spot_price
 
-        spot_price = pool.spot_price_native_per_token
-        if spot_price > 0:
-            staged.latest_price = spot_price
-            if staged.min_price <= 0 or spot_price < staged.min_price:
-                staged.min_price = spot_price
-
-        # Check buy activity: buyer spent native currency for token
-        is_buy = (swap.token_out == staged.token_address)
+        # Update volume and trade stats
+        staged.total_volume_native += sol_amount
         if is_buy:
             staged.buy_count += 1
-            staged.total_volume_native += swap.amount_in
-            if swap.sender:
-                staged.unique_buyers.add(swap.sender)
-            staged.slot_buy_counts[swap.block_number] += 1
-            staged.buy_blocks.add(swap.block_number)
-            staged.buy_volumes.append(swap.amount_in)
+            if buyer:
+                staged.unique_buyers.add(buyer)
+            if slot > 0:
+                staged.slot_buy_counts[slot] += 1
+                staged.buy_blocks.add(slot)
+            staged.buy_volumes.append(sol_amount)
 
             # Slot Clustering / Bundle Detection:
-            # If >= 60% of initial buys occur within the exact same slot, flag DEV_BUNDLED and reject
-            if staged.buy_count >= 5:
+            if staged.buy_count >= min(self.min_buys, 5):
                 max_slot_buys = max(staged.slot_buy_counts.values()) if staged.slot_buy_counts else 0
                 slot_cluster_pct = max_slot_buys / staged.buy_count
                 if slot_cluster_pct >= self.slot_bundle_threshold:
@@ -220,7 +246,7 @@ class PendingLaunchBuffer:
                     staged.dropped = True
                     staged.drop_reason = (
                         f"DEV_BUNDLED: Slot clustering {slot_cluster_pct:.1%} >= {self.slot_bundle_threshold:.1%} "
-                        f"({max_slot_buys}/{staged.buy_count} in block {swap.block_number})"
+                        f"({max_slot_buys}/{staged.buy_count} in block {slot})"
                     )
                     logger.warning(
                         "PendingLaunchBuffer: DROPPING launch %s — %s (Jito bundle footprint)",
@@ -228,8 +254,6 @@ class PendingLaunchBuffer:
                         staged.drop_reason,
                     )
                     return None
-        else:
-            staged.total_volume_native += swap.amount_out
 
         # Telemetry: emit countdown and progress logging every 15 seconds
         if age <= self.max_age_s and (staged.last_telemetry_s == 0.0 or (now_s - staged.last_telemetry_s) >= 15.0):
@@ -248,7 +272,7 @@ class PendingLaunchBuffer:
                 self.min_unique_signers,
             )
 
-        # Dump filter: drops if price dumps > 30% from initial bonding curve within the first min_age_s
+        # Dump filter: drops if price dumps > max_dump_pct from initial bonding curve within the first min_age_s
         if staged.initial_price > Decimal(0):
             dump_pct = (staged.initial_price - staged.latest_price) / staged.initial_price
             if dump_pct > self.max_dump_pct and age <= self.min_age_s:
@@ -273,9 +297,6 @@ class PendingLaunchBuffer:
             return None
 
         # Graduation criteria check:
-        # Age between min_age_s and max_age_s, buy count >= min_buys, volume >= min_volume_native,
-        # not dumped > max_dump_pct, unique buyers >= min_unique_signers,
-        # slot clustering < slot_bundle_threshold, and block span >= min_blocks_span
         if age >= self.min_age_s and not staged.is_dev_bundled:
             max_slot_buys = max(staged.slot_buy_counts.values()) if staged.slot_buy_counts else 0
             slot_cluster_pct = (max_slot_buys / staged.buy_count) if staged.buy_count > 0 else 0.0
@@ -298,12 +319,27 @@ class PendingLaunchBuffer:
                     len(staged.buy_blocks),
                     staged.total_volume_native,
                 )
-                return signal_generator.generate_launch_signal(
-                    staged=staged,
-                    pool=pool,
-                )
+                if signal_generator is not None and pool is not None:
+                    return signal_generator.generate_launch_signal(
+                        staged=staged,
+                        pool=pool,
+                    )
 
         return None
+
+    def record_swap(
+        self,
+        swap: SwapEvent,
+        pool: PoolState,
+        signal_generator: SignalGenerator,
+        current_time_s: float | None = None,
+    ) -> SignalEvent | None:
+        return self.record_trade(
+            token_address=swap,
+            pool=pool,
+            signal_generator=signal_generator,
+            current_time_s=current_time_s,
+        )
 
     def sweep_expired(self, current_time_s: float | None = None) -> list[str]:
         now_s = current_time_s if current_time_s is not None else time.time()

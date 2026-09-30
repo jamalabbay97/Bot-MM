@@ -23,6 +23,7 @@ from alpha_engine.ingestion.decoders import (
     SvmPoolMeta,
     _normalise,
     _parse_pump_fun_logs,
+    _parse_pump_fun_trade_logs,
     _parse_raydium_initialize2_logs,
     _parse_raydium_log_line,
 )
@@ -183,8 +184,10 @@ class SVMIngester:
             self._ws_url,
             ssl=ssl_ctx,
             ping_interval=20,
-            ping_timeout=15,
+            ping_timeout=60,
             close_timeout=10,
+            max_size=10 * 1024 * 1024,
+            max_queue=4096,
         ) as ws:
             logger.info("SVM WebSocket connected to Helius")
             self._backoff.reset()
@@ -192,6 +195,7 @@ class SVMIngester:
 
             req_id = 1
             pending_ids: dict[int, str] = {}
+            confirmed = 0
 
             raw_targets = list(self._pool_registry.keys())
             if PUMP_FUN_PROGRAM_ID not in raw_targets:
@@ -214,91 +218,182 @@ class SVMIngester:
             if not valid_targets:
                 valid_targets = [PUMP_FUN_PROGRAM_ID, RAYDIUM_AMM_PROGRAM_ID]
 
-            for target_pubkey in valid_targets:
-                msg = json.dumps({
-                    "jsonrpc": "2.0",
-                    "id": req_id,
-                    "method": "logsSubscribe",
-                    "params": [
-                        {"mentions": [target_pubkey]},
-                        {"commitment": "confirmed"},
-                    ],
-                })
-                await self._limiter.helius.acquire(cost=1.0)
-                await ws.send(msg)
-                pending_ids[req_id] = target_pubkey
-                req_id += 1
+            expected = len(valid_targets)
+            batch_size = 20
 
-            confirmed = 0
-            expected = len(pending_ids)
-            while confirmed < expected:
+            # Throttled Subscription Batching: chunks of 20 pools with 0.08s pause
+            async def _send_subscriptions() -> None:
+                nonlocal req_id
                 try:
-                    raw = await asyncio.wait_for(ws.recv(), timeout=10.0)
-                except asyncio.TimeoutError:
-                    logger.warning(
-                        "SVM subscription confirmation timeout after %d/%d pools",
-                        confirmed, expected,
-                    )
-                    break
-                try:
-                    resp: dict[str, Any] = json.loads(raw)
-                except json.JSONDecodeError:
-                    continue
+                    for i in range(0, len(valid_targets), batch_size):
+                        if not self._running:
+                            break
+                        batch = valid_targets[i : i + batch_size]
+                        for target_pubkey in batch:
+                            msg = json.dumps({
+                                "jsonrpc": "2.0",
+                                "id": req_id,
+                                "method": "logsSubscribe",
+                                "params": [
+                                    {"mentions": [target_pubkey]},
+                                    {"commitment": "confirmed"},
+                                ],
+                            })
+                            await ws.send(msg)
+                            pending_ids[req_id] = target_pubkey
+                            req_id += 1
+                        if i + batch_size < len(valid_targets):
+                            await asyncio.sleep(0.08)
+                except asyncio.CancelledError:
+                    pass
+                except Exception as exc:
+                    logger.warning("SVM subscription sender task encountered error: %s", exc)
 
-                resp_id = resp.get("id")
-                sub_id = resp.get("result")
-                if resp_id in pending_ids and isinstance(sub_id, int):
-                    pool_key = pending_ids[resp_id]
-                    self._sub_to_pool[sub_id] = pool_key
-                    confirmed += 1
-                    logger.info(
-                        "SVM pool %s…%s subscribed (sub_id=%d)",
-                        pool_key[:6], pool_key[-4:], sub_id,
-                    )
-                elif "error" in resp:
-                    logger.error(
-                        "SVM logsSubscribe error for req_id=%s: %s",
-                        resp_id, resp["error"],
-                    )
-                    confirmed += 1
+            sub_task = asyncio.create_task(_send_subscriptions())
 
-            logger.info(
-                "SVM subscribed to %d/%d pool(s).",
-                len(self._sub_to_pool), expected,
-            )
+            try:
+                async for raw_msg in ws:
+                    if not self._running:
+                        return
+                    try:
+                        msg: dict[str, Any] = json.loads(raw_msg)
+                    except json.JSONDecodeError:
+                        continue
 
-            async for raw_msg in ws:
-                if not self._running:
-                    return
-                try:
-                    msg: dict[str, Any] = json.loads(raw_msg)
-                except json.JSONDecodeError:
-                    continue
+                    # Handle subscription confirmation responses
+                    resp_id = msg.get("id")
+                    if resp_id in pending_ids:
+                        sub_id = msg.get("result")
+                        if isinstance(sub_id, int):
+                            pool_key = pending_ids[resp_id]
+                            self._sub_to_pool[sub_id] = pool_key
+                            confirmed += 1
+                            logger.debug(
+                                "SVM pool %s…%s subscribed (sub_id=%d, confirmed=%d/%d)",
+                                pool_key[:6], pool_key[-4:], sub_id, confirmed, expected,
+                            )
+                            if confirmed == expected:
+                                logger.info(
+                                    "SVM subscribed to all %d pool(s).",
+                                    confirmed,
+                                )
+                        elif "error" in msg:
+                            logger.error(
+                                "SVM logsSubscribe error for req_id=%s: %s",
+                                resp_id, msg["error"],
+                            )
+                            confirmed += 1
+                        continue
 
-                if msg.get("method") != "logsNotification":
-                    continue
+                    if msg.get("method") != "logsNotification":
+                        continue
 
-                params = msg.get("params", {})
-                sub_id = params.get("subscription")
-                pool_key = self._sub_to_pool.get(sub_id)
-                if pool_key is None:
-                    continue
+                    params = msg.get("params", {})
+                    sub_id = params.get("subscription")
+                    pool_key = self._sub_to_pool.get(sub_id)
+                    if pool_key is None:
+                        continue
 
-                value = params.get("result", {}).get("value", {})
-                if not value or value.get("err") is not None:
-                    continue
+                    result_ctx = params.get("result", {})
+                    slot: int = result_ctx.get("context", {}).get("slot", 0)
+                    value = result_ctx.get("value", {})
+                    if not value or value.get("err") is not None:
+                        continue
 
-                tx_sig: str = value.get("signature", "")
-                logs: list[str] = value.get("logs", [])
+                    tx_sig: str = value.get("signature", "")
+                    logs: list[str] = value.get("logs", [])
 
-                # 1. Check for Raydium Swap
-                event = self._parse_raydium_transaction(tx_sig, logs, pool_key)
-                if event is not None:
-                    await self._queue.put(event)
-                    logger.debug(
-                        "SVM Swap queued: pool=%s sig=%s",
-                        pool_key[:10], tx_sig[:12],
-                    )
+                    # 1. Check for Pump.fun Trade (Buy / Swap / Sell)
+                    pump_trade = _parse_pump_fun_trade_logs(logs, tx_sig, slot=slot)
+                    if pump_trade is not None:
+                        mint_addr = sanitize_solana_pubkey(pump_trade.get("mint"))
+                        buyer_addr = sanitize_solana_pubkey(pump_trade.get("buyer")) or (tx_sig[:44] if len(tx_sig) >= 32 else "PumpBuyer111111111111111111111111111111111")
+                        if (
+                            mint_addr
+                            and mint_addr not in SOLANA_SYSTEM_PROGRAM_IDS
+                            and not mint_addr.startswith("11111111")
+                        ):
+                            sol_mint = "So11111111111111111111111111111111111111112"
+                            is_buy = pump_trade.get("is_buy", True)
+                            sol_amt = pump_trade.get("sol_amount", Decimal("0"))
+                            tok_amt = pump_trade.get("token_amount", Decimal("0"))
+
+                            curve_addr = mint_addr
+                            if pool_key in self._pool_registry and pool_key != PUMP_FUN_PROGRAM_ID:
+                                curve_addr = pool_key
+                            else:
+                                for c_addr, meta in self._pool_registry.items():
+                                    if meta[0] == mint_addr:
+                                        curve_addr = c_addr
+                                        break
+
+                            if is_buy:
+                                token_in = sol_mint
+                                token_out = mint_addr
+                                amt_in = sol_amt
+                                amt_out = tok_amt
+                            else:
+                                token_in = mint_addr
+                                token_out = sol_mint
+                                amt_in = tok_amt
+                                amt_out = sol_amt
+
+                            if amt_in > Decimal(0) and amt_out > Decimal(0):
+                                swap_ev = SwapEvent(
+                                    timestamp_ns=time.time_ns(),
+                                    block_number=slot,
+                                    chain=ChainIdentifier.SOLANA_MAINNET,
+                                    pool_address=curve_addr,
+                                    token_in=token_in,
+                                    token_out=token_out,
+                                    amount_in=amt_in,
+                                    amount_out=amt_out,
+                                    sender=buyer_addr,
+                                    tx_hash=tx_sig,
+                                    log_index=None,
+                                )
+                                await self._queue.put(swap_ev)
+                                logger.info(
+                                    "SVM Pump.fun trade queued: %s mint=%s sol=%s buyer=%s slot=%d",
+                                    "BUY" if is_buy else "SELL",
+                                    mint_addr[:10],
+                                    sol_amt,
+                                    buyer_addr[:8],
+                                    slot,
+                                )
+
+                            v_sol = pump_trade.get("virtual_sol_reserves", Decimal("0"))
+                            v_tok = pump_trade.get("virtual_token_reserves", Decimal("0"))
+                            if v_sol > Decimal(0) and v_tok > Decimal(0):
+                                pool_state = PoolState(
+                                    pool_address=curve_addr,
+                                    chain=ChainIdentifier.SOLANA_MAINNET,
+                                    token_address=mint_addr,
+                                    native_reserve=v_sol,
+                                    token_reserve=v_tok,
+                                    fee_numerator=10,
+                                    fee_denominator=1000,
+                                    last_updated_block=slot,
+                                    token_decimals=6,
+                                    native_decimals=9,
+                                )
+                                await self._queue.put(
+                                    PoolStateUpdateEvent(
+                                        timestamp_ns=time.time_ns(),
+                                        chain=ChainIdentifier.SOLANA_MAINNET,
+                                        pool_address=curve_addr,
+                                        new_pool_state=pool_state,
+                                    )
+                                )
+
+                    # 2. Check for Raydium Swap
+                    event = self._parse_raydium_transaction(tx_sig, logs, pool_key)
+                    if event is not None:
+                        await self._queue.put(event)
+                        logger.debug(
+                            "SVM Swap queued: pool=%s sig=%s",
+                            pool_key[:10], tx_sig[:12],
+                        )
 
                 # 2. Check for Pump.fun Mint / Bonding Curve Creation
                 pump_info = _parse_pump_fun_logs(logs, tx_sig)
@@ -369,6 +464,13 @@ class SVMIngester:
                             )
                         )
                         logger.info("SVM Raydium CreatePool detected: %s", pool_addr[:10])
+            finally:
+                if not sub_task.done():
+                    sub_task.cancel()
+                    try:
+                        await sub_task
+                    except (asyncio.CancelledError, Exception):
+                        pass
 
 
     def _parse_raydium_transaction(

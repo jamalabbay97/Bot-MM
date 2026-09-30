@@ -31,26 +31,31 @@ def test_pending_launch_buffer_default_parameters():
     """Verify PendingLaunchBuffer default thresholds are calibrated for paper trading."""
     buffer = PendingLaunchBuffer()
     assert buffer.min_age_s == 30.0
-    assert buffer.max_age_s == 120.0
-    assert buffer.min_volume_native == Decimal("3.0")
-    assert buffer.min_buys == 5
-    assert buffer.min_unique_signers == 3
+    assert buffer.max_age_s == 90.0
+    assert buffer.min_volume_native == Decimal("0.8")
+    assert buffer.min_buys == 3
+    assert buffer.min_unique_signers == 2
 
 
 def test_engine_config_buffer_parameters():
     """Verify EngineConfig loads and exposes relaxed buffer parameters with backward compatibility."""
     cfg = EngineConfig()
     assert cfg.observation_window_min_sec == 30.0
-    assert cfg.observation_window_max_sec == 120.0
-    assert cfg.buffer_target_volume_sol == Decimal("3.0")
-    assert cfg.buffer_min_buys == 5
-    assert cfg.buffer_min_unique_buyers == 3
-    assert cfg.min_unique_buyers == 3
+    assert cfg.observation_window_max_sec == 90.0
+    assert cfg.buffer_target_volume_sol == Decimal("0.8")
+    assert cfg.buffer_min_buys == 3
+    assert cfg.buffer_min_unique_buyers == 2
+    assert cfg.min_unique_buyers == 2
+    assert cfg.min_buyers == 2
+    assert cfg.min_buys == 3
+    assert cfg.target_vol_sol == Decimal("0.8")
+    assert cfg.observation_window_sec == 90.0
 
     # Backward compatibility: setting min_unique_buyers works
     cfg_legacy = EngineConfig(min_unique_buyers=10)
     assert cfg_legacy.buffer_min_unique_buyers == 10
     assert cfg_legacy.min_unique_buyers == 10
+    assert cfg_legacy.min_buyers == 10
 
 
 def test_buffer_telemetry_countdown_and_progress_logging(caplog):
@@ -102,14 +107,14 @@ def test_buffer_telemetry_countdown_and_progress_logging(caplog):
         # 1. At t_0 + 15s: periodic check_telemetry logs progress
         buffer.check_telemetry(current_time_s=t_0 + 15.0, interval_s=15.0)
         assert f"Token [{token[:10]}]: 15s elapsed" in caplog.text
-        assert "Vol: 0.0/3.0 SOL" in caplog.text
-        assert "Buys: 0/5" in caplog.text
-        assert "Buyers: 0/3" in caplog.text
+        assert "Vol: 0.0/0.8 SOL" in caplog.text
+        assert "Buys: 0/3" in caplog.text
+        assert "Buyers: 0/2" in caplog.text
 
         caplog.clear()
 
-        # 2. Add buy transactions to simulate progress (3 unique buyers, 4 buys totaling 2.1 SOL)
-        for i in range(4):
+        # 2. Add buy transactions to simulate progress (2 unique buyers, 2 buys totaling 0.4 SOL < 0.8 SOL target)
+        for i in range(2):
             swap = SwapEvent(
                 timestamp_ns=int((t_0 + 20.0 + i * 5.0) * 1e9),
                 block_number=10 + i,
@@ -117,9 +122,9 @@ def test_buffer_telemetry_countdown_and_progress_logging(caplog):
                 pool_address=pool_addr,
                 token_in="So11111111111111111111111111111111111111112",
                 token_out=token,
-                amount_in=Decimal("0.525"),  # 4 * 0.525 = 2.1 SOL
-                amount_out=Decimal("10000000"),
-                sender=f"Buyer{i % 3:028d}",  # 3 unique buyers
+                amount_in=Decimal("0.2"),  # 2 * 0.2 = 0.4 SOL
+                amount_out=Decimal("5000000"),
+                sender=f"Buyer{i:028d}",  # 2 unique buyers
                 tx_hash=f"tx_{i:030d}",
             )
             buffer.record_swap(swap, pool, sig_gen, current_time_s=t_0 + 20.0 + i * 5.0)
@@ -129,9 +134,9 @@ def test_buffer_telemetry_countdown_and_progress_logging(caplog):
         # Check telemetry output at 45s
         buffer.check_telemetry(current_time_s=t_0 + 45.0, interval_s=15.0)
         assert f"Token [{token[:10]}]: 45s elapsed" in caplog.text
-        assert "Vol: 2.1/3.0 SOL" in caplog.text
-        assert "Buys: 4/5" in caplog.text
-        assert "Buyers: 3/3" in caplog.text
+        assert "Vol: 0.4/0.8 SOL" in caplog.text
+        assert "Buys: 2/3" in caplog.text
+        assert "Buyers: 2/2" in caplog.text
 
 
 def test_buffer_exact_condition_logged_on_expiration(caplog):

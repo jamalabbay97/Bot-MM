@@ -99,13 +99,13 @@ class PaperTradingEngine:
         self._signal_gen = SignalGenerator(hold_seconds=300.0)
         doh_servers = getattr(config, "dns_doh_servers", None)
         patch_dns_resolvers(servers=doh_servers)
-        min_buyers = getattr(config, "buffer_min_unique_buyers", getattr(config, "min_unique_buyers", 3))
+        min_buyers = getattr(config, "buffer_min_unique_buyers", getattr(config, "min_unique_buyers", 2))
         bundle_thresh = getattr(config, "slot_bundle_threshold", 0.60)
         self._pending_launch_buffer = PendingLaunchBuffer(
             min_age_s=getattr(config, "observation_window_min_sec", 30.0),
-            max_age_s=getattr(config, "observation_window_max_sec", 120.0),
-            min_buys=getattr(config, "buffer_min_buys", 5),
-            min_volume_native=getattr(config, "buffer_target_volume_sol", Decimal("3.0")),
+            max_age_s=getattr(config, "observation_window_max_sec", 90.0),
+            min_buys=getattr(config, "buffer_min_buys", 3),
+            min_volume_native=getattr(config, "buffer_target_volume_sol", Decimal("0.8")),
             min_unique_signers=min_buyers,
             slot_bundle_threshold=bundle_thresh,
         )
@@ -223,10 +223,17 @@ class PaperTradingEngine:
         if not mint_ok:
             reasons.append("Mint authority active")
         top10 = float(getattr(report, "top10_concentration", 0.0) or 0.0)
-        if top10 > 0.50:
-            reasons.append(f"Top 10 concentration > 50% ({top10 * 100:.1f}%)")
-        elif top10 > 0.20:
-            reasons.append(f"Top 10 concentration > 20% ({top10 * 100:.1f}%)")
+        is_pump = getattr(report, "is_pump_fun", False) or (
+            hasattr(report, "token_address") and str(report.token_address).lower().endswith("pump")
+        )
+        if is_pump:
+            if top10 > 0.65:
+                reasons.append(f"Top 10 concentration > 65% ({top10 * 100:.1f}%)")
+        else:
+            if top10 > 0.50:
+                reasons.append(f"Top 10 concentration > 50% ({top10 * 100:.1f}%)")
+            elif top10 > 0.20:
+                reasons.append(f"Top 10 concentration > 20% ({top10 * 100:.1f}%)")
         lp_burned = float(getattr(report, "lp_burned_ratio", 1.0) or 0.0)
         if lp_burned < 0.90:
             reasons.append(f"LP not burned or locked ({lp_burned * 100:.1f}% < 90%)")
@@ -472,40 +479,30 @@ class PaperTradingEngine:
 
             swap: SwapEvent = item
 
-            if is_blacklisted_token(swap.token_out, swap.chain):
+            out_is_native = is_blacklisted_token(swap.token_out, swap.chain)
+            in_is_native = is_blacklisted_token(swap.token_in, swap.chain)
+
+            # Drop only if both sides are blacklisted/native
+            if out_is_native and in_is_native:
                 self._record_gatekeeper_eval(swap.token_out, swap.chain, "Blacklisted native/wrapped token", passed=False)
+                continue
+
+            target_token = swap.token_in if out_is_native else swap.token_out
+
+            # Fast-path check: immediately drop swap if token is in negative rejection cache
+            if gk.is_rejected(target_token, swap.chain) is True:
                 continue
 
             pool = self._pool_registry.get(swap.pool_address)
             if pool is None:
+                pool = self._pool_registry.get(target_token)
+            if pool is None and (self._pending_launch_buffer.is_staged(target_token) or self.is_position_open(target_token, swap.chain)):
+                pool = self.get_or_create_initial_pool_state(swap.chain, target_token, swap.pool_address)
+
+            if pool is None:
                 logger.debug(
                     "Unknown pool %s — skipping until state is seeded.",
                     swap.pool_address[:10],
-                )
-                continue
-
-            try:
-                report = await gk.screen_token(
-                    token_address=swap.token_out,
-                    chain=swap.chain,
-                    pool_address=swap.pool_address,
-                )
-            except Exception as exc:  # noqa: BLE001
-                logger.error(
-                    "Security gatekeeper raised for %s: %s",
-                    swap.token_out[:10],
-                    exc,
-                )
-                continue
-
-            reason = self._extract_gatekeeper_rejection_reason(report)
-            self._record_gatekeeper_eval(swap.token_out, swap.chain, reason, passed=report.passes_hard_gates)
-
-            if not report.passes_hard_gates:
-                logger.info(
-                    "Token %s rejected by gatekeeper (reason=%s).",
-                    swap.token_out[:10],
-                    reason,
                 )
                 continue
 
@@ -514,8 +511,12 @@ class PaperTradingEngine:
             # Check dynamic exits (TP ladder, trailing stop-loss, emergency liquidity drain)
             await self._check_dynamic_exits_for_swap(swap, updated_pool)
 
-            # Check smart launch buffer graduations for staged tokens
-            launch_signal = self._pending_launch_buffer.record_swap(swap, updated_pool, self._signal_gen)
+            # Route trade directly to launch buffer; incoming swap events bypass gatekeeper screening
+            launch_signal = self._pending_launch_buffer.record_trade(
+                swap,
+                pool=updated_pool,
+                signal_generator=self._signal_gen,
+            )
             if launch_signal is not None:
                 if not self.is_position_open(launch_signal.token_address, launch_signal.chain):
                     if self._ledger:
@@ -529,6 +530,10 @@ class PaperTradingEngine:
                     )
                 continue
 
+            # Sells do not trigger buy signals
+            if out_is_native:
+                continue
+
             # Deduplication check for BUY
             if self.is_position_open(swap.token_out, swap.chain):
                 logger.debug("Position already open for token %s; skipping buy signal from swap", swap.token_out[:10])
@@ -539,22 +544,25 @@ class PaperTradingEngine:
                 logger.debug("Token %s staged in PendingLaunchBuffer; awaiting graduation before BUY signal", swap.token_out[:10])
                 continue
 
-            signal_event = self._signal_gen.generate_buy_signal(swap, updated_pool, report)
-            if signal_event is None:
-                continue
+            staged = self._pending_launch_buffer.get_staged(target_token)
+            report = staged.report if staged is not None else None
+            if report is not None and report.passes_hard_gates:
+                signal_event = self._signal_gen.generate_buy_signal(swap, updated_pool, report)
+                if signal_event is None:
+                    continue
 
-            if self._ledger:
-                await self._ledger.record_signal(signal_event)
+                if self._ledger:
+                    await self._ledger.record_signal(signal_event)
 
-            await self._signal_q.put(signal_event)
-            logger.info(
-                "Signal [%s] generated: %s %s alpha=%.3f strength=%s",
-                signal_event.signal_id[:8],
-                signal_event.suggested_side.value.upper(),
-                signal_event.token_address[:10],
-                signal_event.alpha_score,
-                signal_event.strength.value,
-            )
+                await self._signal_q.put(signal_event)
+                logger.info(
+                    "Signal [%s] generated: %s %s alpha=%.3f strength=%s",
+                    signal_event.signal_id[:8],
+                    signal_event.suggested_side.value.upper(),
+                    signal_event.token_address[:10],
+                    signal_event.alpha_score,
+                    signal_event.strength.value,
+                )
 
     async def _check_dynamic_exits_for_swap(self, swap: SwapEvent, pool: PoolState) -> None:
         executor = self._executor
@@ -1387,6 +1395,8 @@ class PaperTradingEngine:
                 weth_address=cfg.weth_address,
                 enable_tier2=True,
                 solana_rpc_url=cfg.solana_rpc_http or cfg.helius_http_url,
+                negative_cache_ttl_s=getattr(cfg, "gatekeeper_negative_cache_ttl_s", 300.0),
+                negative_cache_maxsize=getattr(cfg, "gatekeeper_negative_cache_maxsize", 5000),
             )
 
             self._executor = PaperExecutor(
@@ -1410,6 +1420,7 @@ class PaperTradingEngine:
                 telegram_admin_ids=cfg.telegram_admin_ids,
                 db_path=cfg.db_path,
                 status_provider=self._get_engine_status,
+                gatekeeper=self._gatekeeper,
             )
 
             async with coordinator:

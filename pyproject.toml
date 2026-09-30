@@ -31,3 +31,7 @@ alpha-engine = "alpha_engine.cli:main"
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["alpha_engine*"]
+
+[tool.pytest.ini_options]
+addopts = "-p anyio"
+

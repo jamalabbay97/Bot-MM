@@ -243,31 +243,60 @@ class EngineConfig(BaseSettings):
         description="Minimum observation window in seconds before graduating staged launch in PendingLaunchBuffer (default: 30s)",
     )
     observation_window_max_sec: float = Field(
-        default=120.0,
+        default=90.0,
         ge=5.0,
-        description="Maximum observation window in seconds before dropping staged launch in PendingLaunchBuffer (default: 120s)",
+        validation_alias=AliasChoices("observation_window_max_sec", "observation_window_sec"),
+        description="Maximum observation window in seconds before dropping staged launch in PendingLaunchBuffer (default: 90s)",
     )
     buffer_target_volume_sol: Decimal = Field(
-        default=Decimal("3.0"),
+        default=Decimal("0.8"),
         gt=Decimal(0),
-        description="Target cumulative native volume in SOL to graduate staged launch (default: 3.0 SOL)",
+        validation_alias=AliasChoices("buffer_target_volume_sol", "target_vol_sol"),
+        description="Target cumulative native volume in SOL to graduate staged launch (default: 0.8 SOL)",
     )
     buffer_min_buys: int = Field(
-        default=5,
-        ge=1,
-        description="Minimum buy transactions required to graduate staged launch in PendingLaunchBuffer (default: 5)",
-    )
-    buffer_min_unique_buyers: int = Field(
         default=3,
         ge=1,
-        validation_alias=AliasChoices("buffer_min_unique_buyers", "min_unique_buyers"),
-        description="Minimum distinct buyers required to graduate a staged launch in PendingLaunchBuffer (default: 3)",
+        validation_alias=AliasChoices("buffer_min_buys", "min_buys"),
+        description="Minimum buy transactions required to graduate staged launch in PendingLaunchBuffer (default: 3)",
+    )
+    buffer_min_unique_buyers: int = Field(
+        default=2,
+        ge=1,
+        validation_alias=AliasChoices("buffer_min_unique_buyers", "min_unique_buyers", "min_buyers"),
+        description="Minimum distinct buyers required to graduate a staged launch in PendingLaunchBuffer (default: 2)",
     )
     slot_bundle_threshold: float = Field(
         default=0.60,
         ge=0.0,
         le=1.0,
         description="Max allowed fraction of initial buys in the same slot before flagging DEV_BUNDLED",
+    )
+
+    # -------------------------------------------------------------------------
+    # 5b. Security Gatekeeper & Negative Cache Settings
+    # -------------------------------------------------------------------------
+    max_top10_concentration: float = Field(
+        default=0.20,
+        ge=0.0,
+        le=1.0,
+        description="Max Top 10 holder concentration for standard tokens (default: 20%)",
+    )
+    max_pump_fun_top10_concentration: float = Field(
+        default=0.65,
+        ge=0.0,
+        le=1.0,
+        description="Max Top 10 holder concentration for Pump.fun tokens excluding bonding curve (default: 65%)",
+    )
+    gatekeeper_negative_cache_ttl_s: float = Field(
+        default=300.0,
+        gt=0.0,
+        description="TTL for gatekeeper negative rejection cache in seconds (default: 300s)",
+    )
+    gatekeeper_negative_cache_maxsize: int = Field(
+        default=5000,
+        ge=100,
+        description="Max capacity for gatekeeper negative cache (default: 5000 entries)",
     )
 
     # -------------------------------------------------------------------------
@@ -428,6 +457,26 @@ class EngineConfig(BaseSettings):
     def min_unique_buyers(self) -> int:
         """Backward compatibility alias for buffer_min_unique_buyers."""
         return self.buffer_min_unique_buyers
+
+    @property
+    def min_buyers(self) -> int:
+        """Alias for buffer_min_unique_buyers."""
+        return self.buffer_min_unique_buyers
+
+    @property
+    def min_buys(self) -> int:
+        """Alias for buffer_min_buys."""
+        return self.buffer_min_buys
+
+    @property
+    def target_vol_sol(self) -> Decimal:
+        """Alias for buffer_target_volume_sol."""
+        return self.buffer_target_volume_sol
+
+    @property
+    def observation_window_sec(self) -> float:
+        """Alias for observation_window_max_sec."""
+        return self.observation_window_max_sec
 
     @property
     def initial_equity_usd(self) -> Decimal:

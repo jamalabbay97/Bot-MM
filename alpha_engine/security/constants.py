@@ -22,9 +22,48 @@ _MAX_SELL_TAX_BPS = 500          # 5%
 _MAX_BUY_TAX_BPS = 500           # 5%
 _MIN_LP_BURNED_RATIO = 0.90      # 90%
 _MAX_TOP10_CONCENTRATION = 0.20  # 20%
+_MAX_PUMP_FUN_TOP10_CONCENTRATION = 0.65  # 65% for Pump.fun tokens
 _API_TIMEOUT_S = 1.5
 _MIN_SELL_RETURN_RATIO = Decimal("0.90")   # Tier 2 threshold
 MIN_LOCK_DURATION_SECONDS = 180 * 86400    # 6 months
+
+PUMP_FUN_PROGRAM_ID: str = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"
+SPL_TOKEN_PROGRAM_ID: str = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
+SPL_ATA_PROGRAM_ID: str = "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL"
+
+
+def is_pump_fun_token(token_address: str, chain: ChainIdentifier | None = None) -> bool:
+    """Return True if token matches Pump.fun naming / chain conventions."""
+    if not token_address:
+        return False
+    if chain is not None and chain != ChainIdentifier.SOLANA_MAINNET:
+        return False
+    return token_address.lower().endswith("pump")
+
+
+def derive_pump_fun_bonding_curve(mint_address: str) -> tuple[str | None, str | None]:
+    """
+    Derive the Solana PDA for a Pump.fun bonding curve and its associated token account.
+    Returns (bonding_curve_address, bonding_curve_ata).
+    """
+    if not mint_address or not is_pump_fun_token(mint_address):
+        return None, None
+    try:
+        from solders.pubkey import Pubkey
+
+        mint = Pubkey.from_string(mint_address)
+        pump_prog = Pubkey.from_string(PUMP_FUN_PROGRAM_ID)
+        tok_prog = Pubkey.from_string(SPL_TOKEN_PROGRAM_ID)
+        ata_prog = Pubkey.from_string(SPL_ATA_PROGRAM_ID)
+
+        curve_pda, _ = Pubkey.find_program_address([b"bonding-curve", bytes(mint)], pump_prog)
+        curve_ata, _ = Pubkey.find_program_address(
+            [bytes(curve_pda), bytes(tok_prog), bytes(mint)], ata_prog
+        )
+        return str(curve_pda), str(curve_ata)
+    except Exception:
+        return None, None
+
 
 # Dead / burn addresses for LP burned detection
 _BURN_ADDRESSES: frozenset[str] = frozenset({

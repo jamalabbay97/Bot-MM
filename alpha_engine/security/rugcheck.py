@@ -22,11 +22,14 @@ from alpha_engine.rate_limiter.registry import RateLimiterRegistry
 from alpha_engine.security.constants import (
     _API_TIMEOUT_S,
     _MAX_BUY_TAX_BPS,
+    _MAX_PUMP_FUN_TOP10_CONCENTRATION,
     _MAX_SELL_TAX_BPS,
     _MAX_TOP10_CONCENTRATION,
     _MIN_LP_BURNED_RATIO,
     _RUGCHECK_URL,
+    derive_pump_fun_bonding_curve,
     is_blacklisted_token,
+    is_pump_fun_token,
 )
 from alpha_engine.security.preflight import verify_solana_mint_preflight
 
@@ -75,12 +78,13 @@ async def _verify_solana_mint_on_chain(
     session: aiohttp.ClientSession,
     mint_address: str,
     rpc_url: str,
+    pool_address: str = "",
 ) -> dict[str, Any] | None:
     """
     Fallback local Solana JSON-RPC check (getAccountInfo) to verify if an unindexed
     token mint account physically exists on-chain as a valid SPL / Token-2022 mint.
     """
-    return await verify_solana_mint_preflight(session, mint_address, rpc_url)
+    return await verify_solana_mint_preflight(session, mint_address, rpc_url, pool_address=pool_address)
 
 
 async def _fetch_rugcheck_report(
@@ -89,6 +93,7 @@ async def _fetch_rugcheck_report(
     limiter: RateLimiterRegistry,
     rpc_url: str = "",
     token_age_s: float | None = None,
+    pool_address: str = "",
 ) -> dict[str, Any] | None:
     """
     Fetch token report from RugCheck API for a Solana token mint.
@@ -112,7 +117,9 @@ async def _fetch_rugcheck_report(
             token_age_s,
         )
         if fallback_rpc:
-            on_chain_info = await verify_solana_mint_preflight(session, mint_address, fallback_rpc)
+            on_chain_info = await verify_solana_mint_preflight(
+                session, mint_address, fallback_rpc, pool_address=pool_address
+            )
             if on_chain_info is not None:
                 on_chain_info["state"] = "UNINDEXED_NEW_BONDING_CURVE"
                 return on_chain_info
@@ -125,7 +132,9 @@ async def _fetch_rugcheck_report(
             mint_address[:10],
         )
         if fallback_rpc:
-            on_chain_info = await verify_solana_mint_preflight(session, mint_address, fallback_rpc)
+            on_chain_info = await verify_solana_mint_preflight(
+                session, mint_address, fallback_rpc, pool_address=pool_address
+            )
             if on_chain_info is not None:
                 on_chain_info["state"] = "UNINDEXED_NEW_BONDING_CURVE"
                 return on_chain_info
@@ -154,7 +163,9 @@ async def _fetch_rugcheck_report(
                         mint_address[:10],
                     )
                     if fallback_rpc:
-                        on_chain_info = await verify_solana_mint_preflight(session, mint_address, fallback_rpc)
+                        on_chain_info = await verify_solana_mint_preflight(
+                            session, mint_address, fallback_rpc, pool_address=pool_address
+                        )
                         if on_chain_info is not None:
                             on_chain_info["state"] = "UNINDEXED_NEW_BONDING_CURVE"
                             return on_chain_info
@@ -188,7 +199,9 @@ async def _fetch_rugcheck_report(
 
     # Fallback to local RPC account validation before declaring token invalid
     if fallback_rpc:
-        on_chain_info = await verify_solana_mint_preflight(session, mint_address, fallback_rpc)
+        on_chain_info = await verify_solana_mint_preflight(
+            session, mint_address, fallback_rpc, pool_address=pool_address
+        )
         if on_chain_info is not None:
             logger.debug(
                 "Local RPC preflight validation verified unindexed mint %s on-chain.",
@@ -204,8 +217,12 @@ async def _fetch_rugcheck_report(
 def _parse_rugcheck_report(
     mint_address: str,
     raw: dict[str, Any],
+    pool_address: str = "",
 ) -> SecurityReport:
     """Parse a RugCheck API response or on-chain fallback into a SecurityReport."""
+    is_pump = is_pump_fun_token(mint_address) or bool(pool_address) or bool(raw.get("pool_address"))
+    max_conc = _MAX_PUMP_FUN_TOP10_CONCENTRATION if is_pump else _MAX_TOP10_CONCENTRATION
+
     if raw.get("invalid_mint"):
         return SecurityReport(
             token_address=mint_address,
@@ -236,18 +253,19 @@ def _parse_rugcheck_report(
         sniper_bundle = bool(raw.get("developer_sniper_bundle", False))
         max_holder_pct = float(raw.get("max_single_holder_pct", 0.0) or 0.0)
 
-        # Directive 3: Reject if > 20% scooped within block 0 (developer sniper bundle)
-        if sniper_bundle or max_holder_pct > 0.20:
+        # Reject if > max_conc scooped within block 0 (developer sniper bundle)
+        if sniper_bundle or max_holder_pct > max_conc:
             logger.warning(
-                "Rejecting mint %s: developer sniper bundle detected (>20%% of supply: %.1f%%)",
+                "Rejecting mint %s: developer sniper bundle detected (>%.0f%% of supply: %.1f%%)",
                 mint_address[:10],
+                max_conc * 100,
                 max_holder_pct * 100,
             )
             tier = SecurityTier.TIER1_REJECTED
         else:
             tier = (
                 SecurityTier.CLEAN
-                if (mint_disabled and freeze_disabled and top10_conc <= _MAX_TOP10_CONCENTRATION)
+                if (mint_disabled and freeze_disabled and top10_conc <= max_conc)
                 else SecurityTier.TIER1_REJECTED
             )
 
@@ -284,8 +302,28 @@ def _parse_rugcheck_report(
         lp_locked_pct = float(lp_info.get("lpLockedPct", 0) or 0)
         lp_burned_ratio = min(1.0, lp_locked_pct / 100.0)
 
+    curve_pda, curve_ata = derive_pump_fun_bonding_curve(mint_address)
+    excluded_holders: set[str] = set()
+    if curve_pda:
+        excluded_holders.add(curve_pda)
+    if curve_ata:
+        excluded_holders.add(curve_ata)
+    if pool_address:
+        excluded_holders.add(pool_address)
+
     top_holders: list[dict[str, Any]] = raw.get("topHolders") or []
     non_insider = [h for h in top_holders if isinstance(h, dict) and not h.get("insider", False)]
+    if is_pump:
+        filtered_holders = []
+        for idx, h in enumerate(non_insider):
+            h_addr = h.get("address", "") or h.get("owner", "")
+            h_pct = float(h.get("pct", 0) or 0)
+            if h_addr in excluded_holders or (idx == 0 and h_pct >= 50.0):
+                logger.debug("Excluding Pump.fun bonding curve %s from topHolders", h_addr[:10])
+                continue
+            filtered_holders.append(h)
+        non_insider = filtered_holders
+
     top10_pcts = [float(h.get("pct", 0) or 0) for h in non_insider[:10]]
     top10_concentration = min(1.0, sum(top10_pcts) / 100.0)
 
@@ -309,7 +347,7 @@ def _parse_rugcheck_report(
         or lp_burned_ratio < _MIN_LP_BURNED_RATIO
         or not mint_disabled
         or not freeze_disabled
-        or top10_concentration > _MAX_TOP10_CONCENTRATION
+        or top10_concentration > max_conc
     ):
         tier = SecurityTier.TIER1_REJECTED
 

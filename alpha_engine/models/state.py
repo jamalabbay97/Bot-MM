@@ -135,21 +135,33 @@ class SecurityReport(BaseModel):
         return data
 
     @property
+    def is_pump_fun(self) -> bool:
+        """True if token is a Solana Pump.fun token (ends with 'pump' or raw data indicates pump.fun)."""
+        if self.chain != ChainIdentifier.SOLANA_MAINNET:
+            return False
+        if self.token_address.lower().endswith("pump"):
+            return True
+        if self.external_api_raw and "pump" in self.external_api_raw.lower():
+            return True
+        return False
+
+    @property
     def passes_hard_gates(self) -> bool:
         """
         Returns True only if ALL hard-reject criteria are satisfied:
           - Sell tax <= 5% (500 bps)
           - LP burned >= 90%
           - Mint authority is disabled
-          - Top-10 holder concentration (excl. LP) <= 20%
+          - Top-10 holder concentration (excl. LP/bonding curve) <= 20% (65% for Pump.fun)
           - Not flagged as honeypot
         """
+        max_conc = 0.65 if self.is_pump_fun else 0.20
         return (
             self.sell_tax_bps <= 500
             and self.buy_tax_bps <= 500
             and self.lp_burned_ratio >= 0.90
             and self.mint_authority_disabled
-            and self.top10_concentration <= 0.20
+            and self.top10_concentration <= max_conc
             and not self.is_honeypot
         )
 

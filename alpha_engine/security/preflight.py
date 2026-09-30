@@ -17,10 +17,14 @@ import aiohttp
 from alpha_engine.rate_limiter.registry import RateLimiterRegistry
 from alpha_engine.security.constants import (
     _ERC20_BALANCE_ABI,
+    _MAX_PUMP_FUN_TOP10_CONCENTRATION,
+    _MAX_TOP10_CONCENTRATION,
     _MIN_SELL_RETURN_RATIO,
     _ROUTER_ABI_SWAP_EXACT_ETH,
     TAX_MUTATION_MAP,
     TAX_MUTATION_SELECTORS,
+    derive_pump_fun_bonding_curve,
+    is_pump_fun_token,
 )
 
 logger = logging.getLogger(__name__)
@@ -250,6 +254,7 @@ async def verify_solana_mint_preflight(
     session: aiohttp.ClientSession,
     mint_address: str,
     rpc_url: str,
+    pool_address: str = "",
 ) -> dict[str, Any] | None:
     """
     Local Solana JSON-RPC preflight validation for unindexed / new mints.
@@ -257,7 +262,8 @@ async def verify_solana_mint_preflight(
       - Owner program (SPL Token / Token-2022)
       - Mint authority (disabled / null)
       - Freeze authority (disabled / null)
-      - Top-10 holder concentration via getTokenLargestAccounts & getTokenSupply
+      - Top-10 holder concentration via getTokenLargestAccounts & getTokenSupply,
+        excluding the Pump.fun bonding curve address.
     """
     if not rpc_url:
         return None
@@ -342,27 +348,60 @@ async def verify_solana_mint_preflight(
                     if resp_largest.status == 200:
                         largest_body = await resp_largest.json()
                         accounts = (largest_body.get("result") or {}).get("value") or []
+
+                        is_pump = is_pump_fun_token(mint_address) or bool(pool_address)
+                        curve_pda, curve_ata = derive_pump_fun_bonding_curve(mint_address)
+                        excluded_addresses: set[str] = set()
+                        if curve_pda:
+                            excluded_addresses.add(curve_pda)
+                        if curve_ata:
+                            excluded_addresses.add(curve_ata)
+                        if pool_address:
+                            excluded_addresses.add(pool_address)
+
+                        # Exclude Pump.fun bonding curve from holder concentration calculations
+                        filtered_accounts: list[dict[str, Any]] = []
+                        for idx, acc in enumerate(accounts):
+                            if not isinstance(acc, dict):
+                                continue
+                            addr = acc.get("address", "")
+                            acc_amt = Decimal(str(acc.get("amount", 0)))
+                            pct = float(acc_amt / total_supply)
+                            # Exclude if explicitly matches bonding curve / ATA / pool, or is the dominant initial curve holding >= 50%
+                            if is_pump and (addr in excluded_addresses or (idx == 0 and pct >= 0.50)):
+                                logger.debug(
+                                    "Excluding Pump.fun bonding curve %s (holding %.2f%%) from top 10 calculations",
+                                    addr[:10] if addr else "account",
+                                    pct * 100,
+                                )
+                                continue
+                            filtered_accounts.append(acc)
+
                         top10_sum = sum(
                             Decimal(str(acc.get("amount", 0)))
-                            for acc in accounts[:10]
-                            if isinstance(acc, dict)
+                            for acc in filtered_accounts[:10]
                         )
                         top10_concentration = float(min(Decimal(1), top10_sum / total_supply))
 
-                        # Sybil & Bundled Mint Detection: Reject tokens where > 20% of supply scooped in block 0/single account
-                        for acc in accounts:
-                            if isinstance(acc, dict):
-                                acc_amt = Decimal(str(acc.get("amount", 0)))
-                                pct = float(acc_amt / total_supply)
-                                if pct > max_holder_pct:
-                                    max_holder_pct = pct
-                                if pct > 0.20:
-                                    developer_sniper_bundle = True
-                                    logger.warning(
-                                        "Developer sniper bundle detected for %s: account holds %.2f%% of supply (>20%%)",
-                                        mint_address[:10],
-                                        pct * 100,
-                                    )
+                        # Sybil & Bundled Mint Detection on non-bonding-curve accounts
+                        max_conc_threshold = (
+                            _MAX_PUMP_FUN_TOP10_CONCENTRATION
+                            if is_pump
+                            else _MAX_TOP10_CONCENTRATION
+                        )
+                        for acc in filtered_accounts:
+                            acc_amt = Decimal(str(acc.get("amount", 0)))
+                            pct = float(acc_amt / total_supply)
+                            if pct > max_holder_pct:
+                                max_holder_pct = pct
+                            if pct > max_conc_threshold:
+                                developer_sniper_bundle = True
+                                logger.warning(
+                                    "Developer sniper bundle detected for %s: non-bonding-curve account holds %.2f%% (>%.0f%%)",
+                                    mint_address[:10],
+                                    pct * 100,
+                                    max_conc_threshold * 100,
+                                )
         except Exception as exc:
             logger.debug("Failed fetching top holders for %s: %s", mint_address[:10], exc)
 
