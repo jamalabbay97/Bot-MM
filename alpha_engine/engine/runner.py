@@ -99,9 +99,13 @@ class PaperTradingEngine:
         self._signal_gen = SignalGenerator(hold_seconds=300.0)
         doh_servers = getattr(config, "dns_doh_servers", None)
         patch_dns_resolvers(servers=doh_servers)
-        min_buyers = getattr(config, "min_unique_buyers", 8)
+        min_buyers = getattr(config, "buffer_min_unique_buyers", getattr(config, "min_unique_buyers", 3))
         bundle_thresh = getattr(config, "slot_bundle_threshold", 0.60)
         self._pending_launch_buffer = PendingLaunchBuffer(
+            min_age_s=getattr(config, "observation_window_min_sec", 30.0),
+            max_age_s=getattr(config, "observation_window_max_sec", 120.0),
+            min_buys=getattr(config, "buffer_min_buys", 5),
+            min_volume_native=getattr(config, "buffer_target_volume_sol", Decimal("3.0")),
             min_unique_signers=min_buyers,
             slot_bundle_threshold=bundle_thresh,
         )
@@ -432,9 +436,13 @@ class PaperTradingEngine:
                         t_0=time.time(),
                     )
                     logger.info(
-                        "Pump.fun mint [%s] staged in PendingLaunchBuffer (observation window 90s-300s, target vol >= 15 SOL, >= 15 buys, >= %d unique buyers)",
+                        "Pump.fun mint [%s] staged in PendingLaunchBuffer (observation window %.0fs-%.0fs, target vol >= %s SOL, >= %d buys, >= %d unique buyers)",
                         raw_sig.token_address[:10],
-                        getattr(self.config, "min_unique_buyers", 8),
+                        self._pending_launch_buffer.min_age_s,
+                        self._pending_launch_buffer.max_age_s,
+                        self._pending_launch_buffer.min_volume_native,
+                        self._pending_launch_buffer.min_buys,
+                        self._pending_launch_buffer.min_unique_signers,
                     )
                     continue
 
@@ -519,6 +527,7 @@ class PaperTradingEngine:
                         launch_signal.token_address[:10],
                         launch_signal.source.value,
                     )
+                continue
 
             # Deduplication check for BUY
             if self.is_position_open(swap.token_out, swap.chain):
@@ -1036,6 +1045,32 @@ class PaperTradingEngine:
                 self._metrics.max_drawdown_pct,
             )
 
+    async def _pending_buffer_watchdog(self) -> None:
+        """
+        Monitors PendingLaunchBuffer: logs progress telemetry every 15s
+        and sweeps expired tokens.
+        """
+        while not self._shutdown_event.is_set():
+            try:
+                await asyncio.wait_for(
+                    self._shutdown_event.wait(),
+                    timeout=5.0,
+                )
+                break
+            except asyncio.TimeoutError:
+                pass
+            except asyncio.CancelledError:
+                break
+
+            if self._shutdown_event.is_set():
+                break
+
+            try:
+                self._pending_launch_buffer.check_telemetry(interval_s=15.0)
+                self._pending_launch_buffer.sweep_expired()
+            except Exception as exc:  # noqa: BLE001
+                logger.error("Error in pending buffer watchdog: %s", exc)
+
     def _get_engine_status(self) -> dict[str, Any]:
         """Collects real-time engine telemetry for the interactive Telegram bot."""
         uptime_s = time.time() - self._start_time if self._start_time else 0.0
@@ -1403,8 +1438,11 @@ class PaperTradingEngine:
                 heartbeat_task = asyncio.create_task(
                     self._heartbeat_task(), name="heartbeat_watchdog"
                 )
+                buffer_task = asyncio.create_task(
+                    self._pending_buffer_watchdog(), name="pending_buffer_watchdog"
+                )
 
-                worker_tasks = [bridge_task, ingest_task, signal_task, poller_task, snapshot_task, heartbeat_task]
+                worker_tasks = [bridge_task, ingest_task, signal_task, poller_task, snapshot_task, heartbeat_task, buffer_task]
                 logger.info("All engine pipelines active. Awaiting market and social signals...")
 
                 # Monitor tasks: wait for either graceful shutdown or unexpected worker crash
@@ -1448,8 +1486,9 @@ class PaperTradingEngine:
                     poller_task.cancel()
                     snapshot_task.cancel()
                     heartbeat_task.cancel()
+                    buffer_task.cancel()
                     shutdown_waiter.cancel()
-                    await asyncio.gather(poller_task, snapshot_task, heartbeat_task, return_exceptions=True)
+                    await asyncio.gather(poller_task, snapshot_task, heartbeat_task, buffer_task, return_exceptions=True)
 
                     # 4. Flush and checkpoint SQLite database
                     await ledger.checkpoint()

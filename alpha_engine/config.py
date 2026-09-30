@@ -11,7 +11,7 @@ import os
 from decimal import Decimal
 from typing import Any, Optional, Sequence
 
-from pydantic import Field, field_validator, model_validator
+from pydantic import AliasChoices, Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 # Risk and Portfolio State Machine Constants
@@ -237,10 +237,31 @@ class EngineConfig(BaseSettings):
         default_factory=lambda: ["1.1.1.1", "8.8.8.8"],
         description="Trusted upstream DoH/DNS servers to bypass local sinkholes",
     )
-    min_unique_buyers: int = Field(
-        default=8,
+    observation_window_min_sec: float = Field(
+        default=30.0,
+        ge=1.0,
+        description="Minimum observation window in seconds before graduating staged launch in PendingLaunchBuffer (default: 30s)",
+    )
+    observation_window_max_sec: float = Field(
+        default=120.0,
+        ge=5.0,
+        description="Maximum observation window in seconds before dropping staged launch in PendingLaunchBuffer (default: 120s)",
+    )
+    buffer_target_volume_sol: Decimal = Field(
+        default=Decimal("3.0"),
+        gt=Decimal(0),
+        description="Target cumulative native volume in SOL to graduate staged launch (default: 3.0 SOL)",
+    )
+    buffer_min_buys: int = Field(
+        default=5,
         ge=1,
-        description="Minimum distinct buyers required to graduate a staged launch in PendingLaunchBuffer",
+        description="Minimum buy transactions required to graduate staged launch in PendingLaunchBuffer (default: 5)",
+    )
+    buffer_min_unique_buyers: int = Field(
+        default=3,
+        ge=1,
+        validation_alias=AliasChoices("buffer_min_unique_buyers", "min_unique_buyers"),
+        description="Minimum distinct buyers required to graduate a staged launch in PendingLaunchBuffer (default: 3)",
     )
     slot_bundle_threshold: float = Field(
         default=0.60,
@@ -402,6 +423,11 @@ class EngineConfig(BaseSettings):
     @property
     def helius_ws_url(self) -> str:
         return self.solana_rpc_ws
+
+    @property
+    def min_unique_buyers(self) -> int:
+        """Backward compatibility alias for buffer_min_unique_buyers."""
+        return self.buffer_min_unique_buyers
 
     @property
     def initial_equity_usd(self) -> Decimal:

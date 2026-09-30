@@ -49,29 +49,30 @@ class StagedLaunch:
     buy_blocks: set[int] = field(default_factory=set)
     buy_volumes: list[Decimal] = field(default_factory=list)
     is_dev_bundled: bool = False
+    last_telemetry_s: float = 0.0
 
 
 class PendingLaunchBuffer:
     """
     In-memory staging buffer for new token launches (e.g. Pump.fun mints).
     Prevents instant mint sniping and enforces observation window, volume, and anti-bundle criteria:
-      - Minimum age = 90 seconds, Maximum age = 300 seconds from mint creation (t_0).
-      - Sustained swap activity: minimum of 15 buy transactions.
-      - Confirmed volume spike: >= 15 SOL (or native) cumulative volume within window.
-      - Dump filter: drops immediately if price dumps > 30% from initial bonding curve within first 90s.
-      - Unique Buyer Entropy: >= min_unique_signers (default 8) distinct buyer wallets.
+      - Minimum age = 30 seconds, Maximum age = 120 seconds from mint creation (t_0).
+      - Sustained swap activity: minimum of 5 buy transactions.
+      - Confirmed volume spike: >= 3.0 SOL (or native) cumulative volume within window.
+      - Dump filter: drops immediately if price dumps > 30% from initial bonding curve within first 30s.
+      - Unique Buyer Entropy: >= min_unique_signers (default 3) distinct buyer wallets.
       - Slot Clustering / Bundle Detection: drops if >= 60% of buys cluster in the exact same slot.
       - Curve Completion Delta: verifies volume growth spans across multiple blocks (>= min_blocks_span).
     """
 
     def __init__(
         self,
-        min_age_s: float = 90.0,
-        max_age_s: float = 300.0,
-        min_buys: int = 15,
-        min_volume_native: Decimal = Decimal("15.0"),
+        min_age_s: float = 30.0,
+        max_age_s: float = 120.0,
+        min_buys: int = 5,
+        min_volume_native: Decimal = Decimal("3.0"),
         max_dump_pct: Decimal = Decimal("0.30"),
-        min_unique_signers: int = 8,
+        min_unique_signers: int = 3,
         slot_bundle_threshold: float = 0.60,
         min_blocks_span: int = 3,
     ) -> None:
@@ -107,6 +108,7 @@ class PendingLaunchBuffer:
             min_price=init_p,
             report=report,
             raw_signal=raw_signal,
+            last_telemetry_s=now_s,
         )
         self._staged[token_address] = staged
         logger.info(
@@ -124,6 +126,56 @@ class PendingLaunchBuffer:
     def get_staged(self, token_address: str) -> StagedLaunch | None:
         return self._staged.get(token_address)
 
+    def _evaluate_unmet_conditions(self, staged: StagedLaunch) -> list[str]:
+        """Compile a list of exact graduation conditions currently unmet for a staged launch."""
+        unmet: list[str] = []
+        if staged.total_volume_native < self.min_volume_native:
+            unmet.append(f"Vol: {staged.total_volume_native:.1f}/{self.min_volume_native:.1f} SOL")
+        if staged.buy_count < self.min_buys:
+            unmet.append(f"Buys: {staged.buy_count}/{self.min_buys}")
+        if len(staged.unique_buyers) < self.min_unique_signers:
+            unmet.append(f"Buyers: {len(staged.unique_buyers)}/{self.min_unique_signers}")
+        if len(staged.buy_blocks) < self.min_blocks_span:
+            unmet.append(f"Blocks: {len(staged.buy_blocks)}/{self.min_blocks_span}")
+        if staged.is_dev_bundled:
+            unmet.append("DEV_BUNDLED (slot clustering)")
+        elif staged.buy_count > 0:
+            max_slot_buys = max(staged.slot_buy_counts.values()) if staged.slot_buy_counts else 0
+            slot_cluster_pct = max_slot_buys / staged.buy_count
+            if slot_cluster_pct >= self.slot_bundle_threshold:
+                unmet.append(f"Slot clustering ({slot_cluster_pct:.1%} >= {self.slot_bundle_threshold:.1%})")
+        if staged.initial_price > Decimal(0):
+            dump_pct = (staged.initial_price - staged.latest_price) / staged.initial_price
+            if dump_pct > self.max_dump_pct:
+                unmet.append(f"Price dump ({float(dump_pct*100):.1f}% > {float(self.max_dump_pct*100):.0f}%)")
+        return unmet
+
+    def check_telemetry(self, current_time_s: float | None = None, interval_s: float = 15.0) -> None:
+        """
+        Telemetry: Emits countdown and progress logging every interval_s seconds (default 15s)
+        for all actively staged tokens.
+        """
+        now_s = current_time_s if current_time_s is not None else time.time()
+        for staged in list(self._staged.values()):
+            if not staged.dropped and not staged.graduated:
+                age = now_s - staged.t_0
+                if age <= self.max_age_s:
+                    if staged.last_telemetry_s == 0.0 or (now_s - staged.last_telemetry_s) >= interval_s:
+                        staged.last_telemetry_s = now_s
+                        remaining_s = max(0.0, self.max_age_s - age)
+                        logger.info(
+                            "PendingLaunchBuffer: Token [%s]: %ds elapsed (%ds remaining) | Vol: %.1f/%.1f SOL | Buys: %d/%d | Buyers: %d/%d",
+                            staged.token_address[:10],
+                            int(age),
+                            int(remaining_s),
+                            staged.total_volume_native,
+                            self.min_volume_native,
+                            staged.buy_count,
+                            self.min_buys,
+                            len(staged.unique_buyers),
+                            self.min_unique_signers,
+                        )
+
     def record_swap(
         self,
         swap: SwapEvent,
@@ -137,6 +189,9 @@ class PendingLaunchBuffer:
 
         now_s = current_time_s if current_time_s is not None else time.time()
         age = now_s - staged.t_0
+
+        if not staged.pool_address and pool and pool.pool_address:
+            staged.pool_address = pool.pool_address
 
         spot_price = pool.spot_price_native_per_token
         if spot_price > 0:
@@ -176,7 +231,24 @@ class PendingLaunchBuffer:
         else:
             staged.total_volume_native += swap.amount_out
 
-        # Dump filter: drops if price dumps > 30% from initial bonding curve within the first 90s
+        # Telemetry: emit countdown and progress logging every 15 seconds
+        if age <= self.max_age_s and (staged.last_telemetry_s == 0.0 or (now_s - staged.last_telemetry_s) >= 15.0):
+            staged.last_telemetry_s = now_s
+            remaining_s = max(0.0, self.max_age_s - age)
+            logger.info(
+                "PendingLaunchBuffer: Token [%s]: %ds elapsed (%ds remaining) | Vol: %.1f/%.1f SOL | Buys: %d/%d | Buyers: %d/%d",
+                staged.token_address[:10],
+                int(age),
+                int(remaining_s),
+                staged.total_volume_native,
+                self.min_volume_native,
+                staged.buy_count,
+                self.min_buys,
+                len(staged.unique_buyers),
+                self.min_unique_signers,
+            )
+
+        # Dump filter: drops if price dumps > 30% from initial bonding curve within the first min_age_s
         if staged.initial_price > Decimal(0):
             dump_pct = (staged.initial_price - staged.latest_price) / staged.initial_price
             if dump_pct > self.max_dump_pct and age <= self.min_age_s:
@@ -191,16 +263,19 @@ class PendingLaunchBuffer:
                 )
                 return None
 
-        # Expired observation window (> 300s)
+        # Expired observation window (> max_age_s)
         if age > self.max_age_s:
+            unmet = self._evaluate_unmet_conditions(staged)
+            unmet_str = " | ".join(unmet) if unmet else "Criteria not satisfied"
             staged.dropped = True
-            staged.drop_reason = f"Observation window expired ({age:.1f}s > {self.max_age_s}s)"
+            staged.drop_reason = f"Observation window expired ({age:.1f}s > {self.max_age_s}s) - Unmet: [{unmet_str}]"
             logger.info("PendingLaunchBuffer: DROPPING launch %s — %s", staged.token_address[:10], staged.drop_reason)
             return None
 
         # Graduation criteria check:
-        # Age between 90s and 300s, buy count >= 15, volume >= 15 SOL, not dumped > 30%,
-        # unique buyers >= 8, slot clustering < 60%, and block span >= 3
+        # Age between min_age_s and max_age_s, buy count >= min_buys, volume >= min_volume_native,
+        # not dumped > max_dump_pct, unique buyers >= min_unique_signers,
+        # slot clustering < slot_bundle_threshold, and block span >= min_blocks_span
         if age >= self.min_age_s and not staged.is_dev_bundled:
             max_slot_buys = max(staged.slot_buy_counts.values()) if staged.slot_buy_counts else 0
             slot_cluster_pct = (max_slot_buys / staged.buy_count) if staged.buy_count > 0 else 0.0
@@ -235,9 +310,17 @@ class PendingLaunchBuffer:
         expired: list[str] = []
         for token, staged in list(self._staged.items()):
             if not staged.dropped and not staged.graduated:
-                if (now_s - staged.t_0) > self.max_age_s:
+                age = now_s - staged.t_0
+                if age > self.max_age_s:
+                    unmet = self._evaluate_unmet_conditions(staged)
+                    unmet_str = " | ".join(unmet) if unmet else "Criteria not satisfied"
                     staged.dropped = True
-                    staged.drop_reason = f"Observation window expired ({(now_s - staged.t_0):.1f}s > {self.max_age_s}s)"
+                    staged.drop_reason = f"Observation window expired ({age:.1f}s > {self.max_age_s}s) - Unmet: [{unmet_str}]"
+                    logger.info(
+                        "PendingLaunchBuffer: DROPPING launch %s — %s",
+                        staged.token_address[:10],
+                        staged.drop_reason,
+                    )
                     expired.append(token)
         return expired
 
