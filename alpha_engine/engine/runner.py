@@ -48,6 +48,8 @@ from alpha_engine.models.enums import (
 )
 from alpha_engine.models.events import (
     PoolStateUpdateEvent,
+    PumpMintEvent,
+    PumpSwapEvent,
     RawSignalEvent,
     ShutdownSentinel,
     SignalEvent,
@@ -143,6 +145,10 @@ class PaperTradingEngine:
     @property
     def rpc_monitor(self) -> RPCHealthMonitor:
         return self._rpc_monitor
+
+    @property
+    def launch_buffer(self) -> PendingLaunchBuffer:
+        return self._pending_launch_buffer
 
     def _install_signal_handlers(self) -> None:
         """
@@ -387,6 +393,60 @@ class PaperTradingEngine:
                     logger.info("News Social Signal [%s] queued: %s", signal_event.signal_id[:8], token_addr[:10])
                 continue
 
+            if isinstance(item, PumpMintEvent):
+                mint_ev: PumpMintEvent = item
+                mint = mint_ev.mint
+                chain = mint_ev.chain
+                curve_addr = mint_ev.bonding_curve or mint
+
+                if is_blacklisted_token(mint, chain):
+                    self._record_gatekeeper_eval(mint, chain, "Blacklisted native/wrapped token", passed=False)
+                    logger.debug("Skipping blacklisted mint: %s", mint)
+                    continue
+
+                if gk.is_rejected(mint, chain):
+                    logger.debug("Skipping rejected mint from negative cache: %s", mint[:10])
+                    continue
+
+                try:
+                    report = await gk.evaluate_token(
+                        token_address=mint,
+                        chain=chain,
+                        pool_address=curve_addr,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    logger.error("Security gatekeeper raised for PumpMintEvent %s: %s", mint[:10], exc)
+                    continue
+
+                reason = self._extract_gatekeeper_rejection_reason(report)
+                self._record_gatekeeper_eval(mint, chain, reason, passed=report.passes_hard_gates)
+
+                if not report.passes_hard_gates:
+                    logger.info("Pump.fun mint %s rejected by gatekeeper (reason=%s).", mint[:10], reason)
+                    continue
+
+                pool = self.get_or_create_initial_pool_state(chain, mint, curve_addr)
+                init_price = pool.spot_price_native_per_token if pool else Decimal("0.000000028")
+
+                self._pending_launch_buffer.stage_token(
+                    token_address=mint,
+                    chain=chain,
+                    pool_address=curve_addr,
+                    initial_price=init_price,
+                    report=report,
+                    t_0=time.time(),
+                )
+                logger.info(
+                    "Pump.fun mint [%s] staged in PendingLaunchBuffer (observation window %.0fs-%.0fs, target vol >= %s SOL, >= %d buys, >= %d unique buyers)",
+                    mint[:10],
+                    self._pending_launch_buffer.min_age_s,
+                    self._pending_launch_buffer.max_age_s,
+                    self._pending_launch_buffer.min_volume_native,
+                    self._pending_launch_buffer.min_buys,
+                    self._pending_launch_buffer.min_unique_signers,
+                )
+                continue
+
             if isinstance(item, RawSignalEvent):
                 raw_sig: RawSignalEvent = item
                 if is_blacklisted_token(raw_sig.token_address, raw_sig.chain):
@@ -399,7 +459,7 @@ class PaperTradingEngine:
                     continue
 
                 try:
-                    report = await gk.screen_token(
+                    report = await gk.evaluate_token(
                         token_address=raw_sig.token_address,
                         chain=raw_sig.chain,
                         pool_address=raw_sig.pool_address or "",
@@ -433,7 +493,7 @@ class PaperTradingEngine:
 
                 if raw_sig.source == SignalSource.PUMP_FUN_MINT:
                     init_price = pool.spot_price_native_per_token if pool else Decimal("0.000000028")
-                    self._pending_launch_buffer.add_launch(
+                    self._pending_launch_buffer.stage_token(
                         token_address=raw_sig.token_address,
                         chain=raw_sig.chain,
                         pool_address=raw_sig.pool_address or (pool.pool_address if pool else ""),
@@ -488,10 +548,53 @@ class PaperTradingEngine:
                 continue
 
             target_token = swap.token_in if out_is_native else swap.token_out
+            is_buy = not out_is_native
+            sol_amount = swap.amount_in if is_buy else swap.amount_out
 
             # Fast-path check: immediately drop swap if token is in negative rejection cache
             if gk.is_rejected(target_token, swap.chain) is True:
                 continue
+
+            # Auto-discovery fallback: If a buy trade >= 0.5 SOL arrives for an unstaged token
+            # that is NOT in the negative cache, trigger an immediate async security evaluation and stage if clean.
+            if (
+                is_buy
+                and sol_amount >= Decimal("0.5")
+                and not self._pending_launch_buffer.is_staged(target_token)
+                and not self.is_position_open(target_token, swap.chain)
+                and not is_blacklisted_token(target_token, swap.chain)
+                and not gk.is_rejected(target_token, swap.chain)
+            ):
+                try:
+                    disc_report = await gk.evaluate_token(
+                        token_address=target_token,
+                        chain=swap.chain,
+                        pool_address=swap.pool_address,
+                    )
+                    disc_reason = self._extract_gatekeeper_rejection_reason(disc_report)
+                    self._record_gatekeeper_eval(target_token, swap.chain, disc_reason, passed=disc_report.passes_hard_gates)
+                    if disc_report.passes_hard_gates:
+                        initial_pool = self.get_or_create_initial_pool_state(swap.chain, target_token, swap.pool_address)
+                        init_price = initial_pool.spot_price_native_per_token if initial_pool else Decimal("0.000000028")
+                        self._pending_launch_buffer.stage_token(
+                            token_address=target_token,
+                            chain=swap.chain,
+                            pool_address=swap.pool_address,
+                            initial_price=init_price,
+                            report=disc_report,
+                            t_0=time.time(),
+                        )
+                        logger.info(
+                            "Auto-discovery fallback: staged %s in PendingLaunchBuffer on buy of %s SOL",
+                            target_token[:10],
+                            sol_amount,
+                        )
+                except Exception as exc:  # noqa: BLE001
+                    logger.error(
+                        "Auto-discovery security evaluation failed for %s: %s",
+                        target_token[:10],
+                        exc,
+                    )
 
             pool = self._pool_registry.get(swap.pool_address)
             if pool is None:

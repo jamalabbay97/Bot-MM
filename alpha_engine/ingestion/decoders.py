@@ -15,7 +15,12 @@ from decimal import Decimal
 from typing import Any
 
 from alpha_engine.models.enums import ChainIdentifier
-from alpha_engine.models.events import PoolStateUpdateEvent, SwapEvent
+from alpha_engine.models.events import (
+    PoolStateUpdateEvent,
+    PumpMintEvent,
+    PumpSwapEvent,
+    SwapEvent,
+)
 from alpha_engine.models.state import PoolState
 
 logger = logging.getLogger(__name__)
@@ -246,15 +251,9 @@ class PairCreatedResult(dict):
         yield is_weth_first
 
 
-class PumpFunResult(dict):
-    """Dictionary representing Pump.fun logs that also unpacks as (mint, curve_sol)."""
-    def __iter__(self):
-        yield self.get("mint", "")
-        sol_reserve = self.get("virtual_sol_reserves", Decimal("30.0"))
-        if isinstance(sol_reserve, Decimal):
-            yield sol_reserve
-        else:
-            yield Decimal(str(sol_reserve))
+class PumpFunResult(PumpMintEvent):
+    """Dictionary/model representing Pump.fun logs that also unpacks as (mint, curve_sol)."""
+    pass
 
 
 class RaydiumInitResult(dict):
@@ -365,7 +364,12 @@ def _decode_evm_pool_created_log(log: dict[str, Any]) -> dict[str, Any] | None:
 
 
 _B58_ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
-_PUMP_CREATE_EVENT_DISCRIMINATOR = bytes.fromhex("1b72a94ddeeb6376")
+_PUMP_CREATE_EVENT_DISCRIMINATOR = bytes.fromhex("1b72a94f18d748f2")
+_PUMP_CREATE_EVENT_DISCRIMINATOR_ALT = bytes.fromhex("1b72a94ddeeb6376")
+_PUMP_CREATE_EVENT_DISCRIMINATORS = (
+    bytes.fromhex("1b72a94f18d748f2"),
+    bytes.fromhex("1b72a94ddeeb6376"),
+)
 _PUMP_TRADE_EVENT_DISCRIMINATOR = bytes.fromhex("bddb7fd34ee661ee")
 
 
@@ -380,10 +384,15 @@ def _b58encode(b: bytes) -> str:
     return "1" * pad + "".join(reversed(chars))
 
 
-def _parse_pump_fun_logs(logs: list[str], tx_sig: str = "") -> dict[str, Any] | None:
+def _parse_pump_fun_logs(
+    logs: list[str],
+    tx_sig: str = "",
+    slot: int = 0,
+) -> PumpMintEvent | None:
     """
     Parse Solana logs for Pump.fun program mint & bonding curve initialization.
-    Detects Anchor CreateEvent, InitializeMint2, Create, or bonding curve parameters.
+    Detects Anchor CreateEvent (discriminator 0x1b72a94f18d748f2), Instruction: Create,
+    InitializeMint2, or bonding curve parameters.
     Excludes smart contract / bot program IDs invoked in the transaction.
     """
     import base64
@@ -415,7 +424,7 @@ def _parse_pump_fun_logs(logs: list[str], tx_sig: str = "") -> dict[str, Any] | 
             b64_str = line[len("Program data:"):].strip()
             try:
                 raw_bytes = base64.b64decode(b64_str)
-                if len(raw_bytes) >= 116 and raw_bytes[:8] == _PUMP_CREATE_EVENT_DISCRIMINATOR:
+                if len(raw_bytes) >= 80 and raw_bytes[:8] in _PUMP_CREATE_EVENT_DISCRIMINATORS:
                     offset = 8
                     n_len = struct.unpack_from("<I", raw_bytes, offset)[0]
                     offset += 4 + n_len
@@ -423,25 +432,31 @@ def _parse_pump_fun_logs(logs: list[str], tx_sig: str = "") -> dict[str, Any] | 
                     offset += 4 + s_len
                     u_len = struct.unpack_from("<I", raw_bytes, offset)[0]
                     offset += 4 + u_len
-                    mint_b = raw_bytes[offset:offset + 32]
-                    offset += 32
-                    curve_b = raw_bytes[offset:offset + 32]
-                    mint_address = _b58encode(mint_b)
-                    bonding_curve = _b58encode(curve_b)
-                    is_create = True
-                    break
+                    if offset + 64 <= len(raw_bytes):
+                        mint_b = raw_bytes[offset:offset + 32]
+                        offset += 32
+                        curve_b = raw_bytes[offset:offset + 32]
+                        mint_address = _b58encode(mint_b)
+                        bonding_curve = _b58encode(curve_b)
+                        is_create = True
+                        break
             except Exception:
                 pass
 
     # 2. Secondary: Text log pattern parsing if Anchor event is not present
     b58_re = re.compile(r"\b[1-9A-HJ-NP-Za-km-z]{32,44}\b")
 
-    if not mint_address:
-        for line in logs:
-            line_lower = line.lower()
-            if "create" in line_lower or "initializemint" in line_lower:
-                is_create = True
+    for line in logs:
+        line_lower = line.lower()
+        if (
+            "instruction: create" in line_lower
+            or "instruction: initializemint" in line_lower
+            or "create" in line_lower
+            or "initializemint" in line_lower
+        ):
+            is_create = True
 
+        if not mint_address:
             # Look for explicit mint keyword in log lines
             if "create mint" in line_lower or "mint:" in line_lower:
                 matches = b58_re.findall(line)
@@ -496,15 +511,16 @@ def _parse_pump_fun_logs(logs: list[str], tx_sig: str = "") -> dict[str, Any] | 
 
     # Pump.fun standard bonding curve initial reserves:
     # 30 SOL virtual reserve, 1.073B virtual tokens
-    return PumpFunResult({
-        "mint": mint_address,
-        "bonding_curve": bonding_curve or mint_address,
-        "virtual_sol_reserves": Decimal("30.0"),
-        "virtual_token_reserves": Decimal("1073000000.0"),
-        "token_decimals": 6,
-        "native_decimals": 9,
-        "tx_hash": tx_sig,
-    })
+    return PumpMintEvent(
+        mint=mint_address,
+        bonding_curve=bonding_curve or mint_address,
+        virtual_sol_reserves=Decimal("30.0"),
+        virtual_token_reserves=Decimal("1073000000.0"),
+        token_decimals=6,
+        native_decimals=9,
+        tx_hash=tx_sig,
+        slot=slot,
+    )
 
 
 def _parse_raydium_initialize2_logs(logs: list[str], tx_sig: str = "") -> dict[str, Any] | None:
@@ -550,6 +566,34 @@ def _parse_raydium_initialize2_logs(logs: list[str], tx_sig: str = "") -> dict[s
 
 class PumpFunTradeResult(dict):
     """Dictionary representing Pump.fun trade log data that also unpacks as (mint, sol_amount, token_amount, buyer)."""
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self.__dict__ = self
+
+    @property
+    def mint(self) -> str:
+        return self.get("mint", "")
+
+    @property
+    def sol_amount(self) -> Decimal:
+        return self.get("sol_amount", Decimal("0"))
+
+    @property
+    def token_amount(self) -> Decimal:
+        return self.get("token_amount", Decimal("0"))
+
+    @property
+    def buyer(self) -> str:
+        return self.get("buyer", "")
+
+    @property
+    def is_buy(self) -> bool:
+        return self.get("is_buy", True)
+
+    @property
+    def slot(self) -> int:
+        return self.get("slot", 0)
+
     def __iter__(self):
         yield self.get("mint", "")
         yield self.get("sol_amount", Decimal("0"))

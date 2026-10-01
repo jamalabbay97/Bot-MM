@@ -10,7 +10,7 @@ from __future__ import annotations
 import time
 import uuid
 from decimal import Decimal
-from typing import Annotated, Optional
+from typing import Any,Annotated, Optional
 
 from pydantic import (
     BaseModel,
@@ -148,4 +148,96 @@ class RawSignalEvent(BaseModel):
     status: NewsSignalStatus = NewsSignalStatus.VALID
     sybil_channel_count: Annotated[int, Field(ge=1)] = 1
     is_edit: bool = False
+
+
+class PumpMintEvent(BaseModel):
+    """
+    Event emitted when a Pump.fun mint / bonding curve creation is detected.
+    """
+
+    model_config = _STRICT_MODEL_CFG
+
+    timestamp_ns: Annotated[int, Field(gt=0)] = Field(default_factory=lambda: time.time_ns())
+    chain: ChainIdentifier = ChainIdentifier.SOLANA_MAINNET
+    mint: Annotated[str, Field(min_length=32, max_length=66)]
+    bonding_curve: Annotated[str, Field(min_length=32, max_length=66)]
+    virtual_sol_reserves: Decimal = Decimal("30.0")
+    virtual_token_reserves: Decimal = Decimal("1073000000.0")
+    token_decimals: int = 6
+    native_decimals: int = 9
+    tx_hash: str = ""
+    slot: int = 0
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        if args and isinstance(args[0], dict):
+            d = dict(args[0])
+            d.update(kwargs)
+            super().__init__(**d)
+        else:
+            super().__init__(**kwargs)
+
+    @property
+    def token_address(self) -> str:
+        return self.mint
+
+    @property
+    def pool_address(self) -> str:
+        return self.bonding_curve
+
+    def __getitem__(self, key: str) -> Any:
+        return getattr(self, key)
+
+    def get(self, key: str, default: Any = None) -> Any:
+        return getattr(self, key, default)
+
+    def __contains__(self, key: str) -> bool:
+        return hasattr(self, key)
+
+    def __iter__(self):
+        yield self.mint
+        yield self.virtual_sol_reserves
+
+
+class PumpSwapEvent(SwapEvent):
+    """
+    Event emitted when a Pump.fun swap / trade transaction is detected.
+    Subclasses SwapEvent for backwards compatibility while providing
+    dedicated Pump.fun attributes and helpers.
+    """
+
+    mint: str = ""
+    sol_amount: Decimal = Decimal("0")
+    token_amount: Decimal = Decimal("0")
+    buyer: str = ""
+    is_buy: bool = True
+    virtual_sol_reserves: Decimal = Decimal("30.0")
+    virtual_token_reserves: Decimal = Decimal("1073000000.0")
+    slot: int = 0
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        if args and isinstance(args[0], dict):
+            d = dict(args[0])
+            d.update(kwargs)
+            if "tx_hash" in d and len(str(d["tx_hash"])) < 32:
+                d["tx_hash"] = str(d["tx_hash"]).ljust(32, "0")
+            super().__init__(**d)
+        else:
+            if "tx_hash" in kwargs and len(str(kwargs["tx_hash"])) < 32:
+                kwargs["tx_hash"] = str(kwargs["tx_hash"]).ljust(32, "0")
+            super().__init__(**kwargs)
+
+    def __getitem__(self, key: str) -> Any:
+        return getattr(self, key)
+
+    def get(self, key: str, default: Any = None) -> Any:
+        return getattr(self, key, default)
+
+    def __contains__(self, key: str) -> bool:
+        return hasattr(self, key)
+
+    def __iter__(self):
+        yield self.mint
+        yield self.sol_amount
+        yield self.token_amount
+        yield self.buyer
 

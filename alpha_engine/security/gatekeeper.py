@@ -8,13 +8,19 @@ Python 3.11+ | aiohttp + web3.py
 from __future__ import annotations
 
 import logging
+from typing import Any
 
 import aiohttp
 
 from alpha_engine.models.enums import ChainIdentifier, SecurityTier
 from alpha_engine.models.state import SecurityReport
 from alpha_engine.rate_limiter.registry import RateLimiterRegistry
-from alpha_engine.security.constants import is_blacklisted_token
+from alpha_engine.security.constants import (
+    _MAX_PUMP_FUN_TOP10_CONCENTRATION,
+    _MAX_TOP10_CONCENTRATION,
+    derive_pump_fun_bonding_curve,
+    is_blacklisted_token,
+)
 from alpha_engine.security.goplus import _fetch_goplus_report, _parse_goplus_report
 from alpha_engine.security.preflight import _tier2_evm_preflight
 from alpha_engine.security.rugcheck import _fetch_rugcheck_report, _parse_rugcheck_report
@@ -22,6 +28,45 @@ from alpha_engine.security.rugcheck import _fetch_rugcheck_report, _parse_rugche
 import time
 
 logger = logging.getLogger(__name__)
+
+MAX_TOP10_CONCENTRATION_PUMP_FUN: float = _MAX_PUMP_FUN_TOP10_CONCENTRATION  # 0.65
+MAX_TOP10_CONCENTRATION: float = _MAX_TOP10_CONCENTRATION  # 0.20
+
+
+def calculate_top10_concentration(
+    holders: list[dict[str, Any]],
+    is_pump: bool = False,
+    mint_address: str = "",
+    pool_address: str = "",
+) -> float:
+    """
+    Calculate Top 10 holder concentration, excluding Pump.fun bonding curve / ATA.
+    """
+    excluded: set[str] = set()
+    if is_pump and mint_address:
+        pda, ata = derive_pump_fun_bonding_curve(mint_address)
+        if pda:
+            excluded.add(pda)
+        if ata:
+            excluded.add(ata)
+    if pool_address:
+        excluded.add(pool_address)
+
+    filtered: list[dict[str, Any]] = []
+    for idx, h in enumerate(holders):
+        if not isinstance(h, dict):
+            continue
+        addr = h.get("address", "") or h.get("owner", "")
+        pct = float(h.get("pct", 0) or h.get("percent", 0) or 0)
+        if is_pump and (addr in excluded or (idx == 0 and pct >= 50.0)):
+            continue
+        filtered.append(h)
+
+    top10_pcts = [float(h.get("pct", 0) or h.get("percent", 0) or 0) for h in filtered[:10]]
+    raw_sum = sum(top10_pcts)
+    if raw_sum > 1.0:
+        raw_sum /= 100.0
+    return min(1.0, max(0.0, raw_sum))
 
 
 def _build_fallback_report(
@@ -138,6 +183,26 @@ class SecurityGatekeeper:
     """
 
     is_blacklisted = staticmethod(is_blacklisted_token)
+    MAX_TOP10_CONCENTRATION_PUMP_FUN: float = MAX_TOP10_CONCENTRATION_PUMP_FUN
+    MAX_TOP10_CONCENTRATION: float = MAX_TOP10_CONCENTRATION
+
+    async def evaluate_token(
+        self,
+        token_address: str,
+        chain: ChainIdentifier = ChainIdentifier.SOLANA_MAINNET,
+        pool_address: str = "",
+        token_age_s: float | None = None,
+    ) -> SecurityReport:
+        """
+        Evaluate token security posture across all screening tiers.
+        Alias / wrapper for screen_token for pipeline interoperability.
+        """
+        return await self.screen_token(
+            token_address=token_address,
+            chain=chain,
+            pool_address=pool_address,
+            token_age_s=token_age_s,
+        )
 
     def __init__(
         self,

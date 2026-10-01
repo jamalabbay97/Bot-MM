@@ -445,3 +445,285 @@ async def test_runner_pump_fun_swap_routing_to_buffer_graduation():
     assert grad_signal.token_address == token
     assert grad_signal.source == SignalSource.PUMP_FUN_MINT
 
+
+def test_pump_fun_anchor_create_event_0x1b72a94f18d748f2():
+    """Verify parsing of Pump.fun CreateEvent with discriminator 0x1b72a94f18d748f2."""
+    from alpha_engine.ingestion.decoders import _PUMP_CREATE_EVENT_DISCRIMINATOR, _parse_pump_fun_logs
+    from alpha_engine.models.events import PumpMintEvent
+
+    assert _PUMP_CREATE_EVENT_DISCRIMINATOR == bytes.fromhex("1b72a94f18d748f2")
+
+    mint_bytes = _encode_b58_pubkey("M")
+    curve_bytes = _encode_b58_pubkey("C")
+    expected_mint = _b58encode(mint_bytes)
+    expected_curve = _b58encode(curve_bytes)
+
+    # Build binary Anchor CreateEvent
+    # 8 discriminator + name(len+str) + symbol(len+str) + uri(len+str) + mint(32) + bonding_curve(32)
+    payload = bytearray()
+    payload.extend(bytes.fromhex("1b72a94f18d748f2"))
+    name = b"TokenName"
+    symbol = b"TKN"
+    uri = b"https://token.uri"
+    payload.extend(struct.pack("<I", len(name)) + name)
+    payload.extend(struct.pack("<I", len(symbol)) + symbol)
+    payload.extend(struct.pack("<I", len(uri)) + uri)
+    payload.extend(mint_bytes)
+    payload.extend(curve_bytes)
+
+    b64_event = base64.b64encode(payload).decode("ascii")
+    logs = [
+        f"Program {PUMP_FUN_PROGRAM_ID} invoke [1]",
+        "Program log: Instruction: Create",
+        f"Program data: {b64_event}",
+        f"Program {PUMP_FUN_PROGRAM_ID} success",
+    ]
+
+    event = _parse_pump_fun_logs(logs, tx_sig="create_sig_123", slot=55555)
+    assert event is not None
+    assert isinstance(event, PumpMintEvent)
+    assert event.mint == expected_mint
+    assert event.bonding_curve == expected_curve
+    assert event.virtual_sol_reserves == Decimal("30.0")
+    assert event.slot == 55555
+
+
+@pytest.mark.anyio
+async def test_svm_trade_deduplication():
+    """Verify SVMIngester deduplicates identical slot:mint:buyer:sol_amount trades."""
+    event_q: asyncio.Queue = asyncio.Queue()
+    limiter = RateLimiterRegistry.default()
+
+    mint = "M" * 32
+    buyer = "B" * 32
+    mint_b58 = _b58encode(mint.encode("ascii"))
+    buyer_b58 = _b58encode(buyer.encode("ascii"))
+
+    ingester = SVMIngester(
+        ws_url="wss://mainnet.helius-rpc.com/?api-key=test",
+        pool_registry={},
+        event_queue=event_q,
+        limiter=limiter,
+    )
+
+    # Build a trade log notification message
+    sol_raw = 1_000_000_000  # 1.0 SOL
+    token_raw = 10_000_000_000_000
+    payload = bytearray()
+    payload.extend(_PUMP_TRADE_EVENT_DISCRIMINATOR)
+    payload.extend(mint.encode("ascii"))
+    payload.extend(struct.pack("<Q", sol_raw))
+    payload.extend(struct.pack("<Q", token_raw))
+    payload.append(1)  # is_buy
+    payload.extend(buyer.encode("ascii"))
+    payload.extend(struct.pack("<q", int(time.time())))
+    payload.extend(struct.pack("<Q", 31_000_000_000))
+    payload.extend(struct.pack("<Q", 1_000_000_000_000_000))
+
+    b64_event = base64.b64encode(payload).decode("ascii")
+    logs = [
+        f"Program {PUMP_FUN_PROGRAM_ID} invoke [1]",
+        "Program log: Instruction: Buy",
+        f"Program data: {b64_event}",
+        f"Program {PUMP_FUN_PROGRAM_ID} success",
+    ]
+
+    notif_msg = json.dumps({
+        "jsonrpc": "2.0",
+        "method": "logsNotification",
+        "params": {
+            "subscription": 1,
+            "result": {
+                "context": {"slot": 77777},
+                "value": {
+                    "signature": "sig_trade_123456789012345678901234567890",
+                    "logs": logs,
+                },
+            },
+        },
+    })
+
+    class MockWS:
+        def __init__(self):
+            self.send = AsyncMock()
+            self._messages = [
+                json.dumps({"jsonrpc": "2.0", "result": 1, "id": 1}),
+                notif_msg,
+                notif_msg,  # duplicate
+            ]
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            await asyncio.sleep(0.01)
+            if self._messages:
+                return self._messages.pop(0)
+            await asyncio.sleep(0.05)
+            raise StopAsyncIteration
+
+    class MockConnectContext:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return MockWS()
+
+        async def __aexit__(self, exc_type, exc, tb):
+            pass
+
+    with patch("websockets.connect", side_effect=MockConnectContext):
+        ingester._running = True
+        await ingester._connect_and_stream()
+
+    # Collect events queued
+    events = []
+    while not event_q.empty():
+        events.append(await event_q.get())
+
+    from alpha_engine.models.events import PumpSwapEvent
+    swaps = [e for e in events if isinstance(e, PumpSwapEvent)]
+    # Exactly 1 swap should be queued despite duplicate notifications
+    assert len(swaps) == 1
+    assert swaps[0].amount_in == Decimal("1.0")
+
+
+@pytest.mark.anyio
+async def test_runner_pump_mint_event_pipeline_evaluation_and_staging():
+    """Verify runner evaluates PumpMintEvent through gatekeeper and stages it in launch_buffer."""
+    from alpha_engine.engine.runner import PaperTradingEngine
+    from alpha_engine.models.events import PumpMintEvent
+    from alpha_engine.security.gatekeeper import SecurityGatekeeper
+
+    config = EngineConfig()
+    engine = PaperTradingEngine(config)
+    mock_gk = MagicMock(spec=SecurityGatekeeper)
+    clean_report = SecurityReport(
+        token_address="PumpMintPipe111111111111111111111111111111",
+        chain=ChainIdentifier.SOLANA_MAINNET,
+        tier=SecurityTier.CLEAN,
+        is_honeypot=False,
+        buy_tax_bps=0,
+        sell_tax_bps=0,
+        passes_hard_gates=True,
+    )
+    mock_gk.evaluate_token = AsyncMock(return_value=clean_report)
+    mock_gk.is_rejected = MagicMock(return_value=False)
+    engine._gatekeeper = mock_gk
+
+    mint_ev = PumpMintEvent(
+        mint="PumpMintPipe111111111111111111111111111111",
+        bonding_curve="PumpCurvePipe11111111111111111111111111111",
+        virtual_sol_reserves=Decimal("30.0"),
+        virtual_token_reserves=Decimal("1073000000.0"),
+        slot=88888,
+    )
+
+    await engine._ingestion_q.put(mint_ev)
+
+    task = asyncio.create_task(engine._process_ingestion_queue())
+    await asyncio.sleep(0.05)
+    task.cancel()
+    try:
+        await task
+    except (asyncio.CancelledError, Exception):
+        pass
+
+    mock_gk.evaluate_token.assert_awaited_once_with(
+        token_address="PumpMintPipe111111111111111111111111111111",
+        chain=ChainIdentifier.SOLANA_MAINNET,
+        pool_address="PumpCurvePipe11111111111111111111111111111",
+    )
+    assert engine.launch_buffer.is_staged("PumpMintPipe111111111111111111111111111111") is True
+
+
+@pytest.mark.anyio
+async def test_runner_auto_discovery_fallback_on_large_buy():
+    """Verify auto-discovery fallback evaluates security and stages unstaged token on buy >= 0.5 SOL."""
+    from alpha_engine.engine.runner import PaperTradingEngine
+    from alpha_engine.models.events import PumpSwapEvent
+    from alpha_engine.security.gatekeeper import SecurityGatekeeper
+
+    config = EngineConfig()
+    engine = PaperTradingEngine(config)
+    mock_gk = MagicMock(spec=SecurityGatekeeper)
+    clean_report = SecurityReport(
+        token_address="AutoDiscToken11111111111111111111111111111",
+        chain=ChainIdentifier.SOLANA_MAINNET,
+        tier=SecurityTier.CLEAN,
+        is_honeypot=False,
+        buy_tax_bps=0,
+        sell_tax_bps=0,
+        passes_hard_gates=True,
+    )
+    mock_gk.evaluate_token = AsyncMock(return_value=clean_report)
+    mock_gk.is_rejected = MagicMock(return_value=False)
+    engine._gatekeeper = mock_gk
+
+    target_token = "AutoDiscToken11111111111111111111111111111"
+    pool_addr = "AutoDiscPool111111111111111111111111111111"
+
+    # Buy of 0.6 SOL for an unstaged token
+    buy_swap = PumpSwapEvent(
+        chain=ChainIdentifier.SOLANA_MAINNET,
+        block_number=99999,
+        tx_hash="tx_autodisc_11111111111111111111111111111111",
+        sender="BigBuyer11111111111111111111111111111111111",
+        pool_address=pool_addr,
+        token_in="So11111111111111111111111111111111111111112",
+        token_out=target_token,
+        amount_in=Decimal("0.6"),
+        amount_out=Decimal("15000000"),
+        timestamp_ns=time.time_ns(),
+        slot=99999,
+        mint=target_token,
+        sol_amount=Decimal("0.6"),
+        buyer="BigBuyer11111111111111111111111111111111111",
+        is_buy=True,
+    )
+
+    await engine._ingestion_q.put(buy_swap)
+
+    task = asyncio.create_task(engine._process_ingestion_queue())
+    await asyncio.sleep(0.05)
+    task.cancel()
+    try:
+        await task
+    except (asyncio.CancelledError, Exception):
+        pass
+
+    # Verify auto-discovery triggered evaluate_token and staged the token
+    mock_gk.evaluate_token.assert_awaited()
+    assert engine.launch_buffer.is_staged(target_token) is True
+    staged = engine.launch_buffer.get_staged(target_token)
+    assert staged is not None
+    assert staged.total_volume_native == Decimal("0.6")
+    assert staged.buy_count == 1
+
+
+def test_gatekeeper_and_config_thresholds():
+    """Verify MAX_TOP10_CONCENTRATION_PUMP_FUN threshold is 0.65 across gatekeeper and config."""
+    from alpha_engine.config import MAX_TOP10_CONCENTRATION_PUMP_FUN as CFG_CONC, EngineConfig
+    from alpha_engine.security.gatekeeper import (
+        MAX_TOP10_CONCENTRATION_PUMP_FUN as GK_CONC,
+        SecurityGatekeeper,
+        calculate_top10_concentration,
+    )
+
+    assert CFG_CONC == 0.65
+    assert GK_CONC == 0.65
+    assert SecurityGatekeeper.MAX_TOP10_CONCENTRATION_PUMP_FUN == 0.65
+    cfg = EngineConfig()
+    assert cfg.max_pump_fun_top10_concentration == 0.65
+
+    # Test calculate_top10_concentration excludes pump.fun bonding curve
+    mint = "PumpTokenCalc111111111111111111111111111111"
+    holders = [
+        {"address": "CurveAccount1111111111111111111111111111", "pct": 70.0},
+        {"address": "HolderA11111111111111111111111111111111", "pct": 10.0},
+        {"address": "HolderB11111111111111111111111111111111", "pct": 10.0},
+    ]
+    conc = calculate_top10_concentration(holders, is_pump=True, mint_address=mint)
+    # The 70% curve holding is excluded (>= 50% on idx 0)
+    assert conc == pytest.approx(0.20, rel=1e-2)
+

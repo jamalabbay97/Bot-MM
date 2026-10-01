@@ -18,6 +18,8 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 MAX_ACTIVE_POSITIONS: int = 3
 MAX_PORTFOLIO_EXPOSURE_PCT: float = 0.05
 MAX_PER_TOKEN_RISK_PCT: float = 0.015
+MAX_TOP10_CONCENTRATION: float = 0.20
+MAX_TOP10_CONCENTRATION_PUMP_FUN: float = 0.65
 
 
 class EngineConfig(BaseSettings):
@@ -276,6 +278,9 @@ class EngineConfig(BaseSettings):
     # -------------------------------------------------------------------------
     # 5b. Security Gatekeeper & Negative Cache Settings
     # -------------------------------------------------------------------------
+    MAX_TOP10_CONCENTRATION: float = 0.20
+    MAX_TOP10_CONCENTRATION_PUMP_FUN: float = 0.65
+
     max_top10_concentration: float = Field(
         default=0.20,
         ge=0.0,

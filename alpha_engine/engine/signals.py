@@ -119,6 +119,42 @@ class PendingLaunchBuffer:
         )
         return staged
 
+    def stage_token(
+        self,
+        token_address: str,
+        chain: ChainIdentifier = ChainIdentifier.SOLANA_MAINNET,
+        pool_address: str = "",
+        initial_price: Decimal = Decimal("0.000000028"),
+        report: SecurityReport | None = None,
+        raw_signal: RawSignalEvent | None = None,
+        t_0: float | None = None,
+    ) -> StagedLaunch:
+        """Stage a newly evaluated token launch into the observation buffer."""
+        rep = report or SecurityReport(
+            token_address=token_address,
+            chain=chain,
+            tier=SecurityTier.CLEAN,
+            is_honeypot=False,
+            buy_tax_bps=0,
+            sell_tax_bps=0,
+            passes_hard_gates=True,
+        )
+        sig = raw_signal or RawSignalEvent(
+            chain=chain,
+            token_address=token_address,
+            pool_address=pool_address,
+            source=SignalSource.PUMP_FUN_MINT,
+        )
+        return self.add_launch(
+            token_address=token_address,
+            chain=chain,
+            pool_address=pool_address,
+            initial_price=initial_price,
+            report=rep,
+            raw_signal=sig,
+            t_0=t_0,
+        )
+
     def is_staged(self, token_address: str) -> bool:
         launch = self._staged.get(token_address)
         return launch is not None and not launch.dropped and not launch.graduated

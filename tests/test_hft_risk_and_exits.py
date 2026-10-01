@@ -937,3 +937,27 @@ async def test_telegram_trades_dynamic_pnl_and_state_indicators():
     assert "LOCKED (+30%)" in text
 
 
+def test_signal_source_dynamic_exit():
+    """Verify SignalSource.DYNAMIC_EXIT exists and is accepted by TradeReflection."""
+    from alpha_engine.engine.feedback import TradeReflection
+    from alpha_engine.models.enums import SignalSource
+
+    assert hasattr(SignalSource, "DYNAMIC_EXIT")
+    assert SignalSource.DYNAMIC_EXIT == "dynamic_exit"
+
+    reflection = TradeReflection.from_trade(
+        trade_id="exit_order_123",
+        token_address="TokenExit11111111111111111111111111111111111",
+        chain=ChainIdentifier.SOLANA_MAINNET,
+        signal_source=SignalSource.DYNAMIC_EXIT,
+        entry_price=Decimal("1.0"),
+        exit_price=Decimal("1.25"),
+        realized_pnl_usd=Decimal("25.0"),
+        realized_pnl_native=Decimal("0.15"),
+        time_to_fill_ms=12.5,
+    )
+    assert reflection.signal_source == SignalSource.DYNAMIC_EXIT
+    assert reflection.is_win is True
+
+
+

@@ -82,6 +82,7 @@ class SignalSource(str, Enum):
     X_SENTIMENT = "x_sentiment"
     PUMP_FUN_MINT = "pump_fun_mint"
     PAIR_CREATED = "pair_created"
+    DYNAMIC_EXIT = "dynamic_exit"
 
 
 class LotStatus(str, Enum):

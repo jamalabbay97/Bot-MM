@@ -8,6 +8,7 @@ Python 3.11+ | websockets
 from __future__ import annotations
 
 import asyncio
+from collections import deque
 import json
 import logging
 import time
@@ -30,6 +31,8 @@ from alpha_engine.ingestion.decoders import (
 from alpha_engine.models.enums import ChainIdentifier, SignalSource
 from alpha_engine.models.events import (
     PoolStateUpdateEvent,
+    PumpMintEvent,
+    PumpSwapEvent,
     RawSignalEvent,
     ShutdownSentinel,
     SwapEvent,
@@ -133,6 +136,10 @@ class SVMIngester:
         self._backoff = ExponentialBackoff(initial=1.0, max_delay=10.0)
         self._sub_to_pool: dict[int, str] = {}
         self._ssl_fallback = False
+        self._trade_dedup_set: set[str] = set()
+        self._trade_dedup_queue: deque[str] = deque(maxlen=5000)
+        self._mint_dedup_set: set[str] = set()
+        self._mint_dedup_queue: deque[str] = deque(maxlen=2000)
 
     async def run(self) -> None:
         self._running = True
@@ -308,83 +315,103 @@ class SVMIngester:
                     if pump_trade is not None:
                         mint_addr = sanitize_solana_pubkey(pump_trade.get("mint"))
                         buyer_addr = sanitize_solana_pubkey(pump_trade.get("buyer")) or (tx_sig[:44] if len(tx_sig) >= 32 else "PumpBuyer111111111111111111111111111111111")
+                        sol_amt = pump_trade.get("sol_amount", Decimal("0"))
                         if (
                             mint_addr
                             and mint_addr not in SOLANA_SYSTEM_PROGRAM_IDS
                             and not mint_addr.startswith("11111111")
                         ):
-                            sol_mint = "So11111111111111111111111111111111111111112"
-                            is_buy = pump_trade.get("is_buy", True)
-                            sol_amt = pump_trade.get("sol_amount", Decimal("0"))
-                            tok_amt = pump_trade.get("token_amount", Decimal("0"))
-
-                            curve_addr = mint_addr
-                            if pool_key in self._pool_registry and pool_key != PUMP_FUN_PROGRAM_ID:
-                                curve_addr = pool_key
+                            # Deduplication set based on slot:mint:buyer:sol_amount
+                            trade_dedup_key = f"{slot}:{mint_addr}:{buyer_addr}:{sol_amt}"
+                            if trade_dedup_key in self._trade_dedup_set:
+                                logger.debug("Duplicate SVM Pump.fun trade skipped: %s", trade_dedup_key)
                             else:
-                                for c_addr, meta in self._pool_registry.items():
-                                    if meta[0] == mint_addr:
-                                        curve_addr = c_addr
-                                        break
+                                self._trade_dedup_set.add(trade_dedup_key)
+                                self._trade_dedup_queue.append(trade_dedup_key)
+                                if len(self._trade_dedup_queue) > 5000:
+                                    old_key = self._trade_dedup_queue.popleft()
+                                    self._trade_dedup_set.discard(old_key)
 
-                            if is_buy:
-                                token_in = sol_mint
-                                token_out = mint_addr
-                                amt_in = sol_amt
-                                amt_out = tok_amt
-                            else:
-                                token_in = mint_addr
-                                token_out = sol_mint
-                                amt_in = tok_amt
-                                amt_out = sol_amt
+                                sol_mint = "So11111111111111111111111111111111111111112"
+                                is_buy = pump_trade.get("is_buy", True)
+                                tok_amt = pump_trade.get("token_amount", Decimal("0"))
 
-                            if amt_in > Decimal(0) and amt_out > Decimal(0):
-                                swap_ev = SwapEvent(
-                                    timestamp_ns=time.time_ns(),
-                                    block_number=slot,
-                                    chain=ChainIdentifier.SOLANA_MAINNET,
-                                    pool_address=curve_addr,
-                                    token_in=token_in,
-                                    token_out=token_out,
-                                    amount_in=amt_in,
-                                    amount_out=amt_out,
-                                    sender=buyer_addr,
-                                    tx_hash=tx_sig,
-                                    log_index=None,
-                                )
-                                await self._queue.put(swap_ev)
-                                logger.info(
-                                    "SVM Pump.fun trade queued: %s mint=%s sol=%s buyer=%s slot=%d",
-                                    "BUY" if is_buy else "SELL",
-                                    mint_addr[:10],
-                                    sol_amt,
-                                    buyer_addr[:8],
-                                    slot,
-                                )
+                                curve_addr = mint_addr
+                                if pool_key in self._pool_registry and pool_key != PUMP_FUN_PROGRAM_ID:
+                                    curve_addr = pool_key
+                                else:
+                                    for c_addr, meta in self._pool_registry.items():
+                                        if meta[0] == mint_addr:
+                                            curve_addr = c_addr
+                                            break
 
-                            v_sol = pump_trade.get("virtual_sol_reserves", Decimal("0"))
-                            v_tok = pump_trade.get("virtual_token_reserves", Decimal("0"))
-                            if v_sol > Decimal(0) and v_tok > Decimal(0):
-                                pool_state = PoolState(
-                                    pool_address=curve_addr,
-                                    chain=ChainIdentifier.SOLANA_MAINNET,
-                                    token_address=mint_addr,
-                                    native_reserve=v_sol,
-                                    token_reserve=v_tok,
-                                    fee_numerator=10,
-                                    fee_denominator=1000,
-                                    last_updated_block=slot,
-                                    token_decimals=6,
-                                    native_decimals=9,
-                                )
-                                await self._queue.put(
-                                    PoolStateUpdateEvent(
+                                if is_buy:
+                                    token_in = sol_mint
+                                    token_out = mint_addr
+                                    amt_in = sol_amt
+                                    amt_out = tok_amt
+                                else:
+                                    token_in = mint_addr
+                                    token_out = sol_mint
+                                    amt_in = tok_amt
+                                    amt_out = sol_amt
+
+                                v_sol = pump_trade.get("virtual_sol_reserves", Decimal("0"))
+                                v_tok = pump_trade.get("virtual_token_reserves", Decimal("0"))
+
+                                if amt_in > Decimal(0) and amt_out > Decimal(0):
+                                    swap_ev = PumpSwapEvent(
                                         timestamp_ns=time.time_ns(),
+                                        block_number=slot,
                                         chain=ChainIdentifier.SOLANA_MAINNET,
                                         pool_address=curve_addr,
-                                        new_pool_state=pool_state,
+                                        token_in=token_in,
+                                        token_out=token_out,
+                                        amount_in=amt_in,
+                                        amount_out=amt_out,
+                                        sender=buyer_addr,
+                                        tx_hash=tx_sig,
+                                        log_index=None,
+                                        mint=mint_addr,
+                                        sol_amount=sol_amt,
+                                        token_amount=tok_amt,
+                                        buyer=buyer_addr,
+                                        is_buy=is_buy,
+                                        virtual_sol_reserves=v_sol if v_sol > Decimal(0) else Decimal("30.0"),
+                                        virtual_token_reserves=v_tok if v_tok > Decimal(0) else Decimal("1073000000.0"),
+                                        slot=slot,
                                     )
-                                )
+                                    await self._queue.put(swap_ev)
+                                    logger.info(
+                                        "SVM Pump.fun trade queued: %s mint=%s sol=%s buyer=%s slot=%d",
+                                        "BUY" if is_buy else "SELL",
+                                        mint_addr[:10],
+                                        sol_amt,
+                                        buyer_addr[:8],
+                                        slot,
+                                    )
+
+                                if v_sol > Decimal(0) and v_tok > Decimal(0):
+                                    pool_state = PoolState(
+                                        pool_address=curve_addr,
+                                        chain=ChainIdentifier.SOLANA_MAINNET,
+                                        token_address=mint_addr,
+                                        native_reserve=v_sol,
+                                        token_reserve=v_tok,
+                                        fee_numerator=10,
+                                        fee_denominator=1000,
+                                        last_updated_block=slot,
+                                        token_decimals=6,
+                                        native_decimals=9,
+                                    )
+                                    await self._queue.put(
+                                        PoolStateUpdateEvent(
+                                            timestamp_ns=time.time_ns(),
+                                            chain=ChainIdentifier.SOLANA_MAINNET,
+                                            pool_address=curve_addr,
+                                            new_pool_state=pool_state,
+                                        )
+                                    )
 
                     # 2. Check for Raydium Swap
                     event = self._parse_raydium_transaction(tx_sig, logs, pool_key)
@@ -395,75 +422,103 @@ class SVMIngester:
                             pool_key[:10], tx_sig[:12],
                         )
 
-                # 2. Check for Pump.fun Mint / Bonding Curve Creation
-                pump_info = _parse_pump_fun_logs(logs, tx_sig)
-                if pump_info is not None:
-                    mint_addr = sanitize_solana_pubkey(pump_info.get("mint"))
-                    curve_addr = sanitize_solana_pubkey(pump_info.get("bonding_curve"))
-                    if (
-                        mint_addr
-                        and curve_addr
-                        and mint_addr not in SOLANA_SYSTEM_PROGRAM_IDS
-                        and not mint_addr.startswith("11111111")
-                    ):
-                        self._pool_registry[curve_addr] = (
-                            mint_addr,
-                            "So11111111111111111111111111111111111111112",
-                            pump_info["token_decimals"],
-                            pump_info["native_decimals"],
-                        )
-                        pool_state = PoolState(
-                            pool_address=curve_addr,
-                            chain=ChainIdentifier.SOLANA_MAINNET,
-                            token_address=mint_addr,
-                            native_reserve=pump_info["virtual_sol_reserves"],
-                            token_reserve=pump_info["virtual_token_reserves"],
-                            fee_numerator=10,
-                            fee_denominator=1000,
-                            last_updated_block=0,
-                            token_decimals=pump_info["token_decimals"],
-                            native_decimals=pump_info["native_decimals"],
-                        )
-                        await self._queue.put(
-                            PoolStateUpdateEvent(
-                                timestamp_ns=time.time_ns(),
-                                chain=ChainIdentifier.SOLANA_MAINNET,
-                                pool_address=curve_addr,
-                                new_pool_state=pool_state,
-                            )
-                        )
-                        await self._queue.put(
-                            RawSignalEvent(
-                                chain=ChainIdentifier.SOLANA_MAINNET,
-                                token_address=mint_addr,
-                                pool_address=curve_addr,
-                                source=SignalSource.PUMP_FUN_MINT,
-                                originating_channel="pump_fun_stream",
-                                raw_text=f"Pump.fun New Mint: {mint_addr} curve={curve_addr}",
-                            )
-                        )
-                        logger.info("SVM Pump.fun mint detected: %s (curve=%s)", mint_addr[:10], curve_addr[:10])
+                    # 3. Check for Pump.fun Mint / Bonding Curve Creation
+                    pump_info = _parse_pump_fun_logs(logs, tx_sig, slot=slot)
+                    if pump_info is not None:
+                        mint_addr = sanitize_solana_pubkey(pump_info.get("mint") or pump_info.mint)
+                        curve_addr = sanitize_solana_pubkey(pump_info.get("bonding_curve") or pump_info.bonding_curve)
+                        if (
+                            mint_addr
+                            and curve_addr
+                            and mint_addr not in SOLANA_SYSTEM_PROGRAM_IDS
+                            and not mint_addr.startswith("11111111")
+                        ):
+                            mint_dedup_key = f"{slot}:{mint_addr}"
+                            if mint_dedup_key in self._mint_dedup_set:
+                                logger.debug("Duplicate SVM Pump.fun mint skipped: %s", mint_dedup_key)
+                            else:
+                                self._mint_dedup_set.add(mint_dedup_key)
+                                self._mint_dedup_queue.append(mint_dedup_key)
+                                if len(self._mint_dedup_queue) > 2000:
+                                    old_key = self._mint_dedup_queue.popleft()
+                                    self._mint_dedup_set.discard(old_key)
 
-                # 3. Check for Raydium AMM Pool Creation
-                ray_init = _parse_raydium_initialize2_logs(logs, tx_sig)
-                if ray_init is not None:
-                    pool_addr = sanitize_solana_pubkey(ray_init.get("pool_address"))
-                    if (
-                        pool_addr
-                        and pool_addr not in SOLANA_SYSTEM_PROGRAM_IDS
-                        and not pool_addr.startswith("11111111")
-                    ):
-                        await self._queue.put(
-                            RawSignalEvent(
-                                chain=ChainIdentifier.SOLANA_MAINNET,
-                                token_address=pool_addr,
-                                pool_address=pool_addr,
-                                source=SignalSource.PAIR_CREATED,
-                                originating_channel="raydium_stream",
-                                raw_text=f"Raydium AMM CreatePool: {pool_addr}",
+                                tok_dec = pump_info.get("token_decimals", 6)
+                                nat_dec = pump_info.get("native_decimals", 9)
+                                v_sol = pump_info.get("virtual_sol_reserves", Decimal("30.0"))
+                                v_tok = pump_info.get("virtual_token_reserves", Decimal("1073000000.0"))
+
+                                self._pool_registry[curve_addr] = (
+                                    mint_addr,
+                                    "So11111111111111111111111111111111111111112",
+                                    tok_dec,
+                                    nat_dec,
+                                )
+                                pool_state = PoolState(
+                                    pool_address=curve_addr,
+                                    chain=ChainIdentifier.SOLANA_MAINNET,
+                                    token_address=mint_addr,
+                                    native_reserve=v_sol,
+                                    token_reserve=v_tok,
+                                    fee_numerator=10,
+                                    fee_denominator=1000,
+                                    last_updated_block=slot,
+                                    token_decimals=tok_dec,
+                                    native_decimals=nat_dec,
+                                )
+                                await self._queue.put(
+                                    PoolStateUpdateEvent(
+                                        timestamp_ns=time.time_ns(),
+                                        chain=ChainIdentifier.SOLANA_MAINNET,
+                                        pool_address=curve_addr,
+                                        new_pool_state=pool_state,
+                                    )
+                                )
+                                mint_ev = PumpMintEvent(
+                                    timestamp_ns=time.time_ns(),
+                                    chain=ChainIdentifier.SOLANA_MAINNET,
+                                    mint=mint_addr,
+                                    bonding_curve=curve_addr,
+                                    virtual_sol_reserves=v_sol,
+                                    virtual_token_reserves=v_tok,
+                                    token_decimals=tok_dec,
+                                    native_decimals=nat_dec,
+                                    tx_hash=tx_sig,
+                                    slot=slot,
+                                )
+                                await self._queue.put(mint_ev)
+                                await self._queue.put(
+                                    RawSignalEvent(
+                                        chain=ChainIdentifier.SOLANA_MAINNET,
+                                        token_address=mint_addr,
+                                        pool_address=curve_addr,
+                                        source=SignalSource.PUMP_FUN_MINT,
+                                        originating_channel="pump_fun_stream",
+                                        raw_text=f"Pump.fun New Mint: {mint_addr} curve={curve_addr}",
+                                    )
+                                )
+                                logger.info("SVM Pump.fun mint detected: %s (curve=%s)", mint_addr[:10], curve_addr[:10])
+
+                    # 4. Check for Raydium AMM Pool Creation
+                    ray_init = _parse_raydium_initialize2_logs(logs, tx_sig)
+                    if ray_init is not None:
+                        pool_addr = sanitize_solana_pubkey(ray_init.get("pool_address"))
+                        if (
+                            pool_addr
+                            and pool_addr not in SOLANA_SYSTEM_PROGRAM_IDS
+                            and not pool_addr.startswith("11111111")
+                        ):
+                            await self._queue.put(
+                                RawSignalEvent(
+                                    chain=ChainIdentifier.SOLANA_MAINNET,
+                                    token_address=pool_addr,
+                                    pool_address=pool_addr,
+                                    source=SignalSource.PAIR_CREATED,
+                                    originating_channel="raydium_stream",
+                                    raw_text=f"Raydium AMM CreatePool: {pool_addr}",
+                                )
                             )
-                        )
-                        logger.info("SVM Raydium CreatePool detected: %s", pool_addr[:10])
+                            logger.info("SVM Raydium CreatePool detected: %s", pool_addr[:10])
             finally:
                 if not sub_task.done():
                     sub_task.cancel()
