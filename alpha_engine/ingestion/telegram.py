@@ -238,6 +238,7 @@ class TelegramIngester:
             self._target_channels = list(DEFAULT_TELEGRAM_CHANNELS)
 
         self._admin_ids: Set[int] = {int(x) for x in admin_ids} if admin_ids else set()
+        self._active_dm_chat_ids: Set[int] = set()
         self._db_path = db_path
         self._status_provider = status_provider
         self._limiter = limiter
@@ -462,6 +463,25 @@ class TelegramIngester:
         except Exception as exc:
             logger.warning("[TelegramIngester] Failed to send reply: %s", exc)
 
+    async def broadcast_trade_alert(self, message: str) -> None:
+        """
+        Broadcast real-time trade alert to all configured admin user IDs
+        and active DM participants.
+        """
+        targets = set(self._admin_ids) | set(self._active_dm_chat_ids)
+        if not targets:
+            logger.debug("[TelegramIngester] No admin or DM recipients registered for trade broadcast.")
+            return
+
+        for chat_id in targets:
+            try:
+                if self._client is not None and hasattr(self._client, "send_message"):
+                    res = self._client.send_message(chat_id, message)
+                    if asyncio.iscoroutine(res):
+                        await res
+            except Exception as exc:
+                logger.warning("[TelegramIngester] Failed to send trade alert to %s: %s", chat_id, exc)
+
     def _is_authorized(self, sender_id: Optional[int]) -> bool:
         """
         Check if sender is an authorized admin.
@@ -638,6 +658,9 @@ class TelegramIngester:
                 sender_id,
             )
             return
+
+        if sender_id is not None:
+            self._active_dm_chat_ids.add(int(sender_id))
 
         raw_text = getattr(event, "raw_text", getattr(event, "text", "")) or ""
         text = raw_text.strip()
@@ -1041,7 +1064,9 @@ class TelegramIngester:
             except Exception as exc:
                 logger.debug("[TelegramIngester] DB trades query error: %s", exc)
 
-        if not open_trades and not trade_rows:
+        closed_trades = metrics.get("recent_closed_trades", [])
+
+        if not open_trades and not trade_rows and not closed_trades:
             await self._safe_reply(event, "📋 No executed paper trades recorded in ledger yet.")
             return
 
@@ -1109,7 +1134,39 @@ class TelegramIngester:
             open_lines.append("```")
             response_sections.append("\n".join(open_lines))
 
-        if trade_rows:
+        if closed_trades:
+            closed_lines = [
+                f"📊 **Recent Closed Trades ({len(closed_trades)})**\n",
+                "```",
+            ]
+            for ct in closed_trades[:10]:
+                token_str = str(ct.get("token_address", ""))
+                short_token = f"{token_str[:4]}..{token_str[-4:]}" if len(token_str) > 10 else token_str
+                chain_str = str(ct.get("chain", "")).replace("ChainIdentifier.", "").replace("_mainnet", "")[:5]
+                ep_raw = ct.get("entry_price", 0)
+                xp_raw = ct.get("exit_price", 0)
+                entry_p = self._format_price(ep_raw)
+                exit_p = self._format_price(xp_raw)
+                pnl_f = float(ct.get("realized_pnl_usd", 0.0))
+                pnl_pct = float(ct.get("realized_pnl_pct", 0.0))
+                is_win = ct.get("is_win", pnl_f > 0)
+                status_icon = "🟢 WIN" if is_win else "🔴 LOSS"
+                usd_str = f"+${pnl_f:.2f}" if pnl_f > 0 else f"-${abs(pnl_f):.2f}" if pnl_f < 0 else "$0.00"
+                pnl_pct_str = f"{pnl_pct:+.2f}%"
+                pnl_display = f"{pnl_pct_str} ({usd_str})"
+                reason = str(ct.get("exit_reason", "exit"))[:24]
+                dur_s = int(float(ct.get("duration_s", 0.0)))
+                dur_str = f"{dur_s}s" if dur_s > 0 else "<1s"
+
+                closed_lines.append(f"• {status_icon} {short_token} ({chain_str}) | {reason}")
+                closed_lines.append(f"  ENTRY: {entry_p} | EXIT: {exit_p}")
+                closed_lines.append(f"  PNL %: {pnl_display} | DUR: {dur_str}")
+                closed_lines.append("-" * 40)
+            if closed_lines and closed_lines[-1] == "-" * 40:
+                closed_lines.pop()
+            closed_lines.append("```")
+            response_sections.append("\n".join(closed_lines))
+        elif trade_rows:
             lines = [
                 "📋 **Last 5 Executed Paper Trades**\n",
                 "```",

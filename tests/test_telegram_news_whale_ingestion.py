@@ -295,3 +295,82 @@ def test_config_telegram_defaults() -> None:
     assert "TreeNewsFeed" in cfg.telegram_channels
     assert "lookonchain" in cfg.telegram_channels
     assert "WatcherGuru" in cfg.telegram_channels
+
+
+def test_telegram_broadcast_and_rich_closed_trades_command() -> None:
+    """Verify TelegramIngester broadcasts real-time trade alerts and displays rich closed trades telemetry."""
+    async def run() -> None:
+        from decimal import Decimal
+        queue: asyncio.Queue = asyncio.Queue()
+        mock_client = MagicMock()
+        mock_client.send_message = AsyncMock()
+
+        ingester = TelegramIngester(
+            event_queue=queue,
+            admin_ids=[12345],
+            client=mock_client,
+        )
+
+        # 1. Test broadcast_trade_alert
+        await ingester.broadcast_trade_alert("🟢 **BUY EXECUTED**\n• Token: `TestToken`")
+        mock_client.send_message.assert_called_once_with(12345, "🟢 **BUY EXECUTED**\n• Token: `TestToken`")
+
+        # 2. Test /trades with rich closed trades
+        status_mock = {
+            "open_trades": [],
+            "recent_closed_trades": [
+                {
+                    "token_address": "CcnCKDE6Zz11111111111111111111111111111111",
+                    "chain": ChainIdentifier.SOLANA_MAINNET,
+                    "side": "SELL",
+                    "entry_price": Decimal("0.00000005422"),
+                    "exit_price": Decimal("0.00000003424"),
+                    "realized_pnl_usd": Decimal("-15.25"),
+                    "realized_pnl_pct": -36.85,
+                    "exit_reason": "sl_hard",
+                    "duration_s": 42.5,
+                    "is_win": False,
+                    "timestamp": time.time(),
+                },
+                {
+                    "token_address": "WinToken1111111111111111111111111111111111",
+                    "chain": ChainIdentifier.SOLANA_MAINNET,
+                    "side": "SELL",
+                    "entry_price": Decimal("0.00000001000"),
+                    "exit_price": Decimal("0.00000001500"),
+                    "realized_pnl_usd": Decimal("25.00"),
+                    "realized_pnl_pct": 50.00,
+                    "exit_reason": "tp_50",
+                    "duration_s": 85.0,
+                    "is_win": True,
+                    "timestamp": time.time(),
+                },
+            ],
+        }
+        ingester.set_status_provider(lambda: status_mock)
+
+        class MockEvent:
+            def __init__(self):
+                self.is_private = True
+                self.sender_id = 12345
+                self.raw_text = "/trades"
+                self.reply_text = ""
+
+            async def reply(self, text):
+                self.reply_text = text
+
+        event = MockEvent()
+        await ingester._handle_dm_message(event)
+
+        assert "Recent Closed Trades" in event.reply_text
+        assert "🔴 LOSS" in event.reply_text
+        assert "sl_hard" in event.reply_text
+        assert "-36.85%" in event.reply_text
+        assert "-$15.25" in event.reply_text
+        assert "🟢 WIN" in event.reply_text
+        assert "+50.00%" in event.reply_text
+        assert "+$25.00" in event.reply_text
+        assert "tp_50" in event.reply_text
+
+    asyncio.run(run())
+

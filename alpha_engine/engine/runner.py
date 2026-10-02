@@ -115,6 +115,8 @@ class PaperTradingEngine:
         self._ledger: SQLiteLedger | None = None
         self._gatekeeper: SecurityGatekeeper | None = None
         self._session: aiohttp.ClientSession | None = None
+        self._telegram: Any = None
+        self._recent_closed_trades: deque[dict[str, Any]] = deque(maxlen=50)
 
         self._trades_since_kelly_refresh = 0
         self._kelly_refresh_interval = 10
@@ -149,6 +151,89 @@ class PaperTradingEngine:
     @property
     def launch_buffer(self) -> PendingLaunchBuffer:
         return self._pending_launch_buffer
+
+    @staticmethod
+    def _format_price_clean(price: Any) -> str:
+        try:
+            val = float(price)
+            if val <= 0:
+                return "$0.00"
+            if val >= 1.0:
+                return f"${val:.4f}"
+            s = f"{val:.12f}"
+            dec_part = s.split(".")[1]
+            zero_count = 0
+            for ch in dec_part:
+                if ch == "0":
+                    zero_count += 1
+                else:
+                    break
+            subscripts = "₀₁₂₃₄₅₆₇₈₉"
+            if zero_count >= 3:
+                sub_str = "".join(subscripts[int(d)] for d in str(zero_count))
+                sig_digits = dec_part[zero_count : zero_count + 4]
+                return f"$0.0{sub_str}{sig_digits}"
+            return f"${val:.8f}"
+        except Exception:
+            return f"${price}"
+
+    async def _broadcast_trade_alert(self, message: str) -> None:
+        """Broadcast real-time trade alert to Telegram admins."""
+        if self._telegram is not None and hasattr(self._telegram, "broadcast_trade_alert"):
+            try:
+                res = self._telegram.broadcast_trade_alert(message)
+                if asyncio.iscoroutine(res):
+                    await res
+            except Exception as exc:
+                logger.warning("Failed to broadcast trade alert to Telegram: %s", exc)
+
+    def _record_closed_trade_and_notify(
+        self,
+        lot: Any,
+        exit_fill: Any,
+        decision_reason: str,
+        exit_pnl_usd: Decimal,
+        pnl_native: Decimal,
+    ) -> None:
+        """Records closed trade in memory and dispatches rich Telegram alert."""
+        ep = getattr(lot, "entry_price", Decimal(0))
+        xp = getattr(exit_fill, "effective_price", Decimal(0))
+        pct = float((xp - ep) / ep * 100) if ep > 0 else 0.0
+        is_win = exit_pnl_usd > 0
+        dur_s = (time.time_ns() - lot.open_timestamp_ns) / 1e9 if getattr(lot, "open_timestamp_ns", 0) > 0 else 0.0
+
+        self._recent_closed_trades.append({
+            "token_address": lot.token_address,
+            "chain": lot.chain,
+            "side": "SELL",
+            "entry_price": ep,
+            "exit_price": xp,
+            "realized_pnl_usd": exit_pnl_usd,
+            "realized_pnl_pct": pct,
+            "exit_reason": decision_reason,
+            "duration_s": dur_s,
+            "is_win": is_win,
+            "timestamp": time.time(),
+        })
+
+        status_icon = "🟢" if is_win else "🔴"
+        title = f"TAKE-PROFIT (+{pct:.2f}%)" if is_win else f"STOP-LOSS ({pct:.2f}%)"
+        ep_str = self._format_price_clean(ep)
+        xp_str = self._format_price_clean(xp)
+        t_str = f"{lot.token_address[:4]}..{lot.token_address[-4:]}"
+        usd_sign = "+" if exit_pnl_usd > 0 else ""
+        chain_val = lot.chain.value if hasattr(lot.chain, "value") else str(lot.chain)
+        exit_msg = (
+            f"{status_icon} **{title} (Paper Trade)**\n\n"
+            f"• **Token:** `{t_str}` (`{lot.token_address}`)\n"
+            f"• **Chain:** {chain_val}\n"
+            f"• **Entry Price:** `{ep_str}`\n"
+            f"• **Exit Price:** `{xp_str}`\n"
+            f"• **Return %:** `{pct:+.2f}%` ({usd_sign}${float(exit_pnl_usd):.2f})\n"
+            f"• **Exit Reason:** `{decision_reason}`\n"
+            f"• **Holding Time:** `{dur_s:.1f}s`"
+        )
+        asyncio.create_task(self._broadcast_trade_alert(exit_msg))
 
     def _install_signal_handlers(self) -> None:
         """
@@ -741,6 +826,13 @@ class PaperTradingEngine:
                             time_to_fill_ms=exit_fill.fill_latency_ms,
                         )
                         await self._feedback.record_closed_trade(reflection)
+                        self._record_closed_trade_and_notify(
+                            lot=lot,
+                            exit_fill=exit_fill,
+                            decision_reason=decision.exit_reason.value if decision.exit_reason else "swap_exit",
+                            exit_pnl_usd=exit_pnl_usd,
+                            pnl_native=pnl_native,
+                        )
 
     def validate_signal_strength(
         self,
@@ -987,6 +1079,22 @@ class PaperTradingEngine:
                 else:
                     self._cash_sol -= fill.simulated_native_spent
 
+                p_str = self._format_price_clean(fill.effective_price)
+                t_str = f"{fill.token_address[:4]}..{fill.token_address[-4:]}"
+                unit = "ETH" if signal_item.chain == ChainIdentifier.BASE_MAINNET else "SOL"
+                spent_val = float(fill.simulated_native_spent)
+                tok_val = float(fill.tokens_acquired)
+                buy_alert = (
+                    f"🟢 **BUY EXECUTED (Paper Trade)**\n\n"
+                    f"• **Token:** `{t_str}` (`{fill.token_address}`)\n"
+                    f"• **Chain:** {signal_item.chain.value}\n"
+                    f"• **Buy Price:** `{p_str}`\n"
+                    f"• **Spent:** `{spent_val:.4f} {unit}`\n"
+                    f"• **Tokens Acquired:** `{tok_val:,.2f}`\n"
+                    f"• **Order ID:** `{fill.order_id[:8]}`"
+                )
+                asyncio.create_task(self._broadcast_trade_alert(buy_alert))
+
             elif fill.side == OrderSide.SELL:
                 native_price = (
                     self._eth_price
@@ -1035,6 +1143,33 @@ class PaperTradingEngine:
                     time_to_fill_ms=fill.fill_latency_ms,
                 )
                 await self._feedback.record_closed_trade(reflection)
+
+                is_win = bool(realized_pnl_usd and realized_pnl_usd > 0)
+                xp = fill.effective_price
+                self._recent_closed_trades.append({
+                    "token_address": fill.token_address,
+                    "chain": fill.chain,
+                    "side": "SELL",
+                    "entry_price": xp,
+                    "exit_price": xp,
+                    "realized_pnl_usd": realized_pnl_usd or Decimal(0),
+                    "realized_pnl_pct": 0.0,
+                    "exit_reason": "signal_sell",
+                    "duration_s": 0.0,
+                    "is_win": is_win,
+                    "timestamp": time.time(),
+                })
+                usd_sign = "+" if (realized_pnl_usd or 0) > 0 else ""
+                icon = "🟢" if is_win else "🔴"
+                sell_alert = (
+                    f"{icon} **SELL EXECUTED (Paper Trade)**\n\n"
+                    f"• **Token:** `{fill.token_address[:4]}..{fill.token_address[-4:]}` (`{fill.token_address}`)\n"
+                    f"• **Chain:** {fill.chain.value}\n"
+                    f"• **Exit Price:** `{self._format_price_clean(xp)}`\n"
+                    f"• **Realized PnL:** `{usd_sign}${float(realized_pnl_usd or 0):.2f}`\n"
+                    f"• **Reason:** `signal_sell`"
+                )
+                asyncio.create_task(self._broadcast_trade_alert(sell_alert))
 
             trade_record = TradeRecord.from_fill(
                 fill=fill,
@@ -1255,6 +1390,7 @@ class PaperTradingEngine:
             "recent_news": list(self._recent_news_events),
             "recent_whales": list(self._recent_whale_alerts),
             "open_trades": open_trades_info,
+            "recent_closed_trades": list(self._recent_closed_trades),
         }
 
     async def _position_price_poller(self) -> None:
@@ -1411,6 +1547,13 @@ class PaperTradingEngine:
                                 time_to_fill_ms=exit_fill.fill_latency_ms,
                             )
                             await self._feedback.record_closed_trade(reflection)
+                            self._record_closed_trade_and_notify(
+                                lot=lot,
+                                exit_fill=exit_fill,
+                                decision_reason=decision.exit_reason.value if decision.exit_reason else "dynamic_exit",
+                                exit_pnl_usd=exit_pnl_usd,
+                                pnl_native=pnl_native,
+                            )
                             logger.info(
                                 "DYNAMIC EXIT executed | %s %s | reason=%s | exit_price=%s | PnL=%.4f USD | WR=%.1f%% | impact=%d bps",
                                 decision.chain.value,
@@ -1527,6 +1670,7 @@ class PaperTradingEngine:
             )
 
             async with coordinator:
+                self._telegram = coordinator.telegram_ingester
                 async def _bridge_queues() -> None:
                     try:
                         async for event in coordinator:
