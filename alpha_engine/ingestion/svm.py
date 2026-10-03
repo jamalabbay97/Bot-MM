@@ -110,6 +110,91 @@ def is_valid_solana_pubkey(addr: str) -> bool:
     return sanitize_solana_pubkey(addr) is not None
 
 
+class SubscriptionRegistry:
+    """
+    Dedicated bidirectional registry for SVM WebSocket subscriptions.
+    Tracks mint/pool <-> subscription_id mappings, timestamps, and protects
+    permanent infrastructure subscriptions (Pump.fun program, Raydium program).
+    """
+
+    def __init__(self, max_capacity: int = 800) -> None:
+        self.max_capacity = max_capacity
+        self._target_to_sub: dict[str, int] = {}
+        self._sub_to_target: dict[int, str] = {}
+        self._target_timestamps: dict[str, float] = {}
+        self._permanent_targets: set[str] = set()
+
+    def __len__(self) -> int:
+        return len(self._target_to_sub)
+
+    def register(self, target: str, sub_id: int, is_permanent: bool = False, timestamp: float | None = None) -> str | None:
+        evicted = None
+        if len(self._target_to_sub) >= self.max_capacity and target not in self._target_to_sub:
+            non_perm = [
+                (t, self._target_timestamps.get(t, 0.0))
+                for t in self._target_to_sub
+                if t not in self._permanent_targets
+            ]
+            if non_perm:
+                oldest_target = min(non_perm, key=lambda kv: kv[1])[0]
+                self.remove(oldest_target)
+                evicted = oldest_target
+
+        now = timestamp if timestamp is not None else time.time()
+        self._target_to_sub[target] = sub_id
+        self._sub_to_target[sub_id] = target
+        self._target_timestamps[target] = now
+        if is_permanent:
+            self._permanent_targets.add(target)
+        return evicted
+
+    def touch(self, target: str, timestamp: float | None = None) -> None:
+        if target in self._target_to_sub:
+            self._target_timestamps[target] = timestamp if timestamp is not None else time.time()
+
+    def get_sub_id(self, target: str) -> int | None:
+        return self._target_to_sub.get(target)
+
+    def get_target(self, sub_id: int) -> str | None:
+        return self._sub_to_target.get(sub_id)
+
+    def is_permanent(self, target: str) -> bool:
+        return target in self._permanent_targets
+
+    def remove(self, target: str) -> int | None:
+        sub_id = self._target_to_sub.pop(target, None)
+        if sub_id is not None:
+            self._sub_to_target.pop(sub_id, None)
+        self._target_timestamps.pop(target, None)
+        return sub_id
+
+    def remove_by_sub_id(self, sub_id: int) -> str | None:
+        target = self._sub_to_target.pop(sub_id, None)
+        if target is not None:
+            self._target_to_sub.pop(target, None)
+            self._target_timestamps.pop(target, None)
+        return target
+
+    def get_stale_targets(self, max_age_s: float = 120.0, current_time: float | None = None) -> list[tuple[str, int]]:
+        """Return non-permanent targets with age > max_age_s."""
+        now = current_time if current_time is not None else time.time()
+        stale: list[tuple[str, int]] = []
+        for target, ts in list(self._target_timestamps.items()):
+            if target not in self._permanent_targets and (now - ts) > max_age_s:
+                sub_id = self._target_to_sub.get(target)
+                if sub_id is not None:
+                    stale.append((target, sub_id))
+        return stale
+
+    def active_count(self) -> int:
+        return len(self._target_to_sub)
+
+    def clear(self) -> None:
+        self._target_to_sub.clear()
+        self._sub_to_target.clear()
+        self._target_timestamps.clear()
+
+
 class SVMIngester:
     """
     Ingests Raydium V4 swap events from Solana via Helius WebSocket.
@@ -135,11 +220,97 @@ class SVMIngester:
         # Exponential backoff starting at 1.0s, capped at 10.0s
         self._backoff = ExponentialBackoff(initial=1.0, max_delay=10.0)
         self._sub_to_pool: dict[int, str] = {}
+        self._subscriptions = SubscriptionRegistry(max_capacity=800)
+        self._ws: Any = None
+        self._req_id = 1
+        self._pending_ids: dict[int, str] = {}
+        self._pending_unsubs: dict[int, str] = {}
+        self._sweep_task: asyncio.Task[None] | None = None
         self._ssl_fallback = False
         self._trade_dedup_set: set[str] = set()
         self._trade_dedup_queue: deque[str] = deque(maxlen=5000)
         self._mint_dedup_set: set[str] = set()
         self._mint_dedup_queue: deque[str] = deque(maxlen=2000)
+
+    @property
+    def subscriptions(self) -> SubscriptionRegistry:
+        return self._subscriptions
+
+    async def unsubscribe(self, target: str) -> bool:
+        """
+        Asynchronously dispatch logsUnsubscribe for target token or pool.
+        Removes subscription from registry and pool registry.
+        """
+        clean = sanitize_solana_pubkey(target) or target
+        if not clean:
+            return False
+
+        if self._subscriptions.is_permanent(clean):
+            logger.debug("Cannot unsubscribe permanent infrastructure target %s", clean)
+            return False
+
+        sub_id = self._subscriptions.remove(clean)
+        self._pool_registry.pop(clean, None)
+
+        if sub_id is None:
+            # Check if clean target is a token address mapped to a curve
+            for curve, meta in list(self._pool_registry.items()):
+                if meta[0] == clean:
+                    self._pool_registry.pop(curve, None)
+                    sub_id = self._subscriptions.remove(curve)
+                    clean = curve
+                    break
+
+        if sub_id is not None:
+            self._sub_to_pool.pop(sub_id, None)
+            ws = self._ws
+            if ws is not None:
+                try:
+                    self._req_id += 1
+                    req_id = self._req_id
+                    self._pending_unsubs[req_id] = clean
+                    msg = json.dumps({
+                        "jsonrpc": "2.0",
+                        "id": req_id,
+                        "method": "logsUnsubscribe",
+                        "params": [sub_id],
+                    })
+                    await ws.send(msg)
+                    logger.info("SVM logsUnsubscribe dispatched for %s (sub_id=%d, req_id=%d)", clean[:10], sub_id, req_id)
+                    return True
+                except Exception as exc:
+                    logger.warning("Failed to send logsUnsubscribe for %s: %s", clean[:10], exc)
+            return True
+        return False
+
+    async def sweep_stale_subscriptions(self, max_age_s: float = 120.0) -> list[str]:
+        """Evict stale non-permanent subscriptions older than max_age_s."""
+        stale = self._subscriptions.get_stale_targets(max_age_s=max_age_s)
+        unsubscribed: list[str] = []
+        for target, _ in stale:
+            success = await self.unsubscribe(target)
+            if success:
+                unsubscribed.append(target)
+        if unsubscribed:
+            logger.info(
+                "Evicted %d stale SVM subscriptions (older than %.0fs): %s",
+                len(unsubscribed),
+                max_age_s,
+                [t[:8] for t in unsubscribed[:5]],
+            )
+        return unsubscribed
+
+    async def _eviction_loop(self) -> None:
+        """Periodic background sweeper for stale subscriptions."""
+        while self._running:
+            try:
+                await asyncio.sleep(20.0)
+                if self._running:
+                    await self.sweep_stale_subscriptions(max_age_s=120.0)
+            except asyncio.CancelledError:
+                break
+            except Exception as exc:
+                logger.warning("Error in SVM subscription eviction loop: %s", exc)
 
     async def run(self) -> None:
         self._running = True
@@ -170,6 +341,13 @@ class SVMIngester:
 
     async def stop(self) -> None:
         self._running = False
+        if self._sweep_task and not self._sweep_task.done():
+            self._sweep_task.cancel()
+        if self._ws:
+            try:
+                await self._ws.close()
+            except Exception:
+                pass
 
     async def _connect_and_stream(self) -> None:
         await self._limiter.helius.acquire(cost=1.0)
@@ -197,11 +375,16 @@ class SVMIngester:
             max_queue=4096,
         ) as ws:
             logger.info("SVM WebSocket connected to Helius")
+            self._ws = ws
             self._backoff.reset()
             self._sub_to_pool.clear()
+            self._subscriptions.clear()
 
-            req_id = 1
-            pending_ids: dict[int, str] = {}
+            self._sweep_task = asyncio.create_task(self._eviction_loop())
+
+            self._req_id = 1
+            self._pending_ids.clear()
+            self._pending_unsubs.clear()
             confirmed = 0
 
             raw_targets = list(self._pool_registry.keys())
@@ -225,21 +408,25 @@ class SVMIngester:
             if not valid_targets:
                 valid_targets = [PUMP_FUN_PROGRAM_ID, RAYDIUM_AMM_PROGRAM_ID]
 
+            # Bounded subscription safety: cap initial targets to subscription capacity
+            valid_targets = valid_targets[: self._subscriptions.max_capacity]
             expected = len(valid_targets)
             batch_size = 20
 
             # Throttled Subscription Batching: chunks of 20 pools with 0.08s pause
             async def _send_subscriptions() -> None:
-                nonlocal req_id
                 try:
                     for i in range(0, len(valid_targets), batch_size):
                         if not self._running:
                             break
                         batch = valid_targets[i : i + batch_size]
                         for target_pubkey in batch:
+                            curr_id = self._req_id
+                            self._req_id += 1
+                            self._pending_ids[curr_id] = target_pubkey
                             msg = json.dumps({
                                 "jsonrpc": "2.0",
-                                "id": req_id,
+                                "id": curr_id,
                                 "method": "logsSubscribe",
                                 "params": [
                                     {"mentions": [target_pubkey]},
@@ -247,8 +434,6 @@ class SVMIngester:
                                 ],
                             })
                             await ws.send(msg)
-                            pending_ids[req_id] = target_pubkey
-                            req_id += 1
                         if i + batch_size < len(valid_targets):
                             await asyncio.sleep(0.08)
                 except asyncio.CancelledError:
@@ -267,13 +452,21 @@ class SVMIngester:
                     except json.JSONDecodeError:
                         continue
 
-                    # Handle subscription confirmation responses
+                    # Handle unsubscription confirmation responses
                     resp_id = msg.get("id")
-                    if resp_id in pending_ids:
+                    if resp_id in self._pending_unsubs:
+                        unsub_target = self._pending_unsubs.pop(resp_id)
+                        logger.debug("SVM logsUnsubscribe confirmed for req_id=%s (target=%s)", resp_id, unsub_target[:10])
+                        continue
+
+                    # Handle subscription confirmation responses
+                    if resp_id in self._pending_ids:
                         sub_id = msg.get("result")
                         if isinstance(sub_id, int):
-                            pool_key = pending_ids[resp_id]
+                            pool_key = self._pending_ids.pop(resp_id)
                             self._sub_to_pool[sub_id] = pool_key
+                            is_permanent = pool_key in (PUMP_FUN_PROGRAM_ID, RAYDIUM_AMM_PROGRAM_ID)
+                            self._subscriptions.register(pool_key, sub_id, is_permanent=is_permanent)
                             confirmed += 1
                             logger.debug(
                                 "SVM pool %s…%s subscribed (sub_id=%d, confirmed=%d/%d)",
@@ -285,6 +478,7 @@ class SVMIngester:
                                     confirmed,
                                 )
                         elif "error" in msg:
+                            pool_key = self._pending_ids.pop(resp_id, "unknown")
                             logger.error(
                                 "SVM logsSubscribe error for req_id=%s: %s",
                                 resp_id, msg["error"],
@@ -300,6 +494,7 @@ class SVMIngester:
                     pool_key = self._sub_to_pool.get(sub_id)
                     if pool_key is None:
                         continue
+                    self._subscriptions.touch(pool_key)
 
                     result_ctx = params.get("result", {})
                     slot: int = result_ctx.get("context", {}).get("slot", 0)
@@ -521,12 +716,19 @@ class SVMIngester:
                             )
                             logger.info("SVM Raydium CreatePool detected: %s", pool_addr[:10])
             finally:
+                if self._sweep_task and not self._sweep_task.done():
+                    self._sweep_task.cancel()
+                    try:
+                        await self._sweep_task
+                    except (asyncio.CancelledError, Exception):
+                        pass
                 if not sub_task.done():
                     sub_task.cancel()
                     try:
                         await sub_task
                     except (asyncio.CancelledError, Exception):
                         pass
+                self._ws = None
 
 
     def _parse_raydium_transaction(

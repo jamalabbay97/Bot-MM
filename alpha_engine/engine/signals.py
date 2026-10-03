@@ -7,12 +7,13 @@ Python 3.11+
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
 from collections import defaultdict
 from dataclasses import dataclass, field
 from decimal import Decimal
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 from alpha_engine.math.sizing import classify_alpha_score
 from alpha_engine.models.enums import (
@@ -85,6 +86,35 @@ class PendingLaunchBuffer:
         self.slot_bundle_threshold = slot_bundle_threshold
         self.min_blocks_span = min_blocks_span
         self._staged: dict[str, StagedLaunch] = {}
+        self._on_removal_callbacks: list[Callable[[str], Any]] = []
+
+    def register_on_removal_callback(self, callback: Callable[[str], Any]) -> None:
+        """Register callback invoked whenever a staged token is dropped, graduated, or removed."""
+        if callback not in self._on_removal_callbacks:
+            self._on_removal_callbacks.append(callback)
+
+    def _notify_removal(self, token_address: str) -> None:
+        """Dispatch removal callbacks asynchronously or synchronously."""
+        for cb in self._on_removal_callbacks:
+            try:
+                res = cb(token_address)
+                if asyncio.iscoroutine(res):
+                    try:
+                        loop = asyncio.get_running_loop()
+                        loop.create_task(res)
+                    except RuntimeError:
+                        pass
+            except Exception as exc:
+                logger.warning("Error in PendingLaunchBuffer removal callback for %s: %s", token_address[:10], exc)
+
+    def remove_launch(self, token_address: str, reason: str = "manual_removal") -> StagedLaunch | None:
+        """Manually remove and drop a launch, triggering removal callbacks."""
+        staged = self._staged.get(token_address)
+        if staged is not None and not staged.dropped:
+            staged.dropped = True
+            staged.drop_reason = reason
+            self._notify_removal(token_address)
+        return staged
 
     def add_launch(
         self,
@@ -284,6 +314,7 @@ class PendingLaunchBuffer:
                         f"DEV_BUNDLED: Slot clustering {slot_cluster_pct:.1%} >= {self.slot_bundle_threshold:.1%} "
                         f"({max_slot_buys}/{staged.buy_count} in block {slot})"
                     )
+                    self._notify_removal(staged.token_address)
                     logger.warning(
                         "PendingLaunchBuffer: DROPPING launch %s — %s (Jito bundle footprint)",
                         staged.token_address[:10],
@@ -314,6 +345,7 @@ class PendingLaunchBuffer:
             if dump_pct > self.max_dump_pct and age <= self.min_age_s:
                 staged.dropped = True
                 staged.drop_reason = f"DUMP > {float(self.max_dump_pct*100):.0f}% ({float(dump_pct*100):.1f}%) within {age:.1f}s"
+                self._notify_removal(staged.token_address)
                 logger.warning(
                     "PendingLaunchBuffer: DROPPING launch %s — %s (initial=%s, curr=%s)",
                     staged.token_address[:10],
@@ -329,6 +361,7 @@ class PendingLaunchBuffer:
             unmet_str = " | ".join(unmet) if unmet else "Criteria not satisfied"
             staged.dropped = True
             staged.drop_reason = f"Observation window expired ({age:.1f}s > {self.max_age_s}s) - Unmet: [{unmet_str}]"
+            self._notify_removal(staged.token_address)
             logger.info("PendingLaunchBuffer: DROPPING launch %s — %s", staged.token_address[:10], staged.drop_reason)
             return None
 
@@ -346,6 +379,7 @@ class PendingLaunchBuffer:
                 and len(staged.buy_blocks) >= self.min_blocks_span
             ):
                 staged.graduated = True
+                self._notify_removal(staged.token_address)
                 logger.info(
                     "PendingLaunchBuffer: GRADUATING launch %s! Age=%.1fs, buys=%d, unique_buyers=%d, blocks=%d, vol=%s native",
                     staged.token_address[:10],
@@ -388,6 +422,7 @@ class PendingLaunchBuffer:
                     unmet_str = " | ".join(unmet) if unmet else "Criteria not satisfied"
                     staged.dropped = True
                     staged.drop_reason = f"Observation window expired ({age:.1f}s > {self.max_age_s}s) - Unmet: [{unmet_str}]"
+                    self._notify_removal(token)
                     logger.info(
                         "PendingLaunchBuffer: DROPPING launch %s — %s",
                         staged.token_address[:10],

@@ -8,10 +8,11 @@ Python 3.11+ | Pydantic v2 | Strict JSON Schema Compliance
 from __future__ import annotations
 
 import json
+from decimal import Decimal
 from enum import Enum
-from typing import Annotated
+from typing import Annotated, Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 from alpha_engine.models.base import _STRICT_MODEL_CFG
 
@@ -161,3 +162,44 @@ class AISupervisorResponse(BaseModel):
             clean = clean[start : end + 1]
         data = json.loads(clean)
         return cls.model_validate(data)
+
+
+class AuditedTokenOutcome(BaseModel):
+    """Tracks token audit decision and subsequent on-chain price evolution for self-learning."""
+
+    model_config = ConfigDict(frozen=False, extra="forbid")
+
+    token_address: str = Field(description="Audited token mint or address")
+    chain: str = Field(description="Chain identifier string")
+    decision: str = Field(description="EXECUTE_BUY | PASS")
+    initial_price: Decimal = Field(description="Spot price at the moment of audit")
+    audit_timestamp: float = Field(description="Timestamp in seconds when audit occurred")
+    flags: list[str] = Field(default_factory=list, description="Rejection flags or audit flags")
+    confidence: float = Field(default=0.90, description="Confidence score emitted at audit")
+    peak_price: Decimal = Field(default=Decimal("0"), description="Highest observed price post-audit")
+    min_price: Decimal = Field(default=Decimal("0"), description="Lowest observed price post-audit")
+    latest_price: Decimal = Field(default=Decimal("0"), description="Most recent price update")
+    peak_multiplier: float = Field(default=1.0, description="Highest multiplier reached (peak / initial)")
+    max_drawdown_pct: float = Field(default=0.0, description="Maximum drawdown percentage ((initial - min) / initial * 100)")
+    is_finalized: bool = Field(default=False, description="True if outcome observation window has matured")
+    outcome_label: Optional[str] = Field(default=None, description="TRUE_POSITIVE | FALSE_POSITIVE | TRUE_NEGATIVE | FALSE_NEGATIVE")
+
+
+class OutcomeTrackerMetrics(BaseModel):
+    """Aggregate telemetry from the self-learning outcome tracking loop."""
+
+    model_config = _STRICT_MODEL_CFG
+
+    total_tracked: int = 0
+    finalized_count: int = 0
+    true_positives: int = 0
+    false_positives: int = 0
+    true_negatives: int = 0
+    false_negatives: int = 0
+    accuracy_pct: float = 100.0
+    win_rate_pct: float = 0.0
+    veto_efficiency_pct: float = 100.0
+    false_negative_rate_pct: float = 0.0
+    false_positive_rate_pct: float = 0.0
+    calibration_status: str = "BALANCED"
+

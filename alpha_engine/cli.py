@@ -141,7 +141,10 @@ def main(args: list[str] | None = None) -> int:
         import sqlite3
 
         try:
-            conn = sqlite3.connect(config.db_path)
+            conn = sqlite3.connect(config.db_path, timeout=30.0)
+            conn.execute("PRAGMA journal_mode = WAL;")
+            conn.execute("PRAGMA busy_timeout = 30000;")
+            conn.execute("PRAGMA synchronous = NORMAL;")
             conn.row_factory = sqlite3.Row
             cur = conn.cursor()
             if parsed.trades or parsed.status:

@@ -111,7 +111,7 @@ class SQLiteLedger:
 
     async def __aenter__(self) -> "SQLiteLedger":
         self._conn = await asyncio.wait_for(
-            aiosqlite.connect(self._db_path),
+            aiosqlite.connect(self._db_path, timeout=30.0),
             timeout=_DB_INIT_TIMEOUT_S,
         )
         await self._initialise()
@@ -139,6 +139,7 @@ class SQLiteLedger:
         conn = self._conn
         assert conn is not None, "Database not connected."
         await conn.execute("PRAGMA journal_mode=WAL;")
+        await conn.execute("PRAGMA busy_timeout=30000;")
         await conn.execute("PRAGMA synchronous=NORMAL;")
         await conn.execute("PRAGMA cache_size=-8000;")
         await conn.execute("PRAGMA temp_store=MEMORY;")

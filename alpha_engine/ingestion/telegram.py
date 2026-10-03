@@ -24,8 +24,10 @@ import asyncio
 import logging
 import os
 import re
+import sqlite3
 import time
 from collections import defaultdict, deque
+from contextlib import asynccontextmanager
 from decimal import Decimal
 from typing import Any, Awaitable, Callable, Optional, Sequence, Set
 
@@ -46,7 +48,7 @@ except ImportError:
 try:
     from telethon import TelegramClient, events
     from telethon.errors import FloodWaitError, RPCError
-    from telethon.sessions import StringSession
+    from telethon.sessions import SQLiteSession, StringSession
     TELETHON_AVAILABLE = True
 except ImportError:  # pragma: no cover
     TELETHON_AVAILABLE = False
@@ -59,12 +61,64 @@ except ImportError:  # pragma: no cover
 
     events = None  # type: ignore
     StringSession = None  # type: ignore
+    SQLiteSession = object  # type: ignore
 
     class FloodWaitError(Exception):  # type: ignore
         seconds: int = 0
 
     class RPCError(Exception):  # type: ignore
         pass
+
+
+class HardenedSQLiteSession(SQLiteSession):
+    """
+    Hardened SQLiteSession for Telethon:
+    - 30-second busy timeout to prevent 'database is locked' errors
+    - PRAGMA journal_mode = WAL for concurrent reader/writer support
+    - PRAGMA synchronous = NORMAL
+    - Commit retry loop on transient lock errors
+    """
+
+    def _cursor(self):
+        if getattr(self, "_conn", None) is None:
+            self._conn = sqlite3.connect(
+                self.filename,
+                timeout=30.0,
+                check_same_thread=False,
+            )
+            try:
+                self._conn.execute("PRAGMA busy_timeout = 30000;")
+                self._conn.execute("PRAGMA journal_mode = WAL;")
+                self._conn.execute("PRAGMA synchronous = NORMAL;")
+            except Exception:
+                pass
+        return self._conn.cursor()
+
+    def save(self):
+        if getattr(self, "_conn", None) is not None:
+            for attempt in range(5):
+                try:
+                    self._conn.commit()
+                    return
+                except sqlite3.OperationalError as exc:
+                    if "locked" in str(exc).lower() and attempt < 4:
+                        time.sleep(0.05 * (2 ** attempt))
+                        continue
+                    raise
+
+
+@asynccontextmanager
+async def _connect_aiosqlite(db_path: str):
+    """aiosqlite context manager configured with WAL and 30s busy timeout."""
+    assert aiosqlite is not None
+    conn = await aiosqlite.connect(db_path, timeout=30.0)
+    try:
+        await conn.execute("PRAGMA busy_timeout = 30000;")
+        await conn.execute("PRAGMA journal_mode = WAL;")
+        await conn.execute("PRAGMA synchronous = NORMAL;")
+        yield conn
+    finally:
+        await conn.close()
 
 from alpha_engine.models.enums import ChainIdentifier, NewsSignalStatus, SignalSource
 from alpha_engine.models.events import RawSignalEvent, ShutdownSentinel
@@ -215,6 +269,7 @@ class TelegramIngester:
         status_provider: Optional[Callable[[], dict[str, Any] | Awaitable[dict[str, Any]]]] = None,
         limiter: Optional[RateLimiterRegistry] = None,
         client: Optional[TelegramClient] = None,
+        ai_supervisor: Optional[Any] = None,
     ) -> None:
         self._queue = event_queue
         self._signal_queue = signal_queue
@@ -241,6 +296,7 @@ class TelegramIngester:
         self._db_path = db_path
         self._status_provider = status_provider
         self._limiter = limiter
+        self._ai_supervisor = ai_supervisor
 
         self._shutdown_event = asyncio.Event()
         self._running = False
@@ -270,6 +326,17 @@ class TelegramIngester:
     def is_dormant(self) -> bool:
         """Returns True if the ingester is in dormant fallback mode."""
         return self._is_dormant
+
+    @property
+    def ai_supervisor(self) -> Any | None:
+        """Access AI supervisor instance directly or through status provider target."""
+        if self._ai_supervisor is not None:
+            return self._ai_supervisor
+        if self._status_provider is not None:
+            target = getattr(self._status_provider, "__self__", None)
+            if target is not None and hasattr(target, "ai_supervisor"):
+                return target.ai_supervisor
+        return None
 
     @property
     def is_running(self) -> bool:
@@ -438,23 +505,52 @@ class TelegramIngester:
             except asyncio.QueueFull:
                 logger.warning("Event queue full; dropped event %s", event)
 
-    async def _safe_reply(self, event: Any, text: str) -> None:
+    def get_default_keyboard_markup(self) -> Any:
+        """Return the default persistent reply keyboard buttons for interactive DMs."""
+        if not TELETHON_AVAILABLE:
+            return None
+        try:
+            from telethon import Button
+            return [
+                [Button.text("📊 Status", resize=True), Button.text("🧠 AI Supervisor", resize=True)],
+                [Button.text("📋 Trades", resize=True), Button.text("🛡️ AI Vetoes", resize=True)],
+                [Button.text("📰 Alpha News", resize=True), Button.text("🐋 Whales", resize=True)],
+                [Button.text("📡 Signals", resize=True), Button.text("❓ Help", resize=True)],
+            ]
+        except Exception:
+            return None
+
+    async def _safe_reply(self, event: Any, text: str, buttons: Any = None) -> None:
         """
         Safely reply to a message in DM, catching RPCError or network failures.
+        Supports custom reply keyboards and inline button markups.
         """
         try:
+            kwargs: dict[str, Any] = {}
+            if buttons is not None:
+                kwargs["buttons"] = buttons
+
             if hasattr(event, "reply"):
-                res = event.reply(text)
+                try:
+                    res = event.reply(text, **kwargs)
+                except TypeError:
+                    res = event.reply(text)
                 if asyncio.iscoroutine(res):
                     await res
             elif hasattr(event, "respond"):
-                res = event.respond(text)
+                try:
+                    res = event.respond(text, **kwargs)
+                except TypeError:
+                    res = event.respond(text)
                 if asyncio.iscoroutine(res):
                     await res
             elif self._client is not None and hasattr(self._client, "send_message"):
                 sender_id = getattr(event, "sender_id", None)
                 if sender_id is not None:
-                    res = self._client.send_message(sender_id, text)
+                    try:
+                        res = self._client.send_message(sender_id, text, **kwargs)
+                    except TypeError:
+                        res = self._client.send_message(sender_id, text)
                     if asyncio.iscoroutine(res):
                         await res
         except RPCError as exc:
@@ -666,28 +762,34 @@ class TelegramIngester:
         if not text:
             return
 
-        lower_text = text.lower()
-        first_token = lower_text.split()[0].split("@")[0]
+        # Strip leading emojis / symbols to support custom reply keyboards and buttons
+        clean_text = re.sub(r"^[^\w/]+", "", text).strip()
+        lower_clean = clean_text.lower()
+        parts = lower_clean.split()
+        first_token = parts[0].split("@")[0] if parts else ""
 
-        if first_token in ("/start", "/help"):
+        if first_token in ("/start", "/help", "help", "start"):
             await self._cmd_start_help(event)
-        elif first_token == "/status":
+        elif first_token in ("/status", "status"):
             await self._cmd_status(event)
-        elif first_token in ("/ai", "/supervisor"):
-            await self._cmd_ai(event)
-        elif first_token == "/audit":
-            args = text[len(text.split()[0]):].strip()
+        elif "veto" in lower_clean:
+            await self._cmd_ai(event, "vetoes")
+        elif first_token in ("/ai", "/supervisor", "ai", "supervisor"):
+            args = clean_text[len(clean_text.split()[0]):].strip() if len(clean_text.split()) > 1 else ""
+            await self._cmd_ai(event, args)
+        elif first_token in ("/audit", "audit"):
+            args = clean_text[len(clean_text.split()[0]):].strip() if len(clean_text.split()) > 1 else ""
             await self._cmd_audit(event, args)
-        elif first_token == "/trades":
+        elif first_token in ("/trades", "trades"):
             await self._cmd_trades(event)
-        elif first_token == "/news":
+        elif first_token in ("/news", "news"):
             await self._cmd_news(event)
-        elif first_token == "/whales":
+        elif first_token in ("/whales", "whales"):
             await self._cmd_whales(event)
-        elif first_token == "/signals":
+        elif first_token in ("/signals", "signals"):
             await self._cmd_signals(event)
-        elif first_token == "/scan":
-            args = text[len(text.split()[0]):].strip()
+        elif first_token in ("/scan", "scan"):
+            args = clean_text[len(clean_text.split()[0]):].strip() if len(clean_text.split()) > 1 else ""
             await self._cmd_scan(event, args, sender_id)
         else:
             await self._cmd_direct_ca_or_help(event, text, sender_id)
@@ -699,6 +801,8 @@ class TelegramIngester:
             "**Status:** Online 🟢\n"
             "**Engine Mode:** Paper Trading (Zero-Capital Simulation)\n"
             "**Supervisor Engine:** AlphaSupervisor-AI Active 🧠\n\n"
+            "**Quick Controls:**\n"
+            "• Tap any button below to immediately view live telemetry, risk, or trades.\n\n"
             "**Available Commands:**\n"
             "• `/status` — View real-time system uptime, memory RSS, portfolio equity, PnL, and queue telemetry.\n"
             "• `/ai` — View AlphaSupervisor-AI autonomous risk posture, telemetry, and learned insights.\n"
@@ -711,7 +815,7 @@ class TelegramIngester:
             "• `/help` — Display this command reference.\n\n"
             "💡 *Tip:* You can also directly paste a contract address (EVM `0x...` or Solana Base58) in this chat to trigger an immediate scan."
         )
-        await self._safe_reply(event, msg)
+        await self._safe_reply(event, msg, buttons=self.get_default_keyboard_markup())
 
 
     async def _cmd_status(self, event: Any) -> None:
@@ -760,7 +864,7 @@ class TelegramIngester:
 
         if equity_usd is None and AIOSQLITE_AVAILABLE and aiosqlite is not None:
             try:
-                async with aiosqlite.connect(self._db_path) as db:
+                async with _connect_aiosqlite(self._db_path) as db:
                     async with db.execute(
                         "SELECT total_equity_usd, realized_pnl_usd, open_positions, win_rate_pct, max_drawdown_pct "
                         "FROM portfolio_snapshots ORDER BY created_at DESC LIMIT 1"
@@ -801,7 +905,7 @@ class TelegramIngester:
             f"   • Signal: `{signal_q_size}/{signal_q_max}`\n\n"
             "⚡ **Telemetry:** Normal 🟢"
         )
-        await self._safe_reply(event, msg)
+        await self._safe_reply(event, msg, buttons=self.get_default_keyboard_markup())
 
     async def _cmd_scan(self, event: Any, args: str, sender_id: Optional[int]) -> None:
         """Handle /scan <CONTRACT_ADDRESS> command."""
@@ -1037,8 +1141,96 @@ class TelegramIngester:
         lines.append("```")
         await self._safe_reply(event, "\n".join(lines))
 
-    async def _cmd_ai(self, event: Any) -> None:
-        """Handle /ai command in DMs: displays AlphaSupervisor-AI status and risk stance."""
+    async def _cmd_ai(self, event: Any, args: str = "") -> None:
+        """
+        Handle /ai command and its subcommands in Telegram DMs:
+        /ai [status]           - Displays the rich AlphaSupervisor-AI status card and self-learning telemetry.
+        /ai stance <mode>      - Set global risk stance (DEFENSIVE, NEUTRAL, EXPAND).
+        /ai strict <on|off>    - Toggle strict veto mode.
+        /ai vetoes             - Show recently vetoed tokens with rejection rationale.
+        /ai reset              - Reset self-learning outcome counters to baseline.
+        """
+        supervisor = self.ai_supervisor
+        parts = args.strip().split()
+        subcmd = parts[0].lower() if parts else "status"
+
+        if subcmd in ("stance", "mode"):
+            if len(parts) < 2:
+                current_mode = supervisor.get_status().get("global_risk_mode", "NEUTRAL") if supervisor else "NEUTRAL"
+                await self._safe_reply(event, f"⚠️ Current stance: **{current_mode}**\nUsage: `/ai stance <DEFENSIVE|NEUTRAL|EXPAND>`")
+                return
+            new_mode = parts[1].upper()
+            if new_mode not in ("DEFENSIVE", "NEUTRAL", "EXPAND"):
+                await self._safe_reply(event, "❌ Invalid mode. Choose from: `DEFENSIVE`, `NEUTRAL`, `EXPAND`.")
+                return
+            if supervisor:
+                supervisor.set_global_risk_mode(new_mode)
+                icon = "🛡️" if new_mode == "DEFENSIVE" else "🟢" if new_mode == "EXPAND" else "⚖️"
+                await self._safe_reply(event, f"✅ Global risk stance updated to: {icon} **{new_mode}**")
+            else:
+                await self._safe_reply(event, f"⚠️ Supervisor unavailable to set stance to **{new_mode}**.")
+            return
+
+        elif subcmd == "strict":
+            if len(parts) < 2:
+                current_strict = supervisor.get_status().get("strict_veto", True) if supervisor else True
+                strict_str = "ON 🔒" if current_strict else "OFF 🔓"
+                await self._safe_reply(event, f"⚠️ Strict Veto is currently: **{strict_str}**\nUsage: `/ai strict <on|off>`")
+                return
+            val = parts[1].lower()
+            if val in ("on", "true", "1", "yes"):
+                is_strict = True
+            elif val in ("off", "false", "0", "no"):
+                is_strict = False
+            else:
+                await self._safe_reply(event, "❌ Invalid option. Use `/ai strict on` or `/ai strict off`.")
+                return
+            if supervisor:
+                supervisor.set_strict_veto(is_strict)
+                state_str = "ON 🔒" if is_strict else "OFF 🔓"
+                await self._safe_reply(event, f"✅ Strict Veto mode set to: **{state_str}**")
+            else:
+                await self._safe_reply(event, "⚠️ Supervisor unavailable.")
+            return
+
+        elif subcmd in ("vetoes", "rejections"):
+            if not supervisor:
+                await self._safe_reply(event, "⚠️ Supervisor unavailable.")
+                return
+            recent_vetoes = supervisor.get_recent_vetoes(limit=10)
+            if not recent_vetoes:
+                await self._safe_reply(event, "🛡️ **Recent AI Vetoes:**\n\nNo recent vetoed signals in memory.")
+                return
+            lines = ["🛡️ **AlphaSupervisor-AI: Recent Vetoes (Last 10)**\n"]
+            lines.append("```")
+            lines.append(f"{'Token':<14} | {'Chain':<6} | {'Flags & Rationale'}")
+            lines.append("-" * 55)
+            for v in reversed(recent_vetoes):
+                t_str = str(v.get("token", ""))
+                short_t = f"{t_str[:4]}..{t_str[-4:]}" if len(t_str) > 10 else t_str
+                c_str = str(v.get("chain", "")).replace("ChainIdentifier.", "").replace("_mainnet", "")[:6]
+                flags = v.get("flags", [])
+                flag_str = ", ".join(flags[:2]) if flags else str(v.get("rationale", "Veto"))[:24]
+                lines.append(f"{short_t:<14} | {c_str:<6} | {flag_str}")
+            lines.append("```")
+            await self._safe_reply(event, "\n".join(lines))
+            return
+
+        elif subcmd == "reset":
+            if supervisor:
+                supervisor.reset_learning_metrics()
+                await self._safe_reply(
+                    event,
+                    "🔄 **Self-Learning Metrics Reset**\n\n"
+                    "• True/False Positives & Negatives reset to baseline.\n"
+                    "• Calibration status restored to **BALANCED**.\n"
+                    "• Global risk stance restored to **NEUTRAL** ⚖️."
+                )
+            else:
+                await self._safe_reply(event, "⚠️ Supervisor unavailable.")
+            return
+
+        # Default: Display rich status card
         metrics: dict[str, Any] = {}
         if self._status_provider is not None:
             try:
@@ -1050,27 +1242,58 @@ class TelegramIngester:
             except Exception as exc:
                 logger.warning("[TelegramIngester] status_provider error in /ai: %s", exc)
 
-        ai_status = metrics.get("ai_supervisor", {})
+        ai_status = metrics.get("ai_supervisor") or (supervisor.get_status() if supervisor else {})
         if not ai_status:
             await self._safe_reply(event, "🧠 **AlphaSupervisor-AI Engine**\n\nStatus: Active (Default Heuristic Fallback)")
             return
 
         mode = ai_status.get("global_risk_mode", "NEUTRAL")
         mode_icon = "🟢" if mode == "EXPAND" else "🛡️" if mode == "DEFENSIVE" else "⚖️"
+        strict = ai_status.get("strict_veto", True)
+        strict_icon = "🔒 ON" if strict else "🔓 OFF"
+
+        total_audits = ai_status.get("total_audits", 0)
+        approved = ai_status.get("approved_buys", 0)
+        vetoed = ai_status.get("vetoed_signals", 0)
+
+        ot = ai_status.get("outcome_tracker", {})
+        calib = ot.get("calibration_status", "BALANCED")
+        calib_icon = "⚖️" if calib == "BALANCED" else "🚀" if calib == "CALIBRATING_EXPAND" else "🛡️"
+
         lines = [
             "🧠 **AlphaSupervisor-AI Autonomous Risk Engine**\n",
             "• **Status:** Active 🟢",
             f"• **Provider:** `{ai_status.get('provider', 'gemini')}` (`{ai_status.get('model', 'gemini-2.5-flash')}`)",
             f"• **Global Risk Stance:** {mode_icon} **{mode}**",
-            f"• **Total Audits:** {ai_status.get('total_audits', 0)} (Approved: {ai_status.get('approved_buys', 0)}, Vetoed: {ai_status.get('vetoed_signals', 0)})",
-            f"• **Blacklisted Entities:** {ai_status.get('blacklisted_entities_count', 0)}",
+            f"• **Strict Veto Mode:** {strict_icon}",
+            f"• **Audit Counters:** Total: `{total_audits}` | Approved: `{approved}` | Vetoed: `{vetoed}`",
+            f"• **Blacklisted Entities:** `{ai_status.get('blacklisted_entities_count', 0)}`",
+            "",
+            "📊 **Self-Learning Outcome Tracking:**",
+            f"• Tracked: `{ot.get('total_tracked', 0)}` | Finalized: `{ot.get('finalized_count', 0)}`",
+            f"• Approved & Pumped (TP): `{ot.get('true_positives', 0)}` 🟢 | Approved & Dumped (FP): `{ot.get('false_positives', 0)}` 🔴",
+            f"• Vetoed & Dumped (TN): `{ot.get('true_negatives', 0)}` 🛡️ | Vetoed & Pumped (FN): `{ot.get('false_negatives', 0)}` ⚠️",
+            f"• Win Rate: `{ot.get('win_rate_pct', 0.0):.1f}%` | Veto Efficiency: `{ot.get('veto_efficiency_pct', 100.0):.1f}%`",
+            f"• Overall Accuracy: `{ot.get('accuracy_pct', 100.0):.1f}%`",
+            f"• Calibration: {calib_icon} **{calib}**",
         ]
+
         recent_insights = ai_status.get("recent_insights", [])
         if recent_insights:
-            lines.append("\n**Recent Strategic Insights:**")
+            lines.append("\n📝 **Recent Strategic Insights:**")
             for idx, insight in enumerate(recent_insights[-3:], 1):
                 lines.append(f"{idx}. {insight}")
-        lines.append("\n💡 *Tip:* Use `/audit <CA>` to execute an on-demand deep forensics audit on any token.")
+
+        lines.extend([
+            "",
+            "🎮 **Control Subcommands:**",
+            "• `/ai stance <DEFENSIVE|NEUTRAL|EXPAND>`",
+            "• `/ai strict <on|off>`",
+            "• `/ai vetoes`",
+            "• `/ai reset`",
+            "• `/audit <CA>` (deep forensics)",
+        ])
+
         await self._safe_reply(event, "\n".join(lines))
 
     async def _cmd_audit(self, event: Any, args: str) -> None:
@@ -1185,7 +1408,7 @@ class TelegramIngester:
         trade_rows: list[Any] = []
         if AIOSQLITE_AVAILABLE and aiosqlite is not None:
             try:
-                async with aiosqlite.connect(self._db_path) as db:
+                async with _connect_aiosqlite(self._db_path) as db:
                     cursor = await db.execute(
                         "SELECT name FROM sqlite_master WHERE type='table' AND name IN ('trades', 'paper_trades')"
                     )
@@ -1353,6 +1576,8 @@ class TelegramIngester:
             session: Any = self._session_name
             if self._session_string:
                 session = StringSession(self._session_string)
+            elif isinstance(self._session_name, str):
+                session = HardenedSQLiteSession(self._session_name)
             self._client = TelegramClient(session, self._api_id, self._api_hash)
 
         if self._client is not None:
@@ -1446,6 +1671,59 @@ class TelegramIngester:
                     self._handle_dm_message,
                     events.NewMessage(func=lambda e: bool(getattr(e, "is_private", False))),
                 )
+
+            # 4. Register Bot Commands with Telegram API so the [/] Menu button appears
+            if self._client is not None and self._bot_token:
+                try:
+                    from telethon.tl.functions.bots import SetBotCommandsRequest
+                    from telethon.tl.types import BotCommand, BotCommandScopeDefault
+
+                    commands = [
+                        BotCommand(command="status", description="Live Engine Health & PnL"),
+                        BotCommand(command="ai", description="AlphaSupervisor-AI Control & Risk"),
+                        BotCommand(command="trades", description="Active Positions & Closed Ledger"),
+                        BotCommand(command="audit", description="Deep Forensics Audit on Token CA"),
+                        BotCommand(command="scan", description="Scan & Ingest Token CA"),
+                        BotCommand(command="signals", description="Recent Signals & Evaluations"),
+                        BotCommand(command="news", description="Live Alpha News Headlines"),
+                        BotCommand(command="whales", description="On-Chain Whale & Smart Money Alerts"),
+                        BotCommand(command="help", description="Full Command Reference"),
+                    ]
+                    set_cmd_res = self._client(
+                        SetBotCommandsRequest(
+                            scope=BotCommandScopeDefault(),
+                            lang_code="",
+                            commands=commands,
+                        )
+                    )
+                    if asyncio.iscoroutine(set_cmd_res):
+                        await set_cmd_res
+                    logger.info(
+                        "[TelegramIngester] Registered %d bot commands with Telegram successfully.",
+                        len(commands),
+                    )
+                except Exception as exc:
+                    logger.warning("[TelegramIngester] Could not register bot commands: %s", exc)
+
+            # 5. Proactively notify configured admin IDs that bot is live with interactive buttons
+            if self._client is not None and hasattr(self._client, "send_message"):
+                for admin_id in self._admin_ids:
+                    try:
+                        greeting = (
+                            "🚀 **Bot-MM Alpha Engine is ONLINE & Ready!**\n\n"
+                            "Tap any button below or send `/status` to view real-time engine telemetry, AI risk posture, and live trades."
+                        )
+                        send_res = self._client.send_message(
+                            admin_id,
+                            greeting,
+                            buttons=self.get_default_keyboard_markup(),
+                        )
+                        if asyncio.iscoroutine(send_res):
+                            await send_res
+                        self._active_dm_chat_ids.add(admin_id)
+                        logger.info("[TelegramIngester] Sent initial online greeting to admin %s.", admin_id)
+                    except Exception as exc:
+                        logger.debug("[TelegramIngester] Initial greeting to admin %s skipped: %s", admin_id, exc)
 
             self._running = True
             logger.info("TelegramIngester connected: dual-mode active (passive channel scraping + interactive DM control).")

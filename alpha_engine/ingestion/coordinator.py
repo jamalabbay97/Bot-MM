@@ -150,6 +150,7 @@ class IngestionCoordinator:
         x_bearer_token: Optional[str] = None,
         enable_x_stream: bool = False,
         gatekeeper: Optional[Any] = None,
+        ai_supervisor: Optional[Any] = None,
     ) -> None:
         self._queue: asyncio.Queue[
             SwapEvent | PoolStateUpdateEvent | RawSignalEvent | ShutdownSentinel
@@ -191,6 +192,7 @@ class IngestionCoordinator:
                 db_path=db_path,
                 status_provider=status_provider,
                 limiter=limiter,
+                ai_supervisor=ai_supervisor,
             )
 
         if x_stream_ingester is not None:

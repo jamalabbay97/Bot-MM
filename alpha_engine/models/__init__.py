@@ -41,11 +41,13 @@ from alpha_engine.models.ai import (
     ActionParameters,
     AISupervisorDecisionEnum,
     AISupervisorResponse,
+    AuditedTokenOutcome,
     FeedbackTuning,
     GlobalRiskMode,
     HoneypotRisk,
     LiquidityHealth,
     LossAttribution,
+    OutcomeTrackerMetrics,
     SecurityAssessment,
     TakeProfitStage,
     WalletAudit,
@@ -112,5 +114,7 @@ __all__ = [
     "SecurityAssessment",
     "FeedbackTuning",
     "AISupervisorResponse",
+    "AuditedTokenOutcome",
+    "OutcomeTrackerMetrics",
 ]
 

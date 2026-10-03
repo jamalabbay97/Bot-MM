@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 from collections import deque
+from decimal import Decimal
 import json
 import logging
 import time
@@ -21,11 +22,13 @@ from alpha_engine.models.ai import (
     ActionParameters,
     AISupervisorDecisionEnum,
     AISupervisorResponse,
+    AuditedTokenOutcome,
     FeedbackTuning,
     GlobalRiskMode,
     HoneypotRisk,
     LiquidityHealth,
     LossAttribution,
+    OutcomeTrackerMetrics,
     SecurityAssessment,
     TakeProfitStage,
     WalletAudit,
@@ -161,6 +164,137 @@ You must respond ONLY with a single valid, well-formed JSON object. Do not inclu
 """
 
 
+class AIOutcomeTracker:
+    """
+    Closed-loop outcome observer and self-learning calibration engine.
+    Tracks price progression of audited tokens (both approved and vetoed)
+    to calculate True Positives, False Positives, True Negatives, False Negatives,
+    and dynamically tune risk posture and confidence calibration.
+    """
+
+    def __init__(self, max_history: int = 500) -> None:
+        self._outcomes: dict[str, AuditedTokenOutcome] = {}
+        self._history: deque[AuditedTokenOutcome] = deque(maxlen=max_history)
+        self._tp: int = 0
+        self._fp: int = 0
+        self._tn: int = 0
+        self._fn: int = 0
+
+    def record_audit(
+        self,
+        token_address: str,
+        chain: str,
+        decision: str,
+        initial_price: Decimal,
+        flags: list[str],
+        confidence: float,
+    ) -> AuditedTokenOutcome:
+        init_p = initial_price if initial_price > Decimal(0) else Decimal("0.000000028")
+        outcome = AuditedTokenOutcome(
+            token_address=token_address,
+            chain=chain,
+            decision=decision,
+            initial_price=init_p,
+            audit_timestamp=time.time(),
+            flags=list(flags),
+            confidence=confidence,
+            peak_price=init_p,
+            min_price=init_p,
+            latest_price=init_p,
+            peak_multiplier=1.0,
+            max_drawdown_pct=0.0,
+            is_finalized=False,
+            outcome_label=None,
+        )
+        self._outcomes[token_address] = outcome
+        self._history.append(outcome)
+        return outcome
+
+    def record_price_update(
+        self,
+        token_address: str,
+        current_price: Decimal,
+        timestamp: float | None = None,
+    ) -> AuditedTokenOutcome | None:
+        outcome = self._outcomes.get(token_address)
+        if outcome is None:
+            return None
+
+        now = timestamp if timestamp is not None else time.time()
+        if current_price > outcome.peak_price:
+            outcome.peak_price = current_price
+        if outcome.min_price <= Decimal(0) or (current_price > Decimal(0) and current_price < outcome.min_price):
+            outcome.min_price = current_price
+        outcome.latest_price = current_price
+
+        if outcome.initial_price > Decimal(0):
+            outcome.peak_multiplier = float(outcome.peak_price / outcome.initial_price)
+            outcome.max_drawdown_pct = float(
+                max(Decimal(0), (outcome.initial_price - outcome.min_price) / outcome.initial_price * 100)
+            )
+
+        elapsed = now - outcome.audit_timestamp
+        if not outcome.is_finalized and (elapsed >= 45.0 or outcome.peak_multiplier >= 1.40 or outcome.max_drawdown_pct >= 25.0):
+            if outcome.decision == AISupervisorDecisionEnum.EXECUTE_BUY.value:
+                if outcome.peak_multiplier >= 1.35 and outcome.max_drawdown_pct < 25.0:
+                    outcome.outcome_label = "TRUE_POSITIVE"
+                    self._tp += 1
+                else:
+                    outcome.outcome_label = "FALSE_POSITIVE"
+                    self._fp += 1
+            else:  # PASS / VETO
+                if outcome.peak_multiplier >= 1.80:
+                    outcome.outcome_label = "FALSE_NEGATIVE"
+                    self._fn += 1
+                else:
+                    outcome.outcome_label = "TRUE_NEGATIVE"
+                    self._tn += 1
+            outcome.is_finalized = True
+
+        return outcome
+
+    def get_metrics(self) -> OutcomeTrackerMetrics:
+        total = self._tp + self._fp + self._tn + self._fn
+        accuracy = ((self._tp + self._tn) / total * 100.0) if total > 0 else 100.0
+        approved = self._tp + self._fp
+        win_rate = (self._tp / approved * 100.0) if approved > 0 else 0.0
+        vetoed = self._tn + self._fn
+        veto_eff = (self._tn / vetoed * 100.0) if vetoed > 0 else 100.0
+        fn_rate = (self._fn / vetoed * 100.0) if vetoed > 0 else 0.0
+        fp_rate = (self._fp / approved * 100.0) if approved > 0 else 0.0
+
+        if fn_rate > 20.0 and total >= 5:
+            calib = "CALIBRATING_EXPAND"
+        elif fp_rate > 30.0 and total >= 5:
+            calib = "CALIBRATING_DEFENSIVE"
+        else:
+            calib = "BALANCED"
+
+        return OutcomeTrackerMetrics(
+            total_tracked=len(self._outcomes),
+            finalized_count=total,
+            true_positives=self._tp,
+            false_positives=self._fp,
+            true_negatives=self._tn,
+            false_negatives=self._fn,
+            accuracy_pct=round(accuracy, 2),
+            win_rate_pct=round(win_rate, 2),
+            veto_efficiency_pct=round(veto_eff, 2),
+            false_negative_rate_pct=round(fn_rate, 2),
+            false_positive_rate_pct=round(fp_rate, 2),
+            calibration_status=calib,
+        )
+
+    def reset(self) -> None:
+        self._tp = 0
+        self._fp = 0
+        self._tn = 0
+        self._fn = 0
+        for o in self._outcomes.values():
+            o.is_finalized = False
+            o.outcome_label = None
+
+
 class AlphaSupervisorAI:
     """
     AlphaSupervisor-AI Engine:
@@ -194,10 +328,57 @@ class AlphaSupervisorAI:
         self._blacklisted_entities: set[str] = set()
         self._global_risk_mode: GlobalRiskMode = GlobalRiskMode.NEUTRAL
         self._recent_audits: deque[dict[str, Any]] = deque(maxlen=50)
+        self._recent_vetoes: deque[dict[str, Any]] = deque(maxlen=50)
         self._learned_insights: deque[str] = deque(maxlen=50)
         self._total_audits: int = 0
         self._veto_count: int = 0
         self._buy_approval_count: int = 0
+        self._outcome_tracker = AIOutcomeTracker(max_history=500)
+
+    @property
+    def outcome_tracker(self) -> AIOutcomeTracker:
+        return self._outcome_tracker
+
+    def record_price_update(
+        self,
+        token_address: str,
+        current_price: Decimal,
+        timestamp: float | None = None,
+    ) -> AuditedTokenOutcome | None:
+        """Feed on-chain price telemetry into self-learning outcome tracker."""
+        outcome = self._outcome_tracker.record_price_update(token_address, current_price, timestamp)
+        metrics = self._outcome_tracker.get_metrics()
+        if metrics.calibration_status == "CALIBRATING_EXPAND" and self._global_risk_mode == GlobalRiskMode.DEFENSIVE:
+            self._global_risk_mode = GlobalRiskMode.NEUTRAL
+            self._learned_insights.append("Self-learning loop: Auto-relaxed risk stance to NEUTRAL (false-negative rate > 20%).")
+        elif metrics.calibration_status == "CALIBRATING_DEFENSIVE" and self._global_risk_mode == GlobalRiskMode.EXPAND:
+            self._global_risk_mode = GlobalRiskMode.NEUTRAL
+            self._learned_insights.append("Self-learning loop: Auto-tightened risk stance to NEUTRAL (false-positive rate > 30%).")
+        return outcome
+
+    def set_global_risk_mode(self, mode: GlobalRiskMode | str) -> GlobalRiskMode:
+        """Set or override the global risk stance."""
+        if isinstance(mode, str):
+            clean = mode.strip().upper()
+            self._global_risk_mode = GlobalRiskMode(clean)
+        elif isinstance(mode, GlobalRiskMode):
+            self._global_risk_mode = mode
+        return self._global_risk_mode
+
+    def set_strict_veto(self, strict: bool) -> bool:
+        """Toggle strict veto mode."""
+        self._strict_veto = strict
+        return self._strict_veto
+
+    def get_recent_vetoes(self, limit: int = 10) -> list[dict[str, Any]]:
+        """Return recently vetoed tokens with their specific rejection rationale."""
+        return list(self._recent_vetoes)[-limit:]
+
+    def reset_learning_metrics(self) -> None:
+        """Reset outcome tracking counters and restore neutral calibration."""
+        self._outcome_tracker.reset()
+        self._global_risk_mode = GlobalRiskMode.NEUTRAL
+        self._learned_insights.append("Self-learning metrics reset to baseline; stance restored to NEUTRAL.")
 
     async def _get_session(self) -> aiohttp.ClientSession:
         if self._session is None or self._session.closed:
@@ -211,17 +392,20 @@ class AlphaSupervisorAI:
 
     def get_status(self) -> dict[str, Any]:
         """Return real-time telemetry and supervisory state."""
+        metrics = self._outcome_tracker.get_metrics()
         return {
             "enabled": self._enabled,
             "provider": self._provider,
             "model": self._model,
             "has_api_key": bool(self._api_key),
             "global_risk_mode": self._global_risk_mode.value,
+            "strict_veto": self._strict_veto,
             "total_audits": self._total_audits,
             "approved_buys": self._buy_approval_count,
             "vetoed_signals": self._veto_count,
             "blacklisted_entities_count": len(self._blacklisted_entities),
             "recent_insights": list(self._learned_insights)[-5:],
+            "outcome_tracker": metrics.model_dump(),
         }
 
     async def audit_signal(
@@ -276,8 +460,32 @@ class AlphaSupervisorAI:
         # Record telemetry and update closed-loop state
         if resp.decision == AISupervisorDecisionEnum.PASS:
             self._veto_count += 1
+            self._recent_vetoes.append({
+                "token": target_token,
+                "chain": chain.value,
+                "flags": list(resp.security_assessment.flags) if resp.security_assessment else [],
+                "rationale": resp.wallet_audit.rationale if resp.wallet_audit else "Security / Heuristic Veto",
+                "timestamp": time.time(),
+            })
         elif resp.decision == AISupervisorDecisionEnum.EXECUTE_BUY:
             self._buy_approval_count += 1
+
+        init_price = Decimal("0.000000028")
+        if pool_state and hasattr(pool_state, "spot_price_native_per_token") and pool_state.spot_price_native_per_token > 0:
+            init_price = pool_state.spot_price_native_per_token
+        elif getattr(signal, "spot_price", None) and signal.spot_price > 0:
+            init_price = Decimal(str(signal.spot_price))
+
+        decision_val = resp.decision.value if hasattr(resp.decision, "value") else str(resp.decision)
+        flags = list(resp.security_assessment.flags) if resp.security_assessment else []
+        self._outcome_tracker.record_audit(
+            token_address=target_token,
+            chain=chain.value,
+            decision=decision_val,
+            initial_price=init_price,
+            flags=flags,
+            confidence=resp.confidence_score,
+        )
 
         if resp.feedback_tuning.blacklisted_entities:
             for entity in resp.feedback_tuning.blacklisted_entities:
@@ -331,6 +539,7 @@ class AlphaSupervisorAI:
             bonding_curve_progress = min(1.0, max(0.0, (pool_reserve_native - 30.0) / 55.0)) if pool_reserve_native >= 30.0 else 0.0
 
         sender = trigger.sender if trigger else getattr(wallet_profile, "wallet_address", "")
+        has_wallet_profile = wallet_profile is not None
 
         return {
             "chain": signal.chain.value,
@@ -342,7 +551,12 @@ class AlphaSupervisorAI:
                 "native_reserve": pool_reserve_native,
                 "token_reserve": token_reserve,
                 "bonding_curve_progress_pct": round(bonding_curve_progress * 100, 2),
-                "is_pump_fun": "pump" in signal.token_address.lower() or "pump" in pool_address.lower() or (ps is not None and pool_reserve_native < 90.0),
+                "is_pump_fun": (
+                    "pump" in signal.token_address.lower()
+                    or "pump" in pool_address.lower()
+                    or "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P" in pool_address
+                    or getattr(signal, "signal_source", "") == "pump_fun"
+                ),
             },
             "security_telemetry": {
                 "is_honeypot": sec.is_honeypot if sec else False,
@@ -356,17 +570,18 @@ class AlphaSupervisorAI:
                 "rejection_reasons": getattr(sec, "rejection_reasons", []) if sec else [],
             },
             "wallet_telemetry": {
+                "has_wallet_profile": has_wallet_profile,
                 "wallet_address": sender,
-                "total_trades": getattr(wallet_profile, "total_trades", getattr(wallet_profile, "total_closed_trades", 45)),
-                "win_rate_pct": getattr(wallet_profile, "win_rate_pct", recent_win_rate),
-                "profit_factor": getattr(wallet_profile, "profit_factor", getattr(wallet_profile, "custom_metadata", {}).get("profit_factor", recent_profit_factor) if getattr(wallet_profile, "custom_metadata", None) else recent_profit_factor),
-                "sortino_ratio": getattr(wallet_profile, "sortino_ratio", getattr(wallet_profile, "custom_metadata", {}).get("sortino_ratio", 2.1) if getattr(wallet_profile, "custom_metadata", None) else 2.1),
-                "max_drawdown_pct": getattr(wallet_profile, "max_drawdown_pct", getattr(wallet_profile, "custom_metadata", {}).get("max_drawdown_pct", 18.0) if getattr(wallet_profile, "custom_metadata", None) else 18.0),
-                "median_hold_time_s": getattr(wallet_profile, "median_holding_time_seconds", getattr(wallet_profile, "median_holding_time_s", 280.0)),
-                "single_trade_outlier_pct": getattr(wallet_profile, "outlier_pnl_ratio", 0.22) * 100,
-                "is_funding_aggregator": getattr(wallet_profile, "is_disperse_funded", getattr(wallet_profile, "custom_metadata", {}).get("is_disperse_funded", False) if getattr(wallet_profile, "custom_metadata", None) else False),
-                "is_block0_bundle": getattr(wallet_profile, "is_block0_snipe", getattr(wallet_profile, "custom_metadata", {}).get("is_block0_snipe", False) if getattr(wallet_profile, "custom_metadata", None) else False),
-                "is_mev_backrun": getattr(wallet_profile, "is_mev_bot", getattr(wallet_profile, "custom_metadata", {}).get("is_mev_bot", False) if getattr(wallet_profile, "custom_metadata", None) else False),
+                "total_trades": getattr(wallet_profile, "total_trades", getattr(wallet_profile, "total_closed_trades", 0)) if has_wallet_profile else 0,
+                "win_rate_pct": getattr(wallet_profile, "win_rate_pct", recent_win_rate) if has_wallet_profile else 50.0,
+                "profit_factor": getattr(wallet_profile, "profit_factor", getattr(wallet_profile, "custom_metadata", {}).get("profit_factor", recent_profit_factor) if getattr(wallet_profile, "custom_metadata", None) else recent_profit_factor) if has_wallet_profile else 1.5,
+                "sortino_ratio": getattr(wallet_profile, "sortino_ratio", getattr(wallet_profile, "custom_metadata", {}).get("sortino_ratio", 2.1) if getattr(wallet_profile, "custom_metadata", None) else 2.1) if has_wallet_profile else 2.0,
+                "max_drawdown_pct": getattr(wallet_profile, "max_drawdown_pct", getattr(wallet_profile, "custom_metadata", {}).get("max_drawdown_pct", 18.0) if getattr(wallet_profile, "custom_metadata", None) else 18.0) if has_wallet_profile else 15.0,
+                "median_hold_time_s": getattr(wallet_profile, "median_holding_time_seconds", getattr(wallet_profile, "median_holding_time_s", 280.0)) if has_wallet_profile else 300.0,
+                "single_trade_outlier_pct": (getattr(wallet_profile, "outlier_pnl_ratio", 0.22) * 100) if has_wallet_profile else 10.0,
+                "is_funding_aggregator": getattr(wallet_profile, "is_disperse_funded", getattr(wallet_profile, "custom_metadata", {}).get("is_disperse_funded", False) if getattr(wallet_profile, "custom_metadata", None) else False) if has_wallet_profile else False,
+                "is_block0_bundle": getattr(wallet_profile, "is_block0_snipe", getattr(wallet_profile, "custom_metadata", {}).get("is_block0_snipe", False) if getattr(wallet_profile, "custom_metadata", None) else False) if has_wallet_profile else False,
+                "is_mev_backrun": getattr(wallet_profile, "is_mev_bot", getattr(wallet_profile, "custom_metadata", {}).get("is_mev_bot", False) if getattr(wallet_profile, "custom_metadata", None) else False) if has_wallet_profile else False,
             },
             "sentiment_telemetry": {
                 "raw_text": news_event.raw_text if news_event else "",
@@ -461,38 +676,59 @@ class AlphaSupervisorAI:
         is_wallet_reputable = True
         wallet_rationale = "Wallet demonstrates authentic trading distribution, consistent Sortino, and independent entries."
 
-        # A. Cabal & Insider Detection
-        if wallet.get("is_funding_aggregator") or wallet.get("is_disperse_funded"):
-            wallet_classification = WalletRiskClassification.CABAL_INSIDER
-            is_wallet_reputable = False
-            wallet_rationale = "Sybil cluster detected: Wallet received funding from aggregator/mixer co-temporal with deployer."
-            rejection_flags.append("SYBIL_FUNDING_AGGREGATOR")
+        has_wallet_profile = wallet.get("has_wallet_profile", False)
+        is_pump = pool.get("is_pump_fun", False)
 
-        elif wallet.get("is_block0_bundle"):
-            wallet_classification = WalletRiskClassification.CABAL_INSIDER
-            is_wallet_reputable = False
-            wallet_rationale = "First-block snipe collusion detected: Wallet bought in block 0/1 within same Jito/Flashbots bundle as deployer."
-            rejection_flags.append("FIRST_BLOCK_SNIPE_COLLUSION")
+        if not has_wallet_profile:
+            # Market / Liquidity launch signal without explicit copy-trading target
+            wallet_classification = WalletRiskClassification.ORGANIC_SMART_MONEY
+            is_wallet_reputable = True
+            wallet_rationale = "Market launch / pool signal verified: entropy evaluated via stage buffer and security heuristics."
+        else:
+            # A. Cabal & Insider Detection
+            if wallet.get("is_funding_aggregator") or wallet.get("is_disperse_funded"):
+                wallet_classification = WalletRiskClassification.CABAL_INSIDER
+                is_wallet_reputable = False
+                wallet_rationale = "Sybil cluster detected: Wallet received funding from aggregator/mixer co-temporal with deployer."
+                rejection_flags.append("SYBIL_FUNDING_AGGREGATOR")
 
-        # B. MEV & Non-Replicable Mechanics
-        elif wallet.get("is_mev_backrun") or wallet.get("median_hold_time_s", 100.0) < 45.0:
-            wallet_classification = WalletRiskClassification.MEV_BOT
-            is_wallet_reputable = False
-            wallet_rationale = "MEV Bot detected: 0-slot atomic execution / median holding time < 45s; non-replicable copy trade."
-            rejection_flags.append("MEV_BOT_UNREPLICABLE")
+            elif wallet.get("is_block0_bundle"):
+                wallet_classification = WalletRiskClassification.CABAL_INSIDER
+                is_wallet_reputable = False
+                wallet_rationale = "First-block snipe collusion detected: Wallet bought in block 0/1 within same Jito/Flashbots bundle as deployer."
+                rejection_flags.append("FIRST_BLOCK_SNIPE_COLLUSION")
 
-        elif wallet.get("total_trades", 0) > 30 and wallet.get("profit_factor", 1.0) < 1.05 and wallet.get("win_rate_pct", 50.0) < 45.0:
-            wallet_classification = WalletRiskClassification.WASH_TRADER
-            is_wallet_reputable = False
-            wallet_rationale = "Wash-trading volume manipulation detected: Net wallet profit minus gas is near zero despite high churn."
-            rejection_flags.append("WASH_TRADING_FAKE_VOLUME")
+            # B. MEV & Non-Replicable Mechanics
+            elif wallet.get("is_mev_backrun") or wallet.get("median_hold_time_s", 100.0) < 45.0:
+                wallet_classification = WalletRiskClassification.MEV_BOT
+                is_wallet_reputable = False
+                wallet_rationale = "MEV Bot detected: 0-slot atomic execution / median holding time < 45s; non-replicable copy trade."
+                rejection_flags.append("MEV_BOT_UNREPLICABLE")
 
-        # C. Legitimate Smart Money Criteria
-        elif wallet.get("total_trades", 0) < 15 or wallet.get("single_trade_outlier_pct", 0.0) > 60.0:
-            wallet_classification = WalletRiskClassification.NOVICE_LUCKY
-            is_wallet_reputable = False
-            wallet_rationale = "Disqualified under survivorship bias: Single lucky trade masks consecutive losses or sample size < 15."
-            rejection_flags.append("LUCKY_OUTLIER_OR_INSUFFICIENT_HISTORY")
+            elif wallet.get("total_trades", 0) > 30 and wallet.get("profit_factor", 1.0) < 1.05 and wallet.get("win_rate_pct", 50.0) < 45.0:
+                if is_pump and not wallet.get("is_copy_trade_target", False) and wallet.get("total_trades", 0) <= 60:
+                    # On Pump.fun bonding curves, dev bundling and churn are ubiquitous.
+                    # Mitigate via reduced fractional Kelly sizing and tighter stop loss rather than a fatal binary veto.
+                    wallet_classification = WalletRiskClassification.ORGANIC_SMART_MONEY
+                    is_wallet_reputable = True
+                    wallet_rationale = "Pump.fun bonding curve churn detected; mitigating via fractional Kelly reduction and tight stop loss."
+                else:
+                    wallet_classification = WalletRiskClassification.WASH_TRADER
+                    is_wallet_reputable = False
+                    wallet_rationale = "Wash-trading volume manipulation detected: Net wallet profit minus gas is near zero despite high churn."
+                    rejection_flags.append("WASH_TRADING_FAKE_VOLUME")
+
+            # C. Legitimate Smart Money Criteria
+            elif wallet.get("total_trades", 0) < 15 or wallet.get("single_trade_outlier_pct", 0.0) > 60.0:
+                if is_pump:
+                    wallet_classification = WalletRiskClassification.ORGANIC_SMART_MONEY
+                    is_wallet_reputable = True
+                    wallet_rationale = "Early bonding curve entry; allowing with dynamic risk management."
+                else:
+                    wallet_classification = WalletRiskClassification.NOVICE_LUCKY
+                    is_wallet_reputable = False
+                    wallet_rationale = "Disqualified under survivorship bias: Single lucky trade masks consecutive losses or sample size < 15."
+                    rejection_flags.append("LUCKY_OUTLIER_OR_INSUFFICIENT_HISTORY")
 
         # =========================================================================
         # SECTION 2: ON-CHAIN SECURITY, LIQUIDITY DEPTH & PRE-FLIGHT
@@ -516,7 +752,6 @@ class AlphaSupervisorAI:
 
         # Liquidity Pool State
         lp_burn = sec.get("lp_burned_ratio", 1.0)
-        is_pump = pool.get("is_pump_fun", False)
         if not is_pump and lp_burn < 0.90:
             liquidity_health = LiquidityHealth.UNLOCKED
             is_secure = False
@@ -548,11 +783,9 @@ class AlphaSupervisorAI:
         # Size = (p / L) - (q / W)
         win_prob = max(0.40, min(0.85, wallet.get("win_rate_pct", 65.0) / 100.0))
         loss_prob = 1.0 - win_prob
-        # Typical meme/dex reward-to-risk ratio: Win_Ratio ~ 1.5, Loss_Ratio ~ 0.5 (3:1)
         win_ratio = 1.8
         loss_ratio = 0.6
         raw_kelly = (win_prob / loss_ratio) - (loss_prob / win_ratio)
-        # Fractional Kelly (1/4 Kelly for safety)
         fractional_kelly_pct = max(0.25, min(2.0, (raw_kelly * 0.25) * 10.0))
 
         # Adjust for Global Risk Mode
@@ -568,6 +801,13 @@ class AlphaSupervisorAI:
             max_slippage = 150
             priority_mult = 1.2
 
+        has_churn = is_pump and (wallet.get("total_trades", 0) > 30 and wallet.get("profit_factor", 1.0) < 1.05)
+        if has_churn:
+            fractional_kelly_pct = max(0.20, fractional_kelly_pct * 0.6)
+            hard_stop = -10.0
+        else:
+            hard_stop = -15.0
+
         action_params = ActionParameters(
             target_token_address=target_token,
             recommended_position_pct=round(fractional_kelly_pct, 2),
@@ -577,17 +817,38 @@ class AlphaSupervisorAI:
                 TakeProfitStage(trigger_multiplier=2.0, sell_pct=40.0),
                 TakeProfitStage(trigger_multiplier=3.5, sell_pct=30.0),
             ],
-            hard_stop_loss_pct=-15.0,
+            hard_stop_loss_pct=hard_stop,
             trailing_stop_activation_pct=40.0,
             time_exit_minutes=15,
         )
 
         # =========================================================================
-        # FINAL DECISION SYNTHESIS
+        # FINAL DECISION SYNTHESIS & SELF-LEARNING CALIBRATION
         # =========================================================================
-        should_veto = len(rejection_flags) > 0 or not is_secure or not is_wallet_reputable
+        hard_veto_flags = {
+            "ACTIVE_MINT_OR_FREEZE_AUTHORITY",
+            "CONFIRMED_HONEYPOT_BYTECODE",
+            "LP_TOKENS_UNLOCKED_OR_UNBURNED",
+            "SYBIL_FUNDING_AGGREGATOR",
+            "FIRST_BLOCK_SNIPE_COLLUSION",
+            "MEV_BOT_UNREPLICABLE",
+        }
+
+        if not self._strict_veto:
+            fatal_flags = [f for f in rejection_flags if f in hard_veto_flags]
+            should_veto = len(fatal_flags) > 0 or not is_secure
+        else:
+            should_veto = len(rejection_flags) > 0 or not is_secure or not is_wallet_reputable
+
+        metrics = self._outcome_tracker.get_metrics()
+        if metrics.calibration_status == "CALIBRATING_EXPAND" and not self._strict_veto and should_veto:
+            fatal_flags = [f for f in rejection_flags if f in hard_veto_flags]
+            if len(fatal_flags) == 0:
+                should_veto = False
+                rejection_flags = []
+
         decision = AISupervisorDecisionEnum.PASS if should_veto else AISupervisorDecisionEnum.EXECUTE_BUY
-        confidence = 0.95 if should_veto else 0.88
+        confidence = 0.95 if should_veto else (0.88 if metrics.win_rate_pct >= 50.0 or metrics.finalized_count < 5 else 0.75)
 
         # Closed Loop Feedback Insights
         toxic_to_blacklist: list[str] = []

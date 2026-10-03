@@ -116,6 +116,7 @@ class PaperTradingEngine:
         self._gatekeeper: SecurityGatekeeper | None = None
         self._session: aiohttp.ClientSession | None = None
         self._telegram: Any = None
+        self._coordinator: Any | None = None
         self._recent_closed_trades: deque[dict[str, Any]] = deque(maxlen=50)
 
         self._trades_since_kelly_refresh = 0
@@ -445,6 +446,11 @@ class PaperTradingEngine:
                     item.pool_address[:10],
                     item.new_pool_state.native_reserve,
                 )
+                if item.new_pool_state.token_address:
+                    self._ai_supervisor.record_price_update(
+                        item.new_pool_state.token_address,
+                        item.new_pool_state.spot_price_native_per_token,
+                    )
                 continue
 
             if isinstance(item, NewsSignalEvent):
@@ -728,6 +734,10 @@ class PaperTradingEngine:
                 continue
 
             updated_pool = self._pool_registry.update_from_swap(swap, pool)
+            self._ai_supervisor.record_price_update(
+                target_token,
+                updated_pool.spot_price_native_per_token,
+            )
 
             # Check dynamic exits (TP ladder, trailing stop-loss, emergency liquidity drain)
             await self._check_dynamic_exits_for_swap(swap, updated_pool)
@@ -1531,6 +1541,11 @@ class PaperTradingEngine:
                         pool = self.get_or_create_initial_pool_state(lot.chain, lot.token_address)
 
                     current_price = pool.spot_price_native_per_token
+                    self._ai_supervisor.record_price_update(
+                        lot.token_address,
+                        current_price,
+                        now_s,
+                    )
                     # Pull tick timestamp; if not stamped on pool, default to now
                     tick_timestamp_s = getattr(pool, "timestamp_s", None) or now_s
 
@@ -1758,10 +1773,19 @@ class PaperTradingEngine:
                 db_path=cfg.db_path,
                 status_provider=self._get_engine_status,
                 gatekeeper=self._gatekeeper,
+                ai_supervisor=self._ai_supervisor,
             )
 
             async with coordinator:
+                self._coordinator = coordinator
                 self._telegram = coordinator.telegram_ingester
+
+                async def _on_launch_buffer_removal(token_addr: str) -> None:
+                    if coordinator.svm_ingester:
+                        await coordinator.svm_ingester.unsubscribe(token_addr)
+
+                self._pending_launch_buffer.register_on_removal_callback(_on_launch_buffer_removal)
+
                 async def _bridge_queues() -> None:
                     try:
                         async for event in coordinator:
