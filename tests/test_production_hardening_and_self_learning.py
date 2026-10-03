@@ -11,9 +11,8 @@ Comprehensive Verification Tests for:
 import asyncio
 from decimal import Decimal
 import json
-import sqlite3
 import time
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -37,17 +36,14 @@ from alpha_engine.ingestion.telegram import (
 from alpha_engine.models.ai import (
     AISupervisorDecisionEnum,
     GlobalRiskMode,
-    WalletRiskClassification,
 )
 from alpha_engine.models.enums import (
     ChainIdentifier,
     OrderSide,
     SecurityTier,
     SignalStrength,
-    WalletClassification,
 )
 from alpha_engine.models.events import SignalEvent
-from alpha_engine.models.profiler import WalletProfile
 from alpha_engine.models.state import PoolState, SecurityReport
 from alpha_engine.rate_limiter.registry import RateLimiterRegistry
 

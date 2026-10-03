@@ -60,6 +60,16 @@ def main(args: list[str] | None = None) -> int:
         metavar="TOKEN_ADDRESS",
         help="Execute an on-demand AlphaSupervisor-AI forensics audit on a token address",
     )
+    parser.add_argument(
+        "--chat",
+        action="store_true",
+        help="Launch the interactive Conversational AI supervisor interface",
+    )
+    parser.add_argument(
+        "--decisions",
+        action="store_true",
+        help="Display recent structured DecisionRecord audit logs",
+    )
     parsed = parser.parse_args(args)
 
     try:
@@ -67,6 +77,30 @@ def main(args: list[str] | None = None) -> int:
     except EnvironmentError as e:
         print(f"Configuration error: {e}", file=sys.stderr)
         return 1
+
+    if parsed.chat:
+        from alpha_engine.chat_interface import cli_chat
+        return asyncio.run(cli_chat(config.db_path))
+
+    if parsed.decisions:
+        import sqlite3
+        try:
+            conn = sqlite3.connect(config.db_path, timeout=30.0)
+            conn.row_factory = sqlite3.Row
+            cur = conn.cursor()
+            cur.execute(
+                "SELECT decision_id, decision_type, chain, token_symbol, token_address, confidence_score, pattern_match_score, reason, created_at "
+                "FROM decision_audit_log ORDER BY created_at DESC LIMIT 15"
+            )
+            rows = cur.fetchall()
+            print(f"=== Last {len(rows)} Structured Decision Records ({config.db_path}) ===")
+            for r in rows:
+                p_score = f"{r['pattern_match_score']:.2f}" if r['pattern_match_score'] is not None else "N/A"
+                print(f"[{r['created_at']}] {r['decision_type']:<10} | {r['chain']} | {r['token_symbol'] or r['token_address'][:10]} | Conf: {r['confidence_score']:.2f} | Pattern: {p_score} | {r['reason']}")
+            conn.close()
+        except Exception as exc:
+            print(f"Database query error: {exc}", file=sys.stderr)
+        return 0
 
 
     if parsed.ai:

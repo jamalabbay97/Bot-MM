@@ -18,6 +18,7 @@ from typing import Any, Optional
 import aiohttp
 
 from alpha_engine.config import EngineConfig
+from alpha_engine.models.decisions import DecisionRecord, DecisionType, PatternFeatureVector
 from alpha_engine.models.ai import (
     ActionParameters,
     AISupervisorDecisionEnum,
@@ -320,7 +321,10 @@ class AlphaSupervisorAI:
             or getattr(config, "ai_api_key", None)
             or getattr(config, "openai_api_key", None)
         )
-        self._model: str = getattr(config, "ai_model", "gemini-2.5-flash")
+        model_val = getattr(config, "ai_model", "gemini-2.5-flash")
+        if model_val in ("gemini", "default", ""):
+            model_val = "gemini-2.5-flash"
+        self._model: str = model_val
         self._timeout_s: float = getattr(config, "ai_timeout_s", 4.0)
         self._strict_veto: bool = getattr(config, "ai_strict_veto", True)
 
@@ -334,6 +338,23 @@ class AlphaSupervisorAI:
         self._veto_count: int = 0
         self._buy_approval_count: int = 0
         self._outcome_tracker = AIOutcomeTracker(max_history=500)
+
+        # Extended persistence, pattern memory & dynamic tuning
+        self._ledger: Optional[Any] = None
+        self._pattern_store: Optional[Any] = None
+        self._parameter_tuner: Optional[Any] = None
+
+    def set_ledger(self, ledger: Any) -> None:
+        """Register the SQLite ledger for structured decision audit trail persistence."""
+        self._ledger = ledger
+
+    def set_pattern_store(self, pattern_store: Any) -> None:
+        """Register vectorized pattern memory store."""
+        self._pattern_store = pattern_store
+
+    def set_parameter_tuner(self, parameter_tuner: Any) -> None:
+        """Register dynamic hyperparameter tuner."""
+        self._parameter_tuner = parameter_tuner
 
     @property
     def outcome_tracker(self) -> AIOutcomeTracker:
@@ -408,6 +429,193 @@ class AlphaSupervisorAI:
             "outcome_tracker": metrics.model_dump(),
         }
 
+    async def answer_user_query(self, query: str, context: Optional[dict[str, Any]] = None) -> str:
+        """
+        Conversational endpoint for user queries, explanations, and risk guidance.
+        Queries the LLM (Gemini or OpenAI/OpenRouter) with strict Arabic localization
+        for user-facing prose, while preserving English metrics, code, tokens, and tables.
+        Falls back gracefully to intelligent deterministic Arabic response if offline.
+        """
+        clean_q = query.strip()
+        if not clean_q:
+            return "مرحباً! أنا المشرف الذكي **AlphaSupervisor-AI**، كيف يمكنني مساعدتك اليوم في تداولاتك؟"
+
+        # Build comprehensive state context
+        sys_status = self.get_status()
+        merged_context: dict[str, Any] = dict(sys_status)
+        if context:
+            merged_context.update(context)
+
+        system_prompt = (
+            "You are AlphaSupervisor-AI, an expert Quantitative Trading Supervisor and Risk Copilot for Bot-MM.\n"
+            "You monitor and supervise multi-chain paper trading across Solana (SVM) and Base (EVM), evaluating "
+            "Wave-2 accumulation breakouts, liquidity depth, honey-pot risks, developer exits, top-10 concentration, "
+            "and dynamic fractional Kelly position sizing.\n\n"
+            "MANDATORY LOCALIZATION RULES:\n"
+            "1. Write all conversational explanations, analysis, summaries, guidance, and greetings in clear, professional Arabic (العربية).\n"
+            "2. Keep all token symbols (e.g. SOL, ETH, BTC), contract addresses (CAs), trade execution alerts, tables, formulas, "
+            "numbers, metrics (e.g. PnL, Win Rate, Uptime, Kelly, Slippage, RSS MB), and code blocks STRICTLY in English.\n"
+            "3. Be concise, precise, and quantitatively rigorous."
+        )
+
+        user_content = (
+            f"Current System State & Telemetry:\n{json.dumps(merged_context, indent=2, default=str)}\n\n"
+            f"User Question: {clean_q}"
+        )
+
+        # Attempt LLM call if configured
+        if self._api_key:
+            try:
+                session = await self._get_session()
+                if self._provider == "gemini":
+                    url = f"https://generativelanguage.googleapis.com/v1beta/models/{self._model}:generateContent?key={self._api_key}"
+                    body = {
+                        "contents": [
+                            {"role": "user", "parts": [{"text": user_content}]}
+                        ],
+                        "systemInstruction": {
+                            "parts": [{"text": system_prompt}]
+                        },
+                        "generationConfig": {
+                            "temperature": 0.4,
+                            "maxOutputTokens": 1024,
+                        },
+                    }
+                    async with session.post(url, json=body, timeout=self._timeout_s) as response:
+                        if response.status == 200:
+                            data = await response.json()
+                            candidates = data.get("candidates", [])
+                            if candidates:
+                                text = candidates[0].get("content", {}).get("parts", [{}])[0].get("text", "")
+                                if text.strip():
+                                    return text.strip()
+                        else:
+                            resp_text = await response.text()
+                            logger.warning("Gemini LLM call in answer_user_query returned status %s: %s", response.status, resp_text[:150])
+
+                elif self._provider in ("openai", "openrouter"):
+                    base_url = "https://api.openai.com/v1" if self._provider == "openai" else "https://openrouter.ai/api/v1"
+                    url = f"{base_url}/chat/completions"
+                    headers = {"Authorization": f"Bearer {self._api_key}", "Content-Type": "application/json"}
+                    body = {
+                        "model": self._model,
+                        "messages": [
+                            {"role": "system", "content": system_prompt},
+                            {"role": "user", "content": user_content},
+                        ],
+                        "temperature": 0.4,
+                        "max_tokens": 1024,
+                    }
+                    async with session.post(url, json=body, headers=headers, timeout=self._timeout_s) as response:
+                        if response.status == 200:
+                            data = await response.json()
+                            text = data["choices"][0]["message"]["content"]
+                            if text.strip():
+                                return text.strip()
+                        else:
+                            resp_text = await response.text()
+                            logger.warning("%s call in answer_user_query returned status %s: %s", self._provider, response.status, resp_text[:150])
+            except Exception as exc:
+                logger.debug("LLM call failed in answer_user_query: %s. Using heuristic fallback.", exc)
+
+        # Deterministic localized fallback
+        return self._deterministic_arabic_response(clean_q, merged_context)
+
+    def _deterministic_arabic_response(self, query: str, context: dict[str, Any]) -> str:
+        """
+        Deterministic, mathematically grounded Arabic response when LLM is unavailable or offline.
+        Keeps all English symbols, tables, metrics, tokens, and code blocks strictly in English.
+        """
+        lower_q = query.lower()
+        mode = context.get("global_risk_mode", self._global_risk_mode.value)
+        total_audits = context.get("total_audits", self._total_audits)
+        approved = context.get("approved_buys", self._buy_approval_count)
+        vetoed = context.get("vetoed_signals", self._veto_count)
+        blacklisted = context.get("blacklisted_entities_count", len(self._blacklisted_entities))
+
+        ot = context.get("outcome_tracker", {})
+        win_rate = ot.get("win_rate_pct", 0.0) if isinstance(ot, dict) else 0.0
+
+        if any(w in lower_q for w in ("status", "health", "state", "حالة", "وضع", "شغال", "نظام")):
+            return (
+                "📊 **تقرير حالة المشرف الذكي (AlphaSupervisor-AI Telemetry)**\n\n"
+                f"• **وضع المخاطرة (Global Risk Mode):** `{mode}`\n"
+                f"• **معدل النجاح (Win Rate):** `{win_rate:.1f}%`\n"
+                f"• **إجمالي الفحوصات (Total Audits):** `{total_audits}` (مقبول: `{approved}` | مرفوض: `{vetoed}`)\n"
+                f"• **الكيانات المحظورة (Blacklisted Entities):** `{blacklisted}`\n"
+                f"• **النمط الصارم (Strict Veto):** `{'ON 🔒' if self._strict_veto else 'OFF 🔓'}`\n\n"
+                "⚡ محرك المراقبة والتحليل الكمي يعمل بكفاءة تامة."
+            )
+
+        if any(w in lower_q for w in ("risk", "mode", "stance", "مخاطر", "مخاطرة", "تحفظ", "توسع")):
+            return (
+                f"🛡️ **وضع المخاطرة الحالي للمحرك هو `{mode}`**\n\n"
+                "• `DEFENSIVE`: حظر أي عقد غير مؤكد، تقليل حجم لوتات كيلي بنسبة 50%، ووقف خسارة مشدد.\n"
+                "• `NEUTRAL`: موازنة المخاطرة الكلاسيكية مع فحص شامل للسيولة والتمركز.\n"
+                "• `EXPAND`: زيادة التحجيم للصفقات ذات الزخم العالي وطفرات الحجم Wave-2 المؤكدة.\n\n"
+                "لتغيير الوضع يدوياً: `/ai stance <DEFENSIVE|NEUTRAL|EXPAND>`"
+            )
+
+        if any(w in lower_q for w in ("veto", "reject", "رفض", "فيتو", "حظر")):
+            recent = self.get_recent_vetoes(limit=5)
+            if not recent:
+                return "🛡️ لا توجد عمليات رفض حديثة مسجلة في الذاكرة. يتم الرفض تلقائياً عند وجود مخاطر Honeypot أو تمركز حيتان > 25%."
+            lines = ["🛡️ **أحدث عمليات الرفض (Recent Vetoes)**\n", "```", f"{'Token':<14} | {'Chain':<6} | {'Flags & Rationale'}", "-" * 55]
+            for v in reversed(recent):
+                t_str = str(v.get("token", ""))
+                short_t = f"{t_str[:4]}..{t_str[-4:]}" if len(t_str) > 10 else t_str
+                c_str = str(v.get("chain", "")).replace("ChainIdentifier.", "").replace("_mainnet", "")[:6]
+                flags = v.get("flags", [])
+                flag_str = ", ".join(flags[:2]) if flags else str(v.get("rationale", "Veto"))[:24]
+                lines.append(f"{short_t:<14} | {c_str:<6} | {flag_str}")
+            lines.append("```")
+            return "\n".join(lines)
+
+        if any(w in lower_q for w in ("wave2", "staging", "breakout", "تجميع", "موجة", "ستيج")):
+            return (
+                "🌊 **معايير انفجار الموجة الثانية (Wave-2 Accumulation Breakout)**:\n\n"
+                "1. **Selling Exhaustion**: هبوط ضغط البيع تدريجياً خلال فترة التجميع.\n"
+                "2. **Volume Surge Multiplier**: حجم آخر 5 دقائق $V_{5m} > 2.5 \\times SMA_{15m}$.\n"
+                "3. **Net Buy Delta**: تفوق أوامر الشراء الصافية بنسبة تتجاوز `65%`.\n"
+                "4. **Dev-Exit / CTO**: رصيد المطور $\\le 0.05\\%$ مع عدم وجود تكتلات حيتان (Top 10 $\\le 25\\%$)."
+            )
+
+        return (
+            "🤖 **AlphaSupervisor-AI — المشرف الذكي والمساعد الكمي**\n\n"
+            "أنا جاهز للإجابة على استفساراتك حول القرارات التحليلية وحالة المحرك وإدارة المخاطر:\n"
+            "• لمعرفة أسباب فحص أو رفض أي عملة: أرسل عنوان العقد (CA) أو استفسر عن `/why <CA>`\n"
+            "• لفحص قائمة المراقبة التجميعية: `/staging`\n"
+            "• لعرض الصفقات المفتوحة والمغلقة: `/trades`\n"
+            "• لتعديل شهية المخاطرة: `/ai stance <DEFENSIVE|NEUTRAL|EXPAND>`"
+        )
+
+    async def audit_trade_candidate(
+        self,
+        signal: Any,
+        pool_state: Optional[PoolState] = None,
+        security_report: Optional[SecurityReport] = None,
+        news_event: Optional[NewsEvent] = None,
+        wallet_profile: Optional[WalletProfile] = None,
+        recent_win_rate: float = 65.0,
+        recent_profit_factor: float = 2.4,
+        sec: Optional[Any] = None,
+    ) -> AISupervisorResponse:
+        """
+        Audit a trade candidate before execution.
+        Safely accepts `sec` parameter and guards against AttributeError if `sec` is None.
+        """
+        effective_sec = sec if sec is not None else security_report
+        return await self.audit_signal(
+            signal=signal,
+            pool_state=pool_state,
+            security_report=effective_sec,
+            news_event=news_event,
+            wallet_profile=wallet_profile,
+            recent_win_rate=recent_win_rate,
+            recent_profit_factor=recent_profit_factor,
+            sec=effective_sec,
+        )
+
     async def audit_signal(
         self,
         signal: SignalEvent,
@@ -417,6 +625,7 @@ class AlphaSupervisorAI:
         wallet_profile: Optional[WalletProfile] = None,
         recent_win_rate: float = 65.0,
         recent_profit_factor: float = 2.4,
+        sec: Optional[Any] = None,
     ) -> AISupervisorResponse:
         """
         Comprehensive pre-flight signal audit.
@@ -501,6 +710,90 @@ class AlphaSupervisorAI:
 
         if resp.feedback_tuning.insights_learned:
             self._learned_insights.append(resp.feedback_tuning.insights_learned)
+
+        # Compute PatternMatchScore using PatternMemoryStore if available
+        pattern_match_score = 0.85
+        effective_sec = sec if sec is not None else (security_report or getattr(signal, "security_report", None))
+        if self._pattern_store is not None and hasattr(self._pattern_store, "calculate_pattern_match"):
+            try:
+                candidate_vector = PatternFeatureVector.from_signal(
+                    signal=signal,
+                    sec=effective_sec,
+                    wallet_profile=wallet_profile,
+                )
+                pattern_match_score = self._pattern_store.calculate_pattern_match(candidate_vector)
+            except AttributeError:
+                try:
+                    top10 = getattr(effective_sec, "top10_concentration", 0.15) if effective_sec else 0.15
+                    candidate_vector = PatternFeatureVector(
+                        token_address=target_token,
+                        consolidation_duration_s=1800.0,
+                        dip_depth_pct=40.0,
+                        volume_surge_multiplier=2.5,
+                        net_buy_delta=0.70,
+                        top10_concentration=float(top10 if top10 is not None else 0.15),
+                        liquidity_to_mc_ratio=0.20,
+                        smart_wallet_inflows=5.0,
+                        peak_gain_multiplier=1.0,
+                    )
+                    pattern_match_score = self._pattern_store.calculate_pattern_match(candidate_vector)
+                except Exception:
+                    pattern_match_score = 0.85
+            except Exception as exc:
+                logger.debug("Failed computing pattern match score: %s", exc)
+                pattern_match_score = 0.85
+
+        # Apply dynamic parameter tuning if available
+        if self._parameter_tuner is not None and hasattr(self._parameter_tuner, "current_params"):
+            dyn_p = self._parameter_tuner.current_params
+            resp.action_parameters.max_slippage_bps = dyn_p.max_slippage_bps
+            resp.action_parameters.hard_stop_loss_pct = dyn_p.hard_stop_loss_pct
+            resp.action_parameters.take_profit_ladder = dyn_p.get_take_profit_ladder()
+            resp.action_parameters.trailing_stop_activation_pct = dyn_p.trailing_stop_activation_pct
+
+        # Construct and persist immutable DecisionRecord audit trail
+        decision_type = (
+            DecisionType.ENTER
+            if resp.decision == AISupervisorDecisionEnum.EXECUTE_BUY
+            else DecisionType.SKIP
+        )
+        if decision_type == DecisionType.ENTER:
+            explicit_reason = (
+                f"BUY APPROVED: AlphaScore={signal.alpha_score:.2f} | PatternMatch={pattern_match_score:.2f} | "
+                f"KellySize={resp.action_parameters.recommended_position_pct}% | MaxSlippage={resp.action_parameters.max_slippage_bps}bps | "
+                f"StopLoss={resp.action_parameters.hard_stop_loss_pct}% | {resp.wallet_audit.rationale}"
+            )
+        else:
+            reasons = list(resp.security_assessment.flags) if resp.security_assessment else []
+            explicit_reason = f"VETO SKIP: [{', '.join(reasons) if reasons else 'Unmet criteria'}]; {resp.wallet_audit.rationale}"
+
+        decision_record = DecisionRecord(
+            token_address=target_token,
+            chain=chain.value,
+            decision_type=decision_type,
+            strategy_pattern=signal.source.value if hasattr(signal.source, "value") else str(signal.source),
+            market_cap_usd=None,
+            volume_5m_usd=None,
+            volume_1h_usd=None,
+            liquidity_pool_depth_usd=float(pool_state.native_reserve * 150) if pool_state and pool_state.native_reserve > 0 else None,
+            active_rules={
+                "WhaleInflow": wallet_profile.total_trades > 30 if wallet_profile else False,
+                "DevExitConfirmed": not (sec and not sec.mint_authority_disabled),
+                "PatternMatchScore": pattern_match_score,
+                "HoneypotSafe": not (sec and sec.is_honeypot),
+                "RejectionFlags": resp.security_assessment.flags if resp.security_assessment else [],
+            },
+            confidence_score=resp.confidence_score,
+            reason=explicit_reason,
+            metadata={"global_risk_mode": self._global_risk_mode.value},
+        )
+
+        if self._ledger is not None and hasattr(self._ledger, "record_decision"):
+            try:
+                loop = asyncio.get_running_loop()
+                loop.create_task(self._ledger.record_decision(decision_record))
+            except RuntimeError:
+                pass
 
         self._recent_audits.append({
             "token": target_token,

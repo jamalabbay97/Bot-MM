@@ -16,6 +16,9 @@
 *.session
 *.session-journal
 *.session.lock
+*.session-shm
+*.session-wal
+*.jsonl
 
 # ------------------------------------------------------------------------------
 # 3. SQLite Databases & WAL Journal Artifacts

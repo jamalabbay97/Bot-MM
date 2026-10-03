@@ -26,6 +26,7 @@ except ImportError:  # pragma: no cover
 
 from collections import deque
 
+from alpha_engine.chat_interface import ConversationalSupervisor
 from alpha_engine.config import EngineConfig
 from alpha_engine.dns_resolver import patch_dns_resolvers
 from alpha_engine.engine.ai_supervisor import AlphaSupervisorAI
@@ -33,6 +34,7 @@ from alpha_engine.engine.feedback import AdaptiveFeedbackEngine, TradeReflection
 from alpha_engine.engine.registry import PoolRegistry
 from alpha_engine.engine.rpc_health import RPCHealthMonitor
 from alpha_engine.engine.signals import PendingLaunchBuffer, SignalGenerator
+from alpha_engine.engine.staging import Wave2StagingBuffer
 from alpha_engine.execution.book import PositionBook, RunningMetrics
 from alpha_engine.execution.executor import PaperExecutor
 from alpha_engine.execution.ledger import SQLiteLedger
@@ -40,6 +42,7 @@ from alpha_engine.ingestion.coordinator import IngestionCoordinator
 from alpha_engine.logging_config import setup_production_logging
 from alpha_engine.math.cpmm import get_initial_bonding_curve_pool
 from alpha_engine.models.ai import ActionParameters, AISupervisorDecisionEnum
+from alpha_engine.models.decisions import DecisionRecord, DecisionType, PatternFeatureVector
 from alpha_engine.models.enums import (
     ChainIdentifier,
     LotStatus,
@@ -111,6 +114,9 @@ class PaperTradingEngine:
             min_unique_signers=min_buyers,
             slot_bundle_threshold=bundle_thresh,
         )
+        self._wave2_buffer = Wave2StagingBuffer(config=config)
+        self._pending_launch_buffer.set_wave2_staging_buffer(self._wave2_buffer)
+        self._explainer: Optional[ConversationalSupervisor] = None
         self._executor: PaperExecutor | None = None
         self._ledger: SQLiteLedger | None = None
         self._gatekeeper: SecurityGatekeeper | None = None
@@ -150,6 +156,13 @@ class PaperTradingEngine:
     def ai_supervisor(self) -> AlphaSupervisorAI:
         return self._ai_supervisor
 
+    @property
+    def wave2_buffer(self) -> Wave2StagingBuffer:
+        return self._wave2_buffer
+
+    @property
+    def explainer(self) -> Optional[ConversationalSupervisor]:
+        return self._explainer
 
     @property
     def rpc_monitor(self) -> RPCHealthMonitor:
@@ -761,6 +774,25 @@ class PaperTradingEngine:
                     )
                 continue
 
+            # Route trade to Wave-2 Staging Buffer to track consolidation and detect accumulation breakout
+            wave2_signal = self._wave2_buffer.record_trade(
+                swap,
+                pool=updated_pool,
+            )
+            if wave2_signal is not None:
+                if not self.is_position_open(wave2_signal.token_address, wave2_signal.chain):
+                    if self._ledger:
+                        await self._ledger.record_signal(wave2_signal)
+                    await self._signal_q.put(wave2_signal)
+                    logger.info(
+                        "Wave-2 Breakout Signal [%s] generated & queued: %s (alpha=%.3f, strength=%s)",
+                        wave2_signal.signal_id[:8],
+                        wave2_signal.token_address[:10],
+                        wave2_signal.alpha_score,
+                        wave2_signal.strength.value,
+                    )
+                continue
+
             # Sells do not trigger buy signals
             if out_is_native:
                 continue
@@ -770,9 +802,13 @@ class PaperTradingEngine:
                 logger.debug("Position already open for token %s; skipping buy signal from swap", swap.token_out[:10])
                 continue
 
-            # If token is staged in pending launch buffer, do not generate premature swap buy signal
+            # If token is staged in pending launch buffer or Wave-2 staging buffer, do not generate premature swap buy signal
             if self._pending_launch_buffer.is_staged(swap.token_out):
                 logger.debug("Token %s staged in PendingLaunchBuffer; awaiting graduation before BUY signal", swap.token_out[:10])
+                continue
+
+            if self._wave2_buffer.is_staged(swap.token_out):
+                logger.debug("Token %s staged in Wave2StagingBuffer; awaiting Wave-2 breakout before BUY signal", swap.token_out[:10])
                 continue
 
             staged = self._pending_launch_buffer.get_staged(target_token)
@@ -856,6 +892,34 @@ class PaperTradingEngine:
                         )
                         if ledger:
                             await ledger.record_trade(rec)
+                            exit_type = DecisionType.TRAIL_STOP if "trail" in str(decision.exit_reason).lower() else DecisionType.EXIT
+                            exit_decision_rec = DecisionRecord(
+                                decision_type=exit_type,
+                                token_address=decision.token_address,
+                                chain=decision.chain,
+                                signal_id=lot.signal_id,
+                                token_symbol=getattr(lot, "token_symbol", "UNKNOWN"),
+                                market_cap_usd=float(pool.spot_price_native_per_token * native_price * Decimal("1000000000")) if pool else 0.0,
+                                liquidity_usd=float(pool.native_reserve * native_price * 2) if pool else 0.0,
+                                volume_5m_usd=float(vol * native_price) if vol else 0.0,
+                                volume_1h_usd=0.0,
+                                rule_triggers={
+                                    "ExitReason": str(decision.exit_reason.value if decision.exit_reason else "swap_exit"),
+                                    "TokensSold": float(decision.tokens_to_sell),
+                                    "EntryPrice": float(lot.entry_price),
+                                    "ExitPrice": float(exit_fill.effective_price),
+                                    "RealizedPnLUSD": float(exit_pnl_usd),
+                                },
+                                confidence_score=1.0,
+                                reason=f"Dynamic exit on swap: {decision.exit_reason}. Entry={lot.entry_price:.8f}, Exit={exit_fill.effective_price:.8f}, PnL=${float(exit_pnl_usd):+.2f}",
+                            )
+                            await ledger.record_decision(exit_decision_rec)
+
+                        self._feedback.parameter_tuner.update_from_performance(
+                            win_rate_24h=self._metrics.win_rate_pct,
+                            realized_pnl_usd=self._metrics.total_realized_pnl_usd,
+                            total_trades_24h=self._metrics.total_trades,
+                        )
 
                         reflection = TradeReflection.from_trade(
                             trade_id=exit_fill.order_id,
@@ -1413,8 +1477,60 @@ class PaperTradingEngine:
             try:
                 self._pending_launch_buffer.check_telemetry(interval_s=15.0)
                 self._pending_launch_buffer.sweep_expired()
+                self._wave2_buffer.sweep_expired()
             except Exception as exc:  # noqa: BLE001
                 logger.error("Error in pending buffer watchdog: %s", exc)
+
+    async def _missed_opportunity_watchdog(self) -> None:
+        """
+        Autonomous Learning Loop Watchdog:
+        Periodically cross-references market gainers and staged tokens
+        to record breakout feature vectors and analyze false negatives.
+        """
+        logger.info("Autonomous learning & missed opportunity watchdog started.")
+        while not self._shutdown_event.is_set():
+            try:
+                await asyncio.wait_for(
+                    self._shutdown_event.wait(),
+                    timeout=60.0,
+                )
+                break
+            except asyncio.TimeoutError:
+                pass
+            except asyncio.CancelledError:
+                break
+
+            if self._shutdown_event.is_set():
+                break
+
+            try:
+                # 1. Learn from closed winning trades: record breakout feature vectors
+                reflections = self._feedback.get_reflections(limit=20)
+                for ref in reflections:
+                    if ref.is_win and ref.roi_pct >= 50.0:
+                        vec = PatternFeatureVector(
+                            token_address=ref.token_address,
+                            consolidation_duration_s=1800.0,
+                            dip_depth_pct=40.0,
+                            volume_surge_multiplier=3.0,
+                            net_buy_delta=0.75,
+                            top10_concentration=0.18,
+                            liquidity_to_mc_ratio=0.25,
+                            smart_wallet_inflows=15.0,
+                            peak_gain_multiplier=1.0 + ref.roi_pct / 100.0,
+                        )
+                        self._feedback.pattern_store.add_pattern(vec)
+
+                # 2. Check staged tokens against current prices to identify breakout patterns
+                staged_map = self._wave2_buffer.get_all_staged()
+                for token_addr, staged in staged_map.items():
+                    if staged.highest_price > staged.initial_price * Decimal("2.0"):
+                        # Staged token reached >= 2x; capture market vector
+                        vec = staged.extract_feature_vector(peak_gain_multiplier=float(staged.highest_price / staged.initial_price))
+                        self._feedback.pattern_store.add_pattern(vec)
+
+            except Exception as exc:  # noqa: BLE001
+                logger.error("Error in missed opportunity watchdog: %s", exc)
 
     def _get_engine_status(self) -> dict[str, Any]:
         """Collects real-time engine telemetry for the interactive Telegram bot."""
@@ -1640,6 +1756,34 @@ class PaperTradingEngine:
                                     realized_pnl_usd=exit_pnl_usd,
                                 )
                                 await self._ledger.record_trade(rec)
+                                poller_exit_type = DecisionType.TRAIL_STOP if "trail" in str(decision.exit_reason).lower() else DecisionType.EXIT
+                                poller_decision_rec = DecisionRecord(
+                                    decision_type=poller_exit_type,
+                                    token_address=decision.token_address,
+                                    chain=decision.chain,
+                                    signal_id=lot.signal_id,
+                                    token_symbol=getattr(lot, "token_symbol", "UNKNOWN"),
+                                    market_cap_usd=float(pool.spot_price_native_per_token * native_price * Decimal("1000000000")) if pool else 0.0,
+                                    liquidity_usd=float(pool.native_reserve * native_price * 2) if pool else 0.0,
+                                    volume_5m_usd=0.0,
+                                    volume_1h_usd=0.0,
+                                    rule_triggers={
+                                        "ExitReason": str(decision.exit_reason.value if decision.exit_reason else "poller_exit"),
+                                        "TokensSold": float(decision.tokens_to_sell),
+                                        "EntryPrice": float(lot.entry_price),
+                                        "ExitPrice": float(exit_fill.effective_price),
+                                        "RealizedPnLUSD": float(exit_pnl_usd),
+                                    },
+                                    confidence_score=1.0,
+                                    reason=f"High-speed poller exit: {decision.exit_reason}. Entry={lot.entry_price:.8f}, Exit={exit_fill.effective_price:.8f}, PnL=${float(exit_pnl_usd):+.2f}",
+                                )
+                                await self._ledger.record_decision(poller_decision_rec)
+
+                            self._feedback.parameter_tuner.update_from_performance(
+                                win_rate_24h=self._metrics.win_rate_pct,
+                                realized_pnl_usd=self._metrics.total_realized_pnl_usd,
+                                total_trades_24h=self._metrics.total_trades,
+                            )
 
                             reflection = TradeReflection.from_trade(
                                 trade_id=exit_fill.order_id,
@@ -1776,9 +1920,32 @@ class PaperTradingEngine:
                 ai_supervisor=self._ai_supervisor,
             )
 
+            self._ai_supervisor.set_ledger(self._ledger)
+            self._ai_supervisor.set_pattern_store(self._feedback.pattern_store)
+            self._ai_supervisor.set_parameter_tuner(self._feedback.parameter_tuner)
+
             async with coordinator:
                 self._coordinator = coordinator
                 self._telegram = coordinator.telegram_ingester
+
+                async def _on_wave2_signal(sig: SignalEvent) -> None:
+                    if not self.is_position_open(sig.token_address, sig.chain):
+                        if self._ledger:
+                            await self._ledger.record_signal(sig)
+                        await self._signal_q.put(sig)
+
+                self._wave2_buffer.register_signal_callback(_on_wave2_signal)
+
+                self._explainer = ConversationalSupervisor(
+                    ledger=self._ledger,
+                    position_book=self._position_book,
+                    staging_buffer=self._wave2_buffer,
+                    parameter_tuner=self._feedback.parameter_tuner,
+                    ai_supervisor=self._ai_supervisor,
+                    metrics=self._metrics,
+                )
+                if self._telegram is not None and hasattr(self._telegram, "set_chat_explainer"):
+                    self._telegram.set_chat_explainer(self._explainer)
 
                 async def _on_launch_buffer_removal(token_addr: str) -> None:
                     if coordinator.svm_ingester:
@@ -1814,8 +1981,11 @@ class PaperTradingEngine:
                 buffer_task = asyncio.create_task(
                     self._pending_buffer_watchdog(), name="pending_buffer_watchdog"
                 )
+                missed_opp_task = asyncio.create_task(
+                    self._missed_opportunity_watchdog(), name="missed_opportunity_watchdog"
+                )
 
-                worker_tasks = [bridge_task, ingest_task, signal_task, poller_task, snapshot_task, heartbeat_task, buffer_task]
+                worker_tasks = [bridge_task, ingest_task, signal_task, poller_task, snapshot_task, heartbeat_task, buffer_task, missed_opp_task]
                 logger.info("All engine pipelines active. Awaiting market and social signals...")
 
                 # Monitor tasks: wait for either graceful shutdown or unexpected worker crash
@@ -1860,8 +2030,9 @@ class PaperTradingEngine:
                     snapshot_task.cancel()
                     heartbeat_task.cancel()
                     buffer_task.cancel()
+                    missed_opp_task.cancel()
                     shutdown_waiter.cancel()
-                    await asyncio.gather(poller_task, snapshot_task, heartbeat_task, buffer_task, return_exceptions=True)
+                    await asyncio.gather(poller_task, snapshot_task, heartbeat_task, buffer_task, missed_opp_task, return_exceptions=True)
 
                     # 4. Flush and checkpoint SQLite database
                     await ledger.checkpoint()

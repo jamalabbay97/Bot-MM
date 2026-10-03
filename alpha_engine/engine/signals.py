@@ -87,6 +87,11 @@ class PendingLaunchBuffer:
         self.min_blocks_span = min_blocks_span
         self._staged: dict[str, StagedLaunch] = {}
         self._on_removal_callbacks: list[Callable[[str], Any]] = []
+        self._wave2_buffer: Optional[Any] = None
+
+    def set_wave2_staging_buffer(self, wave2_buffer: Any) -> None:
+        """Register the Wave-2 Dip-Reversal staging buffer to receive promising dumped tokens."""
+        self._wave2_buffer = wave2_buffer
 
     def register_on_removal_callback(self, callback: Callable[[str], Any]) -> None:
         """Register callback invoked whenever a staged token is dropped, graduated, or removed."""
@@ -339,7 +344,7 @@ class PendingLaunchBuffer:
                 self.min_unique_signers,
             )
 
-        # Dump filter: drops if price dumps > max_dump_pct from initial bonding curve within the first min_age_s
+        # Dump filter: drops from launch buffer; forward to Wave2StagingBuffer if clean
         if staged.initial_price > Decimal(0):
             dump_pct = (staged.initial_price - staged.latest_price) / staged.initial_price
             if dump_pct > self.max_dump_pct and age <= self.min_age_s:
@@ -353,6 +358,16 @@ class PendingLaunchBuffer:
                     staged.initial_price,
                     staged.latest_price,
                 )
+                if self._wave2_buffer is not None and not staged.is_dev_bundled and staged.report.passes_hard_gates:
+                    self._wave2_buffer.stage_token(
+                        token_address=staged.token_address,
+                        chain=staged.chain,
+                        pool_address=staged.pool_address,
+                        initial_price=staged.initial_price,
+                        report=staged.report,
+                        raw_signal=staged.raw_signal,
+                    )
+                    logger.info("PendingLaunchBuffer -> Wave2StagingBuffer: Forwarded dumped token %s for dip-reversal monitoring.", staged.token_address[:10])
                 return None
 
         # Expired observation window (> max_age_s)
@@ -363,6 +378,16 @@ class PendingLaunchBuffer:
             staged.drop_reason = f"Observation window expired ({age:.1f}s > {self.max_age_s}s) - Unmet: [{unmet_str}]"
             self._notify_removal(staged.token_address)
             logger.info("PendingLaunchBuffer: DROPPING launch %s — %s", staged.token_address[:10], staged.drop_reason)
+            if self._wave2_buffer is not None and not staged.is_dev_bundled and staged.report.passes_hard_gates:
+                self._wave2_buffer.stage_token(
+                    token_address=staged.token_address,
+                    chain=staged.chain,
+                    pool_address=staged.pool_address,
+                    initial_price=staged.initial_price,
+                    report=staged.report,
+                    raw_signal=staged.raw_signal,
+                )
+                logger.info("PendingLaunchBuffer -> Wave2StagingBuffer: Forwarded expired token %s for dip-reversal monitoring.", staged.token_address[:10])
             return None
 
         # Graduation criteria check:
@@ -428,6 +453,15 @@ class PendingLaunchBuffer:
                         staged.token_address[:10],
                         staged.drop_reason,
                     )
+                    if self._wave2_buffer is not None and not staged.is_dev_bundled and staged.report.passes_hard_gates:
+                        self._wave2_buffer.stage_token(
+                            token_address=staged.token_address,
+                            chain=staged.chain,
+                            pool_address=staged.pool_address,
+                            initial_price=staged.initial_price,
+                            report=staged.report,
+                            raw_signal=staged.raw_signal,
+                        )
                     expired.append(token)
         return expired
 

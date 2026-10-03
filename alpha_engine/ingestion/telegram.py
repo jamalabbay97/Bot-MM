@@ -313,6 +313,9 @@ class TelegramIngester:
         self._recent_news: deque[dict[str, Any]] = deque(maxlen=20)
         self._recent_whales: deque[dict[str, Any]] = deque(maxlen=20)
 
+        # Conversational supervisor explainer for RAG & natural language queries
+        self._chat_explainer: Optional[Any] = None
+
         # Determine if running in dormant/mock mode
         self._is_dormant = False
         if self._client is None:
@@ -321,6 +324,10 @@ class TelegramIngester:
                 logger.info(
                     "TelegramIngester operating in dormant mode (missing TELEGRAM_API_ID or TELEGRAM_API_HASH)."
                 )
+
+    def set_chat_explainer(self, explainer: Any) -> None:
+        """Register ConversationalSupervisor instance for DM RAG and interactive overrides."""
+        self._chat_explainer = explainer
 
     @property
     def is_dormant(self) -> bool:
@@ -768,27 +775,63 @@ class TelegramIngester:
         parts = lower_clean.split()
         first_token = parts[0].split("@")[0] if parts else ""
 
-        if first_token in ("/start", "/help", "help", "start"):
+        if first_token in ("/start", "/help", "help", "start", "مساعدة", "تعليمات"):
             await self._cmd_start_help(event)
-        elif first_token in ("/status", "status"):
+        elif first_token in ("/status", "status", "حالة", "الحالة"):
             await self._cmd_status(event)
-        elif "veto" in lower_clean:
+        elif "veto" in lower_clean or "رفض" in lower_clean or "الفيتو" in lower_clean:
             await self._cmd_ai(event, "vetoes")
-        elif first_token in ("/ai", "/supervisor", "ai", "supervisor"):
+        elif first_token in ("/ai", "/supervisor", "ai", "supervisor", "مشرف", "المشرف"):
             args = clean_text[len(clean_text.split()[0]):].strip() if len(clean_text.split()) > 1 else ""
             await self._cmd_ai(event, args)
-        elif first_token in ("/audit", "audit"):
+        elif first_token in ("/audit", "audit", "تدقيق", "فحص"):
             args = clean_text[len(clean_text.split()[0]):].strip() if len(clean_text.split()) > 1 else ""
             await self._cmd_audit(event, args)
-        elif first_token in ("/trades", "trades"):
+        elif first_token in ("/trades", "trades", "صفقات", "الصفقات"):
             await self._cmd_trades(event)
-        elif first_token in ("/news", "news"):
+        elif first_token in ("/staging", "staging", "مراقبة", "المراقبة", "ستيج"):
+            if self._chat_explainer:
+                resp = await self._chat_explainer.tool_list_staged_tokens()
+                await self._safe_reply(event, resp)
+            elif self.ai_supervisor and hasattr(self.ai_supervisor, "answer_user_query"):
+                resp = await self.ai_supervisor.answer_user_query("قائمة العملات في الستيجينغ staging")
+                await self._safe_reply(event, resp)
+            else:
+                await self._safe_reply(event, "🌊 قائمة المراقبة التجميعية (Staging buffer) غير متصلة حالياً.")
+        elif first_token in ("/ask", "ask", "سؤال", "اسأل"):
+            args = clean_text[len(clean_text.split()[0]):].strip() if len(clean_text.split()) > 1 else ""
+            if self._chat_explainer:
+                resp = await self._chat_explainer.ask(args)
+                await self._safe_reply(event, resp)
+            elif self.ai_supervisor and hasattr(self.ai_supervisor, "answer_user_query"):
+                resp = await self.ai_supervisor.answer_user_query(args)
+                await self._safe_reply(event, resp)
+            else:
+                await self._safe_reply(event, "🤖 المساعد الذكي غير مهيأ حالياً.")
+        elif first_token in ("/why", "why", "لماذا"):
+            args = clean_text[len(clean_text.split()[0]):].strip() if len(clean_text.split()) > 1 else ""
+            if self._chat_explainer:
+                resp = await self._chat_explainer.tool_why_decision(args)
+                await self._safe_reply(event, resp)
+            elif self.ai_supervisor and hasattr(self.ai_supervisor, "answer_user_query"):
+                resp = await self.ai_supervisor.answer_user_query(f"لماذا تم اتخاذ هذا القرار بخصوص {args}")
+                await self._safe_reply(event, resp)
+            else:
+                await self._safe_reply(event, "🤖 المساعد الذكي غير مهيأ حالياً.")
+        elif first_token in ("/override", "override", "تعديل"):
+            args = clean_text[len(clean_text.split()[0]):].strip() if len(clean_text.split()) > 1 else ""
+            if self._chat_explainer:
+                resp = await self._chat_explainer.tool_override_parameter(args)
+                await self._safe_reply(event, resp)
+            else:
+                await self._safe_reply(event, "🤖 محرك تعديل المعاملات غير متصل.")
+        elif first_token in ("/news", "news", "أخبار", "الأخبار"):
             await self._cmd_news(event)
-        elif first_token in ("/whales", "whales"):
+        elif first_token in ("/whales", "whales", "حيتان", "الحيتان"):
             await self._cmd_whales(event)
-        elif first_token in ("/signals", "signals"):
+        elif first_token in ("/signals", "signals", "إشارات", "الإشارات"):
             await self._cmd_signals(event)
-        elif first_token in ("/scan", "scan"):
+        elif first_token in ("/scan", "scan", "سكان"):
             args = clean_text[len(clean_text.split()[0]):].strip() if len(clean_text.split()) > 1 else ""
             await self._cmd_scan(event, args, sender_id)
         else:
@@ -797,23 +840,23 @@ class TelegramIngester:
     async def _cmd_start_help(self, event: Any) -> None:
         """Handle /start and /help command in DMs."""
         msg = (
-            "🤖 **Bot-MM Alpha Engine & Trading Terminal**\n\n"
-            "**Status:** Online 🟢\n"
-            "**Engine Mode:** Paper Trading (Zero-Capital Simulation)\n"
-            "**Supervisor Engine:** AlphaSupervisor-AI Active 🧠\n\n"
-            "**Quick Controls:**\n"
-            "• Tap any button below to immediately view live telemetry, risk, or trades.\n\n"
-            "**Available Commands:**\n"
-            "• `/status` — View real-time system uptime, memory RSS, portfolio equity, PnL, and queue telemetry.\n"
-            "• `/ai` — View AlphaSupervisor-AI autonomous risk posture, telemetry, and learned insights.\n"
-            "• `/audit <CA>` — Run an ad-hoc AI deep forensics audit on any Solana or Base token.\n"
-            "• `/scan <CA>` — Submit a Solana or Base token CA for immediate security audit & AMM execution.\n"
-            "• `/trades` — View active OPEN positions and executed CLOSED paper trades with entry/current prices and PnL.\n"
-            "• `/news` — View the last 5 ingested news headlines, sources, time elapsed, and sentiment scores.\n"
-            "• `/whales` — View the last 3 on-chain whale alerts from @lookonchain or @bubblemaps.\n"
-            "• `/signals` — View the last 5 tokens evaluated by the gatekeeper and exact pass/reject reasons.\n"
-            "• `/help` — Display this command reference.\n\n"
-            "💡 *Tip:* You can also directly paste a contract address (EVM `0x...` or Solana Base58) in this chat to trigger an immediate scan."
+            "🤖 **Bot-MM Alpha Engine & Trading Terminal (محطة التداول ونظام ألفا)**\n\n"
+            "**الحالة (Status):** متصل (Online) 🟢\n"
+            "**وضع المحرك (Engine Mode):** تداول تجريبي بدون رأس مال حقيقي (Paper Trading)\n"
+            "**المشرف الذكي (Supervisor):** AlphaSupervisor-AI نشط 🧠\n\n"
+            "**التحكم السريع:**\n"
+            "• اضغط على أي زر أدناه لعرض القياسات المباشرة، المخاطر، أو الصفقات فوراً.\n\n"
+            "**الأوامر المتاحة (Available Commands):**\n"
+            "• `/status` — عرض مدة التشغيل (Uptime)، استهلاك الذاكرة (Memory RSS)، رأس المال (Portfolio Equity)، والأرباح (PnL).\n"
+            "• `/ai` — فحص حالة المشرف الذكي AlphaSupervisor-AI، وضع المخاطرة، والتحليلات المكتسبة.\n"
+            "• `/audit <CA>` — إجراء تدقيق جنائي عميق بالذكاء الاصطناعي على أي عقد في Solana أو Base.\n"
+            "• `/scan <CA>` — فحص عقد فوري وتمريره إلى محرك الأمان والتنفيذ.\n"
+            "• `/trades` — استعراض المراكز المفتوحة (OPEN) والصفقات المغلقة (CLOSED) مع الأسعار وPnL.\n"
+            "• `/news` — آخر 5 أخبار عاجلة تم رصدها مع تحليل المشاعر والوقت المنقضي.\n"
+            "• `/whales` — تنبيهات حركة الحيتان والمحافظ الذكية من @lookonchain و@bubblemaps.\n"
+            "• `/signals` — آخر 5 إشارات تم تقييمها بواسطة حارس البوابة مع أسباب القبول والرفض.\n"
+            "• `/help` — عرض دليل الأوامر.\n\n"
+            "💡 *ملاحظة:* يمكنك أيضاً إرسال عنوان العقد مباشرة (EVM `0x...` أو Solana Base58) لبدء الفحص الفوري."
         )
         await self._safe_reply(event, msg, buttons=self.get_default_keyboard_markup())
 
@@ -892,18 +935,18 @@ class TelegramIngester:
         signal_q_max = metrics.get("signal_q_max", 100)
 
         msg = (
-            "📊 **Bot-MM Engine Status Report**\n\n"
-            f"⏱ **Uptime:** `{uptime_str}`\n"
-            f"🧠 **Memory RSS:** `{float(rss_mb):.1f} MB`\n"
-            f"💰 **Portfolio Equity:** `{equity_str}`\n"
-            f"📈 **Realized PnL:** `{pnl_str}`\n"
-            f"📦 **Active Lots:** `{open_lots_val}`\n"
-            f"🎯 **Win Rate (WR):** `{wr_str}`\n"
-            f"📉 **Max Drawdown (MDD):** `{mdd_str}`\n\n"
-            "🚦 **Queue Backlog:**\n"
+            "📊 **تقرير حالة المحرك (Bot-MM Engine Status Report)**\n\n"
+            f"⏱ **مدة التشغيل (Uptime):** `{uptime_str}`\n"
+            f"🧠 **استهلاك الذاكرة (Memory RSS):** `{float(rss_mb):.1f} MB`\n"
+            f"💰 **رأس مال المحفظة (Portfolio Equity):** `{equity_str}`\n"
+            f"📈 **الأرباح المحققة (Realized PnL):** `{pnl_str}`\n"
+            f"📦 **المراكز النشطة - Active Lots:** `{open_lots_val}`\n"
+            f"🎯 **معدل النجاح (Win Rate WR):** `{wr_str}`\n"
+            f"📉 **أقصى تراجع (Max Drawdown MDD):** `{mdd_str}`\n\n"
+            "🚦 **قوائم الانتظار (Queue Backlog):**\n"
             f"   • Ingest: `{ingest_q_size}/{ingest_q_max}`\n"
             f"   • Signal: `{signal_q_size}/{signal_q_max}`\n\n"
-            "⚡ **Telemetry:** Normal 🟢"
+            "⚡ **القياس عن بعد (Telemetry):** طبيعي (Normal) 🟢"
         )
         await self._safe_reply(event, msg, buttons=self.get_default_keyboard_markup())
 
@@ -912,10 +955,10 @@ class TelegramIngester:
         if not args:
             await self._safe_reply(
                 event,
-                "ℹ️ **Usage:** `/scan <CONTRACT_ADDRESS>`\n\n"
+                "ℹ️ **طريقة الاستخدام (Usage):** `/scan <CONTRACT_ADDRESS>`\n\n"
                 "• Base (EVM): 42-char hex string starting with `0x`\n"
                 "• Solana (SVM): 32-44 char Base58 address\n\n"
-                "Example:\n`/scan 0x285617313860407d647990b50375990264186566`",
+                "مثال (Example):\n`/scan 0x285617313860407d647990b50375990264186566`",
             )
             return
 
@@ -926,12 +969,12 @@ class TelegramIngester:
             if is_evm_syntax or is_svm_syntax:
                 await self._safe_reply(
                     event,
-                    "⚠️ Address is a recognized system program or DEX infrastructure router. Trade scanning rejected.",
+                    "⚠️ العنوان يتبع بنية برمجية تابعة لنظام الشبكة أو راوتر DEX. تم رفض فحص التداول (Recognized system program or DEX infrastructure router).",
                 )
             else:
                 await self._safe_reply(
                     event,
-                    "❌ Invalid Contract Address. Please provide a valid Base EVM (42 hex chars starting with 0x) or Solana (32-44 base58 chars) address.",
+                    "❌ عنوان عقد غير صالح (Invalid Contract Address). يرجى تقديم عنوان صالح لشبكة Base (42 hex chars starting with 0x) أو Solana (32-44 base58 chars).",
                 )
             return
 
@@ -958,11 +1001,11 @@ class TelegramIngester:
             await self._enqueue_event(raw_signal)
             await self._safe_reply(
                 event,
-                f"🔎 Ingested CA: `{ca}` | Dispatching to SecurityGatekeeper & AMM Math Engine...",
+                f"🔎 Ingested CA: `{ca}` | Dispatching to SecurityGatekeeper & AMM Math Engine... (تم استلام العقد وتمريره للفحص والتنفيذ)",
             )
 
     async def _cmd_direct_ca_or_help(self, event: Any, text: str, sender_id: Optional[int]) -> None:
-        """Handle raw messages containing contract addresses in DM."""
+        """Handle raw messages containing contract addresses, questions, or general queries in DM."""
         cas = self.extract_contract_addresses(text)
         if cas:
             for chain, ca in cas:
@@ -988,14 +1031,49 @@ class TelegramIngester:
                 await self._enqueue_event(raw_signal)
                 await self._safe_reply(
                     event,
-                    f"🔎 Ingested CA: `{ca}` | Dispatching to SecurityGatekeeper & AMM Math Engine...",
+                    f"🔎 Ingested CA: `{ca}` | Dispatching to SecurityGatekeeper & AMM Math Engine... (تم استلام العقد وتمريره للفحص والتنفيذ)",
                 )
         else:
+            # 1. Unknown slash commands
             if text.startswith("/"):
                 await self._safe_reply(
                     event,
-                    f"❓ Unknown command: `{text.split()[0]}`. Use `/help` to see available commands.",
+                    f"❓ أمر غير معروف (Unknown command): `{text.split()[0]}`. استخدم `/help` لعرض قائمة الأوامر المتاحة.",
                 )
+                return
+
+            # 2. Conversational Supervisor Explainer (RAG over ledger & models)
+            if self._chat_explainer:
+                try:
+                    resp = await self._chat_explainer.ask(text)
+                    if resp:
+                        await self._safe_reply(event, resp)
+                        return
+                except Exception as exc:
+                    logger.debug("Chat explainer error in Telegram DM: %s", exc)
+
+            # 3. AI Supervisor Conversational Endpoint (Direct LLM / Heuristic Fallback)
+            supervisor = self.ai_supervisor
+            if supervisor and hasattr(supervisor, "answer_user_query"):
+                try:
+                    resp = await supervisor.answer_user_query(text)
+                    if resp:
+                        await self._safe_reply(event, resp)
+                        return
+                except Exception as exc:
+                    logger.debug("AI supervisor conversational error in Telegram DM: %s", exc)
+
+            # 4. Fallback: Never drop messages silently! Always respond with interactive guidance.
+            fallback_msg = (
+                "🤖 **المشرف الذكي AlphaSupervisor-AI**\n\n"
+                "أهلاً بك! لقد استلمت رسالتك. يمكنك التفاعل معي عبر إرسال عنوان أي عقد مباشرة لفحصه، أو استخدام الأوامر التالية:\n"
+                "• `/status` — عرض تقرير حالة المحرك والأرباح الحالية\n"
+                "• `/ai` — فحص حالة المشرف الذكي ومستوى المخاطرة\n"
+                "• `/trades` — عرض الصفقات المفتوحة والمغلقة\n"
+                "• `/staging` — قائمة العملات قيد المراقبة التجميعية\n"
+                "• `/help` — دليل الأوامر الكامل"
+            )
+            await self._safe_reply(event, fallback_msg, buttons=self.get_default_keyboard_markup())
 
     @staticmethod
     def _format_price(val: Any) -> str:
@@ -1044,12 +1122,12 @@ class TelegramIngester:
 
         recent_news = metrics.get("recent_news") or list(self._recent_news)
         if not recent_news:
-            await self._safe_reply(event, "📰 No news items ingested yet. Awaiting live RSS / X / Telegram news feeds.")
+            await self._safe_reply(event, "📰 لا توجد أخبار مسجلة حالياً. في انتظار تحديثات RSS وX وتليجرام الحية (No news items ingested yet).")
             return
 
         items = list(reversed(recent_news))[:20]
         lines = [
-            "📰 **Last 5 Ingested News Headlines & Sentiment**\n",
+            "📰 **آخر 5 أخبار عاجلة وتحليل المشاعر (Last 5 Ingested News Headlines & Sentiment)**\n",
             "```",
             f"{'TIME':<8} | {'SRC':<14} | {'SENT':<6} | {'HEADLINE'}",
             "-" * 65,
@@ -1079,12 +1157,12 @@ class TelegramIngester:
 
         recent_whales = metrics.get("recent_whales") or list(self._recent_whales)
         if not recent_whales:
-            await self._safe_reply(event, "🐋 No on-chain whale alerts recorded yet from @lookonchain or @bubblemaps.")
+            await self._safe_reply(event, "🐋 لا توجد تنبيهات حيتان مسجلة حالياً من @lookonchain أو @bubblemaps (No on-chain whale alerts recorded yet).")
             return
 
         items = list(reversed(recent_whales))[:20]
         lines = [
-            "🐋 **Last 3 On-Chain Whale & Smart Money Alerts**\n",
+            "🐋 **أحدث تنبيهات الحيتان والمحافظ الذكية (Last 3 On-Chain Whale & Smart Money Alerts)**\n",
             "```",
             f"{'TIME':<8} | {'SOURCE':<14} | {'TOKEN':<12} | {'ACTION'}",
             "-" * 55,
@@ -1120,12 +1198,12 @@ class TelegramIngester:
 
         recent_signals = metrics.get("recent_signals", [])
         if not recent_signals:
-            await self._safe_reply(event, "🎯 No security evaluations recorded yet. Awaiting incoming token signals.")
+            await self._safe_reply(event, "🎯 لا توجد إشارات تم تقييمها أمنياً حتى الآن. في انتظار تدفق إشارات العملات (No security evaluations recorded yet).")
             return
 
         items = list(reversed(recent_signals))[:5]
         lines = [
-            "🎯 **Last 5 Token Security Screenings**\n",
+            "🎯 **آخر 5 عمليات فحص أمني للإشارات (Last 5 Token Security Screenings)**\n",
             "```",
             f"{'TOKEN':<12} | {'CHAIN':<6} | {'STATUS':<6} | {'REASON'}",
             "-" * 65,
@@ -1154,54 +1232,54 @@ class TelegramIngester:
         parts = args.strip().split()
         subcmd = parts[0].lower() if parts else "status"
 
-        if subcmd in ("stance", "mode"):
+        if subcmd in ("stance", "mode", "وضع", "نمط"):
             if len(parts) < 2:
                 current_mode = supervisor.get_status().get("global_risk_mode", "NEUTRAL") if supervisor else "NEUTRAL"
-                await self._safe_reply(event, f"⚠️ Current stance: **{current_mode}**\nUsage: `/ai stance <DEFENSIVE|NEUTRAL|EXPAND>`")
+                await self._safe_reply(event, f"⚠️ الوضع الحالي (Current stance): **{current_mode}**\nطريقة الاستخدام (Usage): `/ai stance <DEFENSIVE|NEUTRAL|EXPAND>`")
                 return
             new_mode = parts[1].upper()
             if new_mode not in ("DEFENSIVE", "NEUTRAL", "EXPAND"):
-                await self._safe_reply(event, "❌ Invalid mode. Choose from: `DEFENSIVE`, `NEUTRAL`, `EXPAND`.")
+                await self._safe_reply(event, "❌ نمط غير صالح (Invalid mode). اختر من بين: `DEFENSIVE`, `NEUTRAL`, `EXPAND`.")
                 return
             if supervisor:
                 supervisor.set_global_risk_mode(new_mode)
                 icon = "🛡️" if new_mode == "DEFENSIVE" else "🟢" if new_mode == "EXPAND" else "⚖️"
-                await self._safe_reply(event, f"✅ Global risk stance updated to: {icon} **{new_mode}**")
+                await self._safe_reply(event, f"✅ تم تحديث مستوى إدارة المخاطر العام إلى (Global risk stance updated to): {icon} **{new_mode}**")
             else:
-                await self._safe_reply(event, f"⚠️ Supervisor unavailable to set stance to **{new_mode}**.")
+                await self._safe_reply(event, f"⚠️ المشرف غير متاح لضبط الوضع إلى **{new_mode}**.")
             return
 
-        elif subcmd == "strict":
+        elif subcmd in ("strict", "صارم", "حظر"):
             if len(parts) < 2:
                 current_strict = supervisor.get_status().get("strict_veto", True) if supervisor else True
                 strict_str = "ON 🔒" if current_strict else "OFF 🔓"
-                await self._safe_reply(event, f"⚠️ Strict Veto is currently: **{strict_str}**\nUsage: `/ai strict <on|off>`")
+                await self._safe_reply(event, f"⚠️ وضع الحظر الصارم (Strict Veto) حالياً: **{strict_str}**\nالاستخدام (Usage): `/ai strict <on|off>`")
                 return
             val = parts[1].lower()
-            if val in ("on", "true", "1", "yes"):
+            if val in ("on", "true", "1", "yes", "تشغيل", "تفعيل"):
                 is_strict = True
-            elif val in ("off", "false", "0", "no"):
+            elif val in ("off", "false", "0", "no", "تعطيل", "إيقاف"):
                 is_strict = False
             else:
-                await self._safe_reply(event, "❌ Invalid option. Use `/ai strict on` or `/ai strict off`.")
+                await self._safe_reply(event, "❌ خيار غير صالح. استخدم `/ai strict on` أو `/ai strict off`.")
                 return
             if supervisor:
                 supervisor.set_strict_veto(is_strict)
                 state_str = "ON 🔒" if is_strict else "OFF 🔓"
-                await self._safe_reply(event, f"✅ Strict Veto mode set to: **{state_str}**")
+                await self._safe_reply(event, f"✅ تم تعيين وضع الحظر الصارم إلى (Strict Veto mode set to): **{state_str}**")
             else:
-                await self._safe_reply(event, "⚠️ Supervisor unavailable.")
+                await self._safe_reply(event, "⚠️ المشرف غير متاح.")
             return
 
-        elif subcmd in ("vetoes", "rejections"):
+        elif subcmd in ("vetoes", "rejections", "رفض", "المرفوضات"):
             if not supervisor:
-                await self._safe_reply(event, "⚠️ Supervisor unavailable.")
+                await self._safe_reply(event, "⚠️ المشرف الذكي غير متاح حالياً.")
                 return
             recent_vetoes = supervisor.get_recent_vetoes(limit=10)
             if not recent_vetoes:
-                await self._safe_reply(event, "🛡️ **Recent AI Vetoes:**\n\nNo recent vetoed signals in memory.")
+                await self._safe_reply(event, "🛡️ **عمليات الرفض الأخيرة (Recent Vetoes):**\n\nلا توجد إشارات مرفوضة مؤخراً في الذاكرة (No recent vetoed signals in memory).")
                 return
-            lines = ["🛡️ **AlphaSupervisor-AI: Recent Vetoes (Last 10)**\n"]
+            lines = ["🛡️ **AlphaSupervisor-AI: Recent Vetoes (Last 10) | عمليات الرفض الأخيرة**\n"]
             lines.append("```")
             lines.append(f"{'Token':<14} | {'Chain':<6} | {'Flags & Rationale'}")
             lines.append("-" * 55)
@@ -1216,18 +1294,18 @@ class TelegramIngester:
             await self._safe_reply(event, "\n".join(lines))
             return
 
-        elif subcmd == "reset":
+        elif subcmd in ("reset", "تصفير", "إعادة"):
             if supervisor:
                 supervisor.reset_learning_metrics()
                 await self._safe_reply(
                     event,
-                    "🔄 **Self-Learning Metrics Reset**\n\n"
-                    "• True/False Positives & Negatives reset to baseline.\n"
-                    "• Calibration status restored to **BALANCED**.\n"
-                    "• Global risk stance restored to **NEUTRAL** ⚖️."
+                    "🔄 **إعادة تعيين مقاييس التعلم الذاتي (Self-Learning Metrics Reset)**\n\n"
+                    "• تمت إعادة تعيين الإيجابيات والسلبيات الحقيقية والكاذبة إلى القيم الأولية.\n"
+                    "• تمت استعادة حالة المعايرة إلى **BALANCED** ⚖️.\n"
+                    "• تم استعادة مستوى المخاطر العام إلى **NEUTRAL** ⚖️."
                 )
             else:
-                await self._safe_reply(event, "⚠️ Supervisor unavailable.")
+                await self._safe_reply(event, "⚠️ المشرف غير متاح.")
             return
 
         # Default: Display rich status card
@@ -1261,37 +1339,37 @@ class TelegramIngester:
         calib_icon = "⚖️" if calib == "BALANCED" else "🚀" if calib == "CALIBRATING_EXPAND" else "🛡️"
 
         lines = [
-            "🧠 **AlphaSupervisor-AI Autonomous Risk Engine**\n",
-            "• **Status:** Active 🟢",
-            f"• **Provider:** `{ai_status.get('provider', 'gemini')}` (`{ai_status.get('model', 'gemini-2.5-flash')}`)",
+            "🧠 **AlphaSupervisor-AI Autonomous Risk Engine | محرك إدارة المخاطر المستقل**\n",
+            "• **الحالة (Status):** نشط (Active) 🟢",
+            f"• **المزود (Provider):** `{ai_status.get('provider', 'gemini')}` (`{ai_status.get('model', 'gemini-2.5-flash')}`)",
             f"• **Global Risk Stance:** {mode_icon} **{mode}**",
-            f"• **Strict Veto Mode:** {strict_icon}",
-            f"• **Audit Counters:** Total: `{total_audits}` | Approved: `{approved}` | Vetoed: `{vetoed}`",
-            f"• **Blacklisted Entities:** `{ai_status.get('blacklisted_entities_count', 0)}`",
+            f"• **وضع الحظر الصارم (Strict Veto Mode):** {strict_icon}",
+            f"• **عدادات التدقيق (Audit Counters):** Total: `{total_audits}` | Approved: `{approved}` | Vetoed: `{vetoed}`",
+            f"• **العناوين المحظورة (Blacklisted Entities):** `{ai_status.get('blacklisted_entities_count', 0)}`",
             "",
-            "📊 **Self-Learning Outcome Tracking:**",
-            f"• Tracked: `{ot.get('total_tracked', 0)}` | Finalized: `{ot.get('finalized_count', 0)}`",
-            f"• Approved & Pumped (TP): `{ot.get('true_positives', 0)}` 🟢 | Approved & Dumped (FP): `{ot.get('false_positives', 0)}` 🔴",
-            f"• Vetoed & Dumped (TN): `{ot.get('true_negatives', 0)}` 🛡️ | Vetoed & Pumped (FN): `{ot.get('false_negatives', 0)}` ⚠️",
-            f"• Win Rate: `{ot.get('win_rate_pct', 0.0):.1f}%` | Veto Efficiency: `{ot.get('veto_efficiency_pct', 100.0):.1f}%`",
-            f"• Overall Accuracy: `{ot.get('accuracy_pct', 100.0):.1f}%`",
-            f"• Calibration: {calib_icon} **{calib}**",
+            "📊 **Self-Learning Outcome Tracking:** (تتبع نتائج التعلم الذاتي)",
+            f"• المسجل (Tracked): `{ot.get('total_tracked', 0)}` | النهائي (Finalized): `{ot.get('finalized_count', 0)}`",
+            f"• صفقات رابحة مقبولة (TP): `{ot.get('true_positives', 0)}` 🟢 | صفقات خاسرة مقبولة (FP): `{ot.get('false_positives', 0)}` 🔴",
+            f"• صفقات خاسرة تم تجنبها (TN): `{ot.get('true_negatives', 0)}` 🛡️ | فرص رابحة فاتتنا (FN): `{ot.get('false_negatives', 0)}` ⚠️",
+            f"• نسبة الفوز (Win Rate): `{ot.get('win_rate_pct', 0.0):.1f}%` | كفاءة الحظر (Veto Efficiency): `{ot.get('veto_efficiency_pct', 100.0):.1f}%`",
+            f"• الدقة الإجمالية (Overall Accuracy): `{ot.get('accuracy_pct', 100.0):.1f}%`",
+            f"• المعايرة الذاتية (Calibration): {calib_icon} **{calib}**",
         ]
 
         recent_insights = ai_status.get("recent_insights", [])
         if recent_insights:
-            lines.append("\n📝 **Recent Strategic Insights:**")
+            lines.append("\n📝 **أحدث الرؤى الاستراتيجية (Recent Strategic Insights):**")
             for idx, insight in enumerate(recent_insights[-3:], 1):
                 lines.append(f"{idx}. {insight}")
 
         lines.extend([
             "",
-            "🎮 **Control Subcommands:**",
-            "• `/ai stance <DEFENSIVE|NEUTRAL|EXPAND>`",
-            "• `/ai strict <on|off>`",
-            "• `/ai vetoes`",
-            "• `/ai reset`",
-            "• `/audit <CA>` (deep forensics)",
+            "🎮 **Control Subcommands:** (أوامر التحكم)",
+            "• `/ai stance <DEFENSIVE|NEUTRAL|EXPAND>` — ضبط نمط المخاطرة",
+            "• `/ai strict <on|off>` — تفعيل/تعطيل الحظر الصارم",
+            "• `/ai vetoes` — عرض الإشارات المرفوضة مؤخراً",
+            "• `/ai reset` — تصفير مقاييس التعلم الذاتي",
+            "• `/audit <CA>` — فحص وتدقيق أمني وفني عميق لعقد",
         ])
 
         await self._safe_reply(event, "\n".join(lines))
@@ -1300,17 +1378,17 @@ class TelegramIngester:
         """Handle /audit <CA> command in DMs: execute an on-demand AI risk audit."""
         token_ca = args.strip()
         if not token_ca:
-            await self._safe_reply(event, "⚠️ Please provide a contract address: `/audit <CA>`")
+            await self._safe_reply(event, "⚠️ يرجى تزويد عنوان العقد المراد تدقيقه: `/audit <CA>` (Please provide a contract address).")
             return
 
         is_evm = token_ca.startswith("0x") and len(token_ca) == 42
         is_svm = 32 <= len(token_ca) <= 44 and not token_ca.startswith("0x")
         if not (is_evm or is_svm):
-            await self._safe_reply(event, f"❌ Invalid contract address format: `{token_ca}`")
+            await self._safe_reply(event, f"❌ صيغة عنوان العقد غير صحيحة (Invalid contract address format): `{token_ca}`")
             return
 
         chain = ChainIdentifier.BASE_MAINNET if is_evm else ChainIdentifier.SOLANA_MAINNET
-        await self._safe_reply(event, f"🔍 Executing **AlphaSupervisor-AI** deep audit for `{token_ca[:10]}..` on {chain.value}...")
+        await self._safe_reply(event, f"🔍 جاري تنفيذ التدقيق الذكي المعمق لعقد `{token_ca[:10]}..` على شبكة {chain.value}...")
 
         from alpha_engine.config import EngineConfig
         from alpha_engine.engine.ai_supervisor import AlphaSupervisorAI
@@ -1342,7 +1420,7 @@ class TelegramIngester:
                 verified_source_code=True,
             )
 
-        supervisor = AlphaSupervisorAI(config=EngineConfig())
+        supervisor = self.ai_supervisor or AlphaSupervisorAI(config=EngineConfig())
         pool = PoolState(
             pool_address="0x" + "0" * 40 if is_evm else "1" * 32,
             chain=chain,
@@ -1365,16 +1443,15 @@ class TelegramIngester:
         )
         ai_resp = await supervisor.audit_signal(signal=sig, pool_state=pool, security_report=report)
 
-
         dec_icon = "🟢" if str(ai_resp.decision) == "EXECUTE_BUY" else "🔴"
         reply_lines = [
-            f"🧠 **AlphaSupervisor-AI Audit Report**\n",
+            f"🧠 **AlphaSupervisor-AI Audit Report | تقرير التدقيق الأمني والفني**\n",
             f"• **Target:** `{token_ca}` ({chain.value})",
             f"• **Verdict:** {dec_icon} **{ai_resp.decision}** (Confidence: {ai_resp.confidence_score:.2f})",
             f"• **Kelly Position Size:** `{ai_resp.action_parameters.recommended_position_pct}%`",
             f"• **Max Slippage:** `{ai_resp.action_parameters.max_slippage_bps} bps`",
             f"• **Stop-Loss / Inactivity Exit:** `{ai_resp.action_parameters.hard_stop_loss_pct}%` / `{ai_resp.action_parameters.time_exit_minutes} mins`",
-            f"\n🛡️ **Security Assessment:**",
+            f"\n🛡️ **التقييم الأمني (Security Assessment):**",
             f"• Secure: {'Yes 🟢' if ai_resp.security_assessment.is_secure else 'No 🔴'}",
             f"• Honeypot Risk: `{ai_resp.security_assessment.honeypot_risk}`",
             f"• Liquidity Health: `{ai_resp.security_assessment.liquidity_health}`",
@@ -1382,14 +1459,13 @@ class TelegramIngester:
         if ai_resp.security_assessment.flags:
             reply_lines.append(f"• Flags: `{', '.join(ai_resp.security_assessment.flags)}`")
         reply_lines.extend([
-            f"\n👤 **Wallet Audit:**",
+            f"\n👤 **تدقيق المحفظة وسلوك المطور (Wallet Audit):**",
             f"• Classification: `{ai_resp.wallet_audit.risk_classification}`",
             f"• Rationale: {ai_resp.wallet_audit.rationale}",
         ])
         await self._safe_reply(event, "\n".join(reply_lines))
 
     async def _cmd_trades(self, event: Any) -> None:
-
         """Handle /trades command in DMs: displays Entry, Current Price, Unrealized PnL %, Duration (s), and Trailing Stop status for OPEN trades."""
         metrics: dict[str, Any] = {}
         if self._status_provider is not None:
@@ -1427,14 +1503,14 @@ class TelegramIngester:
         closed_trades = metrics.get("recent_closed_trades", [])
 
         if not open_trades and not trade_rows and not closed_trades:
-            await self._safe_reply(event, "📋 No executed paper trades recorded in ledger yet.")
+            await self._safe_reply(event, "📋 لا توجد صفقات منفذة مسجلة في السجل حتى الآن (No executed paper trades recorded in ledger yet).")
             return
 
         response_sections = []
 
         if open_trades:
             open_lines = [
-                f"🟢 **Active Open Positions ({len(open_trades)})**\n",
+                f"🟢 **المراكز المفتوحة النشطة (Active Open Positions) ({len(open_trades)})**\n",
                 "```",
             ]
             for t in open_trades[:10]:
@@ -1496,7 +1572,7 @@ class TelegramIngester:
 
         if closed_trades:
             closed_lines = [
-                f"📊 **Recent Closed Trades ({len(closed_trades)})**\n",
+                f"📊 **الصفقات المغلقة حديثاً (Recent Closed Trades) ({len(closed_trades)})**\n",
                 "```",
             ]
             for ct in closed_trades[:10]:

@@ -8,15 +8,17 @@ Python 3.11+ | aiosqlite + asyncio
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import math
 import time
 from decimal import Decimal
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 
 import aiosqlite
 
+from alpha_engine.models.decisions import DecisionRecord, DecisionType, PatternFeatureVector
 from alpha_engine.models.enums import LotStatus, TradeExitReason
 from alpha_engine.models.events import SignalEvent
 from alpha_engine.models.state import PortfolioSnapshot, TradeRecord
@@ -105,8 +107,49 @@ class SQLiteLedger:
     )
     """
 
-    def __init__(self, db_path: str | Path = "paper_trading.db") -> None:
+    _CREATE_DECISION_AUDIT_LOG = """
+    CREATE TABLE IF NOT EXISTS decision_audit_log (
+        decision_id             TEXT PRIMARY KEY,
+        timestamp_ns            INTEGER NOT NULL,
+        token_address           TEXT NOT NULL,
+        chain                   TEXT NOT NULL,
+        decision_type           TEXT NOT NULL CHECK(decision_type IN ('ENTER','SKIP','EXIT','TRAIL_STOP')),
+        strategy_pattern        TEXT NOT NULL,
+        market_cap_usd          REAL,
+        volume_5m_usd           REAL,
+        volume_1h_usd           REAL,
+        liquidity_pool_depth_usd REAL,
+        active_rules_json       TEXT NOT NULL,
+        confidence_score        REAL NOT NULL,
+        reason                  TEXT NOT NULL,
+        metadata_json           TEXT NOT NULL,
+        created_at              INTEGER NOT NULL
+    )
+    """
+
+    _CREATE_PATTERN_STORE = """
+    CREATE TABLE IF NOT EXISTS pattern_feature_store (
+        token_address           TEXT PRIMARY KEY,
+        consolidation_duration_s REAL NOT NULL,
+        dip_depth_pct           REAL NOT NULL,
+        volume_surge_multiplier REAL NOT NULL,
+        net_buy_delta           REAL NOT NULL,
+        top10_concentration     REAL NOT NULL,
+        liquidity_to_mc_ratio   REAL NOT NULL,
+        smart_wallet_inflows    REAL NOT NULL,
+        peak_gain_multiplier    REAL NOT NULL,
+        timestamp_ns            INTEGER NOT NULL,
+        created_at              INTEGER NOT NULL
+    )
+    """
+
+    def __init__(
+        self,
+        db_path: str | Path = "paper_trading.db",
+        jsonl_path: Optional[str | Path] = None,
+    ) -> None:
         self._db_path = str(db_path)
+        self._jsonl_path = Path(jsonl_path) if jsonl_path else Path(self._db_path).with_suffix(".jsonl")
         self._conn: aiosqlite.Connection | None = None
 
     async def __aenter__(self) -> "SQLiteLedger":
@@ -147,11 +190,18 @@ class SQLiteLedger:
         await conn.execute(self._CREATE_SIGNALS)
         await conn.execute(self._CREATE_SNAPSHOTS)
         await conn.execute(self._CREATE_LOT_LIFECYCLE)
+        await conn.execute(self._CREATE_DECISION_AUDIT_LOG)
+        await conn.execute(self._CREATE_PATTERN_STORE)
         await conn.execute("CREATE INDEX IF NOT EXISTS idx_trades_token ON trades(token_address);")
         await conn.execute("CREATE INDEX IF NOT EXISTS idx_trades_chain ON trades(chain);")
         await conn.execute("CREATE INDEX IF NOT EXISTS idx_signals_ts ON signals(timestamp_ns);")
         await conn.execute("CREATE INDEX IF NOT EXISTS idx_lot_lifecycle_id ON lot_lifecycle(lot_id);")
         await conn.execute("CREATE INDEX IF NOT EXISTS idx_lot_lifecycle_status ON lot_lifecycle(status);")
+        await conn.execute("CREATE INDEX IF NOT EXISTS idx_decision_audit_token ON decision_audit_log(token_address);")
+        await conn.execute("CREATE INDEX IF NOT EXISTS idx_decision_audit_type ON decision_audit_log(decision_type);")
+        await conn.execute("CREATE INDEX IF NOT EXISTS idx_decision_audit_ts ON decision_audit_log(timestamp_ns);")
+        await conn.execute("CREATE INDEX IF NOT EXISTS idx_decision_audit_created ON decision_audit_log(created_at);")
+        await conn.execute("CREATE INDEX IF NOT EXISTS idx_pattern_store_ts ON pattern_feature_store(timestamp_ns);")
         await conn.commit()
         logger.info("SQLite ledger initialised at %s (WAL mode)", self._db_path)
 
@@ -394,3 +444,315 @@ class SQLiteLedger:
                 if dd > max_dd:
                     max_dd = dd
         return max_dd
+
+    async def record_decision(self, record: DecisionRecord) -> None:
+        """
+        Record an immutable structured decision record into the SQLite ledger
+        and asynchronously append to local JSONL for zero-latency audit streaming.
+        """
+        conn = self._conn
+        decision_type_val = (
+            record.decision_type.value
+            if hasattr(record.decision_type, "value")
+            else str(record.decision_type)
+        )
+        meta_dict = dict(record.metadata or {})
+        if record.token_symbol and "token_symbol" not in meta_dict:
+            meta_dict["token_symbol"] = record.token_symbol
+        if record.signal_id and "signal_id" not in meta_dict:
+            meta_dict["signal_id"] = record.signal_id
+        if record.pattern_match_score is not None and "pattern_match_score" not in meta_dict:
+            meta_dict["pattern_match_score"] = record.pattern_match_score
+
+        active_rules_json = json.dumps(record.active_rules or record.rule_triggers or {})
+        metadata_json = json.dumps(meta_dict)
+
+        # 1. Write to SQLite
+        if conn is not None:
+            try:
+                await conn.execute(
+                    """
+                    INSERT OR REPLACE INTO decision_audit_log VALUES (
+                        ?,?,?,?,?,?,?,?,?,?,?,?,?,?,?
+                    )
+                    """,
+                    (
+                        record.decision_id,
+                        record.timestamp_ns,
+                        record.token_address,
+                        record.chain,
+                        decision_type_val,
+                        record.strategy_pattern,
+                        record.market_cap_usd,
+                        record.volume_5m_usd,
+                        record.volume_1h_usd,
+                        record.liquidity_pool_depth_usd,
+                        active_rules_json,
+                        record.confidence_score,
+                        record.reason,
+                        metadata_json,
+                        record.created_at,
+                    ),
+                )
+                await conn.commit()
+            except Exception as exc:
+                logger.error("Failed to record decision into SQLite: %s", exc)
+
+        # 2. Append to JSONL audit file
+        try:
+            line = json.dumps(record.model_dump(mode="json")) + "\n"
+            loop = asyncio.get_running_loop()
+            await loop.run_in_executor(None, self._append_jsonl, line)
+        except Exception as exc:
+            logger.debug("Failed appending decision to JSONL audit log: %s", exc)
+
+        logger.info(
+            "DecisionRecord [%s] %s | Type=%s | Confidence=%.2f | Reason: %s",
+            record.decision_id[:8],
+            record.token_address[:10],
+            decision_type_val,
+            record.confidence_score,
+            record.reason,
+        )
+
+    def _append_jsonl(self, line: str) -> None:
+        try:
+            self._jsonl_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(self._jsonl_path, "a", encoding="utf-8") as f:
+                f.write(line)
+        except Exception as exc:
+            logger.warning("Could not write to jsonl file %s: %s", self._jsonl_path, exc)
+
+    async def get_decisions(
+        self,
+        token_address: Optional[str] = None,
+        decision_type: Optional[DecisionType | str] = None,
+        strategy_pattern: Optional[str] = None,
+        start_time_ns: Optional[int] = None,
+        limit: int = 50,
+    ) -> list[DecisionRecord]:
+        """Query structured decision records from the ledger."""
+        conn = self._conn
+        if conn is None:
+            return []
+
+        query = "SELECT * FROM decision_audit_log WHERE 1=1"
+        params: list[Any] = []
+
+        if token_address:
+            query += " AND token_address = ?"
+            params.append(token_address)
+        if decision_type:
+            dt_val = decision_type.value if hasattr(decision_type, "value") else str(decision_type)
+            query += " AND decision_type = ?"
+            params.append(dt_val)
+        if strategy_pattern:
+            query += " AND strategy_pattern = ?"
+            params.append(strategy_pattern)
+        if start_time_ns:
+            query += " AND timestamp_ns >= ?"
+            params.append(start_time_ns)
+
+        query += " ORDER BY timestamp_ns DESC LIMIT ?"
+        params.append(limit)
+
+        async with conn.execute(query, tuple(params)) as cursor:
+            rows = await cursor.fetchall()
+
+        results: list[DecisionRecord] = []
+        for r in rows:
+            try:
+                meta = json.loads(r[13]) if r[13] else {}
+                rules = json.loads(r[10]) if r[10] else {}
+                rec = DecisionRecord(
+                    decision_id=r[0],
+                    timestamp_ns=r[1],
+                    token_address=r[2],
+                    chain=r[3],
+                    decision_type=DecisionType(r[4]),
+                    strategy_pattern=r[5],
+                    market_cap_usd=r[6],
+                    volume_5m_usd=r[7],
+                    volume_1h_usd=r[8],
+                    liquidity_pool_depth_usd=r[9],
+                    liquidity_usd=r[9],
+                    active_rules=rules,
+                    rule_triggers=rules,
+                    confidence_score=r[11],
+                    pattern_match_score=meta.get("pattern_match_score"),
+                    token_symbol=meta.get("token_symbol"),
+                    signal_id=meta.get("signal_id"),
+                    reason=r[12],
+                    metadata=meta,
+                    created_at=r[14],
+                )
+                results.append(rec)
+            except Exception as exc:
+                logger.debug("Error parsing DecisionRecord from SQLite row: %s", exc)
+
+        return results
+
+    async def get_token_decision_history(self, token_address: str, limit: int = 50) -> list[DecisionRecord]:
+        """Fetch all chronological decisions for a specific token mint/contract."""
+        return await self.get_decisions(token_address=token_address, limit=limit)
+
+    async def get_decision_stats(self, lookback_hours: float = 12.0, hours: Optional[float] = None) -> dict[str, Any]:
+        """
+        Aggregate decision metrics, strategy win rates, skip vs enter ratios
+        over the specified lookback window.
+        """
+        conn = self._conn
+        if conn is None:
+            return {
+                "total_decisions": 0,
+                "total_evaluations": 0,
+                "enter_count": 0,
+                "skip_count": 0,
+                "breakdown": {},
+                "strategy_stats": {},
+            }
+
+        effective_hours = hours if hours is not None else lookback_hours
+        cutoff_ts = int(time.time()) - int(effective_hours * 3600)
+        async with conn.execute(
+            """
+            SELECT decision_type, strategy_pattern, COUNT(*) as cnt
+            FROM decision_audit_log
+            WHERE created_at >= ?
+            GROUP BY decision_type, strategy_pattern
+            """,
+            (cutoff_ts,),
+        ) as cursor:
+            rows = await cursor.fetchall()
+
+        total = sum(r[2] for r in rows)
+        enter_count = sum(r[2] for r in rows if r[0] == "ENTER")
+        skip_count = sum(r[2] for r in rows if r[0] == "SKIP")
+        exit_count = sum(r[2] for r in rows if r[0] in ("EXIT", "TRAIL_STOP"))
+
+        # Strategy breakdown
+        strat_counts: dict[str, dict[str, int]] = {}
+        for r in rows:
+            dt, strat, cnt = r[0], r[1], r[2]
+            if strat not in strat_counts:
+                strat_counts[strat] = {"ENTER": 0, "SKIP": 0, "EXIT": 0, "TRAIL_STOP": 0, "total": 0}
+            strat_counts[strat][dt] = strat_counts[strat].get(dt, 0) + cnt
+            strat_counts[strat]["total"] += cnt
+
+        # Cross-reference with closed trades for realized win rate by strategy
+        async with conn.execute(
+            """
+            SELECT
+                t.signal_id,
+                t.token_address,
+                CAST(t.realized_pnl_usd AS REAL) as pnl,
+                d.strategy_pattern
+            FROM trades t
+            LEFT JOIN decision_audit_log d ON t.token_address = d.token_address AND d.decision_type = 'ENTER'
+            WHERE t.side = 'sell' AND t.realized_pnl_usd IS NOT NULL AND t.created_at >= ?
+            """,
+            (cutoff_ts,),
+        ) as cursor:
+            trade_rows = await cursor.fetchall()
+
+        strat_perf: dict[str, dict[str, Any]] = {}
+        for r in trade_rows:
+            pnl = r[2] or 0.0
+            pattern = r[3] or "unclassified"
+            if pattern not in strat_perf:
+                strat_perf[pattern] = {"trades": 0, "wins": 0, "total_pnl": 0.0}
+            strat_perf[pattern]["trades"] += 1
+            if pnl > 0:
+                strat_perf[pattern]["wins"] += 1
+            strat_perf[pattern]["total_pnl"] += pnl
+
+        for pattern, stats in strat_perf.items():
+            tr = stats["trades"]
+            stats["win_rate_pct"] = round((stats["wins"] / tr * 100.0) if tr > 0 else 0.0, 1)
+
+        return {
+            "lookback_hours": lookback_hours,
+            "total_decisions": total,
+            "total_evaluations": total,
+            "enter_count": enter_count,
+            "skip_count": skip_count,
+            "exit_count": exit_count,
+            "breakdown": {"ENTER": enter_count, "SKIP": skip_count, "EXIT": exit_count},
+            "decision_breakdown": strat_counts,
+            "strategy_performance": strat_perf,
+        }
+
+    async def record_pattern_vector(self, vector: PatternFeatureVector) -> None:
+        """Store or update a breakout pattern feature vector in the pattern memory store."""
+        conn = self._conn
+        if conn is None:
+            return
+        await conn.execute(
+            """
+            INSERT OR REPLACE INTO pattern_feature_store VALUES (
+                ?,?,?,?,?,?,?,?,?,?,?
+            )
+            """,
+            (
+                vector.token_address,
+                vector.consolidation_duration_s,
+                vector.dip_depth_pct,
+                vector.volume_surge_multiplier,
+                vector.net_buy_delta,
+                vector.top10_concentration,
+                vector.liquidity_to_mc_ratio,
+                vector.smart_wallet_inflows,
+                vector.peak_gain_multiplier,
+                vector.timestamp_ns,
+                int(time.time()),
+            ),
+        )
+        await conn.commit()
+        logger.debug("Recorded pattern vector for %s (gain=%.2fx)", vector.token_address[:10], vector.peak_gain_multiplier)
+
+    async def get_pattern_vectors(self, limit: int = 100) -> list[PatternFeatureVector]:
+        """Retrieve recent historical breakout pattern feature vectors."""
+        conn = self._conn
+        if conn is None:
+            return []
+        async with conn.execute(
+            """
+            SELECT
+                token_address,
+                consolidation_duration_s,
+                dip_depth_pct,
+                volume_surge_multiplier,
+                net_buy_delta,
+                top10_concentration,
+                liquidity_to_mc_ratio,
+                smart_wallet_inflows,
+                peak_gain_multiplier,
+                timestamp_ns
+            FROM pattern_feature_store
+            ORDER BY peak_gain_multiplier DESC, created_at DESC
+            LIMIT ?
+            """,
+            (limit,),
+        ) as cursor:
+            rows = await cursor.fetchall()
+
+        results: list[PatternFeatureVector] = []
+        for r in rows:
+            try:
+                results.append(
+                    PatternFeatureVector(
+                        token_address=r[0],
+                        consolidation_duration_s=r[1],
+                        dip_depth_pct=r[2],
+                        volume_surge_multiplier=r[3],
+                        net_buy_delta=r[4],
+                        top10_concentration=r[5],
+                        liquidity_to_mc_ratio=r[6],
+                        smart_wallet_inflows=r[7],
+                        peak_gain_multiplier=r[8],
+                        timestamp_ns=r[9],
+                    )
+                )
+            except Exception as exc:
+                logger.debug("Error parsing PatternFeatureVector: %s", exc)
+        return results

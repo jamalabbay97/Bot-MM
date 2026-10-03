@@ -62,6 +62,11 @@ from alpha_engine.models.state import (
     SecurityReport,
     TradeRecord,
 )
+from alpha_engine.models.decisions import (
+    DecisionRecord,
+    DecisionType,
+    PatternFeatureVector,
+)
 
 __all__ = [
     # Base Config
@@ -116,5 +121,9 @@ __all__ = [
     "AISupervisorResponse",
     "AuditedTokenOutcome",
     "OutcomeTrackerMetrics",
+    # Structured Decision Audit & Pattern Models
+    "DecisionType",
+    "DecisionRecord",
+    "PatternFeatureVector",
 ]
 

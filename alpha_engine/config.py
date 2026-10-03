@@ -208,6 +208,44 @@ class EngineConfig(BaseSettings):
     )
 
     # -------------------------------------------------------------------------
+    # 4b. Staging Buffer & Wave-2 Dip-Reversal Engine Configuration
+    # -------------------------------------------------------------------------
+    wave2_staging_enabled: bool = Field(
+        default=True,
+        description="Enable Wave-2 Dip-Reversal and accumulation breakout monitoring",
+    )
+    wave2_ttl_seconds: float = Field(
+        default=10800.0,
+        ge=3600.0,
+        le=43200.0,
+        description="Adjustable TTL (1 to 6+ hours) for staged tokens in Wave-2 buffer",
+    )
+    wave2_volume_surge_multiplier: float = Field(
+        default=2.5,
+        ge=1.5,
+        le=5.0,
+        description="Volume surge multiplier threshold k: Volume_5m > k * SMA_15m",
+    )
+    wave2_min_buy_delta_pct: float = Field(
+        default=65.0,
+        ge=50.0,
+        le=90.0,
+        description="Net buy volume percentage threshold (>65%) in recent window",
+    )
+    wave2_max_top10_concentration_pct: float = Field(
+        default=25.0,
+        ge=5.0,
+        le=50.0,
+        description="Maximum top-10 non-pool holder concentration percentage (<25%)",
+    )
+    wave2_min_consolidation_duration_s: float = Field(
+        default=900.0,
+        ge=300.0,
+        le=7200.0,
+        description="Minimum consolidation duration in seconds (default: 15 mins)",
+    )
+
+    # -------------------------------------------------------------------------
     # 5. Quantitative Risk & Sizing Parameters
     # -------------------------------------------------------------------------
     max_active_positions: int = Field(

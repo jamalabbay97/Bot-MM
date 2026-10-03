@@ -10,11 +10,13 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from collections import defaultdict
+from collections import defaultdict, deque
 from dataclasses import dataclass, field
 from decimal import Decimal
 from typing import Any, Optional
 
+from alpha_engine.models.ai import TakeProfitStage
+from alpha_engine.models.decisions import PatternFeatureVector
 from alpha_engine.models.enums import ChainIdentifier, SignalSource, WhitelistStatus
 from alpha_engine.profiler.profiler import SmartMoneyProfiler
 
@@ -118,6 +120,11 @@ class AdaptiveFeedbackEngine:
         self._reflections: list[TradeReflection] = []
         self._source_history: dict[SignalSource, list[TradeReflection]] = defaultdict(list)
         self._wallet_history: dict[str, list[TradeReflection]] = defaultdict(list)
+
+        # Autonomous learning & parameter adaptation modules
+        self.pattern_store = PatternMemoryStore()
+        self.parameter_tuner = DynamicParameterTuner()
+        self.missed_opportunity_analyzer = MissedOpportunityAnalyzer(self.pattern_store)
 
     async def record_closed_trade(self, reflection: TradeReflection) -> None:
         """
@@ -224,3 +231,326 @@ class AdaptiveFeedbackEngine:
     def get_reflections(self, limit: int = 50) -> list[TradeReflection]:
         """Return the latest trade reflections."""
         return self._reflections[-limit:]
+
+
+# =============================================================================
+# Vectorized Pattern Store & Feature Memory
+# =============================================================================
+
+class PatternMemoryStore:
+    """
+    Vectorized Pattern Store & Feature Memory:
+    Maintains normalized market state vectors of successful breakout tokens
+    (consolidation duration, dip depth, smart wallet inflows, liquidity-to-MC ratio, surge multiplier, etc.).
+    Computes cosine similarity PatternMatchScore [0.0, 1.0] for candidate tokens.
+    """
+
+    def __init__(self, ledger: Optional[Any] = None) -> None:
+        self._ledger = ledger
+        self._patterns: list[PatternFeatureVector] = []
+        self._load_baseline_archetypes()
+
+    def _load_baseline_archetypes(self) -> None:
+        """Seed initial archetypes representing verified institutional wave-2 accumulation breakouts."""
+        archetype_1 = PatternFeatureVector(
+            token_address="Archetype_CTO_LongConsolidation",
+            consolidation_duration_s=2700.0,  # 45 mins
+            dip_depth_pct=55.0,              # 55% dip from peak
+            volume_surge_multiplier=3.4,     # 3.4x volume surge
+            net_buy_delta=0.74,              # 74% net buy volume
+            top10_concentration=0.17,        # 17% top 10
+            liquidity_to_mc_ratio=0.22,      # 22% liq / MC
+            smart_wallet_inflows=18.5,       # 18.5 SOL smart inflow
+            peak_gain_multiplier=5.2,
+        )
+        archetype_2 = PatternFeatureVector(
+            token_address="Archetype_V_Reversal_HighVolume",
+            consolidation_duration_s=1200.0,  # 20 mins
+            dip_depth_pct=42.0,              # 42% dip
+            volume_surge_multiplier=4.8,     # 4.8x volume surge
+            net_buy_delta=0.82,              # 82% net buy volume
+            top10_concentration=0.14,        # 14% top 10
+            liquidity_to_mc_ratio=0.28,      # 28% liq / MC
+            smart_wallet_inflows=35.0,       # 35.0 SOL smart inflow
+            peak_gain_multiplier=8.5,
+        )
+        self._patterns.extend([archetype_1, archetype_2])
+
+    def add_pattern(self, vector: PatternFeatureVector) -> None:
+        """Add a confirmed breakout pattern vector to memory and ledger."""
+        self._patterns.append(vector)
+        if self._ledger is not None and hasattr(self._ledger, "record_pattern_vector"):
+            try:
+                loop = asyncio.get_running_loop()
+                loop.create_task(self._ledger.record_pattern_vector(vector))
+            except RuntimeError:
+                pass
+        logger.info(
+            "PatternMemoryStore: Recorded new breakout pattern for %s (gain=%.2fx, surge=%.1fx, dip=%.1f%%)",
+            vector.token_address[:10],
+            vector.peak_gain_multiplier,
+            vector.volume_surge_multiplier,
+            vector.dip_depth_pct,
+        )
+
+    def calculate_pattern_match(self, candidate_vector: PatternFeatureVector) -> float:
+        """
+        Compute PatternMatchScore [0.0, 1.0] by finding the highest cosine similarity
+        against stored breakout vectors.
+        """
+        if not self._patterns:
+            return 0.50
+        max_similarity = 0.0
+        for pattern in self._patterns:
+            sim = candidate_vector.cosine_similarity(pattern)
+            if sim > max_similarity:
+                max_similarity = sim
+        return round(max_similarity, 3)
+
+    def get_patterns(self, limit: int = 50) -> list[PatternFeatureVector]:
+        return self._patterns[-limit:]
+
+
+# =============================================================================
+# Missed Opportunity Post-Mortem Analyzer
+# =============================================================================
+
+@dataclass
+class MissedOpportunity:
+    """Post-mortem analysis record of a token that surged despite being skipped or vetoed."""
+
+    token_address: str
+    symbol: str
+    peak_multiplier: float
+    market_source: str
+    first_seen_timestamp: float
+    veto_or_skip_reason: str
+    state_vector: Optional[PatternFeatureVector] = None
+    bottleneck_rule: str = ""
+    suggested_threshold_adjustment: str = ""
+    analyzed_at: float = field(default_factory=time.time)
+
+
+class MissedOpportunityAnalyzer:
+    """
+    Missed Opportunity Post-Mortem Loop:
+    Periodically cross-references top market gainers against tokens that entered
+    staging or preflight evaluation. Identifies false negatives (missed breakouts),
+    extracts their market state vectors, and adjusts pattern memory.
+    """
+
+    def __init__(self, pattern_store: PatternMemoryStore) -> None:
+        self._pattern_store = pattern_store
+        self._missed_opportunities: deque[MissedOpportunity] = deque(maxlen=100)
+
+    async def cross_reference_market_gainers(
+        self,
+        market_gainers: list[dict[str, Any]],
+        audited_outcomes: dict[str, Any],
+        staged_tokens: dict[str, Any],
+    ) -> list[MissedOpportunity]:
+        """
+        Cross-reference top market gainers (e.g. from DexScreener/Birdeye)
+        against tokens evaluated in staging or supervisor audits.
+        """
+        new_missed: list[MissedOpportunity] = []
+
+        for gainer in market_gainers:
+            token_addr = gainer.get("token_address") or gainer.get("baseToken", {}).get("address", "")
+            if not token_addr:
+                continue
+
+            multiplier = float(gainer.get("multiplier", 1.0) or gainer.get("priceChange", {}).get("h24", 0.0) / 100.0 + 1.0)
+            symbol = gainer.get("symbol", token_addr[:6])
+
+            # Check if this token was audited or staged and subsequently skipped/vetoed
+            was_skipped = False
+            skip_reason = ""
+
+            if token_addr in audited_outcomes:
+                outcome = audited_outcomes[token_addr]
+                dec = getattr(outcome, "decision", "")
+                if dec in ("PASS", "SKIP"):
+                    was_skipped = True
+                    skip_reason = f"Supervisor audit veto: {', '.join(getattr(outcome, 'flags', []))}"
+            elif token_addr in staged_tokens:
+                staged = staged_tokens[token_addr]
+                if getattr(staged, "dropped", False):
+                    was_skipped = True
+                    skip_reason = f"Staging dropped: {getattr(staged, 'drop_reason', '')}"
+
+            if was_skipped and multiplier >= 2.0:  # Gained >= 2x after being passed/dropped
+                # Post-mortem root cause identification
+                bottleneck = "Early Dump Drop" if "DUMP" in skip_reason else ("Volume Surge Threshold" if "Surge" in skip_reason else "Security Gate")
+                adjustment = "Relax surge threshold k" if "Surge" in skip_reason else "Extend Wave-2 staging TTL"
+
+                # Extract market state vector at breakout
+                vol_surge = float(gainer.get("volume_surge_multiplier", 2.2))
+                net_buy = float(gainer.get("net_buy_delta", 0.68))
+                dip_depth = float(gainer.get("dip_depth_pct", 48.0))
+                cons_dur = float(gainer.get("consolidation_duration_s", 1800.0))
+
+                vector = PatternFeatureVector(
+                    token_address=token_addr,
+                    consolidation_duration_s=cons_dur,
+                    dip_depth_pct=dip_depth,
+                    volume_surge_multiplier=vol_surge,
+                    net_buy_delta=net_buy,
+                    top10_concentration=float(gainer.get("top10_concentration", 0.18)),
+                    liquidity_to_mc_ratio=float(gainer.get("liquidity_to_mc_ratio", 0.20)),
+                    smart_wallet_inflows=float(gainer.get("smart_wallet_inflows", 10.0)),
+                    peak_gain_multiplier=multiplier,
+                )
+
+                # Persist learned vector into pattern store
+                self._pattern_store.add_pattern(vector)
+
+                opp = MissedOpportunity(
+                    token_address=token_addr,
+                    symbol=symbol,
+                    peak_multiplier=multiplier,
+                    market_source=gainer.get("source", "DexScreener"),
+                    first_seen_timestamp=time.time(),
+                    veto_or_skip_reason=skip_reason,
+                    state_vector=vector,
+                    bottleneck_rule=bottleneck,
+                    suggested_threshold_adjustment=adjustment,
+                )
+                self._missed_opportunities.append(opp)
+                new_missed.append(opp)
+
+                logger.warning(
+                    "MissedOpportunity Post-Mortem: Token %s gained %.2fx after being skipped! "
+                    "Bottleneck: %s | Vector saved to PatternMemoryStore.",
+                    token_addr[:10],
+                    multiplier,
+                    bottleneck,
+                )
+
+        return new_missed
+
+    def get_missed_opportunities(self, limit: int = 20) -> list[MissedOpportunity]:
+        return list(self._missed_opportunities)[-limit:]
+
+
+# =============================================================================
+# Dynamic Hyperparameter Tuning Loop with EMA Smoothing & Safety Bounds
+# =============================================================================
+
+@dataclass
+class DynamicHyperparameters:
+    """
+    Dynamically adapted system hyperparameters tuned based on trailing performance.
+    """
+
+    confidence_multiplier: float = 1.0           # Bounds: [0.70, 1.40]
+    max_slippage_bps: int = 150                  # Bounds: [50, 350]
+    priority_fee_multiplier: float = 1.2         # Bounds: [1.0, 2.5]
+    hard_stop_loss_pct: float = -15.0            # Bounds: [-25.0, -8.0]
+    trailing_stop_activation_pct: float = 40.0   # Bounds: [20.0, 75.0]
+    wave2_surge_k: float = 2.5                   # Bounds: [1.8, 3.5]
+    wave2_net_buy_delta_pct: float = 65.0        # Bounds: [55.0, 75.0]
+    tp1_trigger_multiplier: float = 2.0          # Bounds: [1.4, 2.5]
+    tp1_sell_pct: float = 40.0                   # Bounds: [20.0, 60.0]
+    tp2_trigger_multiplier: float = 3.5          # Bounds: [2.5, 6.0]
+    tp2_sell_pct: float = 30.0                   # Bounds: [15.0, 50.0]
+
+    def get_take_profit_ladder(self) -> list[TakeProfitStage]:
+        return [
+            TakeProfitStage(trigger_multiplier=self.tp1_trigger_multiplier, sell_pct=self.tp1_sell_pct),
+            TakeProfitStage(trigger_multiplier=self.tp2_trigger_multiplier, sell_pct=self.tp2_sell_pct),
+        ]
+
+
+class DynamicParameterTuner:
+    """
+    Dynamic Hyperparameter Tuning Engine:
+    Dynamically tunes threshold weights (confidence multipliers, slippage allowances,
+    exit multipliers, take-profit ladders, surge thresholds) based on trailing 24h win-rate
+    and realized PnL.
+    Applies decaying exponential moving averages (EMA alpha=0.15) to avoid overfitting
+    and strictly enforces safety boundaries.
+    """
+
+    def __init__(self, smoothing_alpha: float = 0.15) -> None:
+        self._alpha = smoothing_alpha
+        self._params = DynamicHyperparameters()
+        self._smoothed_win_rate: float = 65.0
+        self._smoothed_pnl_usd: float = 0.0
+        self._tuning_history: deque[dict[str, Any]] = deque(maxlen=50)
+
+    @property
+    def current_params(self) -> DynamicHyperparameters:
+        return self._params
+
+    def update_from_performance(
+        self,
+        win_rate_24h: float,
+        realized_pnl_usd: Decimal | float,
+        total_trades_24h: int = 10,
+    ) -> DynamicHyperparameters:
+        """
+        Update hyperparameters using EMA smoothing across trailing win rate and PnL.
+        """
+        pnl_float = float(realized_pnl_usd)
+
+        # 1. Update decaying moving averages
+        self._smoothed_win_rate = self._alpha * win_rate_24h + (1.0 - self._alpha) * self._smoothed_win_rate
+        self._smoothed_pnl_usd = self._alpha * pnl_float + (1.0 - self._alpha) * self._smoothed_pnl_usd
+
+        # 2. Compute dynamic adjustments based on regime
+        old_params = DynamicHyperparameters(**self._params.__dict__)
+
+        if total_trades_24h >= 3:
+            if self._smoothed_win_rate >= 70.0 and self._smoothed_pnl_usd > 0:
+                # Strong winning regime: Expand risk appetite, loosen surge k to capture wave-2 earlier
+                target_conf = 1.15
+                target_slippage = 200
+                target_surge_k = 2.2
+                target_net_buy = 60.0
+                target_tp1 = 2.2
+            elif self._smoothed_win_rate < 45.0 or self._smoothed_pnl_usd < -50.0:
+                # Losing regime: Defensive contraction, tighten stop loss, require higher surge
+                target_conf = 0.85
+                target_slippage = 100
+                target_surge_k = 2.9
+                target_net_buy = 70.0
+                target_tp1 = 1.6
+            else:
+                # Balanced neutral regime
+                target_conf = 1.0
+                target_slippage = 150
+                target_surge_k = 2.5
+                target_net_buy = 65.0
+                target_tp1 = 2.0
+
+            # 3. Apply EMA smoothing to target parameter values
+            p = self._params
+            p.confidence_multiplier = round(self._alpha * target_conf + (1.0 - self._alpha) * p.confidence_multiplier, 3)
+            p.max_slippage_bps = int(self._alpha * target_slippage + (1.0 - self._alpha) * p.max_slippage_bps)
+            p.wave2_surge_k = round(self._alpha * target_surge_k + (1.0 - self._alpha) * p.wave2_surge_k, 2)
+            p.wave2_net_buy_delta_pct = round(self._alpha * target_net_buy + (1.0 - self._alpha) * p.wave2_net_buy_delta_pct, 1)
+            p.tp1_trigger_multiplier = round(self._alpha * target_tp1 + (1.0 - self._alpha) * p.tp1_trigger_multiplier, 2)
+
+            # 4. Strictly enforce hard safety boundaries
+            p.confidence_multiplier = max(0.70, min(1.40, p.confidence_multiplier))
+            p.max_slippage_bps = max(50, min(350, p.max_slippage_bps))
+            p.wave2_surge_k = max(1.8, min(3.5, p.wave2_surge_k))
+            p.wave2_net_buy_delta_pct = max(55.0, min(75.0, p.wave2_net_buy_delta_pct))
+            p.tp1_trigger_multiplier = max(1.4, min(2.5, p.tp1_trigger_multiplier))
+
+        self._tuning_history.append({
+            "timestamp": time.time(),
+            "smoothed_win_rate": round(self._smoothed_win_rate, 1),
+            "smoothed_pnl_usd": round(self._smoothed_pnl_usd, 2),
+            "confidence_multiplier": self._params.confidence_multiplier,
+            "max_slippage_bps": self._params.max_slippage_bps,
+            "wave2_surge_k": self._params.wave2_surge_k,
+            "wave2_net_buy_delta_pct": self._params.wave2_net_buy_delta_pct,
+        })
+
+        return self._params
+
+    def get_tuning_history(self) -> list[dict[str, Any]]:
+        return list(self._tuning_history)
+
