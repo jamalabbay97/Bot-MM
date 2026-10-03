@@ -16,17 +16,13 @@ from __future__ import annotations
 
 import asyncio
 import time
-from unittest.mock import AsyncMock, MagicMock, patch
-
-import pytest
-from pydantic import ValidationError
+from unittest.mock import AsyncMock, MagicMock
 
 from alpha_engine.config import EngineConfig
 from alpha_engine.engine.runner import PaperTradingEngine
-from alpha_engine.ingestion.coordinator import IngestionCoordinator
 from alpha_engine.ingestion.telegram import TelegramIngester
-from alpha_engine.models.enums import ChainIdentifier, OrderSide, SecurityTier, SignalSource
-from alpha_engine.models.events import ShutdownSentinel, SignalEvent
+from alpha_engine.models.enums import ChainIdentifier, SecurityTier
+from alpha_engine.models.events import ShutdownSentinel
 from alpha_engine.models.news import NewsEvent
 from alpha_engine.models.state import SecurityReport
 

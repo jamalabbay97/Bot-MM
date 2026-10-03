@@ -147,7 +147,45 @@ class EngineConfig(BaseSettings):
     )
 
     # -------------------------------------------------------------------------
-    # 5. Engine Operations & Logging
+    # 5. AlphaSupervisor-AI Autonomous Risk Engine
+    # -------------------------------------------------------------------------
+    ai_supervisor_enabled: bool = Field(
+        default=True,
+        description="Enable AlphaSupervisor-AI autonomous risk engine and signal vetting",
+    )
+    ai_provider: str = Field(
+        default="gemini",
+        description="AI provider for AlphaSupervisor-AI (gemini, openai, openrouter)",
+    )
+    gemini_api_key: Optional[str] = Field(
+        default=None,
+        description="Google Gemini API key for AlphaSupervisor-AI",
+    )
+    ai_api_key: Optional[str] = Field(
+        default=None,
+        description="Generic AI API key for supervisor engine",
+    )
+    openai_api_key: Optional[str] = Field(
+        default=None,
+        description="OpenAI / OpenRouter API key for supervisor engine",
+    )
+    ai_model: str = Field(
+        default="gemini-2.5-flash",
+        description="AI model to query for AlphaSupervisor-AI supervision",
+    )
+    ai_timeout_s: float = Field(
+        default=4.0,
+        ge=0.5,
+        le=30.0,
+        description="Max latency timeout in seconds for AI supervisor response before falling back to local deterministic engine",
+    )
+    ai_strict_veto: bool = Field(
+        default=True,
+        description="Enforce strict veto if AI supervisor decision is PASS",
+    )
+
+    # -------------------------------------------------------------------------
+    # 6. Engine Operations & Logging
     # -------------------------------------------------------------------------
     log_level: str = Field(
         default="INFO",

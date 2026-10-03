@@ -341,10 +341,11 @@ def _parse_rugcheck_report(
     freeze_disabled = freeze_authority is None or str(freeze_authority).lower() == "null"
 
     tier = SecurityTier.CLEAN
+    lp_burned_ok = True if is_pump else (lp_burned_ratio >= _MIN_LP_BURNED_RATIO)
     if (
         sell_tax_bps > _MAX_SELL_TAX_BPS
         or buy_tax_bps > _MAX_BUY_TAX_BPS
-        or lp_burned_ratio < _MIN_LP_BURNED_RATIO
+        or not lp_burned_ok
         or not mint_disabled
         or not freeze_disabled
         or top10_concentration > max_conc

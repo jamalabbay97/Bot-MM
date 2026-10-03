@@ -18,13 +18,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from alpha_engine.config import (
-    MAX_ACTIVE_POSITIONS,
-    MAX_PER_TOKEN_RISK_PCT,
-    MAX_PORTFOLIO_EXPOSURE_PCT,
-    EngineConfig,
-)
-from alpha_engine.execution.book import ExitDecision, OpenLot, PositionBook, RunningMetrics
+from alpha_engine.execution.book import OpenLot, PositionBook, RunningMetrics
 from alpha_engine.execution.ledger import SQLiteLedger
 from alpha_engine.models.enums import (
     ChainIdentifier,
@@ -34,11 +28,8 @@ from alpha_engine.models.enums import (
     SecurityTier,
     TradeExitReason,
 )
-from alpha_engine.models.state import PaperFill, PoolState
-from alpha_engine.security.gatekeeper import SecurityGatekeeper
-from alpha_engine.security.preflight import verify_solana_mint_preflight
+from alpha_engine.models.state import PaperFill
 from alpha_engine.security.rugcheck import (
-    UNINDEXED_MINT_CACHE,
     UnindexedMintLRUCache,
     _fetch_rugcheck_report,
     _parse_rugcheck_report,

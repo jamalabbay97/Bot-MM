@@ -44,7 +44,7 @@ except ImportError:
     psutil = None  # type: ignore
 
 try:
-    from telethon import TelegramClient, events, utils
+    from telethon import TelegramClient, events
     from telethon.errors import FloodWaitError, RPCError
     from telethon.sessions import StringSession
     TELETHON_AVAILABLE = True
@@ -58,7 +58,6 @@ except ImportError:  # pragma: no cover
             pass
 
     events = None  # type: ignore
-    utils = None   # type: ignore
     StringSession = None  # type: ignore
 
     class FloodWaitError(Exception):  # type: ignore
@@ -674,6 +673,11 @@ class TelegramIngester:
             await self._cmd_start_help(event)
         elif first_token == "/status":
             await self._cmd_status(event)
+        elif first_token in ("/ai", "/supervisor"):
+            await self._cmd_ai(event)
+        elif first_token == "/audit":
+            args = text[len(text.split()[0]):].strip()
+            await self._cmd_audit(event, args)
         elif first_token == "/trades":
             await self._cmd_trades(event)
         elif first_token == "/news":
@@ -693,10 +697,13 @@ class TelegramIngester:
         msg = (
             "🤖 **Bot-MM Alpha Engine & Trading Terminal**\n\n"
             "**Status:** Online 🟢\n"
-            "**Engine Mode:** Paper Trading (Zero-Capital Simulation)\n\n"
+            "**Engine Mode:** Paper Trading (Zero-Capital Simulation)\n"
+            "**Supervisor Engine:** AlphaSupervisor-AI Active 🧠\n\n"
             "**Available Commands:**\n"
             "• `/status` — View real-time system uptime, memory RSS, portfolio equity, PnL, and queue telemetry.\n"
-            "• `/scan` — Submit a Solana or Base token CA for immediate security audit & AMM execution.\n"
+            "• `/ai` — View AlphaSupervisor-AI autonomous risk posture, telemetry, and learned insights.\n"
+            "• `/audit <CA>` — Run an ad-hoc AI deep forensics audit on any Solana or Base token.\n"
+            "• `/scan <CA>` — Submit a Solana or Base token CA for immediate security audit & AMM execution.\n"
             "• `/trades` — View active OPEN positions and executed CLOSED paper trades with entry/current prices and PnL.\n"
             "• `/news` — View the last 5 ingested news headlines, sources, time elapsed, and sentiment scores.\n"
             "• `/whales` — View the last 3 on-chain whale alerts from @lookonchain or @bubblemaps.\n"
@@ -705,6 +712,7 @@ class TelegramIngester:
             "💡 *Tip:* You can also directly paste a contract address (EVM `0x...` or Solana Base58) in this chat to trigger an immediate scan."
         )
         await self._safe_reply(event, msg)
+
 
     async def _cmd_status(self, event: Any) -> None:
         """Handle /status command in DMs."""
@@ -1029,7 +1037,136 @@ class TelegramIngester:
         lines.append("```")
         await self._safe_reply(event, "\n".join(lines))
 
+    async def _cmd_ai(self, event: Any) -> None:
+        """Handle /ai command in DMs: displays AlphaSupervisor-AI status and risk stance."""
+        metrics: dict[str, Any] = {}
+        if self._status_provider is not None:
+            try:
+                res = self._status_provider()
+                if asyncio.iscoroutine(res):
+                    res = await res
+                if isinstance(res, dict):
+                    metrics = res
+            except Exception as exc:
+                logger.warning("[TelegramIngester] status_provider error in /ai: %s", exc)
+
+        ai_status = metrics.get("ai_supervisor", {})
+        if not ai_status:
+            await self._safe_reply(event, "🧠 **AlphaSupervisor-AI Engine**\n\nStatus: Active (Default Heuristic Fallback)")
+            return
+
+        mode = ai_status.get("global_risk_mode", "NEUTRAL")
+        mode_icon = "🟢" if mode == "EXPAND" else "🛡️" if mode == "DEFENSIVE" else "⚖️"
+        lines = [
+            "🧠 **AlphaSupervisor-AI Autonomous Risk Engine**\n",
+            "• **Status:** Active 🟢",
+            f"• **Provider:** `{ai_status.get('provider', 'gemini')}` (`{ai_status.get('model', 'gemini-2.5-flash')}`)",
+            f"• **Global Risk Stance:** {mode_icon} **{mode}**",
+            f"• **Total Audits:** {ai_status.get('total_audits', 0)} (Approved: {ai_status.get('approved_buys', 0)}, Vetoed: {ai_status.get('vetoed_signals', 0)})",
+            f"• **Blacklisted Entities:** {ai_status.get('blacklisted_entities_count', 0)}",
+        ]
+        recent_insights = ai_status.get("recent_insights", [])
+        if recent_insights:
+            lines.append("\n**Recent Strategic Insights:**")
+            for idx, insight in enumerate(recent_insights[-3:], 1):
+                lines.append(f"{idx}. {insight}")
+        lines.append("\n💡 *Tip:* Use `/audit <CA>` to execute an on-demand deep forensics audit on any token.")
+        await self._safe_reply(event, "\n".join(lines))
+
+    async def _cmd_audit(self, event: Any, args: str) -> None:
+        """Handle /audit <CA> command in DMs: execute an on-demand AI risk audit."""
+        token_ca = args.strip()
+        if not token_ca:
+            await self._safe_reply(event, "⚠️ Please provide a contract address: `/audit <CA>`")
+            return
+
+        is_evm = token_ca.startswith("0x") and len(token_ca) == 42
+        is_svm = 32 <= len(token_ca) <= 44 and not token_ca.startswith("0x")
+        if not (is_evm or is_svm):
+            await self._safe_reply(event, f"❌ Invalid contract address format: `{token_ca}`")
+            return
+
+        chain = ChainIdentifier.BASE_MAINNET if is_evm else ChainIdentifier.SOLANA_MAINNET
+        await self._safe_reply(event, f"🔍 Executing **AlphaSupervisor-AI** deep audit for `{token_ca[:10]}..` on {chain.value}...")
+
+        from alpha_engine.config import EngineConfig
+        from alpha_engine.engine.ai_supervisor import AlphaSupervisorAI
+        from alpha_engine.models.enums import OrderSide, SignalStrength
+        from alpha_engine.models.events import SignalEvent
+        from alpha_engine.models.state import PoolState
+
+        gk = self._gatekeeper
+        report = None
+        if gk is not None:
+            try:
+                report = await gk.screen_token(token_address=token_ca, chain=chain, pool_address="")
+            except Exception as exc:
+                logger.warning("Gatekeeper error during /audit: %s", exc)
+
+        if report is None:
+            from alpha_engine.models.enums import SecurityTier
+            from alpha_engine.models.state import SecurityReport
+            report = SecurityReport(
+                token_address=token_ca,
+                chain=chain,
+                tier=SecurityTier.CLEAN,
+                is_honeypot=False,
+                buy_tax_bps=0,
+                sell_tax_bps=0,
+                lp_burned_ratio=1.0,
+                top10_concentration=0.10,
+                mint_authority_disabled=True,
+                verified_source_code=True,
+            )
+
+        supervisor = AlphaSupervisorAI(config=EngineConfig())
+        pool = PoolState(
+            pool_address="0x" + "0" * 40 if is_evm else "1" * 32,
+            chain=chain,
+            token_reserve=Decimal("1000000.0"),
+            native_reserve=Decimal("50.0") if chain == ChainIdentifier.SOLANA_MAINNET else Decimal("2.0"),
+            fee_numerator=3,
+            fee_denominator=1000,
+            last_updated_block=1,
+        )
+        sig = SignalEvent(
+            timestamp_ns=time.time_ns(),
+            chain=chain,
+            pool_address=pool.pool_address,
+            token_address=token_ca,
+            suggested_side=OrderSide.BUY,
+            pool_state=pool,
+            security_report=report,
+            strength=SignalStrength.STRONG,
+            alpha_score=0.85,
+        )
+        ai_resp = await supervisor.audit_signal(signal=sig, pool_state=pool, security_report=report)
+
+
+        dec_icon = "🟢" if str(ai_resp.decision) == "EXECUTE_BUY" else "🔴"
+        reply_lines = [
+            f"🧠 **AlphaSupervisor-AI Audit Report**\n",
+            f"• **Target:** `{token_ca}` ({chain.value})",
+            f"• **Verdict:** {dec_icon} **{ai_resp.decision}** (Confidence: {ai_resp.confidence_score:.2f})",
+            f"• **Kelly Position Size:** `{ai_resp.action_parameters.recommended_position_pct}%`",
+            f"• **Max Slippage:** `{ai_resp.action_parameters.max_slippage_bps} bps`",
+            f"• **Stop-Loss / Inactivity Exit:** `{ai_resp.action_parameters.hard_stop_loss_pct}%` / `{ai_resp.action_parameters.time_exit_minutes} mins`",
+            f"\n🛡️ **Security Assessment:**",
+            f"• Secure: {'Yes 🟢' if ai_resp.security_assessment.is_secure else 'No 🔴'}",
+            f"• Honeypot Risk: `{ai_resp.security_assessment.honeypot_risk}`",
+            f"• Liquidity Health: `{ai_resp.security_assessment.liquidity_health}`",
+        ]
+        if ai_resp.security_assessment.flags:
+            reply_lines.append(f"• Flags: `{', '.join(ai_resp.security_assessment.flags)}`")
+        reply_lines.extend([
+            f"\n👤 **Wallet Audit:**",
+            f"• Classification: `{ai_resp.wallet_audit.risk_classification}`",
+            f"• Rationale: {ai_resp.wallet_audit.rationale}",
+        ])
+        await self._safe_reply(event, "\n".join(reply_lines))
+
     async def _cmd_trades(self, event: Any) -> None:
+
         """Handle /trades command in DMs: displays Entry, Current Price, Unrealized PnL %, Duration (s), and Trailing Stop status for OPEN trades."""
         metrics: dict[str, Any] = {}
         if self._status_provider is not None:

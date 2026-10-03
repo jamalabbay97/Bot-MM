@@ -9,11 +9,11 @@ from __future__ import annotations
 
 import logging
 import math
-import uuid
+import uuid 
 from collections import defaultdict
 from dataclasses import dataclass, field
 from decimal import Decimal
-
+from typing import Optional
 from alpha_engine.models.enums import ChainIdentifier, ExitStage, LotStatus, TradeExitReason
 from alpha_engine.models.state import PaperFill
 
@@ -59,6 +59,11 @@ class OpenLot:
     cumulative_buy_vol: Decimal = Decimal(0)
     peak_pool_reserve_native: Decimal = Decimal(0)
     initial_pool_reserve_native: Decimal = Decimal(0)
+    ai_hard_stop_loss_pct: Optional[float] = None
+    ai_trailing_stop_activation_pct: Optional[float] = None
+    ai_time_exit_minutes: Optional[float] = None
+    ai_tp1_sold: bool = False
+    ai_tp2_sold: bool = False
 
     def record_tick(
         self,
@@ -221,6 +226,9 @@ class PositionBook:
         pool_address: str = "",
         bonding_curve_mode: bool = False,
         trailing_profit_lock_pct: Decimal | None = None,
+        ai_hard_stop_loss_pct: Optional[float] = None,
+        ai_trailing_stop_activation_pct: Optional[float] = None,
+        ai_time_exit_minutes: Optional[float] = None,
     ) -> OpenLot:
         if fill.effective_price <= Decimal(0):
             raise ValueError(
@@ -247,6 +255,9 @@ class PositionBook:
             trailing_profit_lock_pct=trailing_profit_lock_pct,
             initial_pool_reserve_native=initial_pool_reserve_native,
             peak_pool_reserve_native=initial_pool_reserve_native,
+            ai_hard_stop_loss_pct=ai_hard_stop_loss_pct,
+            ai_trailing_stop_activation_pct=ai_trailing_stop_activation_pct,
+            ai_time_exit_minutes=ai_time_exit_minutes,
             price_history=[(fill.fill_timestamp_ns / 1e9 if fill.fill_timestamp_ns > 0 else 0.0, fill.effective_price, fill.simulated_native_spent)],
         )
         key = (fill.chain.value, fill.token_address)
@@ -530,11 +541,33 @@ class PositionBook:
                     prioritized=True,
                 )
 
-            # Velocity / Time Decay Exit (Crucial for Pump.fun):
+            # Velocity / Stagnation Time Decay Exit (Crucial for Pump.fun):
             pnl_pct = (current_price - lot.entry_price) / lot.entry_price
-            if duration_s > 120.0 and pnl_pct < Decimal("0.03"):
+            if lot.ai_time_exit_minutes is not None:
+                ai_timeout_s = float(lot.ai_time_exit_minutes) * 60.0
+                if duration_s > ai_timeout_s and pnl_pct < Decimal("0.15"):
+                    logger.info(
+                        "AI SUPERVISOR INACTIVITY STOP for lot %s (%s): duration=%.1fs (>%.0fs timeout) and PnL=%.2f%% (<+15%%). Liquidating stagnant lot.",
+                        lot.lot_id[:8],
+                        lot.token_address[:10],
+                        duration_s,
+                        ai_timeout_s,
+                        float(pnl_pct * 100),
+                    )
+                    return ExitDecision(
+                        lot_id=lot.lot_id,
+                        token_address=lot.token_address,
+                        chain=lot.chain,
+                        should_exit=True,
+                        exit_reason=TradeExitReason.TIMEOUT_VELOCITY_DECAY,
+                        exit_stage=ExitStage.TIMEOUT,
+                        tokens_to_sell=lot.tokens_held,
+                        current_price=current_price,
+                        pnl_estimate_native=lot.tokens_held * (current_price - lot.entry_price),
+                    )
+            elif (duration_s > 900.0 and abs(pnl_pct) <= Decimal("0.03")) or (duration_s > 120.0 and pnl_pct < Decimal("0.03")):
                 logger.info(
-                    "VELOCITY / TIME DECAY EXIT for lot %s (%s): duration=%.1fs (>120s) and PnL=%.2f%% (<+3%%). Liquidating stagnant lot.",
+                    "VELOCITY / TIME DECAY EXIT for lot %s (%s): duration=%.1fs (>120s/900s stagnation) and PnL=%.2f%%. Liquidating stagnant lot.",
                     lot.lot_id[:8],
                     lot.token_address[:10],
                     duration_s,
@@ -552,8 +585,63 @@ class PositionBook:
                     pnl_estimate_native=lot.tokens_held * (current_price - lot.entry_price),
                 )
 
+            # AI Supervisor Hard Stop-Loss (-15% by default):
+            if lot.ai_hard_stop_loss_pct is not None:
+                ai_sl_ratio = Decimal(1) + (Decimal(str(lot.ai_hard_stop_loss_pct)) / Decimal("100.0"))
+                if gain_ratio <= ai_sl_ratio and not in_grace_period:
+                    logger.info(
+                        "AI SUPERVISOR HARD-STOP (%.1f%%) for lot %s: price %s <= entry %s * %s.",
+                        lot.ai_hard_stop_loss_pct,
+                        lot.lot_id[:8],
+                        current_price,
+                        lot.entry_price,
+                        ai_sl_ratio,
+                    )
+                    return ExitDecision(
+                        lot_id=lot.lot_id,
+                        token_address=lot.token_address,
+                        chain=lot.chain,
+                        should_exit=True,
+                        exit_reason=TradeExitReason.SL_HARD,
+                        exit_stage=ExitStage.SL,
+                        tokens_to_sell=lot.tokens_held,
+                        current_price=current_price,
+                        pnl_estimate_native=lot.tokens_held * (current_price - lot.entry_price),
+                        prioritized=True,
+                    )
+
             # Trailing Stop:
-            # 1. Trailing Stop Activation at +50% ROI:
+            # AI Breakeven Trigger: Once token achieves target gain (+40%), shift stop to entry + round-trip gas
+            if lot.ai_trailing_stop_activation_pct is not None:
+                ai_activation_ratio = Decimal(1) + (Decimal(str(lot.ai_trailing_stop_activation_pct)) / Decimal("100.0"))
+                if gain_ratio >= ai_activation_ratio or current_pnl >= (Decimal(str(lot.ai_trailing_stop_activation_pct)) / Decimal("100.0")):
+                    lot.trailing_stop_active = True
+                    be_stop = (lot.entry_price * Decimal("1.005")).quantize(Decimal("1e-18"))
+                    if be_stop > lot.trailing_stop_price:
+                        lot.trailing_stop_price = be_stop
+                        logger.info(
+                            "Lot %s up +%.0f%% -> AI Breakeven trigger shifted stop to %s",
+                            lot.lot_id[:8],
+                            lot.ai_trailing_stop_activation_pct,
+                            lot.trailing_stop_price,
+                        )
+
+            # 1. Trailing Stop Escalation to Breakeven at +25% ROI:
+            if gain_ratio >= Decimal("1.25") or current_pnl >= Decimal("0.25") or lot.peak_pnl >= Decimal("0.25"):
+                lot.trailing_stop_active = True
+                breakeven_stop = lot.entry_price.quantize(Decimal("1e-18"))
+                if breakeven_stop > lot.trailing_stop_price:
+                    lot.trailing_stop_price = breakeven_stop
+                    logger.info(
+                        "Lot %s (%s) up +25%% ROI (peak PnL=%.2f%%) -> Trailing stop escalated to Breakeven (%s)",
+                        lot.lot_id[:8],
+                        lot.token_address[:10],
+                        float(lot.peak_pnl * 100),
+                        lot.trailing_stop_price,
+                    )
+
+
+            # 2. Trailing Stop Activation at +50% ROI:
             if gain_ratio >= Decimal("1.50") or current_pnl >= Decimal("0.50") or lot.peak_pnl >= Decimal("0.50"):
                 lot.trailing_stop_active = True
                 baseline_30 = (lot.entry_price * Decimal("1.30")).quantize(Decimal("1e-18"))

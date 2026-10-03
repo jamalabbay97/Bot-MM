@@ -37,6 +37,20 @@ from alpha_engine.models.profiler import (
     WalletTradeRecord,
     WhitelistRecord,
 )
+from alpha_engine.models.ai import (
+    ActionParameters,
+    AISupervisorDecisionEnum,
+    AISupervisorResponse,
+    FeedbackTuning,
+    GlobalRiskMode,
+    HoneypotRisk,
+    LiquidityHealth,
+    LossAttribution,
+    SecurityAssessment,
+    TakeProfitStage,
+    WalletAudit,
+    WalletRiskClassification,
+)
 from alpha_engine.models.state import (
     ExitOrder,
     OpenPositionLot,
@@ -85,4 +99,18 @@ __all__ = [
     "OpenPositionLot",
     "ExitOrder",
     "PortfolioSnapshot",
+    # AI Supervisor Models
+    "AISupervisorDecisionEnum",
+    "WalletRiskClassification",
+    "HoneypotRisk",
+    "LiquidityHealth",
+    "GlobalRiskMode",
+    "LossAttribution",
+    "TakeProfitStage",
+    "ActionParameters",
+    "WalletAudit",
+    "SecurityAssessment",
+    "FeedbackTuning",
+    "AISupervisorResponse",
 ]
+

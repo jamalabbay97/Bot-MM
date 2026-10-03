@@ -6,7 +6,6 @@ and execution pipeline dispatch for autonomous paper trading.
 
 from __future__ import annotations
 
-import asyncio
 from decimal import Decimal
 import logging
 from pathlib import Path

@@ -212,6 +212,7 @@ class PumpSwapEvent(SwapEvent):
     is_buy: bool = True
     virtual_sol_reserves: Decimal = Decimal("30.0")
     virtual_token_reserves: Decimal = Decimal("1073000000.0")
+    has_authoritative_reserves: bool = False
     slot: int = 0
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:

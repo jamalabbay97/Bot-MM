@@ -18,7 +18,6 @@ from alpha_engine.models.enums import ChainIdentifier
 from alpha_engine.models.events import (
     PoolStateUpdateEvent,
     PumpMintEvent,
-    PumpSwapEvent,
     SwapEvent,
 )
 from alpha_engine.models.state import PoolState
@@ -646,6 +645,7 @@ def _parse_pump_fun_trade_logs(
                     token_amount = _normalise(token_raw, 6)
                     v_sol = _normalise(v_sol_raw, 9) if v_sol_raw > 0 else Decimal("30.0")
                     v_token = _normalise(v_token_raw, 6) if v_token_raw > 0 else Decimal("1073000000.0")
+                    has_auth = bool(v_sol_raw > 0 and v_token_raw > 0)
 
                     return PumpFunTradeResult({
                         "mint": mint,
@@ -657,6 +657,7 @@ def _parse_pump_fun_trade_logs(
                         "is_buy": is_buy,
                         "virtual_sol_reserves": v_sol,
                         "virtual_token_reserves": v_token,
+                        "has_authoritative_reserves": has_auth,
                         "tx_hash": tx_sig,
                     })
             except Exception:

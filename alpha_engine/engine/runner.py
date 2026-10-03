@@ -28,6 +28,7 @@ from collections import deque
 
 from alpha_engine.config import EngineConfig
 from alpha_engine.dns_resolver import patch_dns_resolvers
+from alpha_engine.engine.ai_supervisor import AlphaSupervisorAI
 from alpha_engine.engine.feedback import AdaptiveFeedbackEngine, TradeReflection
 from alpha_engine.engine.registry import PoolRegistry
 from alpha_engine.engine.rpc_health import RPCHealthMonitor
@@ -38,18 +39,17 @@ from alpha_engine.execution.ledger import SQLiteLedger
 from alpha_engine.ingestion.coordinator import IngestionCoordinator
 from alpha_engine.logging_config import setup_production_logging
 from alpha_engine.math.cpmm import get_initial_bonding_curve_pool
+from alpha_engine.models.ai import ActionParameters, AISupervisorDecisionEnum
 from alpha_engine.models.enums import (
     ChainIdentifier,
     LotStatus,
     OrderSide,
     SignalSource,
     SignalStrength,
-    TradeExitReason,
 )
 from alpha_engine.models.events import (
     PoolStateUpdateEvent,
     PumpMintEvent,
-    PumpSwapEvent,
     RawSignalEvent,
     ShutdownSentinel,
     SignalEvent,
@@ -123,6 +123,7 @@ class PaperTradingEngine:
         self._signal_handlers_installed = False
 
         self._feedback = AdaptiveFeedbackEngine()
+        self._ai_supervisor = AlphaSupervisorAI(config=config, session=self._session)
         base_urls = [config.base_rpc_http] + list(getattr(config, "base_fallback_rpcs", []))
         solana_urls = [config.solana_rpc_http] + list(getattr(config, "solana_fallback_rpcs", []))
         self._rpc_monitor = RPCHealthMonitor(
@@ -145,6 +146,11 @@ class PaperTradingEngine:
         return self._feedback
 
     @property
+    def ai_supervisor(self) -> AlphaSupervisorAI:
+        return self._ai_supervisor
+
+
+    @property
     def rpc_monitor(self) -> RPCHealthMonitor:
         return self._rpc_monitor
 
@@ -153,13 +159,13 @@ class PaperTradingEngine:
         return self._pending_launch_buffer
 
     @staticmethod
-    def _format_price_clean(price: Any) -> str:
+    def _format_number_subscript(price: Any) -> str:
         try:
             val = float(price)
             if val <= 0:
-                return "$0.00"
+                return "0.00"
             if val >= 1.0:
-                return f"${val:.4f}"
+                return f"{val:.4f}"
             s = f"{val:.12f}"
             dec_part = s.split(".")[1]
             zero_count = 0
@@ -172,8 +178,19 @@ class PaperTradingEngine:
             if zero_count >= 3:
                 sub_str = "".join(subscripts[int(d)] for d in str(zero_count))
                 sig_digits = dec_part[zero_count : zero_count + 4]
-                return f"$0.0{sub_str}{sig_digits}"
-            return f"${val:.8f}"
+                return f"0.0{sub_str}{sig_digits}"
+            return f"{val:.8f}"
+        except Exception:
+            return f"{price}"
+
+    @classmethod
+    def _format_price_clean(cls, price: Any, native_price_usd: Any = None, unit: str = "") -> str:
+        try:
+            val = float(price)
+            if native_price_usd is not None and float(native_price_usd) > 0 and unit:
+                usd_val = val * float(native_price_usd)
+                return f"${cls._format_number_subscript(usd_val)} ({cls._format_number_subscript(val)} {unit})"
+            return f"${cls._format_number_subscript(val)}"
         except Exception:
             return f"${price}"
 
@@ -218,8 +235,10 @@ class PaperTradingEngine:
 
         status_icon = "🟢" if is_win else "🔴"
         title = f"TAKE-PROFIT (+{pct:.2f}%)" if is_win else f"STOP-LOSS ({pct:.2f}%)"
-        ep_str = self._format_price_clean(ep)
-        xp_str = self._format_price_clean(xp)
+        unit = "ETH" if lot.chain == ChainIdentifier.BASE_MAINNET else "SOL"
+        native_price = self._eth_price if lot.chain == ChainIdentifier.BASE_MAINNET else self._sol_price
+        ep_str = self._format_price_clean(ep, native_price, unit)
+        xp_str = self._format_price_clean(xp, native_price, unit)
         t_str = f"{lot.token_address[:4]}..{lot.token_address[-4:]}"
         usd_sign = "+" if exit_pnl_usd > 0 else ""
         chain_val = lot.chain.value if hasattr(lot.chain, "value") else str(lot.chain)
@@ -234,6 +253,20 @@ class PaperTradingEngine:
             f"• **Holding Time:** `{dur_s:.1f}s`"
         )
         asyncio.create_task(self._broadcast_trade_alert(exit_msg))
+        if hasattr(self, "_ai_supervisor") and self._ai_supervisor:
+            reflection = TradeReflection.from_trade(
+                trade_id=str(getattr(exit_fill, "order_id", "")),
+                token_address=lot.token_address,
+                chain=lot.chain,
+                signal_source=SignalSource.DEX_SWAP,
+                entry_price=ep,
+                exit_price=xp,
+                realized_pnl_usd=exit_pnl_usd,
+                realized_pnl_native=pnl_native,
+                time_to_fill_ms=getattr(exit_fill, "fill_latency_ms", 50.0),
+            )
+            asyncio.create_task(self._ai_supervisor.reflect_on_trade(reflection))
+
 
     def _install_signal_handlers(self) -> None:
         """
@@ -762,7 +795,7 @@ class PaperTradingEngine:
         for token in (swap.token_out, swap.token_in):
             open_lots = self._position_book.get_open_lots(chain=swap.chain, token_address=token)
             is_sell = (swap.token_in == token)
-            vol = swap.amount_in if is_sell else swap.amount_out
+            vol = swap.amount_out if is_sell else swap.amount_in
             for lot in open_lots:
                 decision = self._position_book.evaluate_lot_exit(
                     lot=lot,
@@ -960,6 +993,17 @@ class PaperTradingEngine:
                             verified_source_code=True,
                         )
 
+                    # News Catalyst & Social Momentum Half-Life Decay:
+                    # If incoming catalyst is older than 5 minutes (300s), classify as local liquidity top and forbid entry.
+                    catalyst_age_s = (time.time() - item.timestamp) if item.timestamp else 0.0
+                    if catalyst_age_s > 300.0:
+                        logger.info(
+                            "News catalyst %s is expired (age=%.1fs > 300s). Classifying as local liquidity top; suppressing entry.",
+                            mint[:10],
+                            catalyst_age_s,
+                        )
+                        continue
+
                     pool = self.get_or_create_initial_pool_state(chain, mint)
                     social_weight = self._feedback.get_social_weight() if hasattr(self, "_feedback") else 1.0
                     raw_sig = RawSignalEvent(
@@ -1041,6 +1085,43 @@ class PaperTradingEngine:
                     pool_address=getattr(signal_item, "pool_address", "") or "",
                 )
 
+            # AlphaSupervisor-AI Pre-Flight Audit & Dynamic Tuning
+            ai_action_params: Optional[ActionParameters] = None
+            if signal_item.suggested_side == OrderSide.BUY and getattr(self._cfg, "ai_supervisor_enabled", True):
+                try:
+                    ai_audit = await self._ai_supervisor.audit_signal(
+                        signal=signal_item,
+                        pool_state=signal_item.pool_state,
+                        security_report=getattr(signal_item, "security_report", None),
+                        recent_win_rate=self._metrics.win_rate_pct,
+                        recent_profit_factor=self._metrics.profit_factor,
+                    )
+                    decision_str = str(ai_audit.decision.value if hasattr(ai_audit.decision, "value") else ai_audit.decision)
+                    logger.info(
+                        "AlphaSupervisor-AI Audit for %s: %s (confidence=%.2f) | %s",
+                        signal_item.token_address[:10],
+                        decision_str,
+                        ai_audit.confidence_score,
+                        ai_audit.wallet_audit.rationale,
+                    )
+                    if decision_str == AISupervisorDecisionEnum.PASS.value and getattr(self._cfg, "ai_strict_veto", True):
+                        logger.info(
+                            "AlphaSupervisor-AI VETO enforced for %s: %s",
+                            signal_item.token_address[:10],
+                            ai_audit.security_assessment.flags or ai_audit.wallet_audit.rationale,
+                        )
+                        self._record_gatekeeper_eval(
+                            signal_item.token_address,
+                            signal_item.chain,
+                            f"AlphaSupervisor-AI Veto: {', '.join(ai_audit.security_assessment.flags) if ai_audit.security_assessment.flags else ai_audit.wallet_audit.rationale}",
+                            passed=False,
+                        )
+                        continue
+
+                    ai_action_params = ai_audit.action_parameters
+                except Exception as exc:  # noqa: BLE001
+                    logger.error("AlphaSupervisor-AI audit raised for %s: %s", signal_item.token_address[:10], exc)
+
             equity = self._current_equity_usd()
             fill = await executor.execute_signal(signal_item, portfolio_equity_usd=equity)
             if fill is None or fill.effective_price <= Decimal(0):
@@ -1066,7 +1147,11 @@ class PaperTradingEngine:
                     initial_pool_reserve_native=initial_reserve,
                     pool_address=getattr(signal_item, "pool_address", "") or "",
                     bonding_curve_mode=True,
+                    ai_hard_stop_loss_pct=ai_action_params.hard_stop_loss_pct if ai_action_params else None,
+                    ai_trailing_stop_activation_pct=ai_action_params.trailing_stop_activation_pct if ai_action_params else None,
+                    ai_time_exit_minutes=ai_action_params.time_exit_minutes if ai_action_params else None,
                 )
+
                 if self._ledger:
                     await self._ledger.record_lot_transition(
                         lot_id=lot.lot_id,
@@ -1079,9 +1164,10 @@ class PaperTradingEngine:
                 else:
                     self._cash_sol -= fill.simulated_native_spent
 
-                p_str = self._format_price_clean(fill.effective_price)
-                t_str = f"{fill.token_address[:4]}..{fill.token_address[-4:]}"
                 unit = "ETH" if signal_item.chain == ChainIdentifier.BASE_MAINNET else "SOL"
+                native_price = self._eth_price if signal_item.chain == ChainIdentifier.BASE_MAINNET else self._sol_price
+                p_str = self._format_price_clean(fill.effective_price, native_price, unit)
+                t_str = f"{fill.token_address[:4]}..{fill.token_address[-4:]}"
                 spent_val = float(fill.simulated_native_spent)
                 tok_val = float(fill.tokens_acquired)
                 buy_alert = (
@@ -1161,11 +1247,14 @@ class PaperTradingEngine:
                 })
                 usd_sign = "+" if (realized_pnl_usd or 0) > 0 else ""
                 icon = "🟢" if is_win else "🔴"
+                unit = "ETH" if fill.chain == ChainIdentifier.BASE_MAINNET else "SOL"
+                native_price = self._eth_price if fill.chain == ChainIdentifier.BASE_MAINNET else self._sol_price
+                xp_str = self._format_price_clean(xp, native_price, unit)
                 sell_alert = (
                     f"{icon} **SELL EXECUTED (Paper Trade)**\n\n"
                     f"• **Token:** `{fill.token_address[:4]}..{fill.token_address[-4:]}` (`{fill.token_address}`)\n"
                     f"• **Chain:** {fill.chain.value}\n"
-                    f"• **Exit Price:** `{self._format_price_clean(xp)}`\n"
+                    f"• **Exit Price:** `{xp_str}`\n"
                     f"• **Realized PnL:** `{usd_sign}${float(realized_pnl_usd or 0):.2f}`\n"
                     f"• **Reason:** `signal_sell`"
                 )
@@ -1391,7 +1480,9 @@ class PaperTradingEngine:
             "recent_whales": list(self._recent_whale_alerts),
             "open_trades": open_trades_info,
             "recent_closed_trades": list(self._recent_closed_trades),
+            "ai_supervisor": self._ai_supervisor.get_status() if hasattr(self, "_ai_supervisor") else {},
         }
+
 
     async def _position_price_poller(self) -> None:
         """

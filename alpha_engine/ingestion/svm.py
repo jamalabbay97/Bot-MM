@@ -379,6 +379,7 @@ class SVMIngester:
                                         is_buy=is_buy,
                                         virtual_sol_reserves=v_sol if v_sol > Decimal(0) else Decimal("30.0"),
                                         virtual_token_reserves=v_tok if v_tok > Decimal(0) else Decimal("1073000000.0"),
+                                        has_authoritative_reserves=bool(pump_trade.get("has_authoritative_reserves", False)),
                                         slot=slot,
                                     )
                                     await self._queue.put(swap_ev)

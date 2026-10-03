@@ -346,3 +346,196 @@ def test_security_report_tax_properties_and_rejection_reason_extraction():
     assert "Mint authority active" in reason
     assert "Top 10 concentration > 50%" in reason
     assert "LP not burned or locked" in reason
+
+
+def test_pool_registry_update_from_swap_buys_and_sells():
+    """Verify that PoolRegistry.update_from_swap updates reserves correctly for both BUY and SELL."""
+    from alpha_engine.engine.registry import PoolRegistry
+    from alpha_engine.models.events import SwapEvent, PumpSwapEvent
+    from alpha_engine.models.state import PoolState
+
+    reg = PoolRegistry()
+    pool = PoolState(
+        pool_address="CurveAddr111111111111111111111111111111111",
+        chain=ChainIdentifier.SOLANA_MAINNET,
+        token_address="TokenMint111111111111111111111111111111111",
+        native_reserve=Decimal("30.0"),
+        token_reserve=Decimal("1073000000.0"),
+        fee_numerator=10,
+        fee_denominator=1000,
+        last_updated_block=100,
+        token_decimals=6,
+        native_decimals=9,
+    )
+    reg.set(pool.pool_address, pool)
+    initial_price = pool.spot_price_native_per_token
+
+    # 1. BUY: Trader puts 1.0 SOL in, gets 30,000,000 tokens out
+    buy_swap = SwapEvent(
+        timestamp_ns=time.time_ns(),
+        block_number=101,
+        chain=ChainIdentifier.SOLANA_MAINNET,
+        pool_address=pool.pool_address,
+        token_in="So11111111111111111111111111111111111111112",
+        token_out=pool.token_address,
+        amount_in=Decimal("1.0"),
+        amount_out=Decimal("30000000.0"),
+        sender="BuyerWallet111111111111111111111111111111111",
+        tx_hash="tx_buy_111111111111111111111111111111111111",
+    )
+    updated_pool = reg.update_from_swap(buy_swap, pool)
+    assert updated_pool.native_reserve == Decimal("31.0")
+    assert updated_pool.token_reserve == Decimal("1043000000.0")
+    assert updated_pool.spot_price_native_per_token > initial_price
+
+    # 2. SELL: Trader puts 5,000,000 tokens in, gets 0.14 SOL out
+    sell_swap = SwapEvent(
+        timestamp_ns=time.time_ns(),
+        block_number=102,
+        chain=ChainIdentifier.SOLANA_MAINNET,
+        pool_address=pool.pool_address,
+        token_in=pool.token_address,
+        token_out="So11111111111111111111111111111111111111112",
+        amount_in=Decimal("5000000.0"),
+        amount_out=Decimal("0.14"),
+        sender="SellerWallet11111111111111111111111111111111",
+        tx_hash="tx_sell_11111111111111111111111111111111111",
+    )
+    pool_after_sell = reg.update_from_swap(sell_swap, updated_pool)
+    # Native reserve must DECREASE, token reserve must INCREASE
+    assert pool_after_sell.native_reserve == Decimal("30.86")
+    assert pool_after_sell.token_reserve == Decimal("1048000000.0")
+    assert pool_after_sell.spot_price_native_per_token < updated_pool.spot_price_native_per_token
+
+    # 3. Direct Authoritative reserves from PumpSwapEvent
+    auth_pump_swap = PumpSwapEvent(
+        timestamp_ns=time.time_ns(),
+        block_number=103,
+        chain=ChainIdentifier.SOLANA_MAINNET,
+        pool_address=pool.pool_address,
+        token_in="So11111111111111111111111111111111111111112",
+        token_out=pool.token_address,
+        amount_in=Decimal("0.5"),
+        amount_out=Decimal("15000000.0"),
+        sender="BuyerWallet111111111111111111111111111111111",
+        tx_hash="tx_pump_auth_111111111111111111111111111111",
+        virtual_sol_reserves=Decimal("32.5"),
+        virtual_token_reserves=Decimal("1000000000.0"),
+        has_authoritative_reserves=True,
+    )
+    pool_auth = reg.update_from_swap(auth_pump_swap, pool_after_sell)
+    assert pool_auth.native_reserve == Decimal("32.5")
+    assert pool_auth.token_reserve == Decimal("1000000000.0")
+
+
+def test_pump_fun_sell_does_not_trigger_phantom_take_profit():
+    """
+    Regression test for realistic market sell behavior:
+    Verifies that a sell of 5M tokens never inflates native reserves into millions
+    and never triggers an erroneous +17,000,000% take-profit exit.
+    """
+    from alpha_engine.engine.registry import PoolRegistry
+    from alpha_engine.models.events import PumpSwapEvent
+    from alpha_engine.models.state import PoolState
+
+    reg = PoolRegistry()
+    mint = "4YnMeeT7dY5UmpcG4poXrChDjsHi6kRg6W5SS2E7pump"
+    curve = "Curve4YnMeeT7dY5UmpcG4poXrChDjsHi6kRg6W5SS2E7"
+
+    pool = PoolState(
+        pool_address=curve,
+        chain=ChainIdentifier.SOLANA_MAINNET,
+        token_address=mint,
+        native_reserve=Decimal("30.0"),
+        token_reserve=Decimal("1073000000.0"),
+        fee_numerator=10,
+        fee_denominator=1000,
+        last_updated_block=1000,
+        token_decimals=6,
+        native_decimals=9,
+    )
+    reg.set(curve, pool)
+
+    book = PositionBook()
+    entry_price = Decimal("0.00000002906")
+    fill = PaperFill(
+        token_address=mint,
+        pool_address=curve,
+        chain=ChainIdentifier.SOLANA_MAINNET,
+        side=OrderSide.BUY,
+        simulated_native_spent=Decimal("0.0244"),
+        tokens_acquired=Decimal("838165.68"),
+        effective_price=entry_price,
+        price_impact_bps=10,
+        simulated_gas_cost_usd=Decimal("0.005"),
+        fill_latency_ms=15,
+        signal_timestamp_ns=time.time_ns(),
+        fill_timestamp_ns=time.time_ns(),
+        portfolio_equity_usd=Decimal("1000.0"),
+    )
+    lot = book.open_lot(
+        fill,
+        signal_id="sig_test_4ynm",
+        initial_pool_reserve_native=Decimal("30.0"),
+        pool_address=curve,
+        bonding_curve_mode=True,
+    )
+
+    # Market sell event arrives: someone sells 5,395,000 tokens for 0.15 SOL
+    sell_event = PumpSwapEvent(
+        timestamp_ns=time.time_ns(),
+        block_number=1001,
+        chain=ChainIdentifier.SOLANA_MAINNET,
+        pool_address=curve,
+        token_in=mint,
+        token_out="So11111111111111111111111111111111111111112",
+        amount_in=Decimal("5395000.0"),
+        amount_out=Decimal("0.15"),
+        sender="SellerWallet11111111111111111111111111111111",
+        tx_hash="tx_market_dump_11111111111111111111111111111",
+        mint=mint,
+        sol_amount=Decimal("0.15"),
+        token_amount=Decimal("5395000.0"),
+        is_buy=False,
+    )
+
+    updated_pool = reg.update_from_swap(sell_event, pool)
+    # Price must be less than or equal to initial, NOT 0.00502819
+    assert updated_pool.spot_price_native_per_token < entry_price
+    assert updated_pool.native_reserve < Decimal("30.0")
+
+    # Native volume passed to book must be 0.15 SOL, not 5,395,000 tokens
+    vol = sell_event.amount_out if not sell_event.is_buy else sell_event.amount_in
+    assert vol == Decimal("0.15")
+
+    decision = book.evaluate_lot_exit(
+        lot=lot,
+        current_price=updated_pool.spot_price_native_per_token,
+        current_pool_reserve_native=updated_pool.native_reserve,
+        tick_timestamp_s=time.time(),
+        current_timestamp_ns=sell_event.timestamp_ns,
+        bonding_curve_mode=True,
+        trade_volume_native=vol,
+        is_sell=True,
+    )
+
+    # Must NOT trigger TP_50 or any take profit
+    if decision is not None and decision.should_exit:
+        assert decision.exit_reason != TradeExitReason.TP_50
+        assert decision.exit_reason != TradeExitReason.TP_25
+
+
+def test_format_price_clean_dual_usd_and_native():
+    """Verify PaperTradingEngine._format_price_clean displays both USD and native values cleanly."""
+    price_sol = Decimal("0.00000002906")
+    sol_usd = Decimal("150.0")
+
+    # Backward-compatible call (just price)
+    legacy_str = PaperTradingEngine._format_price_clean(price_sol)
+    assert legacy_str.startswith("$0.0")
+
+    # Enhanced call (price + native_price_usd + unit)
+    dual_str = PaperTradingEngine._format_price_clean(price_sol, native_price_usd=sol_usd, unit="SOL")
+    assert "SOL" in dual_str
+    assert "$" in dual_str
+

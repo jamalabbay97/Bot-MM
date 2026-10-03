@@ -49,6 +49,17 @@ def main(args: list[str] | None = None) -> int:
         action="store_true",
         help="Display recent on-chain whale alerts",
     )
+    parser.add_argument(
+        "--ai",
+        action="store_true",
+        help="Display AlphaSupervisor-AI risk posture and status",
+    )
+    parser.add_argument(
+        "--audit",
+        type=str,
+        metavar="TOKEN_ADDRESS",
+        help="Execute an on-demand AlphaSupervisor-AI forensics audit on a token address",
+    )
     parsed = parser.parse_args(args)
 
     try:
@@ -57,8 +68,78 @@ def main(args: list[str] | None = None) -> int:
         print(f"Configuration error: {e}", file=sys.stderr)
         return 1
 
+
+    if parsed.ai:
+        from alpha_engine.engine.ai_supervisor import AlphaSupervisorAI
+        supervisor = AlphaSupervisorAI(config=config)
+        status = supervisor.get_status()
+        print("=== AlphaSupervisor-AI Status ===")
+        print(f"Status: Active ({status['provider']} - {status['model']})")
+        print(f"Global Risk Mode: {status['global_risk_mode']}")
+        print(f"Total Audits: {status['total_audits']} (Approved: {status['approved_buys']}, Vetoed: {status['vetoed_signals']})")
+        print(f"Blacklisted Entities: {status['blacklisted_entities_count']}")
+        return 0
+
+    if parsed.audit:
+        from decimal import Decimal
+        from alpha_engine.engine.ai_supervisor import AlphaSupervisorAI
+        from alpha_engine.models.enums import ChainIdentifier, OrderSide, SignalStrength
+        from alpha_engine.models.events import SignalEvent
+        from alpha_engine.models.state import PoolState
+        token_ca = parsed.audit.strip()
+        is_evm = token_ca.startswith("0x") and len(token_ca) == 42
+        chain = ChainIdentifier.BASE_MAINNET if is_evm else ChainIdentifier.SOLANA_MAINNET
+        pool = PoolState(
+            pool_address="0x" + "0" * 40 if is_evm else "1" * 32,
+            chain=chain,
+            token_reserve=Decimal("1000000.0"),
+            native_reserve=Decimal("50.0") if chain == ChainIdentifier.SOLANA_MAINNET else Decimal("2.0"),
+            fee_numerator=3,
+            fee_denominator=1000,
+            last_updated_block=1,
+        )
+        import time
+        from alpha_engine.models.enums import SecurityTier
+        from alpha_engine.models.state import SecurityReport
+        report = SecurityReport(
+            token_address=token_ca,
+            chain=chain,
+            tier=SecurityTier.CLEAN,
+            is_honeypot=False,
+            buy_tax_bps=0,
+            sell_tax_bps=0,
+            lp_burned_ratio=1.0,
+            top10_concentration=0.10,
+            mint_authority_disabled=True,
+            verified_source_code=True,
+        )
+        sig = SignalEvent(
+            timestamp_ns=time.time_ns(),
+            chain=chain,
+            pool_address=pool.pool_address,
+            token_address=token_ca,
+            suggested_side=OrderSide.BUY,
+            pool_state=pool,
+            security_report=report,
+            strength=SignalStrength.STRONG,
+            alpha_score=0.85,
+        )
+        supervisor = AlphaSupervisorAI(config=config)
+        async def _run_audit():
+            try:
+                return await supervisor.audit_signal(signal=sig, pool_state=pool, security_report=report)
+            finally:
+                await supervisor.close()
+
+        resp = asyncio.run(_run_audit())
+        print(f"=== AlphaSupervisor-AI Audit: {token_ca} ({chain.value}) ===")
+        print(resp.to_strict_json())
+        return 0
+
+
     if parsed.status or parsed.trades or parsed.signals or parsed.news or parsed.whales:
         import sqlite3
+
         try:
             conn = sqlite3.connect(config.db_path)
             conn.row_factory = sqlite3.Row

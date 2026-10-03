@@ -5,6 +5,7 @@ Multi-Chain Paper Trading & Alpha Analytics Engine
 """
 
 from alpha_engine.config import EngineConfig, _optional_env, _require_env
+from alpha_engine.engine.ai_supervisor import ALPHA_SUPERVISOR_SYSTEM_PROMPT, AlphaSupervisorAI
 from alpha_engine.engine.feedback import AdaptiveFeedbackEngine, TradeReflection
 from alpha_engine.engine.registry import PoolRegistry
 from alpha_engine.engine.rpc_health import RPCEndpoint, RPCHealthMonitor
@@ -28,4 +29,7 @@ __all__ = [
     "TradeReflection",
     "RPCHealthMonitor",
     "RPCEndpoint",
+    "AlphaSupervisorAI",
+    "ALPHA_SUPERVISOR_SYSTEM_PROMPT",
 ]
+

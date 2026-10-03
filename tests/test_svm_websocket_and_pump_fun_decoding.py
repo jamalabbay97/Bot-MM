@@ -38,10 +38,9 @@ from alpha_engine.ingestion.decoders import (
     _b58encode,
     _parse_pump_fun_trade_logs,
 )
-from alpha_engine.ingestion.svm import SVMIngester, sanitize_solana_pubkey
+from alpha_engine.ingestion.svm import SVMIngester
 from alpha_engine.models.enums import ChainIdentifier, SecurityTier, SignalSource
 from alpha_engine.models.events import (
-    PoolStateUpdateEvent,
     RawSignalEvent,
     SwapEvent,
 )

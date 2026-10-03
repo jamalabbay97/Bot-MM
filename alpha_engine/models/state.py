@@ -156,10 +156,11 @@ class SecurityReport(BaseModel):
           - Not flagged as honeypot
         """
         max_conc = 0.65 if self.is_pump_fun else 0.20
+        lp_burned_ok = True if self.is_pump_fun else (self.lp_burned_ratio >= 0.90)
         return (
             self.sell_tax_bps <= 500
             and self.buy_tax_bps <= 500
-            and self.lp_burned_ratio >= 0.90
+            and lp_burned_ok
             and self.mint_authority_disabled
             and self.top10_concentration <= max_conc
             and not self.is_honeypot
