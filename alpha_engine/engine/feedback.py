@@ -483,6 +483,10 @@ class DynamicParameterTuner:
     def current_params(self) -> DynamicHyperparameters:
         return self._params
 
+    @current_params.setter
+    def current_params(self, params: DynamicHyperparameters) -> None:
+        self._params = params
+
     def update_from_performance(
         self,
         win_rate_24h: float,

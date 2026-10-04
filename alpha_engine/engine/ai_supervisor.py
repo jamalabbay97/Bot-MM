@@ -746,10 +746,24 @@ class AlphaSupervisorAI:
         # Apply dynamic parameter tuning if available
         if self._parameter_tuner is not None and hasattr(self._parameter_tuner, "current_params"):
             dyn_p = self._parameter_tuner.current_params
-            resp.action_parameters.max_slippage_bps = dyn_p.max_slippage_bps
-            resp.action_parameters.hard_stop_loss_pct = dyn_p.hard_stop_loss_pct
-            resp.action_parameters.take_profit_ladder = dyn_p.get_take_profit_ladder()
-            resp.action_parameters.trailing_stop_activation_pct = dyn_p.trailing_stop_activation_pct
+            try:
+                new_action_params = resp.action_parameters.model_copy(
+                    update={
+                        "max_slippage_bps": dyn_p.max_slippage_bps,
+                        "hard_stop_loss_pct": dyn_p.hard_stop_loss_pct,
+                        "take_profit_ladder": dyn_p.get_take_profit_ladder(),
+                        "trailing_stop_activation_pct": dyn_p.trailing_stop_activation_pct,
+                    }
+                )
+                resp = resp.model_copy(update={"action_parameters": new_action_params})
+            except Exception:
+                try:
+                    resp.action_parameters.max_slippage_bps = dyn_p.max_slippage_bps
+                    resp.action_parameters.hard_stop_loss_pct = dyn_p.hard_stop_loss_pct
+                    resp.action_parameters.take_profit_ladder = dyn_p.get_take_profit_ladder()
+                    resp.action_parameters.trailing_stop_activation_pct = dyn_p.trailing_stop_activation_pct
+                except Exception as ex_tuner:
+                    logger.debug("Failed applying dynamic tuner parameters: %s", ex_tuner)
 
         # Construct and persist immutable DecisionRecord audit trail
         decision_type = (

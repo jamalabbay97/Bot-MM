@@ -430,6 +430,22 @@ class EngineConfig(BaseSettings):
             return cleaned if cleaned else list(default_channels)
         return list(default_channels)
 
+    @field_validator("base_fallback_rpcs", "solana_fallback_rpcs", mode="before")
+    @classmethod
+    def parse_fallback_rpcs(cls, v: Any) -> list[str]:
+        """Convert comma-separated strings or list into list[str]."""
+        if v is None:
+            return []
+        if isinstance(v, str):
+            clean = v.strip()
+            if not clean:
+                return []
+            return [rpc.strip() for rpc in clean.split(",") if rpc.strip()]
+        if isinstance(v, (list, tuple, set, Sequence)):
+            cleaned = [str(rpc).strip() for rpc in v if str(rpc).strip()]
+            return cleaned
+        return []
+
     @field_validator("dns_doh_servers", mode="before")
     @classmethod
     def parse_dns_doh_servers(cls, v: Any) -> list[str]:
@@ -504,6 +520,17 @@ class EngineConfig(BaseSettings):
                 data["solana_rpc_ws"] = data["helius_ws_url"]
             elif os.getenv("HELIUS_WS_URL") and "solana_rpc_ws" not in data:
                 data["solana_rpc_ws"] = os.environ["HELIUS_WS_URL"]
+
+            # Failover RPC list mappings
+            if "base_rpc_failover_urls" in data and "base_fallback_rpcs" not in data:
+                data["base_fallback_rpcs"] = data["base_rpc_failover_urls"]
+            elif os.getenv("BASE_RPC_FAILOVER_URLS") and "base_fallback_rpcs" not in data:
+                data["base_fallback_rpcs"] = os.environ["BASE_RPC_FAILOVER_URLS"]
+
+            if "solana_rpc_failover_urls" in data and "solana_fallback_rpcs" not in data:
+                data["solana_fallback_rpcs"] = data["solana_rpc_failover_urls"]
+            elif os.getenv("SOLANA_RPC_FAILOVER_URLS") and "solana_fallback_rpcs" not in data:
+                data["solana_fallback_rpcs"] = os.environ["SOLANA_RPC_FAILOVER_URLS"]
 
             # Initial Balances
             if os.getenv("INITIAL_SOL_BALANCE") and "initial_sol" not in data:

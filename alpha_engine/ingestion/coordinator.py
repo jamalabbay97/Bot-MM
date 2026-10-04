@@ -151,6 +151,7 @@ class IngestionCoordinator:
         enable_x_stream: bool = False,
         gatekeeper: Optional[Any] = None,
         ai_supervisor: Optional[Any] = None,
+        svm_failover_urls: Optional[Sequence[str]] = None,
     ) -> None:
         self._queue: asyncio.Queue[
             SwapEvent | PoolStateUpdateEvent | RawSignalEvent | ShutdownSentinel
@@ -172,6 +173,7 @@ class IngestionCoordinator:
             pool_registry=pool_registry,
             event_queue=self._queue,
             limiter=limiter,
+            failover_urls=list(svm_failover_urls) if svm_failover_urls else None,
         )
 
         if telegram_ingester is not None:

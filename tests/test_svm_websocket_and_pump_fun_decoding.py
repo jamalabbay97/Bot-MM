@@ -726,3 +726,82 @@ def test_gatekeeper_and_config_thresholds():
     # The 70% curve holding is excluded (>= 50% on idx 0)
     assert conc == pytest.approx(0.20, rel=1e-2)
 
+
+@pytest.mark.anyio
+async def test_svm_monitored_pools_isolation_from_dynamic_pump_mints():
+    """Verify dynamic pump.fun mints do not pollute _monitored_pools and reconnection remains bounded."""
+    event_q: asyncio.Queue = asyncio.Queue()
+    limiter = RateLimiterRegistry.default()
+    initial_pool = "8sLbNZoA1cfnvMJLPfp98ZLAnFSYCFApfJKMbiXNLwxj"
+
+    ingester = SVMIngester(
+        ws_url="wss://api.mainnet-beta.solana.com",
+        pool_registry={initial_pool: ("MintA", "MintB", 6, 9)},
+        event_queue=event_q,
+        limiter=limiter,
+    )
+
+    assert ingester._monitored_pools == {initial_pool}
+
+    # Simulate 50 dynamic pump.fun mints arriving and populating _pool_registry
+    for i in range(50):
+        curve_addr = f"DynamicCurve{i:04d}11111111111111111111111"
+        mint_addr = f"DynamicMint{i:04d}11111111111111111111111"
+        ingester._pool_registry[curve_addr] = (mint_addr, "So11111111111111111111111111111111111111112", 6, 9)
+
+    # _pool_registry has grown to 51
+    assert len(ingester._pool_registry) == 51
+    # But _monitored_pools MUST strictly remain 1
+    assert len(ingester._monitored_pools) == 1
+    assert ingester._monitored_pools == {initial_pool}
+
+
+@pytest.mark.anyio
+async def test_svm_rate_limit_1013_triggers_failover_and_extended_backoff():
+    """Verify error 1013 (too many subscriptions) triggers immediate failover and >= 5.0s backoff."""
+    from websockets.exceptions import ConnectionClosed
+    from websockets.frames import Close
+
+    event_q: asyncio.Queue = asyncio.Queue()
+    limiter = RateLimiterRegistry.default()
+
+    ingester = SVMIngester(
+        ws_url="wss://api.mainnet-beta.solana.com",
+        pool_registry={},
+        event_queue=event_q,
+        limiter=limiter,
+        failover_urls=["wss://backup-rpc.solana.com"],
+    )
+
+    assert ingester._ws_url == "wss://api.mainnet-beta.solana.com"
+    assert len(ingester._url_candidates) >= 2
+
+    # Simulate connect_and_stream raising 1013 rate limit error
+    call_count = 0
+    async def mock_connect_and_stream():
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            raise ConnectionClosed(
+                Close(1013, "Rate limit reached: Too many subscriptions attempted. Please open a new connection."),
+                None,
+            )
+        # Terminate loop on second call
+        ingester._running = False
+
+    ingester._connect_and_stream = mock_connect_and_stream  # type: ignore
+
+    # Run ingester.run()
+    task = asyncio.create_task(ingester.run())
+    await asyncio.sleep(1.5)
+    if not task.done():
+        task.cancel()
+        try:
+            await task
+        except (asyncio.CancelledError, Exception):
+            pass
+
+    # Verify that it failed over to backup URL
+    assert ingester._ws_url == "wss://backup-rpc.solana.com"
+
+

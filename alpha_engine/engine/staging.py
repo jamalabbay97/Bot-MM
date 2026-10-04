@@ -112,6 +112,52 @@ class StagedToken:
                 cnt_sell += b.sell_count
         return total_buy, total_sell, cnt_buy, cnt_sell
 
+    @property
+    def highest_price(self) -> Decimal:
+        """Alias for peak_price."""
+        return self.peak_price
+
+    @highest_price.setter
+    def highest_price(self, val: Decimal) -> None:
+        self.peak_price = val
+
+    def extract_feature_vector(self, peak_gain_multiplier: float = 1.0) -> Any:
+        """
+        Extract a normalized PatternFeatureVector from the staged token's historical metrics.
+        """
+        from alpha_engine.models.decisions import PatternFeatureVector
+
+        dip_pct = 0.0
+        ref_peak = max(self.peak_price, self.initial_price)
+        if ref_peak > Decimal("0") and self.trough_price > Decimal("0"):
+            raw_dip = float((ref_peak - self.trough_price) / ref_peak * Decimal("100"))
+            dip_pct = max(0.0, min(100.0, raw_dip))
+
+        now = time.time()
+        if self.consolidation_start_time > 0.0:
+            duration_s = max(0.0, now - self.consolidation_start_time)
+        elif self.t_staged > 0.0:
+            duration_s = max(0.0, now - self.t_staged)
+        else:
+            duration_s = 1800.0
+
+        delta = max(0.0, min(1.0, float(self.net_buy_delta)))
+        top10 = max(0.0, min(1.0, float(self.top10_concentration)))
+        surge = max(0.0, float(self.volume_surge_multiplier))
+        gain_mult = max(0.0, float(peak_gain_multiplier))
+
+        return PatternFeatureVector(
+            token_address=self.token_address,
+            consolidation_duration_s=duration_s,
+            dip_depth_pct=dip_pct,
+            volume_surge_multiplier=surge,
+            net_buy_delta=delta,
+            top10_concentration=top10,
+            liquidity_to_mc_ratio=0.20,
+            smart_wallet_inflows=5.0,
+            peak_gain_multiplier=gain_mult,
+        )
+
 
 class Wave2StagingBuffer:
     r"""
@@ -293,6 +339,10 @@ class Wave2StagingBuffer:
 
     def get_all_staged(self) -> list[StagedToken]:
         return [t for t in self._staged.values() if not t.dropped]
+
+    def get_staged_tokens(self) -> list[StagedToken]:
+        """Alias for get_all_staged returning all active staged tokens."""
+        return self.get_all_staged()
 
     def update_dev_and_holder_stats(
         self,

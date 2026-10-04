@@ -531,39 +531,81 @@ class TelegramIngester:
         """
         Safely reply to a message in DM, catching RPCError or network failures.
         Supports custom reply keyboards and inline button markups.
+        Automatically chunks messages exceeding Telegram's 4096-character limit
+        and retries in plain text if Markdown parsing fails.
         """
-        try:
-            kwargs: dict[str, Any] = {}
-            if buttons is not None:
-                kwargs["buttons"] = buttons
+        if not text:
+            return
 
-            if hasattr(event, "reply"):
-                try:
-                    res = event.reply(text, **kwargs)
-                except TypeError:
-                    res = event.reply(text)
-                if asyncio.iscoroutine(res):
-                    await res
-            elif hasattr(event, "respond"):
-                try:
-                    res = event.respond(text, **kwargs)
-                except TypeError:
-                    res = event.respond(text)
-                if asyncio.iscoroutine(res):
-                    await res
-            elif self._client is not None and hasattr(self._client, "send_message"):
-                sender_id = getattr(event, "sender_id", None)
-                if sender_id is not None:
+        # Chunk message if it exceeds Telegram's 4096 character limit
+        chunks: list[str] = []
+        max_chunk = 4000
+        if len(text) <= max_chunk:
+            chunks = [text]
+        else:
+            lines = text.split("\n")
+            curr: list[str] = []
+            curr_len = 0
+            for line in lines:
+                if curr_len + len(line) + 1 > max_chunk:
+                    chunks.append("\n".join(curr))
+                    curr = [line]
+                    curr_len = len(line)
+                else:
+                    curr.append(line)
+                    curr_len += len(line) + 1
+            if curr:
+                chunks.append("\n".join(curr))
+
+        for idx, chunk in enumerate(chunks):
+            chunk_buttons = buttons if idx == len(chunks) - 1 else None
+            kwargs: dict[str, Any] = {}
+            if chunk_buttons is not None:
+                kwargs["buttons"] = chunk_buttons
+
+            try:
+                if hasattr(event, "reply"):
                     try:
-                        res = self._client.send_message(sender_id, text, **kwargs)
+                        res = event.reply(chunk, **kwargs)
                     except TypeError:
-                        res = self._client.send_message(sender_id, text)
+                        res = event.reply(chunk)
                     if asyncio.iscoroutine(res):
                         await res
-        except RPCError as exc:
-            logger.warning("[TelegramIngester] Telethon RPC error during reply: %s", exc)
-        except Exception as exc:
-            logger.warning("[TelegramIngester] Failed to send reply: %s", exc)
+                elif hasattr(event, "respond"):
+                    try:
+                        res = event.respond(chunk, **kwargs)
+                    except TypeError:
+                        res = event.respond(chunk)
+                    if asyncio.iscoroutine(res):
+                        await res
+                elif self._client is not None and hasattr(self._client, "send_message"):
+                    sender_id = getattr(event, "sender_id", None)
+                    if sender_id is not None:
+                        try:
+                            res = self._client.send_message(sender_id, chunk, **kwargs)
+                        except TypeError:
+                            res = self._client.send_message(sender_id, chunk)
+                        if asyncio.iscoroutine(res):
+                            await res
+            except Exception as exc:
+                logger.warning("[TelegramIngester] First reply attempt failed (%s), retrying as raw text...", exc)
+                try:
+                    if hasattr(event, "reply"):
+                        res = event.reply(chunk, parse_mode=None, **kwargs)
+                        if asyncio.iscoroutine(res):
+                            await res
+                    elif hasattr(event, "respond"):
+                        res = event.respond(chunk, parse_mode=None, **kwargs)
+                        if asyncio.iscoroutine(res):
+                            await res
+                    elif self._client is not None and hasattr(self._client, "send_message"):
+                        sender_id = getattr(event, "sender_id", None)
+                        if sender_id is not None:
+                            res = self._client.send_message(sender_id, chunk, parse_mode=None, **kwargs)
+                            if asyncio.iscoroutine(res):
+                                await res
+                except Exception as final_exc:
+                    logger.warning("[TelegramIngester] Failed to send reply: %s", final_exc)
 
     async def broadcast_trade_alert(self, message: str) -> None:
         """
@@ -584,7 +626,7 @@ class TelegramIngester:
             except Exception as exc:
                 logger.warning("[TelegramIngester] Failed to send trade alert to %s: %s", chat_id, exc)
 
-    def _is_authorized(self, sender_id: Optional[int]) -> bool:
+    def _is_authorized(self, sender_id: Optional[int | str]) -> bool:
         """
         Check if sender is an authorized admin.
         If TELEGRAM_ADMIN_IDS is configured, sender must be in the whitelist.
@@ -592,7 +634,12 @@ class TelegramIngester:
         """
         if not self._admin_ids:
             return True
-        return sender_id in self._admin_ids
+        if sender_id is None:
+            return False
+        try:
+            return int(sender_id) in self._admin_ids
+        except (ValueError, TypeError):
+            return False
 
     # -------------------------------------------------------------------------
     # 1. Passive Channel Scraping Handlers (No Chat Replies)
@@ -749,6 +796,9 @@ class TelegramIngester:
         if not getattr(event, "is_private", False):
             return
 
+        if getattr(event, "out", False):
+            return
+
         sender_id = getattr(event, "sender_id", None)
         if sender_id is None:
             sender = getattr(event, "sender", None)
@@ -762,7 +812,10 @@ class TelegramIngester:
             return
 
         if sender_id is not None:
-            self._active_dm_chat_ids.add(int(sender_id))
+            try:
+                self._active_dm_chat_ids.add(int(sender_id))
+            except (ValueError, TypeError):
+                pass
 
         raw_text = getattr(event, "raw_text", getattr(event, "text", "")) or ""
         text = raw_text.strip()
@@ -779,7 +832,7 @@ class TelegramIngester:
             await self._cmd_start_help(event)
         elif first_token in ("/status", "status", "حالة", "الحالة"):
             await self._cmd_status(event)
-        elif "veto" in lower_clean or "رفض" in lower_clean or "الفيتو" in lower_clean:
+        elif first_token in ("/veto", "veto", "/vetoes", "vetoes", "فيتو", "الفيتو", "مرفوضات", "المرفوضات"):
             await self._cmd_ai(event, "vetoes")
         elif first_token in ("/ai", "/supervisor", "ai", "supervisor", "مشرف", "المشرف"):
             args = clean_text[len(clean_text.split()[0]):].strip() if len(clean_text.split()) > 1 else ""
@@ -800,21 +853,26 @@ class TelegramIngester:
                 await self._safe_reply(event, "🌊 قائمة المراقبة التجميعية (Staging buffer) غير متصلة حالياً.")
         elif first_token in ("/ask", "ask", "سؤال", "اسأل"):
             args = clean_text[len(clean_text.split()[0]):].strip() if len(clean_text.split()) > 1 else ""
+            query_to_send = args or clean_text
             if self._chat_explainer:
-                resp = await self._chat_explainer.ask(args)
+                resp = await self._chat_explainer.ask(query_to_send)
                 await self._safe_reply(event, resp)
             elif self.ai_supervisor and hasattr(self.ai_supervisor, "answer_user_query"):
-                resp = await self.ai_supervisor.answer_user_query(args)
+                resp = await self.ai_supervisor.answer_user_query(query_to_send)
                 await self._safe_reply(event, resp)
             else:
                 await self._safe_reply(event, "🤖 المساعد الذكي غير مهيأ حالياً.")
         elif first_token in ("/why", "why", "لماذا"):
             args = clean_text[len(clean_text.split()[0]):].strip() if len(clean_text.split()) > 1 else ""
-            if self._chat_explainer:
+            is_ca = bool(re.match(r"^([1-9A-HJ-NP-za-km-z]{32,44}|0x[a-fA-F0-9]{40})$", args))
+            if is_ca and self._chat_explainer:
                 resp = await self._chat_explainer.tool_why_decision(args)
                 await self._safe_reply(event, resp)
+            elif self._chat_explainer:
+                resp = await self._chat_explainer.ask(clean_text)
+                await self._safe_reply(event, resp)
             elif self.ai_supervisor and hasattr(self.ai_supervisor, "answer_user_query"):
-                resp = await self.ai_supervisor.answer_user_query(f"لماذا تم اتخاذ هذا القرار بخصوص {args}")
+                resp = await self.ai_supervisor.answer_user_query(clean_text)
                 await self._safe_reply(event, resp)
             else:
                 await self._safe_reply(event, "🤖 المساعد الذكي غير مهيأ حالياً.")
@@ -1745,7 +1803,7 @@ class TelegramIngester:
                 # Interactive DM Interface
                 self._client.add_event_handler(
                     self._handle_dm_message,
-                    events.NewMessage(func=lambda e: bool(getattr(e, "is_private", False))),
+                    events.NewMessage(incoming=True, func=lambda e: bool(getattr(e, "is_private", False))),
                 )
 
             # 4. Register Bot Commands with Telegram API so the [/] Menu button appears

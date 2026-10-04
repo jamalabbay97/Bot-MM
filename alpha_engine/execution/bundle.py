@@ -76,22 +76,18 @@ class PrivateTxRouter:
         Supports 'p50', 'p75', 'p95', 'p99'.
         Returns tip in SOL as Decimal.
         """
+        should_close = False
+        session = self._session
         try:
-            import sys
-            # Prefer httpx if mocked or available, otherwise aiohttp
-            if "httpx" in sys.modules:
-                httpx_mod = sys.modules["httpx"]
-            else:
-                import importlib
-                httpx_mod = importlib.import_module("httpx")
+            if session is None:
+                session = aiohttp.ClientSession()
+                should_close = True
 
-            async with httpx_mod.AsyncClient(timeout=2.0) as client:
-                resp = await client.get(self._jito_tip_floor_url)
-                if resp.status_code == 200:
-                    data = resp.json()
+            async with session.get(self._jito_tip_floor_url, timeout=aiohttp.ClientTimeout(total=2.0)) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
                     if isinstance(data, list) and data:
                         entry = data[0]
-                        # e.g. landed_tips_75th_percentile or landed_tips_p75
                         percentile_num = percentile.replace("p", "")
                         raw_tip = (
                             entry.get(f"landed_tips_{percentile_num}th_percentile")
@@ -99,31 +95,11 @@ class PrivateTxRouter:
                             or 0.00005
                         )
                         return Decimal(str(raw_tip))
-        except Exception:
-            try:
-                should_close = False
-                session = self._session
-                if session is None:
-                    session = aiohttp.ClientSession()
-                    should_close = True
-
-                async with session.get(self._jito_tip_floor_url, timeout=aiohttp.ClientTimeout(total=2.0)) as resp:
-                    if resp.status == 200:
-                        data = await resp.json()
-                        if isinstance(data, list) and data:
-                            entry = data[0]
-                            percentile_num = percentile.replace("p", "")
-                            raw_tip = (
-                                entry.get(f"landed_tips_{percentile_num}th_percentile")
-                                or entry.get(f"landed_tips_{percentile}")
-                                or 0.00005
-                            )
-                            return Decimal(str(raw_tip))
-            except Exception as exc:
-                logger.debug("Failed to query Jito tip floor: %s — using default", exc)
-            finally:
-                if should_close and session is not None:
-                    await session.close()
+        except Exception as exc:
+            logger.debug("Failed to query Jito tip floor via aiohttp: %s — using default", exc)
+        finally:
+            if should_close and session is not None:
+                await session.close()
 
         return Decimal("0.00005")
 

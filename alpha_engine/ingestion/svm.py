@@ -206,9 +206,22 @@ class SVMIngester:
         pool_registry: dict[str, SvmPoolMeta],
         event_queue: asyncio.Queue[SwapEvent | PoolStateUpdateEvent | RawSignalEvent | ShutdownSentinel],
         limiter: RateLimiterRegistry,
+        failover_urls: list[str] | None = None,
     ) -> None:
-        self._ws_url = ws_url
+        self._primary_ws_url = ws_url
+        candidates = [ws_url]
+        if failover_urls:
+            for u in failover_urls:
+                if u and u not in candidates:
+                    candidates.append(u)
+        if "wss://api.mainnet-beta.solana.com" not in candidates:
+            candidates.append("wss://api.mainnet-beta.solana.com")
+        self._url_candidates = candidates
+        self._url_idx = 0
+        self._ws_url = self._url_candidates[0]
+        self._consecutive_fails = 0
         self._pool_registry: dict[str, SvmPoolMeta] = dict(pool_registry)
+        self._monitored_pools: set[str] = set(pool_registry.keys())
         self._queue = event_queue
         self._limiter = limiter
         self._running = False
@@ -249,6 +262,8 @@ class SVMIngester:
             logger.debug("Cannot unsubscribe permanent infrastructure target %s", clean)
             return False
 
+        self._monitored_pools.discard(clean)
+        self._monitored_pools.discard(target)
         sub_id = self._subscriptions.remove(clean)
         self._pool_registry.pop(clean, None)
 
@@ -256,6 +271,7 @@ class SVMIngester:
             # Check if clean target is a token address mapped to a curve
             for curve, meta in list(self._pool_registry.items()):
                 if meta[0] == clean:
+                    self._monitored_pools.discard(curve)
                     self._pool_registry.pop(curve, None)
                     sub_id = self._subscriptions.remove(curve)
                     clean = curve
@@ -332,8 +348,39 @@ class SVMIngester:
                     await asyncio.sleep(0.5)
                     continue
 
+                self._consecutive_fails += 1
+                curr_url = self._ws_url
+                close_code = None
+                if hasattr(exc, "rcvd") and exc.rcvd:
+                    close_code = getattr(exc.rcvd, "code", None)
+
+                is_rate_limited = (
+                    close_code in (1013, 1008)
+                    or "429" in err_msg
+                    or "1013" in err_msg
+                    or "rate limit" in err_msg.lower()
+                    or "too many subscriptions" in err_msg.lower()
+                )
+                if len(self._url_candidates) > 1 and (is_rate_limited or self._consecutive_fails >= 2):
+                    self._url_idx = (self._url_idx + 1) % len(self._url_candidates)
+                    self._ws_url = self._url_candidates[self._url_idx]
+                    logger.warning(
+                        "SVM WebSocket rate-limited/rejected on %s (%s). Failing over to %s",
+                        curr_url,
+                        exc,
+                        self._ws_url,
+                    )
+                    await asyncio.sleep(1.0)
+                    continue
+
                 delay = self._backoff.next_delay()
-                logger.warning("SVM WebSocket ConnectionClosed/error: %s — retrying with exponential backoff in %.1fs", exc, delay)
+                if is_rate_limited:
+                    delay = max(delay, 5.0)
+                logger.warning(
+                    "SVM WebSocket ConnectionClosed/error: %s — retrying with exponential backoff in %.1fs",
+                    exc,
+                    delay,
+                )
                 await asyncio.sleep(delay)
             except asyncio.CancelledError:
                 logger.info("SVMIngester task cancelled.")
@@ -350,7 +397,8 @@ class SVMIngester:
                 pass
 
     async def _connect_and_stream(self) -> None:
-        await self._limiter.helius.acquire(cost=1.0)
+        if "helius" in self._ws_url:
+            await self._limiter.helius.acquire(cost=1.0)
 
         import ssl
         import certifi
@@ -374,9 +422,8 @@ class SVMIngester:
             max_size=10 * 1024 * 1024,
             max_queue=4096,
         ) as ws:
-            logger.info("SVM WebSocket connected to Helius")
+            logger.info("SVM WebSocket connected: %s", self._ws_url)
             self._ws = ws
-            self._backoff.reset()
             self._sub_to_pool.clear()
             self._subscriptions.clear()
 
@@ -387,7 +434,7 @@ class SVMIngester:
             self._pending_unsubs.clear()
             confirmed = 0
 
-            raw_targets = list(self._pool_registry.keys())
+            raw_targets = list(self._monitored_pools)
             if PUMP_FUN_PROGRAM_ID not in raw_targets:
                 raw_targets.append(PUMP_FUN_PROGRAM_ID)
             if RAYDIUM_AMM_PROGRAM_ID not in raw_targets:
@@ -408,8 +455,9 @@ class SVMIngester:
             if not valid_targets:
                 valid_targets = [PUMP_FUN_PROGRAM_ID, RAYDIUM_AMM_PROGRAM_ID]
 
-            # Bounded subscription safety: cap initial targets to subscription capacity
-            valid_targets = valid_targets[: self._subscriptions.max_capacity]
+            # Bounded subscription safety: cap initial targets to subscription capacity (cap at 95 on solana.com to prevent 1013 limit)
+            max_allowed = min(self._subscriptions.max_capacity, 95) if "solana.com" in self._ws_url else self._subscriptions.max_capacity
+            valid_targets = valid_targets[:max_allowed]
             expected = len(valid_targets)
             batch_size = 20
 
@@ -477,6 +525,8 @@ class SVMIngester:
                                     "SVM subscribed to all %d pool(s).",
                                     confirmed,
                                 )
+                                self._consecutive_fails = 0
+                                self._backoff.reset()
                         elif "error" in msg:
                             pool_key = self._pending_ids.pop(resp_id, "unknown")
                             logger.error(
@@ -488,6 +538,11 @@ class SVMIngester:
 
                     if msg.get("method") != "logsNotification":
                         continue
+
+                    # Healthy steady-state streaming: reset backoff and failure counter
+                    if self._consecutive_fails > 0:
+                        self._consecutive_fails = 0
+                        self._backoff.reset()
 
                     params = msg.get("params", {})
                     sub_id = params.get("subscription")

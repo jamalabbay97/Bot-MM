@@ -82,7 +82,13 @@ class TakeProfitStage(BaseModel):
 class ActionParameters(BaseModel):
     """Deterministic execution and risk parameters output by AlphaSupervisor-AI."""
 
-    model_config = _STRICT_MODEL_CFG
+    model_config = ConfigDict(
+        frozen=False,
+        arbitrary_types_allowed=True,
+        str_strip_whitespace=True,
+        validate_default=True,
+        populate_by_name=True,
+    )
 
     target_token_address: str = Field(description="Target token mint or contract address")
     recommended_position_pct: Annotated[float, Field(ge=0.0, le=10.0, description="Fractional Kelly position size clamped 0.25% - 2.0%")] = 1.0
@@ -137,7 +143,13 @@ class AISupervisorResponse(BaseModel):
     Matches the exact schema specified in the supervisory directive.
     """
 
-    model_config = _STRICT_MODEL_CFG
+    model_config = ConfigDict(
+        frozen=False,
+        arbitrary_types_allowed=True,
+        str_strip_whitespace=True,
+        validate_default=True,
+        populate_by_name=True,
+    )
 
     decision: AISupervisorDecisionEnum | str = Field(
         description="EXECUTE_BUY | EXECUTE_SELL | PASS | UPDATE_RISK_PARAMS"

@@ -341,32 +341,32 @@ class ConversationalSupervisor:
 
         # 4. Check for exit decision queries
         if any(w in lower_q for w in ("why did you exit", "explain exit", "exit decision", "/exit", "لماذا خرجت", "سبب الخروج", "شرح الخروج", "قرار الخروج")):
-            # Extract token address or trade id
-            words = [w.strip("?.,!\"'") for w in q.split()]
-            ca = words[-1] if len(words) > 1 else ""
-            for w in words:
-                if len(w) >= 32:
-                    ca = w
-                    break
-            if ca:
-                return await self.tool_explain_exit(ca)
-            return "Please provide the token address or trade ID you wish to inspect (e.g. `explain exit on 7xKX...` أو `لماذا خرجت من 7xKX...`)."
+            # Extract token address or trade id (ASCII hex / base58 / lot id only)
+            ca_match = re.search(r"\b([1-9A-HJ-NP-za-km-z]{32,44}|0x[a-fA-F0-9]{40}|[a-f0-9]{8})\b", q)
+            if ca_match:
+                return await self.tool_explain_exit(ca_match.group(1))
 
-        # 5. Check for "why did you skip / enter" queries
-        if any(w in lower_q for w in ("why did you skip", "why did you pass", "why entered", "why did you enter", "why", "/why", "skip", "skipped", "لماذا تجاوزت", "لماذا تخطيت", "لماذا اشتريت", "لماذا دخلت", "تخطي", "تجاوز", "دخول", "لماذا")):
+        # 5. Check for "why did you skip / enter" queries with specific CA
+        if any(w in lower_q for w in ("why did you skip", "why did you pass", "why entered", "why did you enter", "/why", "لماذا تجاوزت", "لماذا تخطيت", "لماذا اشتريت", "لماذا دخلت")):
             # First check full base58/hex addresses
             ca_match = re.search(r"\b([1-9A-HJ-NP-za-km-z]{32,44}|0x[a-fA-F0-9]{40})\b", q)
             if ca_match:
                 token_ca = ca_match.group(1)
                 return await self.tool_why_decision(token_ca)
-            # Check after keyword skip/enter/pass/token
-            kw_match = re.search(r"(?:skip(?:ped)?|enter(?:ed)?|pass(?:ed)?|token|on|تجاوز|تخطي|دخول|شراء)\s+([A-Za-z0-9_\-]+)", q, re.IGNORECASE)
+            # Check after keyword skip/enter/pass/token for valid alphanumeric tokens
+            kw_match = re.search(r"(?:skip(?:ped)?|enter(?:ed)?|pass(?:ed)?|token|on|تجاوز|تخطي|دخول|شراء)\s+([A-Za-z0-9_\-]{6,44})", q, re.IGNORECASE)
             if kw_match:
                 cand = kw_match.group(1).strip()
-                if cand.lower() not in ("token", "tokens", "at", "the", "on", "it", "this", "عقد", "عملة", "من"):
+                if cand.lower() not in ("token", "tokens", "at", "the", "on", "it", "this"):
                     return await self.tool_why_decision(cand)
+            # Check for short alphanumeric token/lot identifiers (ASCII only, min 6 chars)
             words = [w.strip("?.,!\"'") for w in q.split()]
-            potential_ca = [w for w in words if len(w) >= 4 and w.lower() not in ("why", "did", "you", "skip", "pass", "enter", "entered", "token", "tokens", "what", "which", "could", "لماذا", "تخطيت", "تجاوزت", "دخلت", "اشتريت")]
+            potential_ca = [
+                w for w in words
+                if len(w) >= 6
+                and re.match(r"^[A-Za-z0-9_\-]+$", w)
+                and w.lower() not in ("why", "did", "you", "skip", "pass", "enter", "entered", "token", "tokens", "what", "which", "could")
+            ]
             if potential_ca:
                 return await self.tool_why_decision(potential_ca[-1])
 
@@ -380,7 +380,10 @@ class ConversationalSupervisor:
                     pass
             if self.staging_buffer:
                 try:
-                    context["staged_tokens_count"] = len(self.staging_buffer.get_staged_tokens())
+                    if hasattr(self.staging_buffer, "get_staged_tokens"):
+                        context["staged_tokens_count"] = len(self.staging_buffer.get_staged_tokens())
+                    elif hasattr(self.staging_buffer, "get_all_staged"):
+                        context["staged_tokens_count"] = len(self.staging_buffer.get_all_staged())
                 except Exception:
                     pass
             if self.parameter_tuner and hasattr(self.parameter_tuner, "current_params"):

@@ -23,7 +23,7 @@ _MAX_BUY_TAX_BPS = 500           # 5%
 _MIN_LP_BURNED_RATIO = 0.90      # 90%
 _MAX_TOP10_CONCENTRATION = 0.20  # 20%
 _MAX_PUMP_FUN_TOP10_CONCENTRATION = 0.65  # 65% for Pump.fun tokens
-_API_TIMEOUT_S = 1.5
+_API_TIMEOUT_S = 3.5
 _MIN_SELL_RETURN_RATIO = Decimal("0.90")   # Tier 2 threshold
 MIN_LOCK_DURATION_SECONDS = 180 * 86400    # 6 months
 

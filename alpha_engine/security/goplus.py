@@ -7,6 +7,7 @@ Python 3.11+ | aiohttp
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import time
@@ -104,8 +105,9 @@ async def _fetch_goplus_report(
             payload: dict[str, Any] = await resp.json()
             result: dict[str, Any] = payload.get("result", {})
             return result.get(token_address.lower())
-    except (aiohttp.ClientError, TimeoutError) as exc:
-        logger.warning("GoPlus request failed for %s: %s", token_address, exc)
+    except (aiohttp.ClientError, TimeoutError, asyncio.TimeoutError) as exc:
+        err_detail = str(exc) if str(exc) else type(exc).__name__
+        logger.warning("GoPlus request failed for %s: %s", token_address, err_detail)
         return None
 
 

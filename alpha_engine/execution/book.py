@@ -1115,6 +1115,10 @@ class RunningMetrics:
             self.trip_circuit_breaker(f"Daily drawdown reached {self.daily_drawdown_pct:.2f}% (>= 8.0%)")
 
     @property
+    def total_realized_pnl_usd(self) -> float:
+        return float(self.cumulative_realized_usd)
+
+    @property
     def win_rate_pct(self) -> float:
         if self.total_trades == 0:
             return 0.0
@@ -1125,3 +1129,4 @@ class RunningMetrics:
         if self.gross_loss_usd == 0:
             return math.inf if self.gross_profit_usd > 0 else 0.0
         return float(self.gross_profit_usd / self.gross_loss_usd)
+

@@ -915,9 +915,13 @@ class PaperTradingEngine:
                             )
                             await ledger.record_decision(exit_decision_rec)
 
+                        realized_pnl = float(
+                            getattr(self._metrics, "cumulative_realized_usd",
+                            getattr(self._metrics, "total_realized_pnl_usd", 0.0))
+                        )
                         self._feedback.parameter_tuner.update_from_performance(
                             win_rate_24h=self._metrics.win_rate_pct,
-                            realized_pnl_usd=self._metrics.total_realized_pnl_usd,
+                            realized_pnl_usd=realized_pnl,
                             total_trades_24h=self._metrics.total_trades,
                         )
 
@@ -1522,11 +1526,28 @@ class PaperTradingEngine:
                         self._feedback.pattern_store.add_pattern(vec)
 
                 # 2. Check staged tokens against current prices to identify breakout patterns
-                staged_map = self._wave2_buffer.get_all_staged()
-                for token_addr, staged in staged_map.items():
-                    if staged.highest_price > staged.initial_price * Decimal("2.0"):
+                staged_tokens = self._wave2_buffer.get_all_staged()
+                staged_list = list(staged_tokens.values()) if isinstance(staged_tokens, dict) else list(staged_tokens)
+                for staged in staged_list:
+                    init_p = getattr(staged, "initial_price", Decimal("0"))
+                    highest_p = getattr(staged, "highest_price", getattr(staged, "peak_price", getattr(staged, "latest_price", Decimal("0"))))
+                    if init_p > Decimal("0") and highest_p > init_p * Decimal("2.0"):
                         # Staged token reached >= 2x; capture market vector
-                        vec = staged.extract_feature_vector(peak_gain_multiplier=float(staged.highest_price / staged.initial_price))
+                        gain_mult = float(highest_p / init_p)
+                        if hasattr(staged, "extract_feature_vector"):
+                            vec = staged.extract_feature_vector(peak_gain_multiplier=gain_mult)
+                        else:
+                            vec = PatternFeatureVector(
+                                token_address=getattr(staged, "token_address", ""),
+                                consolidation_duration_s=1800.0,
+                                dip_depth_pct=40.0,
+                                volume_surge_multiplier=float(getattr(staged, "volume_surge_multiplier", 2.0)),
+                                net_buy_delta=float(getattr(staged, "net_buy_delta", 0.6)),
+                                top10_concentration=float(getattr(staged, "top10_concentration", 0.2)),
+                                liquidity_to_mc_ratio=0.20,
+                                smart_wallet_inflows=5.0,
+                                peak_gain_multiplier=gain_mult,
+                            )
                         self._feedback.pattern_store.add_pattern(vec)
 
             except Exception as exc:  # noqa: BLE001
@@ -1779,9 +1800,13 @@ class PaperTradingEngine:
                                 )
                                 await self._ledger.record_decision(poller_decision_rec)
 
+                            realized_pnl = float(
+                                getattr(self._metrics, "cumulative_realized_usd",
+                                getattr(self._metrics, "total_realized_pnl_usd", 0.0))
+                            )
                             self._feedback.parameter_tuner.update_from_performance(
                                 win_rate_24h=self._metrics.win_rate_pct,
-                                realized_pnl_usd=self._metrics.total_realized_pnl_usd,
+                                realized_pnl_usd=realized_pnl,
                                 total_trades_24h=self._metrics.total_trades,
                             )
 
@@ -1900,6 +1925,17 @@ class PaperTradingEngine:
                 native_price_usd=cfg.eth_price_usd,
             )
 
+            svm_failovers = []
+            for rpc in getattr(cfg, "solana_fallback_rpcs", []):
+                if rpc.startswith("https://"):
+                    svm_failovers.append(rpc.replace("https://", "wss://"))
+                elif rpc.startswith("http://"):
+                    svm_failovers.append(rpc.replace("http://", "ws://"))
+                elif rpc.startswith("wss://"):
+                    svm_failovers.append(rpc)
+            if "wss://api.mainnet-beta.solana.com" not in svm_failovers:
+                svm_failovers.append("wss://api.mainnet-beta.solana.com")
+
             coordinator = IngestionCoordinator(
                 evm_ws_url=cfg.alchemy_ws_url,
                 svm_ws_url=cfg.helius_ws_url,
@@ -1918,6 +1954,7 @@ class PaperTradingEngine:
                 status_provider=self._get_engine_status,
                 gatekeeper=self._gatekeeper,
                 ai_supervisor=self._ai_supervisor,
+                svm_failover_urls=svm_failovers,
             )
 
             self._ai_supervisor.set_ledger(self._ledger)
