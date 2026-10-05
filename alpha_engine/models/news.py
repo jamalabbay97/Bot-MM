@@ -55,6 +55,7 @@ class NewsSignalEvent(BaseModel):
     rejection_reason: Optional[str] = None
     sentiment_score: float = 0.0
     headline: Optional[str] = None
+    narrative_cluster: Optional[str] = Field(default=None, description="Theme cluster: ai, dog, cat, political, utility, etc.")
 
 
 class NewsEvent(BaseModel):
@@ -73,6 +74,7 @@ class NewsEvent(BaseModel):
     urgency: float = 0.5
     keywords: list[str] = Field(default_factory=list)
     chain: Optional[ChainIdentifier] = None
+    narrative_cluster: Optional[str] = Field(default=None, description="Theme cluster: ai, dog, cat, political, utility, etc.")
 
     @model_validator(mode="before")
     @classmethod

@@ -15,7 +15,7 @@ from pydantic import AliasChoices, Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 # Risk and Portfolio State Machine Constants
-MAX_ACTIVE_POSITIONS: int = 3
+MAX_ACTIVE_POSITIONS: int = 4
 MAX_PORTFOLIO_EXPOSURE_PCT: float = 0.05
 MAX_PER_TOKEN_RISK_PCT: float = 0.015
 MAX_TOP10_CONCENTRATION: float = 0.20
@@ -378,6 +378,25 @@ class EngineConfig(BaseSettings):
         default=5000,
         ge=100,
         description="Max capacity for gatekeeper negative cache (default: 5000 entries)",
+    )
+
+    # -------------------------------------------------------------------------
+    # 5c. Trade Frequency & Pacing Governor Settings
+    # -------------------------------------------------------------------------
+    pacing_max_initial_trades: int = Field(
+        default=10,
+        ge=1,
+        description="Maximum initial consecutive trades before activating pacing cooldown",
+    )
+    pacing_cooldown_hours: float = Field(
+        default=4.0,
+        ge=0.0,
+        description="Mandatory cooldown in hours after completing initial trades (PACING_COOLDOWN_HOURS)",
+    )
+    pacing_interval_hours: float = Field(
+        default=3.0,
+        ge=0.0,
+        description="Cooldown in hours between subsequent paced trades (PACING_INTERVAL_HOURS)",
     )
 
     # -------------------------------------------------------------------------

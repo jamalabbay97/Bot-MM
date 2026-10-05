@@ -87,9 +87,10 @@ class HardenedSQLiteSession(SQLiteSession):
                 check_same_thread=False,
             )
             try:
-                self._conn.execute("PRAGMA busy_timeout = 30000;")
                 self._conn.execute("PRAGMA journal_mode = WAL;")
+                self._conn.execute("PRAGMA busy_timeout = 30000;")
                 self._conn.execute("PRAGMA synchronous = NORMAL;")
+                self._conn.execute("PRAGMA cache_size = -64000;")
             except Exception:
                 pass
         return self._conn.cursor()
@@ -113,9 +114,10 @@ async def _connect_aiosqlite(db_path: str):
     assert aiosqlite is not None
     conn = await aiosqlite.connect(db_path, timeout=30.0)
     try:
-        await conn.execute("PRAGMA busy_timeout = 30000;")
         await conn.execute("PRAGMA journal_mode = WAL;")
+        await conn.execute("PRAGMA busy_timeout = 30000;")
         await conn.execute("PRAGMA synchronous = NORMAL;")
+        await conn.execute("PRAGMA cache_size = -64000;")
         yield conn
     finally:
         await conn.close()
@@ -851,6 +853,19 @@ class TelegramIngester:
                 await self._safe_reply(event, resp)
             else:
                 await self._safe_reply(event, "🌊 قائمة المراقبة التجميعية (Staging buffer) غير متصلة حالياً.")
+        elif first_token in ("/revival", "revival", "انبعاث", "سوانغ"):
+            if self._chat_explainer and hasattr(self._chat_explainer, "tool_list_revival_tokens"):
+                resp = await self._chat_explainer.tool_list_revival_tokens()
+                await self._safe_reply(event, resp)
+            else:
+                await self._safe_reply(event, "🔄 محرك مراقبة الانبعاث والتجميع (RevivalBreakoutBuffer) غير متصل حالياً.")
+        elif first_token in ("/reset_governor", "/governor_reset", "reset_governor"):
+            target = self.execution_target
+            if target and hasattr(target, "reset_trade_frequency_governor"):
+                target.reset_trade_frequency_governor()
+                await self._safe_reply(event, "✅ تم إعادة ضبط حاكم وتيرة التداول (Trade Frequency Governor) بنجاح.")
+            else:
+                await self._safe_reply(event, "⚠️ محرك التداول غير متاح لإعادة ضبط الحاكم.")
         elif first_token in ("/ask", "ask", "سؤال", "اسأل"):
             args = clean_text[len(clean_text.split()[0]):].strip() if len(clean_text.split()) > 1 else ""
             query_to_send = args or clean_text

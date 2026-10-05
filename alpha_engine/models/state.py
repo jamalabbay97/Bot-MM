@@ -21,6 +21,7 @@ from pydantic import (
 from alpha_engine.models.base import _STRICT_MODEL_CFG
 from alpha_engine.models.enums import (
     ChainIdentifier,
+    ExitProfile,
     ExitStage,
     OrderSide,
     SecurityTier,
@@ -124,6 +125,7 @@ class SecurityReport(BaseModel):
     verified_source_code: bool = False
     liquidity_usd: Optional[Decimal] = None
     top10_holder_fraction: Optional[float] = None
+    dev_balance_ratio: Optional[float] = None
     external_api_raw: Optional[str] = None  # JSON string, not parsed dict
 
     @model_validator(mode="before")
@@ -338,6 +340,10 @@ class OpenPositionLot(BaseModel):
     tp1_sold: bool = False
     tp2_sold: bool = False
     trailing_sl_price: Decimal
+    exit_profile: ExitProfile = ExitProfile.FAST_SNIPE
+    peak_price: Decimal = Decimal(0)
+    tp_stage: int = 0
+    base_market_cap: Decimal = Decimal(0)
 
 
 class ExitOrder(BaseModel):

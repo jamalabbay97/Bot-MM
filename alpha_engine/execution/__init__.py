@@ -9,11 +9,13 @@ from alpha_engine.execution.book import (
     PositionBook,
     RunningMetrics,
 )
+from alpha_engine.execution.bundle import PrivateTxRouter
 from alpha_engine.execution.executor import PaperExecutor
 from alpha_engine.execution.ledger import (
     _DB_INIT_TIMEOUT_S,
     _SNAPSHOT_INTERVAL_S,
     SQLiteLedger,
+    sqlite_retry,
 )
 
 __all__ = [
@@ -22,6 +24,8 @@ __all__ = [
     "RunningMetrics",
     "PaperExecutor",
     "SQLiteLedger",
+    "sqlite_retry",
+    "PrivateTxRouter",
     "_DB_INIT_TIMEOUT_S",
     "_SNAPSHOT_INTERVAL_S",
 ]

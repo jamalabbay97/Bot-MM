@@ -14,7 +14,7 @@ from collections import defaultdict
 from dataclasses import dataclass, field
 from decimal import Decimal
 from typing import Optional
-from alpha_engine.models.enums import ChainIdentifier, ExitStage, LotStatus, TradeExitReason
+from alpha_engine.models.enums import ChainIdentifier, ExitProfile, ExitStage, LotStatus, TradeExitReason
 from alpha_engine.models.state import PaperFill
 
 logger = logging.getLogger(__name__)
@@ -64,6 +64,16 @@ class OpenLot:
     ai_time_exit_minutes: Optional[float] = None
     ai_tp1_sold: bool = False
     ai_tp2_sold: bool = False
+    narrative_cluster: Optional[str] = None
+    tick_prices_5m: list[tuple[float, Decimal]] = field(default_factory=list)
+    tick_returns_5m: list[tuple[float, float]] = field(default_factory=list)
+    exit_profile: ExitProfile = ExitProfile.FAST_SNIPE
+    tp_stage: int = 0
+    base_market_cap: Decimal = Decimal(0)
+    token_age_hours: float = 0.0
+    consolidation_length_hours: float = 0.0
+    volume_surge_multiplier: float = 0.0
+    net_buy_delta: float = 0.0
 
     def record_tick(
         self,
@@ -72,7 +82,7 @@ class OpenLot:
         timestamp_s: float = 0.0,
         is_sell: bool = False,
     ) -> None:
-        """Record price and volume into the moving window (pruning older than 30s)."""
+        """Record price and volume into the moving window (pruning older than 30s) and 5m rolling return buffer."""
         import time
         ts = timestamp_s if timestamp_s > 0 else time.time()
         self.price_history.append((ts, price, volume_native))
@@ -84,6 +94,42 @@ class OpenLot:
             cutoff = ts - 30.0
             filtered = [entry for entry in self.price_history if entry[0] >= cutoff]
             self.price_history = filtered if len(filtered) >= 5 else self.price_history[-20:]
+
+        # Rolling 5-minute (300s) tick price and return tracking
+        if self.tick_prices_5m:
+            prev_price = self.tick_prices_5m[-1][1]
+            if prev_price > Decimal(0):
+                ret = float((price - prev_price) / prev_price)
+                self.tick_returns_5m.append((ts, ret))
+        self.tick_prices_5m.append((ts, price))
+
+        cutoff_5m = ts - 300.0
+        self.tick_prices_5m = [p for p in self.tick_prices_5m if p[0] >= cutoff_5m]
+        self.tick_returns_5m = [r for r in self.tick_returns_5m if r[0] >= cutoff_5m]
+
+    def get_tick_returns_5m(self) -> list[float]:
+        """Return rolling 5-minute tick returns as a list of float values."""
+        if self.tick_returns_5m:
+            return [r[1] for r in self.tick_returns_5m]
+        if len(self.tick_prices_5m) >= 2:
+            return [
+                float((self.tick_prices_5m[i][1] - self.tick_prices_5m[i - 1][1]) / self.tick_prices_5m[i - 1][1])
+                for i in range(1, len(self.tick_prices_5m))
+                if self.tick_prices_5m[i - 1][1] > Decimal(0)
+            ]
+        if len(self.price_history) >= 2:
+            return [
+                float((self.price_history[i][1] - self.price_history[i - 1][1]) / self.price_history[i - 1][1])
+                for i in range(1, len(self.price_history))
+                if self.price_history[i - 1][1] > Decimal(0)
+            ]
+        return []
+
+    def get_tick_prices_5m(self) -> list[float]:
+        """Return rolling 5-minute tick prices as a list of float values."""
+        if self.tick_prices_5m:
+            return [float(p[1]) for p in self.tick_prices_5m]
+        return [float(p[1]) for p in self.price_history]
 
     def get_moving_vwap(self) -> Decimal:
         """Calculate Volume-Weighted Average Price across recent moving window."""
@@ -146,6 +192,7 @@ class ExitDecision:
     current_price: Decimal = Decimal(0)
     pnl_estimate_native: Decimal = Decimal(0)
     prioritized: bool = False
+    action: str = "CLOSE"
 
 
 @dataclass
@@ -159,6 +206,32 @@ class PositionBook:
         default_factory=lambda: defaultdict(list)
     )
 
+    @staticmethod
+    def compute_pearson_correlation(series_x: list[float], series_y: list[float]) -> float:
+        """
+        Compute Pearson correlation coefficient r between two return series.
+        r = Cov(X, Y) / (sigma_X * sigma_Y)
+        Returns 0.0 if length < 2 or variance is zero.
+        """
+        n = min(len(series_x), len(series_y))
+        if n < 2:
+            return 0.0
+        x = [float(v) for v in series_x[-n:]]
+        y = [float(v) for v in series_y[-n:]]
+
+        mean_x = sum(x) / n
+        mean_y = sum(y) / n
+
+        cov = sum((xi - mean_x) * (yi - mean_y) for xi, yi in zip(x, y))
+        var_x = sum((xi - mean_x) ** 2 for xi in x)
+        var_y = sum((yi - mean_y) ** 2 for yi in y)
+
+        denom = math.sqrt(var_x * var_y)
+        if denom <= 1e-12:
+            return 0.0
+        r = cov / denom
+        return max(-1.0, min(1.0, r))
+
     def can_open_position(
         self,
         token_address: str,
@@ -166,13 +239,18 @@ class PositionBook:
         allocated_cost_native: Decimal,
         total_equity_native: Decimal,
         pool_address: str = "",
+        narrative_cluster: Optional[str] = None,
+        candidate_ticks: Optional[list[Decimal | float]] = None,
+        candidate_returns: Optional[list[float]] = None,
     ) -> tuple[bool, str]:
         """
         Enforce Strict Portfolio State Machine & Dynamic Risk Gating:
         1. Atomic concurrency check: duplicate position lot rejection for mint or curve address.
-        2. MAX_ACTIVE_POSITIONS = 3 hard cap.
-        3. MAX_PER_TOKEN_RISK_PCT = 1.5% max capital per signal.
-        4. MAX_PORTFOLIO_EXPOSURE_PCT = 5% max capital across all open lots.
+        2. Narrative Diversification: reject if an active position shares the same narrative cluster.
+        3. Cross-Asset Correlation: reject if Pearson correlation r > 0.80 with any active open lot (>=20 ticks).
+        4. MAX_ACTIVE_POSITIONS = 3 hard cap.
+        5. MAX_PER_TOKEN_RISK_PCT = 1.5% max capital per signal.
+        6. MAX_PORTFOLIO_EXPOSURE_PCT = 5% max capital across all open lots.
         """
         if self.is_position_open(token_address, chain):
             return False, f"Duplicate position already open for token {token_address[:10]}"
@@ -186,6 +264,57 @@ class PositionBook:
                         and lot.pool_address.lower() == pool_address.lower()
                     ):
                         return False, f"Duplicate position already open for curve {pool_address[:10]}"
+
+        # Narrative cluster conflict check (ensure no two active positions share same cluster)
+        if narrative_cluster:
+            cluster_clean = narrative_cluster.strip().lower()
+            if cluster_clean:
+                for lots in self._lots.values():
+                    for lot in lots:
+                        if (
+                            lot.tokens_held > 0
+                            and lot.status in (
+                                LotStatus.OPEN,
+                                LotStatus.PENDING_BUY,
+                                LotStatus.PENDING_SELL,
+                            )
+                            and lot.narrative_cluster
+                            and lot.narrative_cluster.strip().lower() == cluster_clean
+                        ):
+                            return (
+                                False,
+                                f"Narrative cluster conflict: active position already open in cluster '{narrative_cluster}' ({lot.token_address[:10]})",
+                            )
+
+        # Cross-asset rolling return correlation check (Pearson r > 0.80 threshold)
+        cand_rets: list[float] = []
+        if candidate_returns is not None:
+            cand_rets = [float(r) for r in candidate_returns]
+        elif candidate_ticks is not None and len(candidate_ticks) >= 2:
+            t_floats = [float(p) for p in candidate_ticks]
+            cand_rets = [
+                (t_floats[i] - t_floats[i - 1]) / t_floats[i - 1]
+                for i in range(1, len(t_floats))
+                if t_floats[i - 1] != 0
+            ]
+
+        # Check if >= 20 tick points exist (giving >= 19 returns) or >= 20 returns
+        if (len(cand_rets) >= 19 and (candidate_ticks is not None and len(candidate_ticks) >= 20)) or len(cand_rets) >= 20:
+            for lots in self._lots.values():
+                for lot in lots:
+                    if lot.tokens_held > 0 and lot.status in (
+                        LotStatus.OPEN,
+                        LotStatus.PENDING_BUY,
+                        LotStatus.PENDING_SELL,
+                    ):
+                        lot_rets = lot.get_tick_returns_5m()
+                        if len(lot_rets) >= 19:
+                            r = self.compute_pearson_correlation(cand_rets, lot_rets)
+                            if r > 0.80:
+                                return (
+                                    False,
+                                    f"Cross-asset correlation r={r:.4f} exceeds 0.80 threshold with active lot {lot.token_address[:10]}",
+                                )
 
         if self.open_position_count() >= MAX_ACTIVE_POSITIONS:
             return (
@@ -229,11 +358,20 @@ class PositionBook:
         ai_hard_stop_loss_pct: Optional[float] = None,
         ai_trailing_stop_activation_pct: Optional[float] = None,
         ai_time_exit_minutes: Optional[float] = None,
+        narrative_cluster: Optional[str] = None,
+        exit_profile: ExitProfile = ExitProfile.FAST_SNIPE,
+        base_market_cap: Decimal = Decimal(0),
+        tp_stage: int = 0,
+        token_age_hours: float = 0.0,
+        consolidation_length_hours: float = 0.0,
+        volume_surge_multiplier: float = 0.0,
+        net_buy_delta: float = 0.0,
     ) -> OpenLot:
         if fill.effective_price <= Decimal(0):
             raise ValueError(
                 f"Cannot open lot for {fill.token_address} with non-positive fill price: {fill.effective_price}"
             )
+        entry_ts = fill.fill_timestamp_ns / 1e9 if fill.fill_timestamp_ns > 0 else 0.0
         lot = OpenLot(
             token_address=fill.token_address,
             chain=fill.chain,
@@ -258,18 +396,29 @@ class PositionBook:
             ai_hard_stop_loss_pct=ai_hard_stop_loss_pct,
             ai_trailing_stop_activation_pct=ai_trailing_stop_activation_pct,
             ai_time_exit_minutes=ai_time_exit_minutes,
-            price_history=[(fill.fill_timestamp_ns / 1e9 if fill.fill_timestamp_ns > 0 else 0.0, fill.effective_price, fill.simulated_native_spent)],
+            narrative_cluster=narrative_cluster,
+            exit_profile=exit_profile,
+            base_market_cap=base_market_cap,
+            tp_stage=tp_stage,
+            token_age_hours=token_age_hours,
+            consolidation_length_hours=consolidation_length_hours,
+            volume_surge_multiplier=volume_surge_multiplier,
+            net_buy_delta=net_buy_delta,
+            price_history=[(entry_ts, fill.effective_price, fill.simulated_native_spent)],
+            tick_prices_5m=[(entry_ts, fill.effective_price)],
+            tick_returns_5m=[],
         )
         key = (fill.chain.value, fill.token_address)
         self._lots[key].append(lot)
         logger.debug(
-            "Opened lot %s: %s tokens of %s @ %s native (reserve=%s, status=%s)",
+            "Opened lot %s: %s tokens of %s @ %s native (reserve=%s, status=%s, cluster=%s)",
             lot.lot_id[:8],
             lot.tokens_held,
             lot.token_address[:10],
             lot.entry_price,
             lot.last_pool_reserve_native,
             lot.status.value,
+            lot.narrative_cluster,
         )
         return lot
 
@@ -509,6 +658,133 @@ class PositionBook:
             lot.last_pool_reserve_native = current_pool_reserve_native
 
         gain_ratio = current_price / lot.entry_price
+
+        # --- REVIVAL & CTO BREAKOUT SWING EXIT PROFILE ---
+        if lot.exit_profile == ExitProfile.REVIVAL_SWING:
+            pnl_pct = (current_price - lot.entry_price) / lot.entry_price if lot.entry_price > 0 else Decimal(0)
+
+            # 1. 35% ATH Trailing Drawdown Exit:
+            # Liquidate 100% of remaining position if price drops >= 35% from the peak observed price
+            if lot.peak_price > Decimal(0):
+                drawdown = (lot.peak_price - current_price) / lot.peak_price
+                if drawdown >= Decimal("0.35"):
+                    logger.info(
+                        "35%% ATH TRAILING DRAWDOWN EXIT for lot %s (%s): peak=%s, curr=%s, drawdown=%.2f%% (>= 35%%). Liquidating 100%% of remaining lot.",
+                        lot.lot_id[:8],
+                        lot.token_address[:10],
+                        lot.peak_price,
+                        current_price,
+                        float(drawdown * 100),
+                    )
+                    return ExitDecision(
+                        lot_id=lot.lot_id,
+                        token_address=lot.token_address,
+                        chain=lot.chain,
+                        should_exit=True,
+                        exit_reason=TradeExitReason.TRAILING_PEAK_DRAWDOWN_35PCT,
+                        exit_stage=ExitStage.SL,
+                        tokens_to_sell=lot.tokens_held,
+                        current_price=current_price,
+                        pnl_estimate_native=lot.tokens_held * (current_price - lot.entry_price),
+                        prioritized=True,
+                        action="CLOSE_ALL",
+                    )
+
+            # 2. Laddered Take-Profit (50% at +100%, 50% at +200%, 50% at +400%, 50% at +800%)
+            # Stage 0 -> Stage 1: Sell 50% of remaining at +100% (2x)
+            if pnl_pct >= Decimal("1.00") and lot.tp_stage == 0:
+                target_sell = (lot.tokens_held * Decimal("0.50")).quantize(Decimal("1e-18"))
+                qty = target_sell if target_sell > 0 else lot.tokens_held
+                lot.tp_stage = 1
+                logger.info(
+                    "REVIVAL SWING TP1 (+100%%): Lot %s sold 50%% of remaining tokens (%s tokens)",
+                    lot.lot_id[:8],
+                    qty,
+                )
+                return ExitDecision(
+                    lot_id=lot.lot_id,
+                    token_address=lot.token_address,
+                    chain=lot.chain,
+                    should_exit=True,
+                    exit_reason=TradeExitReason.TP_2X,
+                    exit_stage=ExitStage.TP1,
+                    tokens_to_sell=qty,
+                    current_price=current_price,
+                    pnl_estimate_native=qty * (current_price - lot.entry_price),
+                    action="PARTIAL",
+                )
+
+            # Stage 1 -> Stage 2: Sell 50% of remaining at +200% (3x)
+            if pnl_pct >= Decimal("2.00") and lot.tp_stage == 1:
+                target_sell = (lot.tokens_held * Decimal("0.50")).quantize(Decimal("1e-18"))
+                qty = target_sell if target_sell > 0 else lot.tokens_held
+                lot.tp_stage = 2
+                logger.info(
+                    "REVIVAL SWING TP2 (+200%%): Lot %s sold 50%% of remaining tokens (%s tokens)",
+                    lot.lot_id[:8],
+                    qty,
+                )
+                return ExitDecision(
+                    lot_id=lot.lot_id,
+                    token_address=lot.token_address,
+                    chain=lot.chain,
+                    should_exit=True,
+                    exit_reason=TradeExitReason.TP_3X,
+                    exit_stage=ExitStage.TP2,
+                    tokens_to_sell=qty,
+                    current_price=current_price,
+                    pnl_estimate_native=qty * (current_price - lot.entry_price),
+                    action="PARTIAL",
+                )
+
+            # Stage 2 -> Stage 3: Sell 50% of remaining at +400% (5x)
+            if pnl_pct >= Decimal("4.00") and lot.tp_stage == 2:
+                target_sell = (lot.tokens_held * Decimal("0.50")).quantize(Decimal("1e-18"))
+                qty = target_sell if target_sell > 0 else lot.tokens_held
+                lot.tp_stage = 3
+                logger.info(
+                    "REVIVAL SWING TP3 (+400%%): Lot %s sold 50%% of remaining tokens (%s tokens)",
+                    lot.lot_id[:8],
+                    qty,
+                )
+                return ExitDecision(
+                    lot_id=lot.lot_id,
+                    token_address=lot.token_address,
+                    chain=lot.chain,
+                    should_exit=True,
+                    exit_reason=TradeExitReason.TP_5X,
+                    exit_stage=ExitStage.TP3,
+                    tokens_to_sell=qty,
+                    current_price=current_price,
+                    pnl_estimate_native=qty * (current_price - lot.entry_price),
+                    action="PARTIAL",
+                )
+
+            # Stage 3 -> Stage 4: Sell 50% of remaining at +800% (9x)
+            if pnl_pct >= Decimal("8.00") and lot.tp_stage == 3:
+                target_sell = (lot.tokens_held * Decimal("0.50")).quantize(Decimal("1e-18"))
+                qty = target_sell if target_sell > 0 else lot.tokens_held
+                lot.tp_stage = 4
+                logger.info(
+                    "REVIVAL SWING TP4 (+800%%): Lot %s sold 50%% of remaining tokens (%s tokens)",
+                    lot.lot_id[:8],
+                    qty,
+                )
+                return ExitDecision(
+                    lot_id=lot.lot_id,
+                    token_address=lot.token_address,
+                    chain=lot.chain,
+                    should_exit=True,
+                    exit_reason=TradeExitReason.TP_10X,
+                    exit_stage=ExitStage.TP4,
+                    tokens_to_sell=qty,
+                    current_price=current_price,
+                    pnl_estimate_native=qty * (current_price - lot.entry_price),
+                    action="PARTIAL",
+                )
+
+            # Completely bypass short-term 120s velocity decay and scalping exits
+            return None
 
         # --- BONDING-CURVE TUNED EXITS ---
         if is_bc:
@@ -998,7 +1274,7 @@ class PositionBook:
             target_lot.exit_stage = decision.exit_stage
             if decision.exit_reason == TradeExitReason.TP_25:
                 target_lot.scaled_out_50_pct = True
-            if target_lot.tokens_held <= Decimal("1e-18"):
+            if getattr(decision, "action", "") == "CLOSE_ALL" or target_lot.tokens_held <= Decimal("1e-18"):
                 target_lot.status = LotStatus.CLOSED
                 if target_lot in lots:
                     lots.remove(target_lot)

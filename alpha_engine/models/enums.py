@@ -73,6 +73,25 @@ class NewsSignalStatus(str, Enum):
     BOT_FARM_FLAGGED = "bot_farm_flagged"     # Flagged by engagement velocity / anti-sybil
 
 
+class StrategyType(str, Enum):
+    """Categorical classification of trading strategy."""
+
+    FAST_SNIPE = "fast_snipe"
+    WAVE2_BREAKOUT = "wave2_breakout"
+    REVIVAL_SWING = "revival_swing"
+
+
+class ExitProfile(str, Enum):
+    """
+    Position exit profile and risk management regime.
+    FAST_SNIPE: Short-lived scalps (120s velocity decay, -25% SL, +25%/+50% TP).
+    REVIVAL_SWING: Multi-hour/day hold, 35% trailing ATH drawdown, +100%/+200%/+400%/+800% ladder.
+    """
+
+    FAST_SNIPE = "FAST_SNIPE"            # Existing 120s velocity decay, -25% SL, +25%/+50% TP
+    REVIVAL_SWING = "REVIVAL_SWING"      # Multi-hour/day hold, 35% trailing drawdown, 100%/200% TP ladder
+
+
 class SignalSource(str, Enum):
     """Origin of a generated trading signal."""
 
@@ -84,6 +103,7 @@ class SignalSource(str, Enum):
     PAIR_CREATED = "pair_created"
     DYNAMIC_EXIT = "dynamic_exit"
     WAVE2_BREAKOUT = "wave2_breakout"
+    REVIVAL_BREAKOUT = "revival_breakout"
 
 
 class LotStatus(str, Enum):
@@ -123,6 +143,7 @@ class TradeExitReason(str, Enum):
     SL_INITIAL = "sl_initial"                      # Hard stop-loss (-8% / -15%)
     SL_HARD = "sl_hard"                            # Alias for hard stop-loss
     SL_TRAILING = "sl_trailing"                    # Trailing stop
+    TRAILING_PEAK_DRAWDOWN_35PCT = "trailing_peak_drawdown_35pct"  # Multi-day swing: 35% drawdown from ATH peak
     TIMEOUT_VELOCITY_DECAY = "timeout_velocity_decay"  # Duration > 120s and PnL < +3%
     TIMEOUT = "timeout"                            # Alias for timeout decay
     SLIPPAGE_INSOLVENCY = "slippage_insolvency"    # Curve cannot absorb without > 15% price collapse

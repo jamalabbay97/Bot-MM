@@ -8,13 +8,16 @@ Python 3.11+ | aiosqlite + asyncio
 from __future__ import annotations
 
 import asyncio
+import functools
 import json
 import logging
 import math
+import random
+import sqlite3
 import time
 from decimal import Decimal
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Callable, Coroutine, Optional, TypeVar
 
 import aiosqlite
 
@@ -27,6 +30,42 @@ logger = logging.getLogger(__name__)
 
 _DB_INIT_TIMEOUT_S = 10.0
 _SNAPSHOT_INTERVAL_S = 60.0
+
+F = TypeVar("F", bound=Callable[..., Coroutine[Any, Any, Any]])
+
+
+def sqlite_retry(max_retries: int = 5, base_delay: float = 0.1) -> Callable[[F], F]:
+    """
+    Async retry decorator with exponential backoff and jitter
+    specifically catching sqlite3.OperationalError when the database is locked or busy.
+    """
+    def decorator(func: F) -> F:
+        @functools.wraps(func)
+        async def wrapper(*args: Any, **kwargs: Any) -> Any:
+            last_exc = None
+            for attempt in range(max_retries + 1):
+                try:
+                    return await func(*args, **kwargs)
+                except sqlite3.OperationalError as exc:
+                    err_msg = str(exc).lower()
+                    if ("locked" in err_msg or "busy" in err_msg) and attempt < max_retries:
+                        last_exc = exc
+                        jitter = random.uniform(0.5, 1.5)
+                        delay = base_delay * (2 ** attempt) * jitter
+                        logger.warning(
+                            "SQLite busy/locked in %s (attempt %d/%d), retrying in %.3fs: %s",
+                            getattr(func, "__name__", str(func)),
+                            attempt + 1,
+                            max_retries,
+                            exc,
+                        )
+                        await asyncio.sleep(delay)
+                    else:
+                        raise
+            if last_exc is not None:
+                raise last_exc
+        return wrapper  # type: ignore[return-value]
+    return decorator
 
 
 class SQLiteLedger:
@@ -160,6 +199,11 @@ class SQLiteLedger:
         await self._initialise()
         return self
 
+    async def initialize(self) -> "SQLiteLedger":
+        """Explicitly open connection and initialize database schema and PRAGMAs."""
+        return await self.__aenter__()
+
+    @sqlite_retry(max_retries=5, base_delay=0.1)
     async def checkpoint(self) -> None:
         """
         Explicitly checkpoint the Write-Ahead Log (WAL) into the main database.
@@ -178,14 +222,19 @@ class SQLiteLedger:
             await self._conn.close()
             self._conn = None
 
+    async def close(self) -> None:
+        """Explicitly checkpoint and close connection."""
+        await self.__aexit__(None, None, None)
+
+    @sqlite_retry(max_retries=5, base_delay=0.1)
     async def _initialise(self) -> None:
         conn = self._conn
         assert conn is not None, "Database not connected."
-        await conn.execute("PRAGMA journal_mode=WAL;")
-        await conn.execute("PRAGMA busy_timeout=30000;")
-        await conn.execute("PRAGMA synchronous=NORMAL;")
-        await conn.execute("PRAGMA cache_size=-8000;")
-        await conn.execute("PRAGMA temp_store=MEMORY;")
+        await conn.execute("PRAGMA journal_mode = WAL;")
+        await conn.execute("PRAGMA busy_timeout = 30000;")
+        await conn.execute("PRAGMA synchronous = NORMAL;")
+        await conn.execute("PRAGMA cache_size = -64000;")
+        await conn.execute("PRAGMA temp_store = MEMORY;")
         await conn.execute(self._CREATE_TRADES)
         await conn.execute(self._CREATE_SIGNALS)
         await conn.execute(self._CREATE_SNAPSHOTS)
@@ -205,6 +254,7 @@ class SQLiteLedger:
         await conn.commit()
         logger.info("SQLite ledger initialised at %s (WAL mode)", self._db_path)
 
+    @sqlite_retry(max_retries=5, base_delay=0.1)
     async def record_trade(self, record: TradeRecord) -> None:
         conn = self._conn
         if conn is None:
@@ -241,6 +291,7 @@ class SQLiteLedger:
         await conn.commit()
         logger.debug("Trade %s recorded in ledger.", record.trade_id[:8])
 
+    @sqlite_retry(max_retries=5, base_delay=0.1)
     async def record_signal(self, signal: SignalEvent) -> None:
         conn = self._conn
         if conn is None:
@@ -271,6 +322,7 @@ class SQLiteLedger:
         )
         await conn.commit()
 
+    @sqlite_retry(max_retries=5, base_delay=0.1)
     async def record_snapshot(self, snapshot: PortfolioSnapshot) -> None:
         conn = self._conn
         if conn is None:
@@ -302,6 +354,7 @@ class SQLiteLedger:
         )
         await conn.commit()
 
+    @sqlite_retry(max_retries=5, base_delay=0.1)
     async def get_closed_trade_stats(self) -> dict[str, Any]:
         conn = self._conn
         if conn is None:
@@ -340,6 +393,7 @@ class SQLiteLedger:
             "total_trades": total,
         }
 
+    @sqlite_retry(max_retries=5, base_delay=0.1)
     async def record_lot_transition(
         self,
         lot_id: str,
@@ -373,6 +427,7 @@ class SQLiteLedger:
         await conn.commit()
         logger.debug("Recorded lot lifecycle transition: %s -> %s (reason=%s)", lot_id[:8], status_val, reason_val)
 
+    @sqlite_retry(max_retries=5, base_delay=0.1)
     async def get_daily_loss_streak(self) -> int:
         """Count current consecutive loss streak from trades ledger."""
         conn = self._conn
@@ -398,6 +453,7 @@ class SQLiteLedger:
                 break
         return streak
 
+    @sqlite_retry(max_retries=5, base_delay=0.1)
     async def get_rolling_daily_pnl_usd(self) -> Decimal:
         """Calculate rolling 24h realized PnL in USD."""
         conn = self._conn
@@ -414,6 +470,7 @@ class SQLiteLedger:
             row = await cursor.fetchone()
         return Decimal(str(row[0])) if row and row[0] is not None else Decimal(0)
 
+    @sqlite_retry(max_retries=5, base_delay=0.1)
     async def get_daily_drawdown_pct(self) -> float:
         """Calculate maximum rolling daily drawdown percentage from portfolio snapshots."""
         conn = self._conn
@@ -445,6 +502,7 @@ class SQLiteLedger:
                     max_dd = dd
         return max_dd
 
+    @sqlite_retry(max_retries=5, base_delay=0.1)
     async def record_decision(self, record: DecisionRecord) -> None:
         """
         Record an immutable structured decision record into the SQLite ledger
@@ -523,6 +581,7 @@ class SQLiteLedger:
         except Exception as exc:
             logger.warning("Could not write to jsonl file %s: %s", self._jsonl_path, exc)
 
+    @sqlite_retry(max_retries=5, base_delay=0.1)
     async def get_decisions(
         self,
         token_address: Optional[str] = None,
@@ -596,6 +655,7 @@ class SQLiteLedger:
         """Fetch all chronological decisions for a specific token mint/contract."""
         return await self.get_decisions(token_address=token_address, limit=limit)
 
+    @sqlite_retry(max_retries=5, base_delay=0.1)
     async def get_decision_stats(self, lookback_hours: float = 12.0, hours: Optional[float] = None) -> dict[str, Any]:
         """
         Aggregate decision metrics, strategy win rates, skip vs enter ratios
@@ -682,6 +742,7 @@ class SQLiteLedger:
             "strategy_performance": strat_perf,
         }
 
+    @sqlite_retry(max_retries=5, base_delay=0.1)
     async def record_pattern_vector(self, vector: PatternFeatureVector) -> None:
         """Store or update a breakout pattern feature vector in the pattern memory store."""
         conn = self._conn
@@ -710,6 +771,7 @@ class SQLiteLedger:
         await conn.commit()
         logger.debug("Recorded pattern vector for %s (gain=%.2fx)", vector.token_address[:10], vector.peak_gain_multiplier)
 
+    @sqlite_retry(max_retries=5, base_delay=0.1)
     async def get_pattern_vectors(self, limit: int = 100) -> list[PatternFeatureVector]:
         """Retrieve recent historical breakout pattern feature vectors."""
         conn = self._conn
@@ -756,3 +818,11 @@ class SQLiteLedger:
             except Exception as exc:
                 logger.debug("Error parsing PatternFeatureVector: %s", exc)
         return results
+
+
+__all__ = [
+    "SQLiteLedger",
+    "sqlite_retry",
+    "_DB_INIT_TIMEOUT_S",
+    "_SNAPSHOT_INTERVAL_S",
+]

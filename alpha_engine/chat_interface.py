@@ -51,10 +51,12 @@ class ConversationalSupervisor:
         parameter_tuner: Optional[Any] = None,
         metrics: Optional[Any] = None,
         ai_supervisor: Optional[Any] = None,
+        revival_buffer: Optional[Any] = None,
     ) -> None:
         self.ledger = ledger
         self.supervisor = supervisor or ai_supervisor
         self.staging_buffer = staging_buffer
+        self.revival_buffer = revival_buffer
         self.position_book = position_book
         self.parameter_tuner = parameter_tuner
         self.metrics = metrics
@@ -225,6 +227,36 @@ class ConversationalSupervisor:
 
         return f"ℹ️ No specific exit event found for `{clean_id}`."
 
+    async def tool_list_revival_tokens(self) -> str:
+        """
+        List all tokens currently buffered in the RevivalBreakoutBuffer
+        monitoring aged tokens (2h to 10d) breaking out from consolidation.
+        """
+        if self.revival_buffer is None:
+            return "⚠️ Revival Breakout Buffer is not initialized on this engine instance (مخزن مراقبة الانبعاث غير مهيأ)."
+
+        staged_dict = self.revival_buffer.get_all_staged()
+        if not staged_dict:
+            return "📭 **Revival Breakout Buffer:** No aged tokens currently undergoing dormancy/revival monitoring."
+
+        lines = [f"### 🔄 Active Revival & CTO Breakout Watchlist ({len(staged_dict)} Tokens)\n"]
+        lines.append("| Token Mint | Age (h) | 5m Vol ($) | Vol Surge | Buy Delta | 5m RSI | Base Price | Current Price | Status |")
+        lines.append("| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |")
+
+        for addr, tok in staged_dict.items():
+            mint_short = f"`{tok.token_address[:8]}...`"
+            age_h = tok.token_age_hours
+            vol_5m = float(tok.five_min_volume)
+            surge = tok.volume_surge_multiplier
+            buy_delta = tok.net_buy_delta * 100
+            rsi = tok.compute_5m_rsi(14)
+            bp = f"{float(tok.consolidation_base_price):.8f}"
+            cp = f"{float(tok.latest_price):.8f}"
+            status = "🚨 SURGE" if tok.surge_detected else ("💤 DORMANT" if tok.dormant_detected else "MONITORING")
+            lines.append(f"| {mint_short} | {age_h:.1f}h | ${vol_5m:,.0f} | {surge:.1f}x | {buy_delta:.0f}% | {rsi:.1f} | {bp} | {cp} | {status} |")
+
+        return "\n".join(lines)
+
     async def tool_override_parameter(self, command_text: str, value: Any = None) -> str:
         """
         Execute interactive supervisory overrides:
@@ -331,6 +363,10 @@ class ConversationalSupervisor:
             or ("مراقبة" in lower_q and any(k in lower_q for k in ("قائمة", "عرض", "ما هي", "العملات")))
         ):
             return await self.tool_list_staged_tokens()
+
+        # 2b. Check for revival breakout buffer
+        if any(w in lower_q for w in ("revival", "cto", "swing", "/revival", "انبعاث", "سوانغ")):
+            return await self.tool_list_revival_tokens()
 
         # 3. Check for strategy performance / best pattern
         if any(w in lower_q for w in ("highest win rate", "best strategy", "best pattern", "strategy performance", "win rate", "/perf", "أعلى نسبة فوز", "أفضل استراتيجية", "أداء الاستراتيجية", "نسبة الفوز", "أفضل نمط")):

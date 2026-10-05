@@ -209,6 +209,16 @@ class IngestionCoordinator:
             self._x_stream = None
 
         self._tasks: list[asyncio.Task[None]] = []
+        self._screening_semaphore = asyncio.Semaphore(10)
+        self._background_tasks: set[asyncio.Task[Any]] = set()
+
+    @property
+    def screening_semaphore(self) -> asyncio.Semaphore:
+        return self._screening_semaphore
+
+    @property
+    def background_tasks(self) -> set[asyncio.Task[Any]]:
+        return self._background_tasks
 
     @property
     def event_queue(
@@ -280,8 +290,119 @@ class IngestionCoordinator:
             await asyncio.gather(*self._tasks, return_exceptions=True)
             self._tasks = []
 
+        # Cancel and drain background screening tasks
+        for task in list(self._background_tasks):
+            task.cancel()
+        if self._background_tasks:
+            await asyncio.gather(*self._background_tasks, return_exceptions=True)
+            self._background_tasks.clear()
+
         await self._queue.put(ShutdownSentinel())
         logger.info("IngestionCoordinator stopped.")
+
+    async def _process_ingestion_queue(self) -> None:
+        """
+        Processes incoming ingestion queue events with bounded parallel asynchronous
+        security screening (Semaphore(10)), fast-path blacklisting, and TTL deduplication.
+        """
+        while True:
+            item = await self._queue.get()
+
+            if isinstance(item, ShutdownSentinel):
+                logger.info("IngestionCoordinator: ShutdownSentinel received, draining background screening tasks...")
+                if self._signal_queue is not None:
+                    await self._signal_queue.put(item)
+                if self._background_tasks:
+                    await asyncio.gather(*self._background_tasks, return_exceptions=True)
+                break
+
+            # Fast-path blacklist and deduplication filters for RawSignalEvent
+            if isinstance(item, RawSignalEvent):
+                # 1. Fast-path blacklist filter
+                if is_blacklisted_token(item.token_address, item.chain):
+                    logger.debug(
+                        "IngestionCoordinator._process_ingestion_queue: Dropping blacklisted %s (%s)",
+                        item.token_address[:10],
+                        item.chain.value,
+                    )
+                    continue
+
+                # 2. Gatekeeper negative rejection cache check
+                if self._gatekeeper is not None and getattr(self._gatekeeper, "is_rejected", None):
+                    if self._gatekeeper.is_rejected(item.token_address, item.chain) is True:
+                        logger.debug(
+                            "IngestionCoordinator._process_ingestion_queue: Dropping cached rejected token %s",
+                            item.token_address[:10],
+                        )
+                        continue
+
+                # 3. In-memory sliding-window TTL cache deduplication (60s window)
+                if await self._dedup_cache.is_duplicate_or_add(item.token_address):
+                    logger.debug(
+                        "IngestionCoordinator._process_ingestion_queue: Dropping duplicate token %s within TTL",
+                        item.token_address[:10],
+                    )
+                    continue
+
+                # Spawn parallel screening worker via bounded concurrency gate
+                task = asyncio.create_task(
+                    self._screen_candidate_worker(item),
+                    name=f"screen_candidate_{item.token_address[:8]}",
+                )
+                self._background_tasks.add(task)
+                task.add_done_callback(self._background_tasks.discard)
+                continue
+
+            # Forward other events directly
+            if self._signal_queue is not None:
+                await self._signal_queue.put(item)
+
+    async def _screen_candidate_worker(self, raw_signal: RawSignalEvent) -> None:
+        """
+        Worker routine executed under bounded worker concurrency gate (Semaphore(10))
+        for asynchronous token screening via GoPlus, RugCheck, and Preflight.
+        """
+        async with self._screening_semaphore:
+            try:
+                gk = self._gatekeeper
+                if gk is None:
+                    if self._signal_queue is not None:
+                        await self._signal_queue.put(raw_signal)
+                    return
+
+                # Screen candidate through external APIs (GoPlus, RugCheck, preflight)
+                if hasattr(gk, "evaluate_token"):
+                    report = await gk.evaluate_token(
+                        token_address=raw_signal.token_address,
+                        chain=raw_signal.chain,
+                        pool_address=raw_signal.pool_address or "",
+                    )
+                elif hasattr(gk, "screen_token"):
+                    report = await gk.screen_token(
+                        token_address=raw_signal.token_address,
+                        chain=raw_signal.chain,
+                        pool_address=raw_signal.pool_address or "",
+                    )
+                else:
+                    report = None
+
+                if report is not None:
+                    if not getattr(report, "passes_hard_gates", True):
+                        logger.info(
+                            "Candidate token %s rejected during parallel security screening.",
+                            raw_signal.token_address[:10],
+                        )
+                        return
+
+                if self._signal_queue is not None:
+                    await self._signal_queue.put(raw_signal)
+            except Exception as exc:
+                logger.error(
+                    "Parallel security screening error for token %s: %s",
+                    raw_signal.token_address[:10],
+                    exc,
+                    exc_info=True,
+                )
 
     async def __aenter__(self) -> "IngestionCoordinator":
         await self.start()
@@ -338,3 +459,10 @@ class IngestionCoordinator:
                         continue
 
             return item
+
+
+__all__ = [
+    "IngestionCoordinator",
+    "TokenTTLCache",
+    "ExponentialBackoff",
+]

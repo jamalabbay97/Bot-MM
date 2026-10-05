@@ -70,6 +70,11 @@ def main(args: list[str] | None = None) -> int:
         action="store_true",
         help="Display recent structured DecisionRecord audit logs",
     )
+    parser.add_argument(
+        "--reset-governor",
+        action="store_true",
+        help="Manually reset the trade frequency and pacing governor cooldown and trade counter",
+    )
     parsed = parser.parse_args(args)
 
     try:
@@ -86,6 +91,10 @@ def main(args: list[str] | None = None) -> int:
         import sqlite3
         try:
             conn = sqlite3.connect(config.db_path, timeout=30.0)
+            conn.execute("PRAGMA journal_mode = WAL;")
+            conn.execute("PRAGMA busy_timeout = 30000;")
+            conn.execute("PRAGMA synchronous = NORMAL;")
+            conn.execute("PRAGMA cache_size = -64000;")
             conn.row_factory = sqlite3.Row
             cur = conn.cursor()
             cur.execute(
@@ -170,6 +179,11 @@ def main(args: list[str] | None = None) -> int:
         print(resp.to_strict_json())
         return 0
 
+    if parsed.reset_governor:
+        engine = PaperTradingEngine(config)
+        engine.reset_trade_frequency_governor()
+        print("✅ Trade Frequency & Pacing Governor successfully reset to 0 trades and 0 cooldown.")
+        return 0
 
     if parsed.status or parsed.trades or parsed.signals or parsed.news or parsed.whales:
         import sqlite3
@@ -179,6 +193,7 @@ def main(args: list[str] | None = None) -> int:
             conn.execute("PRAGMA journal_mode = WAL;")
             conn.execute("PRAGMA busy_timeout = 30000;")
             conn.execute("PRAGMA synchronous = NORMAL;")
+            conn.execute("PRAGMA cache_size = -64000;")
             conn.row_factory = sqlite3.Row
             cur = conn.cursor()
             if parsed.trades or parsed.status:

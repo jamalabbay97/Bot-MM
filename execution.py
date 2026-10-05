@@ -10,8 +10,10 @@ from alpha_engine.execution import (
     OpenLot,
     PaperExecutor,
     PositionBook,
+    PrivateTxRouter,
     RunningMetrics,
     SQLiteLedger,
+    sqlite_retry,
 )
 
 __all__ = [
@@ -20,6 +22,8 @@ __all__ = [
     "RunningMetrics",
     "PaperExecutor",
     "SQLiteLedger",
+    "sqlite_retry",
+    "PrivateTxRouter",
     "_DB_INIT_TIMEOUT_S",
     "_SNAPSHOT_INTERVAL_S",
 ]

@@ -103,7 +103,7 @@ class ActionParameters(BaseModel):
     )
     hard_stop_loss_pct: Annotated[float, Field(le=0.0, ge=-50.0, description="Initial hard stop loss percentage (e.g. -15.0)")] = -15.0
     trailing_stop_activation_pct: Annotated[float, Field(ge=0.0, description="Gain percentage required to activate trailing stop and breakeven shift")] = 40.0
-    time_exit_minutes: Annotated[int, Field(ge=1, le=120, description="Stagnation timeout in minutes to force exit if target gain not achieved")] = 15
+    time_exit_minutes: Annotated[int, Field(ge=1, le=20160, description="Stagnation timeout in minutes to force exit if target gain not achieved")] = 15
 
 
 class WalletAudit(BaseModel):

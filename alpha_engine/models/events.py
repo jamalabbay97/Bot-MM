@@ -23,6 +23,7 @@ from pydantic import (
 from alpha_engine.models.base import _STRICT_MODEL_CFG
 from alpha_engine.models.enums import (
     ChainIdentifier,
+    ExitProfile,
     NewsSignalStatus,
     OrderSide,
     SignalSource,
@@ -100,6 +101,18 @@ class SignalEvent(BaseModel):
     strength: SignalStrength
     alpha_score: Annotated[float, Field(ge=0.0, le=1.0)]
     source: SignalSource = SignalSource.DEX_SWAP
+    narrative_cluster: Optional[str] = Field(default=None, description="Theme cluster: ai, dog, cat, political, utility, etc.")
+    exit_profile: ExitProfile = Field(default=ExitProfile.FAST_SNIPE, description="Associated exit profile (FAST_SNIPE vs REVIVAL_SWING)")
+    base_market_cap: Optional[Decimal] = Field(default=None, description="Market cap at the consolidation base")
+    strategy_pattern: Optional[str] = Field(default=None, description="Strategy pattern: fast_snipe, wave2_breakout, revival_breakout")
+    token_age_hours: Optional[float] = Field(default=None, description="Token age in hours at signal trigger")
+    consolidation_length_hours: Optional[float] = Field(default=None, description="Consolidation duration in hours")
+    volume_surge_multiplier: Optional[float] = Field(default=None, description="Volume surge over SMA")
+    net_buy_delta: Optional[float] = Field(default=None, description="Net buy volume ratio")
+
+    @property
+    def signal_source(self) -> SignalSource:
+        return self.source
 
 
 class PoolStateUpdateEvent(BaseModel):
@@ -148,6 +161,7 @@ class RawSignalEvent(BaseModel):
     status: NewsSignalStatus = NewsSignalStatus.VALID
     sybil_channel_count: Annotated[int, Field(ge=1)] = 1
     is_edit: bool = False
+    narrative_cluster: Optional[str] = Field(default=None, description="Theme cluster: ai, dog, cat, political, utility, etc.")
 
 
 class PumpMintEvent(BaseModel):

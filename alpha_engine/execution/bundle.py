@@ -29,6 +29,16 @@ JITO_BLOCK_ENGINE_URL = "https://mainnet.block-engine.jito.wtf/api/v1/bundles"
 
 DEFAULT_JITO_TIP_LAMPORTS = 50_000  # 0.00005 SOL
 
+__all__ = [
+    "PrivateTxRouter",
+    "FLASHBOTS_RPC_URL",
+    "TITAN_BUILDER_RPC_URL",
+    "MEV_BLOCKER_RPC_URL",
+    "JITO_TIP_FLOOR_API",
+    "JITO_BLOCK_ENGINE_URL",
+    "DEFAULT_JITO_TIP_LAMPORTS",
+]
+
 
 class PrivateTxRouter:
     """
@@ -58,6 +68,9 @@ class PrivateTxRouter:
             self.titan_rpc,
             self.mev_blocker_rpc,
         ]
+        self._tip_cache: dict[str, tuple[float, Decimal]] = {}
+        self._raw_tip_data_cache: Optional[tuple[float, Any]] = None
+        self._tip_cache_ttl: float = 5.0
 
     def prepare_flashbots_request(self, payload: dict[str, Any]) -> dict[str, Any]:
         """Prepare JSON-RPC HTTP request dictionary targeted for Flashbots builder."""
@@ -72,10 +85,36 @@ class PrivateTxRouter:
 
     async def get_jito_tip_floor(self, percentile: str = "p75") -> Decimal:
         """
-        Dynamically query Jito Tip Floor API for current competitive bundle tips.
+        Dynamically query Jito Tip Floor API for current competitive bundle tips with 5.0s in-memory TTL caching.
         Supports 'p50', 'p75', 'p95', 'p99'.
         Returns tip in SOL as Decimal.
         """
+        import time
+
+        now = time.time()
+        # Fast path: in-memory cache hit for requested percentile
+        if percentile in self._tip_cache:
+            ts, val = self._tip_cache[percentile]
+            if now - ts < self._tip_cache_ttl:
+                return val
+
+        # Secondary fast path: raw tip response cached recently
+        if self._raw_tip_data_cache is not None:
+            ts, raw_data = self._raw_tip_data_cache
+            if now - ts < self._tip_cache_ttl:
+                entry = raw_data if isinstance(raw_data, dict) else (raw_data[0] if raw_data else {})
+                percentile_num = percentile.replace("p", "")
+                raw_tip = (
+                    entry.get(f"landed_tips_{percentile_num}th_percentile")
+                    or entry.get(f"landed_tips_{percentile}")
+                    or entry.get(f"p{percentile_num}")
+                    or entry.get(percentile)
+                    or 0.00005
+                )
+                tip_val = Decimal(str(raw_tip))
+                self._tip_cache[percentile] = (now, tip_val)
+                return tip_val
+
         should_close = False
         session = self._session
         try:
@@ -86,22 +125,32 @@ class PrivateTxRouter:
             async with session.get(self._jito_tip_floor_url, timeout=aiohttp.ClientTimeout(total=2.0)) as resp:
                 if resp.status == 200:
                     data = await resp.json()
-                    if isinstance(data, list) and data:
-                        entry = data[0]
-                        percentile_num = percentile.replace("p", "")
-                        raw_tip = (
-                            entry.get(f"landed_tips_{percentile_num}th_percentile")
-                            or entry.get(f"landed_tips_{percentile}")
-                            or 0.00005
-                        )
-                        return Decimal(str(raw_tip))
+                    entry = data if isinstance(data, dict) else (data[0] if isinstance(data, list) and data else {})
+                    percentile_num = percentile.replace("p", "")
+                    raw_tip = (
+                        entry.get(f"landed_tips_{percentile_num}th_percentile")
+                        or entry.get(f"landed_tips_{percentile}")
+                        or entry.get(f"p{percentile_num}")
+                        or entry.get(percentile)
+                        or 0.00005
+                    )
+                    tip_val = Decimal(str(raw_tip))
+                    now_ts = time.time()
+                    self._raw_tip_data_cache = (now_ts, data)
+                    self._tip_cache[percentile] = (now_ts, tip_val)
+                    return tip_val
         except Exception as exc:
-            logger.debug("Failed to query Jito tip floor via aiohttp: %s — using default", exc)
+            logger.debug("Failed to query Jito tip floor via aiohttp: %s — using cached or fallback", exc)
+            if percentile in self._tip_cache:
+                return self._tip_cache[percentile][1]
         finally:
             if should_close and session is not None:
                 await session.close()
 
         return Decimal("0.00005")
+
+    # Alias matching task specification
+    get_tip_floor = get_jito_tip_floor
 
     async def send_evm_private_tx(
         self,

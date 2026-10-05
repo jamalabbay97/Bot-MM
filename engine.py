@@ -5,10 +5,16 @@ Re-exports all coordination and engine definitions from alpha_engine.engine.
 """
 
 from alpha_engine.engine import (
+    ALPHA_SUPERVISOR_SYSTEM_PROMPT,
+    AdaptiveFeedbackEngine,
+    AlphaSupervisorAI,
     EngineConfig,
     PaperTradingEngine,
     PoolRegistry,
+    RPCEndpoint,
+    RPCHealthMonitor,
     SignalGenerator,
+    TradeReflection,
     _async_main,
     _build_example_config,
     _optional_env,
@@ -24,6 +30,12 @@ __all__ = [
     "PaperTradingEngine",
     "_build_example_config",
     "_async_main",
+    "AdaptiveFeedbackEngine",
+    "TradeReflection",
+    "RPCHealthMonitor",
+    "RPCEndpoint",
+    "AlphaSupervisorAI",
+    "ALPHA_SUPERVISOR_SYSTEM_PROMPT",
 ]
 
 if __name__ == "__main__":

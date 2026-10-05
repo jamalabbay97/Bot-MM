@@ -34,7 +34,7 @@ from alpha_engine.engine.feedback import AdaptiveFeedbackEngine, TradeReflection
 from alpha_engine.engine.registry import PoolRegistry
 from alpha_engine.engine.rpc_health import RPCHealthMonitor
 from alpha_engine.engine.signals import PendingLaunchBuffer, SignalGenerator
-from alpha_engine.engine.staging import Wave2StagingBuffer
+from alpha_engine.engine.staging import RevivalBreakoutBuffer, Wave2StagingBuffer
 from alpha_engine.execution.book import PositionBook, RunningMetrics
 from alpha_engine.execution.executor import PaperExecutor
 from alpha_engine.execution.ledger import SQLiteLedger
@@ -42,9 +42,10 @@ from alpha_engine.ingestion.coordinator import IngestionCoordinator
 from alpha_engine.logging_config import setup_production_logging
 from alpha_engine.math.cpmm import get_initial_bonding_curve_pool
 from alpha_engine.models.ai import ActionParameters, AISupervisorDecisionEnum
-from alpha_engine.models.decisions import DecisionRecord, DecisionType, PatternFeatureVector
+from alpha_engine.models.decisions import DecisionRecord, DecisionType, PatternFeatureVector, RevivalPatternFeatureVector
 from alpha_engine.models.enums import (
     ChainIdentifier,
+    ExitProfile,
     LotStatus,
     OrderSide,
     SignalSource,
@@ -115,7 +116,15 @@ class PaperTradingEngine:
             slot_bundle_threshold=bundle_thresh,
         )
         self._wave2_buffer = Wave2StagingBuffer(config=config)
+        self._revival_buffer = RevivalBreakoutBuffer(config=config)
         self._pending_launch_buffer.set_wave2_staging_buffer(self._wave2_buffer)
+
+        # Trade Frequency & Cooldown Governor State
+        self._consecutive_trade_count: int = 0
+        self._cooldown_until: float = 0.0
+        self._in_paced_mode: bool = False
+        self._last_pnl_cycle_ts: float = time.time()
+
         self._explainer: Optional[ConversationalSupervisor] = None
         self._executor: PaperExecutor | None = None
         self._ledger: SQLiteLedger | None = None
@@ -128,6 +137,8 @@ class PaperTradingEngine:
         self._trades_since_kelly_refresh = 0
         self._kelly_refresh_interval = 10
         self._signal_handlers_installed = False
+        self._screening_semaphore = asyncio.Semaphore(10)
+        self._screening_tasks: set[asyncio.Task[Any]] = set()
 
         self._feedback = AdaptiveFeedbackEngine()
         self._ai_supervisor = AlphaSupervisorAI(config=config, session=self._session)
@@ -159,6 +170,70 @@ class PaperTradingEngine:
     @property
     def wave2_buffer(self) -> Wave2StagingBuffer:
         return self._wave2_buffer
+
+    @property
+    def revival_buffer(self) -> RevivalBreakoutBuffer:
+        return self._revival_buffer
+
+    def is_trading_paused_by_governor(self, now: Optional[float] = None) -> bool:
+        """
+        Check if trading frequency governor is currently enforcing cooldown.
+        10 initial trades -> 4-6h mandatory cooldown -> Paced Mode (1 trade, then 3h cooldown, etc.).
+        Resets after 24h positive PnL cycle or manual CLI reset.
+        """
+        t = now if now is not None else time.time()
+        # 24-hour positive PnL cycle check
+        if t - self._last_pnl_cycle_ts >= 86400.0:
+            self._last_pnl_cycle_ts = t
+            if hasattr(self, "_metrics") and self._metrics.realized_pnl_usd > Decimal(0):
+                self.reset_trade_frequency_governor()
+                logger.info(
+                    "Governor: 24h cycle of positive PnL ($%s) completed. Reset trade counter.",
+                    self._metrics.realized_pnl_usd,
+                )
+
+        if t < self._cooldown_until:
+            return True
+
+        if self._cooldown_until > 0 and t >= self._cooldown_until:
+            if not self._in_paced_mode:
+                self._in_paced_mode = True
+        return False
+
+    def record_governor_trade(self, now: Optional[float] = None) -> None:
+        """
+        Record a newly executed BUY trade with the governor and trigger pacing cooldowns when limits hit.
+        """
+        t = now if now is not None else time.time()
+        self._consecutive_trade_count += 1
+        max_initial = getattr(self._cfg, "pacing_max_initial_trades", 10)
+        cooldown_hours = getattr(self._cfg, "pacing_cooldown_hours", 4.0)
+        interval_hours = getattr(self._cfg, "pacing_interval_hours", 3.0)
+
+        if not self._in_paced_mode:
+            if self._consecutive_trade_count >= max_initial:
+                self._cooldown_until = t + (cooldown_hours * 3600.0)
+                self._in_paced_mode = True
+                logger.warning(
+                    "Governor: Reached %d initial trades. Enforcing %.1f hour mandatory cooldown until %s.",
+                    self._consecutive_trade_count,
+                    cooldown_hours,
+                    time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(self._cooldown_until)),
+                )
+        else:
+            self._cooldown_until = t + (interval_hours * 3600.0)
+            logger.info(
+                "Governor: Paced trade executed. Entering %.1f hour interval cooldown until %s.",
+                interval_hours,
+                time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(self._cooldown_until)),
+            )
+
+    def reset_trade_frequency_governor(self) -> None:
+        """Manually or cyclically reset trade frequency governor state."""
+        self._consecutive_trade_count = 0
+        self._cooldown_until = 0.0
+        self._in_paced_mode = False
+        logger.info("Governor: Trading frequency and pacing governor reset.")
 
     @property
     def explainer(self) -> Optional[ConversationalSupervisor]:
@@ -256,16 +331,47 @@ class PaperTradingEngine:
         t_str = f"{lot.token_address[:4]}..{lot.token_address[-4:]}"
         usd_sign = "+" if exit_pnl_usd > 0 else ""
         chain_val = lot.chain.value if hasattr(lot.chain, "value") else str(lot.chain)
-        exit_msg = (
-            f"{status_icon} **{title} (Paper Trade)**\n\n"
-            f"• **Token:** `{t_str}` (`{lot.token_address}`)\n"
-            f"• **Chain:** {chain_val}\n"
-            f"• **Entry Price:** `{ep_str}`\n"
-            f"• **Exit Price:** `{xp_str}`\n"
-            f"• **Return %:** `{pct:+.2f}%` ({usd_sign}${float(exit_pnl_usd):.2f})\n"
-            f"• **Exit Reason:** `{decision_reason}`\n"
-            f"• **Holding Time:** `{dur_s:.1f}s`"
-        )
+        is_swing = getattr(lot, "exit_profile", None) == ExitProfile.REVIVAL_SWING
+
+        if is_swing:
+            peak_p = getattr(lot, "peak_price", ep)
+            peak_roi = float((peak_p - ep) / ep * 100) if ep > 0 else 0.0
+            revival_vec = RevivalPatternFeatureVector(
+                token_address=lot.token_address,
+                token_age_hours=float(getattr(lot, "token_age_hours", 0.0)),
+                consolidation_length_hours=float(getattr(lot, "consolidation_length_hours", 0.0)),
+                base_mcap_usd=float(getattr(lot, "base_market_cap", 0.0) or 0.0),
+                volume_surge_multiplier=float(getattr(lot, "volume_surge_multiplier", 3.0)),
+                net_buy_ratio=float(getattr(lot, "net_buy_delta", 0.70)),
+                peak_roi_pct=peak_roi,
+                realized_pnl_pct=pct,
+            )
+            if hasattr(self, "_feedback") and self._feedback.pattern_store:
+                self._feedback.pattern_store.add_revival_pattern(revival_vec)
+
+            exit_msg = (
+                f"{status_icon} **REVIVAL SWING EXIT ({title})**\n\n"
+                f"• **Token:** `{t_str}` (`{lot.token_address}`)\n"
+                f"• **Chain:** {chain_val}\n"
+                f"• **Strategy Profile:** `REVIVAL_SWING`\n"
+                f"• **Entry Price:** `{ep_str}`\n"
+                f"• **Exit Price:** `{xp_str}`\n"
+                f"• **Peak Price:** `{self._format_price_clean(peak_p, native_price, unit)}` (Peak: `{peak_roi:+.1f}%`)\n"
+                f"• **Return %:** `{pct:+.2f}%` ({usd_sign}${float(exit_pnl_usd):.2f})\n"
+                f"• **Exit Reason:** `{decision_reason}`\n"
+                f"• **Holding Time:** `{dur_s / 3600.0:.2f}h`"
+            )
+        else:
+            exit_msg = (
+                f"{status_icon} **{title} (Paper Trade)**\n\n"
+                f"• **Token:** `{t_str}` (`{lot.token_address}`)\n"
+                f"• **Chain:** {chain_val}\n"
+                f"• **Entry Price:** `{ep_str}`\n"
+                f"• **Exit Price:** `{xp_str}`\n"
+                f"• **Return %:** `{pct:+.2f}%` ({usd_sign}${float(exit_pnl_usd):.2f})\n"
+                f"• **Exit Reason:** `{decision_reason}`\n"
+                f"• **Holding Time:** `{dur_s:.1f}s`"
+            )
         asyncio.create_task(self._broadcast_trade_alert(exit_msg))
         if hasattr(self, "_ai_supervisor") and self._ai_supervisor:
             reflection = TradeReflection.from_trade(
@@ -449,6 +555,8 @@ class PaperTradingEngine:
 
             if isinstance(item, ShutdownSentinel):
                 logger.info("Ingestion processor received shutdown sentinel. Forwarding to signal queue.")
+                if self._screening_tasks:
+                    await asyncio.gather(*self._screening_tasks, return_exceptions=True)
                 await self._signal_q.put(ShutdownSentinel())
                 return
 
@@ -471,7 +579,7 @@ class PaperTradingEngine:
                 token_addr = news_event.token_address
                 chain = news_event.chain
 
-                # Blacklist filter
+                # Fast-path blacklist filter
                 if is_blacklisted_token(token_addr, chain):
                     self._record_gatekeeper_eval(token_addr, chain, "Blacklisted native/wrapped token", passed=False)
                     logger.debug("Skipping blacklisted token from news: %s", token_addr)
@@ -482,59 +590,18 @@ class PaperTradingEngine:
                     logger.debug("Position already open for news token %s; skipping signal generation", token_addr[:10])
                     continue
 
-                try:
-                    report = await gk.screen_token(
-                        token_address=token_addr,
-                        chain=chain,
-                        pool_address="",
-                    )
-                except Exception as exc:  # noqa: BLE001
-                    logger.error("Security gatekeeper raised for news signal %s: %s", token_addr[:10], exc)
-                    continue
-
-                reason = self._extract_gatekeeper_rejection_reason(report)
-                self._record_gatekeeper_eval(token_addr, chain, reason, passed=report.passes_hard_gates)
-
-                headline = news_event.headline or news_event.content[:80]
-                sentiment = (
-                    news_event.sentiment_score
-                    if news_event.sentiment_score != 0.0
-                    else self._calculate_news_sentiment(news_event.content)
+                task = asyncio.create_task(
+                    self._async_screen_and_process_news(news_event, gk),
+                    name=f"screen_news_{token_addr[:8]}",
                 )
-                self._record_news_event(token_addr, chain, news_event.source.value, headline, sentiment)
-
-                if not report.passes_hard_gates:
-                    logger.info("News token %s rejected by gatekeeper: %s", token_addr[:10], reason)
-                    continue
-
-                pool = self.get_or_create_initial_pool_state(chain, token_addr)
-                social_weight = self._feedback.get_social_weight()
-                raw_sig = RawSignalEvent(
-                    timestamp_ns=time.time_ns(),
-                    chain=chain,
-                    token_address=token_addr,
-                    source=news_event.source,
-                    raw_text=news_event.content,
-                    sybil_channel_count=1,
-                )
-                signal_event = self._signal_gen.generate_social_signal(
-                    raw_signal=raw_sig,
-                    pool=pool,
-                    report=report,
-                    social_weight=social_weight,
-                )
-                if signal_event is not None:
-                    if self._ledger:
-                        await self._ledger.record_signal(signal_event)
-                    await self._signal_q.put(signal_event)
-                    logger.info("News Social Signal [%s] queued: %s", signal_event.signal_id[:8], token_addr[:10])
+                self._screening_tasks.add(task)
+                task.add_done_callback(self._screening_tasks.discard)
                 continue
 
             if isinstance(item, PumpMintEvent):
                 mint_ev: PumpMintEvent = item
                 mint = mint_ev.mint
                 chain = mint_ev.chain
-                curve_addr = mint_ev.bonding_curve or mint
 
                 if is_blacklisted_token(mint, chain):
                     self._record_gatekeeper_eval(mint, chain, "Blacklisted native/wrapped token", passed=False)
@@ -545,43 +612,12 @@ class PaperTradingEngine:
                     logger.debug("Skipping rejected mint from negative cache: %s", mint[:10])
                     continue
 
-                try:
-                    report = await gk.evaluate_token(
-                        token_address=mint,
-                        chain=chain,
-                        pool_address=curve_addr,
-                    )
-                except Exception as exc:  # noqa: BLE001
-                    logger.error("Security gatekeeper raised for PumpMintEvent %s: %s", mint[:10], exc)
-                    continue
-
-                reason = self._extract_gatekeeper_rejection_reason(report)
-                self._record_gatekeeper_eval(mint, chain, reason, passed=report.passes_hard_gates)
-
-                if not report.passes_hard_gates:
-                    logger.info("Pump.fun mint %s rejected by gatekeeper (reason=%s).", mint[:10], reason)
-                    continue
-
-                pool = self.get_or_create_initial_pool_state(chain, mint, curve_addr)
-                init_price = pool.spot_price_native_per_token if pool else Decimal("0.000000028")
-
-                self._pending_launch_buffer.stage_token(
-                    token_address=mint,
-                    chain=chain,
-                    pool_address=curve_addr,
-                    initial_price=init_price,
-                    report=report,
-                    t_0=time.time(),
+                task = asyncio.create_task(
+                    self._async_screen_and_process_pump_mint(mint_ev, gk),
+                    name=f"screen_mint_{mint[:8]}",
                 )
-                logger.info(
-                    "Pump.fun mint [%s] staged in PendingLaunchBuffer (observation window %.0fs-%.0fs, target vol >= %s SOL, >= %d buys, >= %d unique buyers)",
-                    mint[:10],
-                    self._pending_launch_buffer.min_age_s,
-                    self._pending_launch_buffer.max_age_s,
-                    self._pending_launch_buffer.min_volume_native,
-                    self._pending_launch_buffer.min_buys,
-                    self._pending_launch_buffer.min_unique_signers,
-                )
+                self._screening_tasks.add(task)
+                task.add_done_callback(self._screening_tasks.discard)
                 continue
 
             if isinstance(item, RawSignalEvent):
@@ -595,83 +631,12 @@ class PaperTradingEngine:
                     logger.debug("Position already open for %s; skipping raw signal", raw_sig.token_address[:10])
                     continue
 
-                try:
-                    report = await gk.evaluate_token(
-                        token_address=raw_sig.token_address,
-                        chain=raw_sig.chain,
-                        pool_address=raw_sig.pool_address or "",
-                    )
-                except Exception as exc:  # noqa: BLE001
-                    logger.error(
-                        "Security gatekeeper raised for raw signal %s: %s",
-                        raw_sig.token_address[:10],
-                        exc,
-                    )
-                    continue
-
-                reason = self._extract_gatekeeper_rejection_reason(report)
-                self._record_gatekeeper_eval(raw_sig.token_address, raw_sig.chain, reason, passed=report.passes_hard_gates)
-
-                if not report.passes_hard_gates:
-                    logger.info(
-                        "Raw signal token %s rejected by gatekeeper (reason=%s).",
-                        raw_sig.token_address[:10],
-                        reason,
-                    )
-                    continue
-
-                pool = self._pool_registry.get(raw_sig.token_address)
-                if pool is None and raw_sig.pool_address:
-                    pool = self._pool_registry.get(raw_sig.pool_address)
-                if pool is None:
-                    pool = self.get_or_create_initial_pool_state(
-                        raw_sig.chain, raw_sig.token_address, raw_sig.pool_address or ""
-                    )
-
-                if raw_sig.source == SignalSource.PUMP_FUN_MINT:
-                    init_price = pool.spot_price_native_per_token if pool else Decimal("0.000000028")
-                    self._pending_launch_buffer.stage_token(
-                        token_address=raw_sig.token_address,
-                        chain=raw_sig.chain,
-                        pool_address=raw_sig.pool_address or (pool.pool_address if pool else ""),
-                        initial_price=init_price,
-                        report=report,
-                        raw_signal=raw_sig,
-                        t_0=time.time(),
-                    )
-                    logger.info(
-                        "Pump.fun mint [%s] staged in PendingLaunchBuffer (observation window %.0fs-%.0fs, target vol >= %s SOL, >= %d buys, >= %d unique buyers)",
-                        raw_sig.token_address[:10],
-                        self._pending_launch_buffer.min_age_s,
-                        self._pending_launch_buffer.max_age_s,
-                        self._pending_launch_buffer.min_volume_native,
-                        self._pending_launch_buffer.min_buys,
-                        self._pending_launch_buffer.min_unique_signers,
-                    )
-                    continue
-
-                social_weight = self._feedback.get_social_weight()
-                signal_event = self._signal_gen.generate_social_signal(
-                    raw_signal=raw_sig,
-                    pool=pool,
-                    report=report,
-                    social_weight=social_weight,
+                task = asyncio.create_task(
+                    self._async_screen_and_process_raw_signal(raw_sig, gk),
+                    name=f"screen_raw_{raw_sig.token_address[:8]}",
                 )
-                if signal_event is None:
-                    continue
-
-                if self._ledger:
-                    await self._ledger.record_signal(signal_event)
-
-                await self._signal_q.put(signal_event)
-                logger.info(
-                    "Social Signal [%s] queued: %s (source=%s, sybil_count=%d, weight=%.2f)",
-                    signal_event.signal_id[:8],
-                    raw_sig.token_address[:10],
-                    signal_event.source.value,
-                    raw_sig.sybil_channel_count,
-                    social_weight,
-                )
+                self._screening_tasks.add(task)
+                task.add_done_callback(self._screening_tasks.discard)
                 continue
 
             swap: SwapEvent = item
@@ -793,6 +758,26 @@ class PaperTradingEngine:
                     )
                 continue
 
+            # Route trade to Revival Breakout Buffer to track dormant aged tokens and detect CTO breakout
+            revival_signal = self._revival_buffer.record_trade(
+                swap,
+                pool=updated_pool,
+            )
+            if revival_signal is not None:
+                if not self.is_position_open(revival_signal.token_address, revival_signal.chain):
+                    if self._ledger:
+                        await self._ledger.record_signal(revival_signal)
+                    await self._signal_q.put(revival_signal)
+                    logger.info(
+                        "Revival Breakout Signal [%s] generated & queued: %s (alpha=%.3f, strength=%s, age=%.1fh)",
+                        revival_signal.signal_id[:8],
+                        revival_signal.token_address[:10],
+                        revival_signal.alpha_score,
+                        revival_signal.strength.value,
+                        getattr(revival_signal, "token_age_hours", 0.0),
+                    )
+                continue
+
             # Sells do not trigger buy signals
             if out_is_native:
                 continue
@@ -802,13 +787,17 @@ class PaperTradingEngine:
                 logger.debug("Position already open for token %s; skipping buy signal from swap", swap.token_out[:10])
                 continue
 
-            # If token is staged in pending launch buffer or Wave-2 staging buffer, do not generate premature swap buy signal
+            # If token is staged in pending launch buffer, Wave-2, or Revival buffer, do not generate premature swap buy signal
             if self._pending_launch_buffer.is_staged(swap.token_out):
                 logger.debug("Token %s staged in PendingLaunchBuffer; awaiting graduation before BUY signal", swap.token_out[:10])
                 continue
 
             if self._wave2_buffer.is_staged(swap.token_out):
                 logger.debug("Token %s staged in Wave2StagingBuffer; awaiting Wave-2 breakout before BUY signal", swap.token_out[:10])
+                continue
+
+            if self._revival_buffer.is_staged(swap.token_out):
+                logger.debug("Token %s staged in RevivalBreakoutBuffer; awaiting revival breakout before BUY signal", swap.token_out[:10])
                 continue
 
             staged = self._pending_launch_buffer.get_staged(target_token)
@@ -830,6 +819,186 @@ class PaperTradingEngine:
                     signal_event.alpha_score,
                     signal_event.strength.value,
                 )
+
+    async def _async_screen_and_process_news(self, news_event: NewsSignalEvent, gk: Any) -> None:
+        async with self._screening_semaphore:
+            token_addr = news_event.token_address
+            chain = news_event.chain
+            try:
+                report = await gk.screen_token(
+                    token_address=token_addr,
+                    chain=chain,
+                    pool_address="",
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.error("Security gatekeeper raised for news signal %s: %s", token_addr[:10], exc)
+                return
+
+            reason = self._extract_gatekeeper_rejection_reason(report)
+            self._record_gatekeeper_eval(token_addr, chain, reason, passed=report.passes_hard_gates)
+
+            headline = news_event.headline or news_event.content[:80]
+            sentiment = (
+                news_event.sentiment_score
+                if news_event.sentiment_score != 0.0
+                else self._calculate_news_sentiment(news_event.content)
+            )
+            self._record_news_event(token_addr, chain, news_event.source.value, headline, sentiment)
+
+            if not report.passes_hard_gates:
+                logger.info("News token %s rejected by gatekeeper: %s", token_addr[:10], reason)
+                return
+
+            pool = self.get_or_create_initial_pool_state(chain, token_addr)
+            social_weight = self._feedback.get_social_weight()
+            raw_sig = RawSignalEvent(
+                timestamp_ns=time.time_ns(),
+                chain=chain,
+                token_address=token_addr,
+                source=news_event.source,
+                raw_text=news_event.content,
+                sybil_channel_count=1,
+                narrative_cluster=getattr(news_event, "narrative_cluster", None),
+            )
+            signal_event = self._signal_gen.generate_social_signal(
+                raw_signal=raw_sig,
+                pool=pool,
+                report=report,
+                social_weight=social_weight,
+            )
+            if signal_event is not None:
+                if getattr(news_event, "narrative_cluster", None):
+                    signal_event.narrative_cluster = news_event.narrative_cluster
+                if self._ledger:
+                    await self._ledger.record_signal(signal_event)
+                await self._signal_q.put(signal_event)
+                logger.info("News Social Signal [%s] queued: %s", signal_event.signal_id[:8], token_addr[:10])
+
+    async def _async_screen_and_process_pump_mint(self, mint_ev: PumpMintEvent, gk: Any) -> None:
+        async with self._screening_semaphore:
+            mint = mint_ev.mint
+            chain = mint_ev.chain
+            curve_addr = mint_ev.bonding_curve or mint
+            try:
+                report = await gk.evaluate_token(
+                    token_address=mint,
+                    chain=chain,
+                    pool_address=curve_addr,
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.error("Security gatekeeper raised for PumpMintEvent %s: %s", mint[:10], exc)
+                return
+
+            reason = self._extract_gatekeeper_rejection_reason(report)
+            self._record_gatekeeper_eval(mint, chain, reason, passed=report.passes_hard_gates)
+
+            if not report.passes_hard_gates:
+                logger.info("Pump.fun mint %s rejected by gatekeeper (reason=%s).", mint[:10], reason)
+                return
+
+            pool = self.get_or_create_initial_pool_state(chain, mint, curve_addr)
+            init_price = pool.spot_price_native_per_token if pool else Decimal("0.000000028")
+
+            self._pending_launch_buffer.stage_token(
+                token_address=mint,
+                chain=chain,
+                pool_address=curve_addr,
+                initial_price=init_price,
+                report=report,
+                t_0=time.time(),
+            )
+            logger.info(
+                "Pump.fun mint [%s] staged in PendingLaunchBuffer (observation window %.0fs-%.0fs, target vol >= %s SOL, >= %d buys, >= %d unique buyers)",
+                mint[:10],
+                self._pending_launch_buffer.min_age_s,
+                self._pending_launch_buffer.max_age_s,
+                self._pending_launch_buffer.min_volume_native,
+                self._pending_launch_buffer.min_buys,
+                self._pending_launch_buffer.min_unique_signers,
+            )
+
+    async def _async_screen_and_process_raw_signal(self, raw_sig: RawSignalEvent, gk: Any) -> None:
+        async with self._screening_semaphore:
+            try:
+                report = await gk.evaluate_token(
+                    token_address=raw_sig.token_address,
+                    chain=raw_sig.chain,
+                    pool_address=raw_sig.pool_address or "",
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.error(
+                    "Security gatekeeper raised for raw signal %s: %s",
+                    raw_sig.token_address[:10],
+                    exc,
+                )
+                return
+
+            reason = self._extract_gatekeeper_rejection_reason(report)
+            self._record_gatekeeper_eval(raw_sig.token_address, raw_sig.chain, reason, passed=report.passes_hard_gates)
+
+            if not report.passes_hard_gates:
+                logger.info(
+                    "Raw signal token %s rejected by gatekeeper (reason=%s).",
+                    raw_sig.token_address[:10],
+                    reason,
+                )
+                return
+
+            pool = self._pool_registry.get(raw_sig.token_address)
+            if pool is None and raw_sig.pool_address:
+                pool = self._pool_registry.get(raw_sig.pool_address)
+            if pool is None:
+                pool = self.get_or_create_initial_pool_state(
+                    raw_sig.chain, raw_sig.token_address, raw_sig.pool_address or ""
+                )
+
+            if raw_sig.source == SignalSource.PUMP_FUN_MINT:
+                init_price = pool.spot_price_native_per_token if pool else Decimal("0.000000028")
+                self._pending_launch_buffer.stage_token(
+                    token_address=raw_sig.token_address,
+                    chain=raw_sig.chain,
+                    pool_address=raw_sig.pool_address or (pool.pool_address if pool else ""),
+                    initial_price=init_price,
+                    report=report,
+                    raw_signal=raw_sig,
+                    t_0=time.time(),
+                )
+                logger.info(
+                    "Pump.fun mint [%s] staged in PendingLaunchBuffer (observation window %.0fs-%.0fs, target vol >= %s SOL, >= %d buys, >= %d unique buyers)",
+                    raw_sig.token_address[:10],
+                    self._pending_launch_buffer.min_age_s,
+                    self._pending_launch_buffer.max_age_s,
+                    self._pending_launch_buffer.min_volume_native,
+                    self._pending_launch_buffer.min_buys,
+                    self._pending_launch_buffer.min_unique_signers,
+                )
+                return
+
+            social_weight = self._feedback.get_social_weight()
+            signal_event = self._signal_gen.generate_social_signal(
+                raw_signal=raw_sig,
+                pool=pool,
+                report=report,
+                social_weight=social_weight,
+            )
+            if signal_event is None:
+                return
+
+            if getattr(raw_sig, "narrative_cluster", None):
+                signal_event.narrative_cluster = raw_sig.narrative_cluster
+
+            if self._ledger:
+                await self._ledger.record_signal(signal_event)
+
+            await self._signal_q.put(signal_event)
+            logger.info(
+                "Social Signal [%s] queued: %s (source=%s, sybil_count=%d, weight=%.2f)",
+                signal_event.signal_id[:8],
+                raw_sig.token_address[:10],
+                signal_event.source.value,
+                raw_sig.sybil_channel_count,
+                social_weight,
+            )
 
     async def _check_dynamic_exits_for_swap(self, swap: SwapEvent, pool: PoolState) -> None:
         executor = self._executor
@@ -1113,6 +1282,16 @@ class PaperTradingEngine:
             signal_item: SignalEvent = item
 
             if signal_item.suggested_side == OrderSide.BUY:
+                # 0. Trade Frequency & Cooldown Governor
+                if self.is_trading_paused_by_governor():
+                    remaining_cd = max(0.0, self._cooldown_until - time.time())
+                    logger.warning(
+                        "Trading Frequency Governor ACTIVE: Pausing BUY signal for %s (cooldown remaining: %.1f minutes).",
+                        signal_item.token_address[:10],
+                        remaining_cd / 60.0,
+                    )
+                    continue
+
                 # 1. Daily Drawdown & Streak Circuit Breakers (Directive 1)
                 freeze_dur = getattr(self._cfg, "circuit_breaker_freeze_duration_s", 3600.0)
                 if self._metrics.is_circuit_breaker_active(freeze_duration_s=freeze_dur):
@@ -1139,6 +1318,7 @@ class PaperTradingEngine:
                     allocated_cost_native=preliminary_cost,
                     total_equity_native=equity_native,
                     pool_address=getattr(signal_item, "pool_address", "") or "",
+                    narrative_cluster=getattr(signal_item, "narrative_cluster", None),
                 )
                 if not can_open:
                     logger.info(
@@ -1214,6 +1394,7 @@ class PaperTradingEngine:
             realized_pnl_usd: Decimal | None = None
 
             if fill.side == OrderSide.BUY:
+                self.record_governor_trade()
                 initial_reserve = (
                     signal_item.pool_state.native_reserve
                     if signal_item.pool_state
@@ -1228,6 +1409,13 @@ class PaperTradingEngine:
                     ai_hard_stop_loss_pct=ai_action_params.hard_stop_loss_pct if ai_action_params else None,
                     ai_trailing_stop_activation_pct=ai_action_params.trailing_stop_activation_pct if ai_action_params else None,
                     ai_time_exit_minutes=ai_action_params.time_exit_minutes if ai_action_params else None,
+                    narrative_cluster=getattr(signal_item, "narrative_cluster", None),
+                    exit_profile=getattr(signal_item, "exit_profile", ExitProfile.FAST_SNIPE),
+                    base_market_cap=Decimal(str(getattr(signal_item, "base_market_cap", 0.0) or 0.0)),
+                    token_age_hours=float(getattr(signal_item, "token_age_hours", 0.0) or 0.0),
+                    consolidation_length_hours=float(getattr(signal_item, "consolidation_length_hours", 0.0) or 0.0),
+                    volume_surge_multiplier=float(getattr(signal_item, "volume_surge_multiplier", 0.0) or 0.0),
+                    net_buy_delta=float(getattr(signal_item, "net_buy_delta", 0.0) or 0.0),
                 )
 
                 if self._ledger:
@@ -1248,15 +1436,31 @@ class PaperTradingEngine:
                 t_str = f"{fill.token_address[:4]}..{fill.token_address[-4:]}"
                 spent_val = float(fill.simulated_native_spent)
                 tok_val = float(fill.tokens_acquired)
-                buy_alert = (
-                    f"🟢 **BUY EXECUTED (Paper Trade)**\n\n"
-                    f"• **Token:** `{t_str}` (`{fill.token_address}`)\n"
-                    f"• **Chain:** {signal_item.chain.value}\n"
-                    f"• **Buy Price:** `{p_str}`\n"
-                    f"• **Spent:** `{spent_val:.4f} {unit}`\n"
-                    f"• **Tokens Acquired:** `{tok_val:,.2f}`\n"
-                    f"• **Order ID:** `{fill.order_id[:8]}`"
-                )
+
+                if getattr(signal_item, "exit_profile", None) == ExitProfile.REVIVAL_SWING:
+                    buy_alert = (
+                        f"🚀 **REVIVAL & CTO BREAKOUT DETECTED**\n\n"
+                        f"• **Token:** `{t_str}` (`{fill.token_address}`)\n"
+                        f"• **Chain:** {signal_item.chain.value}\n"
+                        f"• **Strategy Profile:** `REVIVAL_SWING`\n"
+                        f"• **Buy Price:** `{p_str}`\n"
+                        f"• **Spent:** `{spent_val:.4f} {unit}`\n"
+                        f"• **Tokens Acquired:** `{tok_val:,.2f}`\n"
+                        f"• **Token Age:** `{float(getattr(signal_item, 'token_age_hours', 0.0)):.1f}h`\n"
+                        f"• **Consolidation Base:** `${float(getattr(signal_item, 'base_market_cap', 0.0)):,.0f}`\n"
+                        f"• **Volume Surge:** `{float(getattr(signal_item, 'volume_surge_multiplier', 0.0)):.1f}x` | **Net Buy Delta:** `{float(getattr(signal_item, 'net_buy_delta', 0.0))*100:.1f}%`\n"
+                        f"• **Order ID:** `{fill.order_id[:8]}`"
+                    )
+                else:
+                    buy_alert = (
+                        f"🟢 **BUY EXECUTED (Paper Trade)**\n\n"
+                        f"• **Token:** `{t_str}` (`{fill.token_address}`)\n"
+                        f"• **Chain:** {signal_item.chain.value}\n"
+                        f"• **Buy Price:** `{p_str}`\n"
+                        f"• **Spent:** `{spent_val:.4f} {unit}`\n"
+                        f"• **Tokens Acquired:** `{tok_val:,.2f}`\n"
+                        f"• **Order ID:** `{fill.order_id[:8]}`"
+                    )
                 asyncio.create_task(self._broadcast_trade_alert(buy_alert))
 
             elif fill.side == OrderSide.SELL:
@@ -1482,6 +1686,7 @@ class PaperTradingEngine:
                 self._pending_launch_buffer.check_telemetry(interval_s=15.0)
                 self._pending_launch_buffer.sweep_expired()
                 self._wave2_buffer.sweep_expired()
+                self._revival_buffer.sweep_expired()
             except Exception as exc:  # noqa: BLE001
                 logger.error("Error in pending buffer watchdog: %s", exc)
 
@@ -1973,10 +2178,19 @@ class PaperTradingEngine:
 
                 self._wave2_buffer.register_signal_callback(_on_wave2_signal)
 
+                async def _on_revival_signal(sig: SignalEvent) -> None:
+                    if not self.is_position_open(sig.token_address, sig.chain):
+                        if self._ledger:
+                            await self._ledger.record_signal(sig)
+                        await self._signal_q.put(sig)
+
+                self._revival_buffer.register_signal_callback(_on_revival_signal)
+
                 self._explainer = ConversationalSupervisor(
                     ledger=self._ledger,
                     position_book=self._position_book,
                     staging_buffer=self._wave2_buffer,
+                    revival_buffer=self._revival_buffer,
                     parameter_tuner=self._feedback.parameter_tuner,
                     ai_supervisor=self._ai_supervisor,
                     metrics=self._metrics,

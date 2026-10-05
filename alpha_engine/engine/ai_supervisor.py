@@ -35,7 +35,7 @@ from alpha_engine.models.ai import (
     WalletAudit,
     WalletRiskClassification,
 )
-from alpha_engine.models.enums import ChainIdentifier
+from alpha_engine.models.enums import ChainIdentifier, ExitProfile
 from alpha_engine.models.events import SignalEvent
 from alpha_engine.models.news import NewsEvent
 from alpha_engine.models.profiler import WalletProfile
@@ -115,6 +115,13 @@ B. Dynamic Exit Matrix:
 
 C. Network Gas & Congestion Mitigation:
 - Dynamically calibrate Jito tips (Solana) or Priority Gas Fees (EVM) to ensure transaction inclusion within the target slot without overpaying beyond expected transaction alpha.
+
+================================================================================
+4b. REVIVAL & COMMUNITY TAKEOVER (CTO) BREAKOUT SWING AUDIT
+================================================================================
+When analyzing tokens emerging from dormant accumulation (2h to 10 days old):
+- Social Momentum vs. Wash Trading: Assess whether the volume surge (>= 3x 1h SMA) is accompanied by authentic organic social momentum (CTO Telegram/X community revival, original creator wallet balance <= 0.1%) vs. a wash-trading sandwich bot pump.
+- Anti-FOMO & Over-Extension Guard: Reject immediately if current_mcap / dormant_mcap > 2.5 or if current price is > 2.2x consolidation base. Do not buy vertical green candles or top wicks.
 
 ================================================================================
 5. CLOSED-LOOP FEEDBACK & HYPERPARAMETER AUTO-TUNING
@@ -897,6 +904,16 @@ class AlphaSupervisorAI:
                 "timestamp_age_s": (time.time() - news_event.timestamp) if news_event and news_event.timestamp else 0.0,
                 "template_duplicate_count": getattr(news_event, "duplicate_count", 0) if news_event else 0,
             },
+            "revival_telemetry": {
+                "is_revival_swing": getattr(signal, "exit_profile", None) == ExitProfile.REVIVAL_SWING or getattr(signal, "strategy_pattern", "") == "REVIVAL_BREAKOUT",
+                "base_market_cap": float(getattr(signal, "base_market_cap", 0.0) or 0.0),
+                "dormant_mcap": float(getattr(signal, "base_market_cap", 0.0) or 0.0),
+                "current_mcap": float(getattr(ps, "market_cap_usd", 0.0) or 0.0) if ps else (float(getattr(signal, "spot_price", 0.0) or 0.0) * float(getattr(ps, "token_reserve", 1_000_000_000.0) or 1_000_000_000.0) if getattr(signal, "spot_price", None) else 0.0),
+                "token_age_hours": float(getattr(signal, "token_age_hours", 0.0) or 0.0),
+                "consolidation_length_hours": float(getattr(signal, "consolidation_length_hours", 0.0) or 0.0),
+                "volume_surge_multiplier": float(getattr(signal, "volume_surge_multiplier", 0.0) or 0.0),
+                "net_buy_delta": float(getattr(signal, "net_buy_delta", 0.0) or 0.0),
+            },
             "system_state": {
                 "global_risk_mode": self._global_risk_mode.value,
                 "recent_win_rate": recent_win_rate,
@@ -1084,6 +1101,16 @@ class AlphaSupervisorAI:
             rejection_flags.append("BOT_FARM_PAID_RAID_DETECTED")
 
         # =========================================================================
+        # SECTION 3b: REVIVAL & CTO BREAKOUT GREEN-CANDLE FOMO GUARD
+        # =========================================================================
+        revival = telemetry.get("revival_telemetry", {})
+        dormant_mcap = float(revival.get("dormant_mcap") or revival.get("base_market_cap") or telemetry.get("dormant_mcap") or telemetry.get("base_market_cap") or 0.0)
+        current_mcap = float(revival.get("current_mcap") or telemetry.get("current_mcap") or pool.get("market_cap_usd") or 0.0)
+        if dormant_mcap > 0 and current_mcap > 0:
+            if (current_mcap / dormant_mcap) > 2.5:
+                rejection_flags.append("OVEREXTENDED_GREEN_CANDLE_FOMO")
+
+        # =========================================================================
         # SECTION 4: ADAPTIVE EXECUTION, POSITION SIZING & EXIT ARCHITECTURE
         # =========================================================================
         # Fractional Kelly Criterion calculation:
@@ -1115,18 +1142,29 @@ class AlphaSupervisorAI:
         else:
             hard_stop = -15.0
 
+        if revival.get("is_revival_swing"):
+            tp_ladder = [
+                TakeProfitStage(trigger_multiplier=2.0, sell_pct=50.0),
+                TakeProfitStage(trigger_multiplier=3.0, sell_pct=50.0),
+                TakeProfitStage(trigger_multiplier=5.0, sell_pct=50.0),
+            ]
+            time_exit_mins = 14400
+        else:
+            tp_ladder = [
+                TakeProfitStage(trigger_multiplier=2.0, sell_pct=40.0),
+                TakeProfitStage(trigger_multiplier=3.5, sell_pct=30.0),
+            ]
+            time_exit_mins = 15
+
         action_params = ActionParameters(
             target_token_address=target_token,
             recommended_position_pct=round(fractional_kelly_pct, 2),
             max_slippage_bps=max_slippage,
             priority_fee_multiplier=priority_mult,
-            take_profit_ladder=[
-                TakeProfitStage(trigger_multiplier=2.0, sell_pct=40.0),
-                TakeProfitStage(trigger_multiplier=3.5, sell_pct=30.0),
-            ],
+            take_profit_ladder=tp_ladder,
             hard_stop_loss_pct=hard_stop,
             trailing_stop_activation_pct=40.0,
-            time_exit_minutes=15,
+            time_exit_minutes=time_exit_mins,
         )
 
         # =========================================================================
@@ -1139,6 +1177,7 @@ class AlphaSupervisorAI:
             "SYBIL_FUNDING_AGGREGATOR",
             "FIRST_BLOCK_SNIPE_COLLUSION",
             "MEV_BOT_UNREPLICABLE",
+            "OVEREXTENDED_GREEN_CANDLE_FOMO",
         }
 
         if not self._strict_veto:

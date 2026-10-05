@@ -91,16 +91,35 @@ class PatternFeatureVector(BaseModel):
             except (TypeError, ValueError):
                 smart_inflows = 5.0
 
+        cons_dur = getattr(signal, "consolidation_duration_s", None)
+        if cons_dur is None:
+            cons_dur = 1800.0
+        dip_pct = getattr(signal, "dip_depth_pct", None)
+        if dip_pct is None:
+            dip_pct = 40.0
+        surge_mult = getattr(signal, "volume_surge_multiplier", None)
+        if surge_mult is None:
+            surge_mult = 2.5
+        net_delta = getattr(signal, "net_buy_delta", None)
+        if net_delta is None:
+            net_delta = 0.70
+        liq_ratio = getattr(signal, "liquidity_to_mc_ratio", None)
+        if liq_ratio is None:
+            liq_ratio = 0.20
+        peak_gain = getattr(signal, "peak_gain_multiplier", None)
+        if peak_gain is None:
+            peak_gain = 1.0
+
         return cls(
             token_address=str(token_address),
-            consolidation_duration_s=float(getattr(signal, "consolidation_duration_s", 1800.0)),
-            dip_depth_pct=float(getattr(signal, "dip_depth_pct", 40.0)),
-            volume_surge_multiplier=float(getattr(signal, "volume_surge_multiplier", 2.5)),
-            net_buy_delta=float(getattr(signal, "net_buy_delta", 0.70)),
+            consolidation_duration_s=float(cons_dur),
+            dip_depth_pct=float(dip_pct),
+            volume_surge_multiplier=float(surge_mult),
+            net_buy_delta=float(net_delta),
             top10_concentration=top10_val,
-            liquidity_to_mc_ratio=float(getattr(signal, "liquidity_to_mc_ratio", 0.20)),
+            liquidity_to_mc_ratio=float(liq_ratio),
             smart_wallet_inflows=max(0.0, float(smart_inflows)),
-            peak_gain_multiplier=float(getattr(signal, "peak_gain_multiplier", 1.0)),
+            peak_gain_multiplier=float(peak_gain),
         )
 
     def cosine_similarity(self, other: "PatternFeatureVector") -> float:
@@ -167,3 +186,33 @@ class DecisionRecord(BaseModel):
             if hasattr(data.get("chain"), "value"):
                 data["chain"] = data["chain"].value
         return data
+
+
+class RevivalPatternFeatureVector(BaseModel):
+    """
+    Closed-loop feature storage vector for Revival & CTO Breakout swing trades.
+    Recorded upon position closure to train the adaptive tuner.
+    """
+
+    model_config = _STRICT_MODEL_CFG
+
+    token_address: str
+    token_age_hours: float = Field(ge=0.0, description="Age of token in hours since creation")
+    consolidation_length_hours: float = Field(ge=0.0, description="Length of dormant consolidation in hours")
+    base_mcap_usd: float = Field(ge=0.0, description="Market cap at the consolidation floor in USD")
+    volume_surge_multiplier: float = Field(ge=0.0, description="Breakout volume multiplier over SMA 1h")
+    net_buy_ratio: float = Field(ge=0.0, le=1.0, description="Organic net buy volume ratio")
+    peak_roi_pct: float = Field(description="Highest peak ROI reached since entry in percent")
+    realized_pnl_pct: float = Field(description="Final realized PnL in percent")
+    timestamp_ns: int = Field(default_factory=time.time_ns)
+
+    def to_vector(self) -> list[float]:
+        """Convert revival features into normalized vector."""
+        norm_age = min(1.0, self.token_age_hours / 240.0)             # 0 to 10 days
+        norm_cons = min(1.0, self.consolidation_length_hours / 72.0)  # 0 to 3 days
+        norm_mcap = min(1.0, self.base_mcap_usd / 200_000.0)         # 0 to $200k base
+        norm_surge = min(1.0, self.volume_surge_multiplier / 10.0)    # 0 to 10x
+        norm_delta = self.net_buy_ratio                               # 0 to 1
+        norm_peak = min(1.0, max(0.0, self.peak_roi_pct / 800.0))    # 0 to +800%
+        return [norm_age, norm_cons, norm_mcap, norm_surge, norm_delta, norm_peak]
+

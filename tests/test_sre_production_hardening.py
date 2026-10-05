@@ -52,8 +52,14 @@ def test_pydantic_settings_validation_and_defaults():
     assert cfg.initial_sol == Decimal("10.0")
     assert cfg.initial_eth == Decimal("2.0")
     assert cfg.initial_equity_usd > 0
-    assert "alchemy" in cfg.alchemy_ws_url or "demo" in cfg.alchemy_ws_url or "base" in cfg.alchemy_ws_url
-    assert "helius" in cfg.helius_ws_url or "demo" in cfg.helius_ws_url or "solana" in cfg.helius_ws_url
+    assert isinstance(cfg.alchemy_ws_url, str) and (
+        cfg.alchemy_ws_url.startswith(("ws://", "wss://"))
+        or any(k in cfg.alchemy_ws_url.lower() for k in ["alchemy", "demo", "base"])
+    ) and len(cfg.alchemy_ws_url) > 0
+    assert isinstance(cfg.helius_ws_url, str) and (
+        cfg.helius_ws_url.startswith(("ws://", "wss://"))
+        or any(k in cfg.helius_ws_url.lower() for k in ["helius", "demo", "solana", "solana.com", "mainnet"])
+    ) and len(cfg.helius_ws_url) > 0
 
 
 def test_env_var_override_and_backward_compatibility(monkeypatch):

@@ -15,6 +15,7 @@ from typing import Any, Optional
 
 import aiosqlite
 
+from alpha_engine.execution.ledger import sqlite_retry
 from alpha_engine.models.enums import ChainIdentifier, WalletClassification, WhitelistStatus
 from alpha_engine.models.profiler import WalletProfile, WhitelistRecord
 
@@ -32,6 +33,7 @@ class WhitelistDatabase:
         self._lock = asyncio.Lock()
         self._conn: Optional[aiosqlite.Connection] = None
 
+    @sqlite_retry(max_retries=5, base_delay=0.1)
     async def connect(self) -> None:
         """Connect to SQLite and initialize schema with WAL mode."""
         if self._conn is not None:
@@ -44,6 +46,7 @@ class WhitelistDatabase:
         await self._conn.execute("PRAGMA journal_mode = WAL;")
         await self._conn.execute("PRAGMA busy_timeout = 30000;")
         await self._conn.execute("PRAGMA synchronous = NORMAL;")
+        await self._conn.execute("PRAGMA cache_size = -64000;")
 
         await self._create_tables()
         await self._conn.commit()
@@ -77,6 +80,7 @@ class WhitelistDatabase:
             """
         )
 
+    @sqlite_retry(max_retries=5, base_delay=0.1)
     async def upsert_wallet(
         self,
         profile: WalletProfile,
@@ -197,6 +201,7 @@ class WhitelistDatabase:
         )
         return await self.upsert_wallet(profile, status=status)
 
+    @sqlite_retry(max_retries=5, base_delay=0.1)
     async def get_wallet(self, wallet_address: str) -> Optional[WhitelistRecord]:
         """Query a single wallet by address."""
         await self.connect()
@@ -232,6 +237,7 @@ class WhitelistDatabase:
             updated_at_ns=row["updated_at_ns"],
         )
 
+    @sqlite_retry(max_retries=5, base_delay=0.1)
     async def is_whitelisted(
         self,
         wallet_address: str,
@@ -260,6 +266,7 @@ class WhitelistDatabase:
         """Ban a compromised or insider wallet."""
         await self.update_status(wallet_address, status=WhitelistStatus.BANNED, reason=f"BAN: {reason}")
 
+    @sqlite_retry(max_retries=5, base_delay=0.1)
     async def update_status(
         self,
         wallet_address: str,
@@ -282,6 +289,7 @@ class WhitelistDatabase:
             await self._conn.commit()
 
 
+    @sqlite_retry(max_retries=5, base_delay=0.1)
     async def list_active(
         self,
         chain: Optional[ChainIdentifier] = None,
@@ -331,3 +339,8 @@ class WhitelistDatabase:
 
 
 WhitelistDB = WhitelistDatabase
+
+__all__ = [
+    "WhitelistDatabase",
+    "WhitelistDB",
+]

@@ -16,7 +16,7 @@ from decimal import Decimal
 from typing import Any, Optional
 
 from alpha_engine.models.ai import TakeProfitStage
-from alpha_engine.models.decisions import PatternFeatureVector
+from alpha_engine.models.decisions import PatternFeatureVector, RevivalPatternFeatureVector
 from alpha_engine.models.enums import ChainIdentifier, SignalSource, WhitelistStatus
 from alpha_engine.profiler.profiler import SmartMoneyProfiler
 
@@ -248,6 +248,7 @@ class PatternMemoryStore:
     def __init__(self, ledger: Optional[Any] = None) -> None:
         self._ledger = ledger
         self._patterns: list[PatternFeatureVector] = []
+        self._revival_patterns: list[RevivalPatternFeatureVector] = []
         self._load_baseline_archetypes()
 
     def _load_baseline_archetypes(self) -> None:
@@ -293,6 +294,24 @@ class PatternMemoryStore:
             vector.dip_depth_pct,
         )
 
+    def add_revival_pattern(self, vector: RevivalPatternFeatureVector) -> None:
+        """Add a closed revival swing breakout pattern vector to memory and ledger."""
+        self._revival_patterns.append(vector)
+        if self._ledger is not None and hasattr(self._ledger, "record_revival_pattern"):
+            try:
+                loop = asyncio.get_running_loop()
+                loop.create_task(self._ledger.record_revival_pattern(vector))
+            except RuntimeError:
+                pass
+        logger.info(
+            "PatternMemoryStore: Recorded new revival swing pattern for %s (peak_roi=%.1f%%, realized_pnl=%.1f%%, surge=%.1fx, age=%.1fh)",
+            vector.token_address[:10],
+            vector.peak_roi_pct,
+            vector.realized_pnl_pct,
+            vector.volume_surge_multiplier,
+            vector.token_age_hours,
+        )
+
     def calculate_pattern_match(self, candidate_vector: PatternFeatureVector) -> float:
         """
         Compute PatternMatchScore [0.0, 1.0] by finding the highest cosine similarity
@@ -309,6 +328,9 @@ class PatternMemoryStore:
 
     def get_patterns(self, limit: int = 50) -> list[PatternFeatureVector]:
         return self._patterns[-limit:]
+
+    def get_revival_patterns(self, limit: int = 50) -> list[RevivalPatternFeatureVector]:
+        return self._revival_patterns[-limit:]
 
 
 # =============================================================================
@@ -557,4 +579,20 @@ class DynamicParameterTuner:
 
     def get_tuning_history(self) -> list[dict[str, Any]]:
         return list(self._tuning_history)
+
+    def tune_revival_parameters(self, patterns: list[RevivalPatternFeatureVector]) -> dict[str, float]:
+        """
+        Analyze closed revival swing patterns.
+        Prioritizes token profiles whose dormant period and volume multiplier yield > 100% return
+        with minimal peak drawdown.
+        """
+        high_gain_patterns = [p for p in patterns if p.realized_pnl_pct >= 100.0 or p.peak_roi_pct >= 100.0]
+        if not high_gain_patterns:
+            return {"recommended_surge_k": 3.0, "min_consolidation_hours": 2.0}
+        avg_surge = sum(p.volume_surge_multiplier for p in high_gain_patterns) / len(high_gain_patterns)
+        avg_cons = sum(p.consolidation_length_hours for p in high_gain_patterns) / len(high_gain_patterns)
+        return {
+            "recommended_surge_k": round(max(2.0, min(5.0, avg_surge)), 2),
+            "min_consolidation_hours": round(max(1.0, min(24.0, avg_cons)), 2),
+        }
 

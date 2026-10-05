@@ -21,12 +21,15 @@ from alpha_engine.models.enums import (
 )
 from alpha_engine.models.events import (
     PoolStateUpdateEvent,
+    PumpMintEvent,
+    PumpSwapEvent,
     RawSignalEvent,
     ShutdownSentinel,
     SignalEvent,
     SwapEvent,
 )
 from alpha_engine.models.news import (
+    NewsEvent,
     NewsSignalEvent,
     TelegramMessage,
 )
@@ -89,9 +92,12 @@ __all__ = [
     "RawSignalEvent",
     "PoolStateUpdateEvent",
     "ShutdownSentinel",
+    "PumpMintEvent",
+    "PumpSwapEvent",
     # News & Social Models
     "TelegramMessage",
     "NewsSignalEvent",
+    "NewsEvent",
     # Profiler Models
     "WalletTradeRecord",
     "FundingHop",
