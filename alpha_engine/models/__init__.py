@@ -8,6 +8,7 @@ Python 3.11+ | Pydantic v2
 from alpha_engine.models.base import _STRICT_MODEL_CFG
 from alpha_engine.models.enums import (
     ChainIdentifier,
+    ExecutionVenue,
     ExitStage,
     LotStatus,
     NewsSignalStatus,
@@ -15,6 +16,7 @@ from alpha_engine.models.enums import (
     SecurityTier,
     SignalSource,
     SignalStrength,
+    StrategyHorizon,
     TradeExitReason,
     WalletClassification,
     WhitelistStatus,
@@ -67,8 +69,10 @@ from alpha_engine.models.state import (
 )
 from alpha_engine.models.decisions import (
     DecisionRecord,
+    DecisionSignal,
     DecisionType,
     PatternFeatureVector,
+    RevivalPatternFeatureVector,
 )
 
 __all__ = [
@@ -76,9 +80,11 @@ __all__ = [
     "_STRICT_MODEL_CFG",
     # Enums
     "ChainIdentifier",
+    "ExecutionVenue",
     "OrderSide",
     "SecurityTier",
     "SignalStrength",
+    "StrategyHorizon",
     "WalletClassification",
     "WhitelistStatus",
     "NewsSignalStatus",
@@ -130,6 +136,8 @@ __all__ = [
     # Structured Decision Audit & Pattern Models
     "DecisionType",
     "DecisionRecord",
+    "DecisionSignal",
     "PatternFeatureVector",
+    "RevivalPatternFeatureVector",
 ]
 

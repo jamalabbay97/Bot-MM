@@ -279,6 +279,7 @@ def _parse_rugcheck_report(
             lp_burned_ratio=1.0,
             top10_concentration=top10_conc,
             mint_authority_disabled=mint_disabled,
+            freeze_authority_disabled=freeze_disabled,
             verified_source_code=True,
             external_api_raw=json.dumps(raw, default=str),
         )
@@ -362,6 +363,7 @@ def _parse_rugcheck_report(
         lp_burned_ratio=lp_burned_ratio,
         top10_concentration=top10_concentration,
         mint_authority_disabled=mint_disabled,
+        freeze_authority_disabled=freeze_disabled,
         verified_source_code=not token_meta.get("mutable", True),
         external_api_raw=raw_json,
     )

@@ -18,6 +18,7 @@ from alpha_engine.ingestion.decoders import (
     _normalise,
     _parse_raydium_log_line,
 )
+from alpha_engine.ingestion.dex_metrics import DEXMetricsAggregator
 from alpha_engine.ingestion.evm import EVMIngester
 from alpha_engine.ingestion.svm import SVMIngester
 from alpha_engine.ingestion.telegram import TelegramIngester
@@ -36,6 +37,7 @@ __all__ = [
     "TelegramIngester",
     "XStreamIngester",
     "IngestionCoordinator",
+    "DEXMetricsAggregator",
     "_SWAP_TOPIC",
     "_SYNC_TOPIC",
 ]

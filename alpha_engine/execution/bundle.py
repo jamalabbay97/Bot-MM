@@ -31,6 +31,8 @@ DEFAULT_JITO_TIP_LAMPORTS = 50_000  # 0.00005 SOL
 
 __all__ = [
     "PrivateTxRouter",
+    "DynamicTipAllocator",
+    "execute_scalp_via_private_relay",
     "FLASHBOTS_RPC_URL",
     "TITAN_BUILDER_RPC_URL",
     "MEV_BLOCKER_RPC_URL",
@@ -283,3 +285,131 @@ class PrivateTxRouter:
         if res and "result" in res and res["result"] is not None:
             return str(res["result"])
         return None
+
+    async def submit_private_bundle(
+        self,
+        chain: ChainIdentifier,
+        signed_transactions: Sequence[str | bytes],
+        tip_wei_or_lamports: int = 10_000_000,
+        priority_percentile: str = "p95",
+    ) -> dict[str, Any]:
+        """
+        Submit transaction bundle directly to private relays (Flashbots/Titan on EVM, Jito on SVM).
+        """
+        return await self.execute_scalp_via_private_relay(
+            chain=chain,
+            transactions=signed_transactions,
+            priority_percentile=priority_percentile,
+        )
+
+    async def execute_scalp_via_private_relay(
+        self,
+        chain: ChainIdentifier,
+        transactions: Sequence[str | bytes],
+        priority_percentile: str = "p95",
+    ) -> dict[str, Any]:
+        """
+        Mandatory Scalp Execution via Private Relays:
+        - EVM: Flashbots / Titan / MEV-Blocker builders.
+        - Solana: Jito Bundles with dynamic tip allocation.
+        - Zero public-mempool exposure.
+        """
+        if not transactions:
+            return {"status": "error", "error": "No transactions provided"}
+
+        if chain == ChainIdentifier.SOLANA_MAINNET:
+            tip = await self.get_jito_tip_floor(priority_percentile)
+            res = await self.send_solana_jito_bundle(transactions, tip_percentile=priority_percentile)
+            return {
+                "status": "success" if res and not res.get("error") else "error",
+                "relay": "jito_block_engine",
+                "tip_sol": float(tip),
+                "response": res,
+            }
+        else:
+            tx_hex = transactions[0].hex() if isinstance(transactions[0], bytes) else str(transactions[0])
+            res = await self.send_evm_private_tx(tx_hex)
+            return {
+                "status": "success" if res and not res.get("error") else "error",
+                "relay": "flashbots_titan",
+                "response": res,
+            }
+
+
+class DynamicTipAllocator:
+    """
+    Dynamic Tip Allocation & Recalculation Routine:
+    - Queries Jito tip floor (Solana) and calculates dynamic priority fees (EVM).
+    - If transaction remains unconfirmed after timeout, recalculates tip with multiplier escalation.
+    """
+
+    def __init__(
+        self,
+        router: Optional[PrivateTxRouter] = None,
+        base_percentile: str = "p75",
+        escalation_multiplier: float = 1.35,
+        max_escalations: int = 3,
+    ) -> None:
+        self.router = router or PrivateTxRouter()
+        self.base_percentile = base_percentile
+        self.escalation_multiplier = escalation_multiplier
+        self.max_escalations = max_escalations
+
+    async def get_initial_tip(self, chain: ChainIdentifier) -> Decimal:
+        """Get initial dynamic tip for chain."""
+        if chain == ChainIdentifier.SOLANA_MAINNET:
+            return await self.router.get_jito_tip_floor(self.base_percentile)
+        else:
+            return Decimal("0.000000002")  # 2 Gwei
+
+    async def get_dynamic_tip(self, chain: ChainIdentifier, percentile: str = "p95") -> int:
+        """Get dynamic tip in wei or lamports."""
+        if chain == ChainIdentifier.SOLANA_MAINNET:
+            sol_tip = await self.router.get_jito_tip_floor(percentile)
+            return int(sol_tip * Decimal(1_000_000_000))
+        else:
+            return 2_000_000_000  # 2 Gwei in wei
+
+    def escalate_tip(self, tip: int, escalation_factor: float = 1.25) -> int:
+        """Escalate tip by factor."""
+        return int(tip * escalation_factor)
+
+    def recalculate_escalated_tip(
+        self,
+        current_tip: Decimal,
+        attempt: int,
+        chain: ChainIdentifier,
+    ) -> Decimal:
+        """
+        Recalculate and escalate tip for unconfirmed / expired transactions.
+        Strictly caps escalation at max_escalations.
+        """
+        if attempt > self.max_escalations:
+            logger.warning("Max tip escalations reached (%d) for %s — cancelling/dropping tx", attempt, chain.value)
+            return current_tip
+        escalated = current_tip * Decimal(str(self.escalation_multiplier))
+        logger.info(
+            "Recalculating unconfirmed tx tip on %s (attempt %d): %s -> %s",
+            chain.value,
+            attempt,
+            current_tip,
+            escalated,
+        )
+        return escalated
+
+
+async def execute_scalp_via_private_relay(
+    chain: ChainIdentifier,
+    transactions: Sequence[str | bytes],
+    priority_percentile: str = "p95",
+    router: Optional[PrivateTxRouter] = None,
+) -> dict[str, Any]:
+    """
+    Top-level helper to execute a scalp transaction via private relay.
+    """
+    r = router or PrivateTxRouter()
+    return await r.execute_scalp_via_private_relay(
+        chain=chain,
+        transactions=transactions,
+        priority_percentile=priority_percentile,
+    )

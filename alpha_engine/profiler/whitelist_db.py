@@ -68,6 +68,7 @@ class WhitelistDatabase:
                 active_days REAL NOT NULL,
                 cluster_tag TEXT,
                 rejection_reasons TEXT NOT NULL,
+                smart_money_score REAL NOT NULL DEFAULT 0.0,
                 created_at_ns INTEGER NOT NULL,
                 updated_at_ns INTEGER NOT NULL
             );
@@ -112,8 +113,8 @@ class WhitelistDatabase:
                 INSERT INTO wallet_whitelist (
                     wallet_address, chain, classification, status, win_rate_pct,
                     total_trades, total_pnl_usd, median_holding_time_s, active_days,
-                    cluster_tag, rejection_reasons, created_at_ns, updated_at_ns
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    cluster_tag, rejection_reasons, smart_money_score, created_at_ns, updated_at_ns
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(wallet_address) DO UPDATE SET
                     chain = excluded.chain,
                     classification = excluded.classification,
@@ -125,6 +126,7 @@ class WhitelistDatabase:
                     active_days = excluded.active_days,
                     cluster_tag = excluded.cluster_tag,
                     rejection_reasons = excluded.rejection_reasons,
+                    smart_money_score = excluded.smart_money_score,
                     updated_at_ns = excluded.updated_at_ns;
                 """,
                 (
@@ -139,6 +141,7 @@ class WhitelistDatabase:
                     float(profile.active_days),
                     profile.cluster_tag,
                     reasons_str,
+                    float(profile.smart_money_score),
                     created_at_ns,
                     now_ns,
                 ),
@@ -157,6 +160,7 @@ class WhitelistDatabase:
             active_days=profile.active_days,
             cluster_tag=profile.cluster_tag,
             rejection_reasons=reasons_str,
+            smart_money_score=profile.smart_money_score,
             created_at_ns=created_at_ns,
             updated_at_ns=now_ns,
         )
@@ -211,7 +215,7 @@ class WhitelistDatabase:
             """
             SELECT wallet_address, chain, classification, status, win_rate_pct,
                    total_trades, total_pnl_usd, median_holding_time_s, active_days,
-                   cluster_tag, rejection_reasons, created_at_ns, updated_at_ns
+                   cluster_tag, rejection_reasons, smart_money_score, created_at_ns, updated_at_ns
             FROM wallet_whitelist
             WHERE wallet_address = ?;
             """,
@@ -220,6 +224,9 @@ class WhitelistDatabase:
         row = await cursor.fetchone()
         if not row:
             return None
+
+        keys = row.keys()
+        sm_score = row["smart_money_score"] if "smart_money_score" in keys else 0.0
 
         return WhitelistRecord(
             wallet_address=row["wallet_address"],
@@ -233,6 +240,7 @@ class WhitelistDatabase:
             active_days=row["active_days"],
             cluster_tag=row["cluster_tag"],
             rejection_reasons=row["rejection_reasons"],
+            smart_money_score=sm_score,
             created_at_ns=row["created_at_ns"],
             updated_at_ns=row["updated_at_ns"],
         )
@@ -301,7 +309,7 @@ class WhitelistDatabase:
         query = """
             SELECT wallet_address, chain, classification, status, win_rate_pct,
                    total_trades, total_pnl_usd, median_holding_time_s, active_days,
-                   cluster_tag, rejection_reasons, created_at_ns, updated_at_ns
+                   cluster_tag, rejection_reasons, smart_money_score, created_at_ns, updated_at_ns
             FROM wallet_whitelist
             WHERE status = ?
         """
@@ -325,6 +333,7 @@ class WhitelistDatabase:
                 active_days=r["active_days"],
                 cluster_tag=r["cluster_tag"],
                 rejection_reasons=r["rejection_reasons"],
+                smart_money_score=r["smart_money_score"] if "smart_money_score" in r.keys() else 0.0,
                 created_at_ns=r["created_at_ns"],
                 updated_at_ns=r["updated_at_ns"],
             )

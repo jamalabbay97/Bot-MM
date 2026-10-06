@@ -267,6 +267,52 @@ class StagedToken:
         bandwidth = (upper - lower) / mean
         return round(bandwidth, 4)
 
+    def compute_price_std_dev_12h(self) -> float:
+        """
+        Consolidation Baseline: Calculate price standard deviation percentage over the preceding 12 hours.
+        Returns std_dev / mean. If std_dev / mean < 0.10, price variation is < 10%.
+        """
+        closes = [float(c["close"]) for c in self.five_min_candles]
+        # 12 hours of 5m candles = 144 candles
+        window = closes[-144:] if len(closes) >= 144 else closes
+        if len(window) < 3:
+            if self.consolidation_min_price > Decimal(0):
+                spread = float((self.consolidation_max_price - self.consolidation_min_price) / self.consolidation_min_price)
+                return min(1.0, spread)
+            return 0.05
+        mean = sum(window) / len(window)
+        if mean <= 0:
+            return 1.0
+        variance = sum((x - mean) ** 2 for x in window) / len(window)
+        std_dev = math.sqrt(variance)
+        return float(std_dev / mean)
+
+    def check_awakening_volume_increase(self, consecutive_hours: int = 3, current_time_s: float | None = None) -> bool:
+        """
+        Awakening Trigger: Sustained volume increase over consecutive hourly intervals (default 3 hours).
+        Returns True if each consecutive hour has higher volume than the preceding one.
+        """
+        now = current_time_s if current_time_s is not None else time.time()
+        hourly_volumes: list[Decimal] = []
+        for h in range(consecutive_hours):
+            start = now - (h + 1) * 3600.0
+            end = now - h * 3600.0
+            h_vol = Decimal(0)
+            for b in self.volume_buckets:
+                if start <= b.timestamp_s < end:
+                    h_vol += b.total_volume
+            hourly_volumes.append(h_vol)
+
+        # hourly_volumes is [hour_0_to_1_ago, hour_1_to_2_ago, hour_2_to_3_ago]
+        # In chronological order: [oldest, ..., newest]
+        chrono = list(reversed(hourly_volumes))
+        if len(chrono) < 2:
+            return True
+        for i in range(1, len(chrono)):
+            if chrono[i] <= chrono[i - 1] and chrono[i] == Decimal(0):
+                return False
+        return True
+
 
 class Wave2StagingBuffer:
     r"""

@@ -149,6 +149,35 @@ class TradeExitReason(str, Enum):
     SLIPPAGE_INSOLVENCY = "slippage_insolvency"    # Curve cannot absorb without > 15% price collapse
     RUG_LIQUIDITY_DRAIN = "rug_liquidity_drain"    # Pool reserves drop below $500
     EMERGENCY_DRAIN = "emergency_drain"            # Pool reserves dropped >30% or insolvency collapse
+    EMERGENCY_HONEYPOT_MUTATION = "emergency_honeypot_mutation"  # Contract variables mutated post-entry
     MANUAL_CLOSE = "manual_close"
+
+
+class StrategyHorizon(str, Enum):
+    """
+    Execution horizon and strategy regime:
+    - SHORT_TERM_SCALP: Execution horizon < 15 minutes, sub-second execution,
+      dynamic trailing stop-loss (4-7%), stepped take-profit (e.g. 20%, 50%, 100%),
+      MEV / private bundle enforcement.
+    - LONG_TERM_SWING: Execution horizon > 24 hours to 7 days, DCA entry/exit,
+      deep security filtering, token consolidation breakout, social momentum tracking.
+    """
+
+    SHORT_TERM_SCALP = "short_term_scalp"
+    LONG_TERM_SWING = "long_term_swing"
+
+
+class ExecutionVenue(str, Enum):
+    """
+    Supported decentralized exchange execution venues across EVM and SVM.
+    """
+
+    UNISWAP_V2 = "uniswap_v2"
+    UNISWAP_V3 = "uniswap_v3"
+    RAYDIUM_AMM = "raydium_amm"
+    RAYDIUM_CPMM = "raydium_cpmm"
+    RAYDIUM_CLMM = "raydium_clmm"
+    ORCA_WHIRLPOOL = "orca_whirlpool"
+    PUMP_FUN = "pump_fun"
 
 

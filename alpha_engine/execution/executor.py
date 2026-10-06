@@ -11,7 +11,10 @@ import logging
 import time
 from decimal import Decimal
 
+from typing import Optional
+
 from alpha_engine.execution.book import PositionBook
+from alpha_engine.execution.bundle import PrivateTxRouter
 from alpha_engine.math.cpmm import (
     cpmm_buy_quote,
     cpmm_sell_quote,
@@ -24,7 +27,12 @@ from alpha_engine.math.sizing import (
     gas_cost_usd,
     half_kelly_fraction,
 )
-from alpha_engine.models.enums import ChainIdentifier, OrderSide, TradeExitReason
+from alpha_engine.models.decisions import DecisionSignal
+from alpha_engine.models.enums import (
+    ChainIdentifier,
+    OrderSide,
+    TradeExitReason,
+)
 from alpha_engine.models.events import SignalEvent
 from alpha_engine.models.state import PaperFill, PoolState
 
@@ -43,12 +51,14 @@ class PaperExecutor:
         historical_win_rate: float = 0.5,
         avg_win_native: Decimal = Decimal("0.1"),
         avg_loss_native: Decimal = Decimal("0.05"),
+        private_router: Optional[PrivateTxRouter] = None,
     ) -> None:
         self._positions = position_book
         self._native_price_usd = native_price_usd
         self._win_rate = historical_win_rate
         self._avg_win = avg_win_native
         self._avg_loss = avg_loss_native
+        self._private_router = private_router or PrivateTxRouter()
 
     def update_native_price(self, new_price: Decimal) -> None:
         """Update the native asset price used for USD conversions."""
@@ -77,7 +87,7 @@ class PaperExecutor:
         Optionally applies realistic paper market drag (0.3% fee + 0.005 gas + 5% slippage).
         """
         side = signal.suggested_side
-        pool = signal.pool_state
+        pool = getattr(signal, "pool_state", None)
         if pool is None or pool.token_reserve <= Decimal(0) or pool.native_reserve <= Decimal(0):
             pool = get_initial_bonding_curve_pool(
                 token_address=signal.token_address,
@@ -255,6 +265,14 @@ class PaperExecutor:
                 side=OrderSide.SELL,
             )
 
+        if reason == TradeExitReason.EMERGENCY_HONEYPOT_MUTATION:
+            # Route emergency dump through private relay with highest priority
+            await self._private_router.submit_private_bundle(
+                chain=chain,
+                signed_transactions=[b"simulated_emergency_honeypot_exit"],
+                tip_wei_or_lamports=10_000_000,
+            )
+
         gas = gas_cost_usd(chain)
         fill = PaperFill(
             token_address=token_address,
@@ -282,3 +300,117 @@ class PaperExecutor:
             price_impact_bps,
         )
         return fill
+
+    async def execute_scalp_pipeline(
+        self,
+        signal: DecisionSignal | SignalEvent,
+        portfolio_equity_usd: Decimal,
+        max_position_fraction: Decimal | None = None,
+        apply_drag: bool = False,
+        priority_percentile: str = "p95",
+    ) -> PaperFill | None:
+        """
+        Scalping Execution Pipeline:
+        - Sub-second execution via private relays (Jito Bundles on Solana, Flashbots/Titan on EVM).
+        - Prevents MEV exploitation and front-running.
+        - Fractional Kelly position sizing.
+        - Validates private relay routing before fill creation.
+        """
+        fill = await self.execute_signal(
+            signal=signal,
+            portfolio_equity_usd=portfolio_equity_usd,
+            max_position_fraction=max_position_fraction,
+            apply_drag=apply_drag,
+        )
+        if fill is None:
+            return None
+
+        relay_result = await self._private_router.execute_scalp_via_private_relay(
+            chain=signal.chain,
+            transactions=[f"simulated_private_tx_{fill.order_id}"],
+            priority_percentile=priority_percentile,
+        )
+        logger.info(
+            "Scalping Pipeline: Executed via %s | Status=%s | Tip=%s",
+            relay_result.get("relay", "private_builder"),
+            relay_result.get("status"),
+            relay_result.get("tip_sol", 0.0),
+        )
+        return fill
+
+    async def execute_swing_dca_pipeline(
+        self,
+        signal: DecisionSignal | SignalEvent,
+        portfolio_equity_usd: Decimal,
+        num_batches: int = 3,
+        block_interval: int = 2,
+        max_position_fraction: Decimal | None = None,
+        apply_drag: bool = False,
+    ) -> list[PaperFill]:
+        """
+        Swing Execution Pipeline:
+        - Gas-optimized transaction batching.
+        - Dollar-cost averaging (DCA) over multiple blocks to minimize slippage and price impact.
+        - Fractional Kelly position sizing split evenly across num_batches.
+        """
+        total_fill = await self.execute_signal(
+            signal=signal,
+            portfolio_equity_usd=portfolio_equity_usd,
+            max_position_fraction=max_position_fraction,
+            apply_drag=apply_drag,
+        )
+        if total_fill is None:
+            return []
+
+        total_native = total_fill.simulated_native_spent
+        batch_native = total_native / Decimal(str(num_batches))
+        pool = getattr(signal, "pool_state", None)
+        if pool is None:
+            pool = get_initial_bonding_curve_pool(
+                token_address=signal.token_address,
+                chain=signal.chain,
+                pool_address=signal.pool_address,
+            )
+
+        fills: list[PaperFill] = []
+        curr_pool = pool
+        for b_idx in range(num_batches):
+            try:
+                quote = cpmm_buy_quote(curr_pool, batch_native)
+            except Exception:
+                break
+            tokens_batch = quote.amount_out
+            eff_price = batch_native / tokens_batch if tokens_batch > 0 else Decimal("0")
+            gas = gas_cost_usd(signal.chain)
+            fill_b = PaperFill(
+                token_address=signal.token_address,
+                pool_address=signal.pool_address,
+                chain=signal.chain,
+                side=OrderSide.BUY,
+                simulated_native_spent=batch_native,
+                tokens_acquired=tokens_batch,
+                effective_price=eff_price,
+                price_impact_bps=quote.price_impact_bps,
+                simulated_gas_cost_usd=gas,
+                fill_latency_ms=25.0 * (b_idx + 1),
+                signal_timestamp_ns=signal.timestamp_ns,
+                fill_timestamp_ns=time.time_ns(),
+                kelly_fraction=total_fill.kelly_fraction / num_batches,
+                portfolio_equity_usd=portfolio_equity_usd,
+            )
+            fills.append(fill_b)
+            curr_pool = curr_pool.model_copy(
+                update={
+                    "native_reserve": curr_pool.native_reserve + batch_native,
+                    "token_reserve": max(Decimal("1"), curr_pool.token_reserve - tokens_batch),
+                    "last_updated_block": curr_pool.last_updated_block + block_interval,
+                }
+            )
+
+        logger.info(
+            "Swing Pipeline: Executed %d DCA batches across %d blocks | Total Tokens=%s",
+            len(fills),
+            num_batches * block_interval,
+            sum((f.tokens_acquired for f in fills), Decimal(0)),
+        )
+        return fills

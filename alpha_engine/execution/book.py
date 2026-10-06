@@ -13,7 +13,7 @@ import uuid
 from collections import defaultdict
 from dataclasses import dataclass, field
 from decimal import Decimal
-from typing import Optional
+from typing import Optional, Any
 from alpha_engine.models.enums import ChainIdentifier, ExitProfile, ExitStage, LotStatus, TradeExitReason
 from alpha_engine.models.state import PaperFill
 
@@ -533,6 +533,7 @@ class PositionBook:
         trade_volume_native: Decimal | None = None,
         is_sell: bool = False,
         emergency_stop_pct: Decimal = Decimal("-0.25"),
+        security_report: Any | None = None,
     ) -> ExitDecision | None:
         """
         Evaluate adaptive dynamic exit rules for an open lot:
@@ -551,6 +552,32 @@ class PositionBook:
         """
         if lot.tokens_held <= 0 or lot.entry_price <= 0:
             return None
+
+        # Post-entry security mutation check (honeypot / tax hike / authority re-enabled)
+        if security_report is not None:
+            buy_tax = getattr(security_report, "buy_tax_bps", 0)
+            sell_tax = getattr(security_report, "sell_tax_bps", 0)
+            is_honeypot = getattr(security_report, "is_honeypot", False)
+            freeze_dis = getattr(security_report, "freeze_authority_disabled", True)
+            mint_dis = getattr(security_report, "mint_authority_disabled", True)
+            if buy_tax > 300 or sell_tax > 300 or is_honeypot or not freeze_dis or not mint_dis:
+                logger.warning(
+                    "EMERGENCY HONEYPOT MUTATION detected for lot %s (%s)! Liquidating 100%% immediately.",
+                    lot.lot_id[:8],
+                    lot.token_address[:10],
+                )
+                return ExitDecision(
+                    lot_id=lot.lot_id,
+                    token_address=lot.token_address,
+                    chain=lot.chain,
+                    should_exit=True,
+                    exit_reason=TradeExitReason.EMERGENCY_HONEYPOT_MUTATION,
+                    exit_stage=ExitStage.RUGPULL,
+                    tokens_to_sell=lot.tokens_held,
+                    current_price=current_price,
+                    pnl_estimate_native=lot.tokens_held * (current_price - lot.entry_price),
+                    prioritized=True,
+                )
 
         is_bc = bonding_curve_mode if bonding_curve_mode is not None else lot.bonding_curve_mode
 

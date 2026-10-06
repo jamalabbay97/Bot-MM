@@ -9,7 +9,11 @@ from alpha_engine.execution.book import (
     PositionBook,
     RunningMetrics,
 )
-from alpha_engine.execution.bundle import PrivateTxRouter
+from alpha_engine.execution.bundle import (
+    DynamicTipAllocator,
+    PrivateTxRouter,
+    execute_scalp_via_private_relay,
+)
 from alpha_engine.execution.executor import PaperExecutor
 from alpha_engine.execution.ledger import (
     _DB_INIT_TIMEOUT_S,
@@ -26,6 +30,8 @@ __all__ = [
     "SQLiteLedger",
     "sqlite_retry",
     "PrivateTxRouter",
+    "DynamicTipAllocator",
+    "execute_scalp_via_private_relay",
     "_DB_INIT_TIMEOUT_S",
     "_SNAPSHOT_INTERVAL_S",
 ]

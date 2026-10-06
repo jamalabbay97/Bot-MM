@@ -22,6 +22,7 @@ from alpha_engine.ingestion.evm import (
     _RECONNECT_MULTIPLIER,
 )
 from alpha_engine.ingestion.svm import SVMIngester
+from alpha_engine.ingestion.dex_metrics import DEXMetricsAggregator
 from alpha_engine.ingestion.telegram import TelegramIngester
 from alpha_engine.ingestion.x_stream import XStreamIngester
 from alpha_engine.models.events import (
@@ -152,6 +153,7 @@ class IngestionCoordinator:
         gatekeeper: Optional[Any] = None,
         ai_supervisor: Optional[Any] = None,
         svm_failover_urls: Optional[Sequence[str]] = None,
+        metrics_aggregator: Optional[DEXMetricsAggregator] = None,
     ) -> None:
         self._queue: asyncio.Queue[
             SwapEvent | PoolStateUpdateEvent | RawSignalEvent | ShutdownSentinel
@@ -161,12 +163,14 @@ class IngestionCoordinator:
         )
         self._gatekeeper = gatekeeper
         self._dedup_cache = TokenTTLCache(ttl_seconds=60.0)
+        self._metrics_aggregator = metrics_aggregator or DEXMetricsAggregator()
 
         self._evm = EVMIngester(
             ws_url=evm_ws_url,
             pool_watchlist=pool_watchlist,
             event_queue=self._queue,
             limiter=limiter,
+            metrics_aggregator=self._metrics_aggregator,
         )
         self._svm = SVMIngester(
             ws_url=svm_ws_url,
@@ -174,6 +178,7 @@ class IngestionCoordinator:
             event_queue=self._queue,
             limiter=limiter,
             failover_urls=list(svm_failover_urls) if svm_failover_urls else None,
+            metrics_aggregator=self._metrics_aggregator,
         )
 
         if telegram_ingester is not None:
@@ -238,6 +243,11 @@ class IngestionCoordinator:
     async def is_duplicate_token(self, token_address: str) -> bool:
         """Check and record token address in coordinator deduplication cache."""
         return await self._dedup_cache.is_duplicate_or_add(token_address)
+
+    @property
+    def metrics_aggregator(self) -> DEXMetricsAggregator:
+        """In-memory sliding-window DEX metrics aggregator."""
+        return self._metrics_aggregator
 
     @property
     def evm_ingester(self) -> EVMIngester:
@@ -457,6 +467,10 @@ class IngestionCoordinator:
                             target_token[:10],
                         )
                         continue
+                self._metrics_aggregator.record_swap(item)
+
+            elif isinstance(item, PoolStateUpdateEvent):
+                self._metrics_aggregator.record_pool_update_event(item)
 
             return item
 
@@ -465,4 +479,5 @@ __all__ = [
     "IngestionCoordinator",
     "TokenTTLCache",
     "ExponentialBackoff",
+    "DEXMetricsAggregator",
 ]

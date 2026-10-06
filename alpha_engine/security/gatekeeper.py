@@ -8,7 +8,7 @@ Python 3.11+ | aiohttp + web3.py
 from __future__ import annotations
 
 import logging
-from typing import Any
+from typing import Any, Optional
 
 import aiohttp
 
@@ -268,6 +268,78 @@ class SecurityGatekeeper:
             return False, f"SYBIL_SUSPECT: unique signers {len(unique_buyers)} < {min_unique}"
         return True, ""
 
+    @staticmethod
+    def detect_insider_cabal(
+        funding_sources: dict[str, str],
+        buy_timestamps: Optional[dict[str, float]] = None,
+        simultaneous_window_s: float = 60.0,
+    ) -> tuple[bool, str, list[str]]:
+        """
+        Insider Cabal Detection:
+        Identifies wallets funded from the same source deploying simultaneous buys.
+        Returns (is_cabal_detected, reason, cabal_wallets).
+        """
+        if not funding_sources:
+            return False, "", []
+
+        funder_to_wallets: dict[str, list[tuple[str, float]]] = {}
+        for w, funder in funding_sources.items():
+            if not funder:
+                continue
+            f_norm = funder.lower().strip()
+            ts = (buy_timestamps or {}).get(w, 0.0)
+            funder_to_wallets.setdefault(f_norm, []).append((w, ts))
+
+        for funder, wallets in funder_to_wallets.items():
+            if len(wallets) < 2:
+                continue
+            if buy_timestamps:
+                timestamps = [t for _, t in wallets if t > 0]
+                if len(timestamps) >= 2:
+                    t_span = max(timestamps) - min(timestamps)
+                    if t_span <= simultaneous_window_s:
+                        cabal_addrs = [w for w, _ in wallets]
+                        return (
+                            True,
+                            f"INSIDER_CABAL_DETECTED: {len(cabal_addrs)} wallets funded by {funder[:12]} deployed buys within {t_span:.1f}s",
+                            cabal_addrs,
+                        )
+            else:
+                cabal_addrs = [w for w, _ in wallets]
+                return (
+                    True,
+                    f"INSIDER_CABAL_DETECTED: {len(cabal_addrs)} wallets funded by common source {funder[:12]}",
+                    cabal_addrs,
+                )
+
+        return False, "", []
+
+    @staticmethod
+    def evaluate_strict_hard_fails(report: SecurityReport) -> tuple[bool, str]:
+        """
+        Enterprise Strict Hard-Fails (Instant Disqualification):
+          - Mint Authority enabled or Freeze Authority not revoked (SVM).
+          - Honeypot / Transfer-Tax logic detected: Buy/Sell tax > 3%.
+          - Liquidity Pool unlocked: LP burn or lock verified must be >= 99%.
+          - Sybil / Top-Holder Concentration: Top 10 non-DEX, non-burn wallets hold > 15% of total supply.
+        """
+        if report.is_honeypot:
+            return False, "HONEYPOT_DETECTED: sell simulation failed / honeypot logic"
+        if report.buy_tax_bps > 300:
+            return False, f"BUY_TAX_EXCEEDED: {report.buy_tax_bps} bps > 300 bps (3%)"
+        if report.sell_tax_bps > 300:
+            return False, f"SELL_TAX_EXCEEDED: {report.sell_tax_bps} bps > 300 bps (3%)"
+        if not report.mint_authority_disabled:
+            return False, "MINT_AUTHORITY_ENABLED: Mint authority is not revoked"
+        if not report.freeze_authority_disabled:
+            return False, "FREEZE_AUTHORITY_NOT_REVOKED: Freeze authority is active"
+        if not report.is_pump_fun and report.lp_burned_ratio < 0.99:
+            return False, f"LP_UNLOCKED: LP burn ratio {report.lp_burned_ratio:.2%} < 99.0%"
+        max_conc = 0.65 if report.is_pump_fun else 0.15
+        if report.top10_concentration > max_conc:
+            return False, f"TOP10_CONCENTRATION_EXCEEDED: {report.top10_concentration:.2%} > {max_conc:.2%}"
+        return True, ""
+
     async def screen_token(
         self,
         token_address: str,
@@ -384,4 +456,9 @@ class SecurityGatekeeper:
 
         else:
             raise ValueError(f"Unsupported chain for security screening: {chain}")
+
+
+detect_insider_cabal = SecurityGatekeeper.detect_insider_cabal
+evaluate_strict_hard_fails = SecurityGatekeeper.evaluate_strict_hard_fails
+
 

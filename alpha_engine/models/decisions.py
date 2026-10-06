@@ -16,6 +16,13 @@ from typing import Any, Optional
 from pydantic import BaseModel, Field, model_validator
 
 from alpha_engine.models.base import _STRICT_MODEL_CFG
+from alpha_engine.models.enums import (
+    ChainIdentifier,
+    ExecutionVenue,
+    OrderSide,
+    SignalStrength,
+    StrategyHorizon,
+)
 
 
 class DecisionType(str, Enum):
@@ -215,4 +222,32 @@ class RevivalPatternFeatureVector(BaseModel):
         norm_delta = self.net_buy_ratio                               # 0 to 1
         norm_peak = min(1.0, max(0.0, self.peak_roi_pct / 800.0))    # 0 to +800%
         return [norm_age, norm_cons, norm_mcap, norm_surge, norm_delta, norm_peak]
+
+
+class DecisionSignal(BaseModel):
+    """
+    Comprehensive multi-chain autonomous decision signal for dual-horizon execution.
+    Encapsulates quantitative metrics, horizon, execution venue, confidence bounds,
+    smart-money clustering, and estimated market impact.
+    """
+
+    model_config = _STRICT_MODEL_CFG
+
+    signal_id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    timestamp_ns: int = Field(default_factory=time.time_ns)
+    chain: ChainIdentifier = ChainIdentifier.SOLANA_MAINNET
+    token_address: str
+    pool_address: str
+    strategy_horizon: StrategyHorizon = StrategyHorizon.SHORT_TERM_SCALP
+    execution_venue: ExecutionVenue = ExecutionVenue.RAYDIUM_AMM
+    suggested_side: OrderSide = OrderSide.BUY
+    signal_strength: SignalStrength = SignalStrength.STRONG
+    confidence_interval: tuple[float, float] = (0.50, 0.95)
+    trigger_reason: str = Field(description="Explicit mathematical or anomaly trigger reason")
+    smart_money_wallet_cluster: list[str] = Field(default_factory=list)
+    estimated_price_impact: float = Field(default=0.0, ge=0.0)
+    alpha_score: float = Field(default=0.50, ge=0.0, le=1.0)
+    pool_state: Optional[Any] = None
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
 

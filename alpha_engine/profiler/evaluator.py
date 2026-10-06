@@ -7,6 +7,7 @@ Python 3.11+
 
 from __future__ import annotations
 
+from collections import defaultdict
 import statistics
 import time
 from decimal import Decimal
@@ -36,6 +37,25 @@ class WalletEvaluator:
     MIN_MEDIAN_HOLDING_TIME_S: float = 45.0
     MAX_INACTIVE_DAYS_REVIVAL: float = 45.0
     MAX_FUNDING_HOPS: int = 3
+    MAX_SINGLE_DEV_VOLUME_RATIO: float = 0.80
+
+    @staticmethod
+    def calculate_smart_money_score(
+        win_rate: float,
+        sharpe_ratio: float,
+        holding_discipline: float,
+        longevity: float,
+    ) -> float:
+        """
+        Smart Money Score (S_wallet) Formula:
+        S_wallet = (WinRate * 0.4) + (SharpeRatio * 0.3) + (HoldingDiscipline * 0.2) + (Longevity * 0.1)
+        Inputs are normalized in [0.0, 1.0].
+        """
+        wr = max(0.0, min(1.0, win_rate / 100.0 if win_rate > 1.0 else win_rate))
+        sr = max(0.0, min(1.0, sharpe_ratio))
+        hd = max(0.0, min(1.0, holding_discipline))
+        lg = max(0.0, min(1.0, longevity))
+        return round(float((wr * 0.4) + (sr * 0.3) + (hd * 0.2) + (lg * 0.1)), 4)
 
     @classmethod
     def evaluate(
@@ -201,6 +221,57 @@ class WalletEvaluator:
                     f"Unprofitable lifetime PnL: ${total_pnl_usd:,.2f} <= $0"
                 )
 
+        # Single-developer volume concentration check (> 80%)
+        if not insider_detected and trades:
+            total_vol = sum((t.invested_native for t in trades), Decimal(0))
+            if total_vol > Decimal(0):
+                dev_vols: dict[str, Decimal] = defaultdict(Decimal)
+                has_dev_info = False
+                for t in trades:
+                    dev = (
+                        (t.custom_metadata or {}).get("developer_address")
+                        or (t.custom_metadata or {}).get("dev_wallet")
+                        or (t.custom_metadata or {}).get("deployer_address")
+                    )
+                    if dev:
+                        has_dev_info = True
+                        dev_vols[dev.lower().strip()] += t.invested_native
+                if has_dev_info and dev_vols:
+                    max_dev_vol = max(dev_vols.values())
+                    if (max_dev_vol / total_vol) > Decimal(str(cls.MAX_SINGLE_DEV_VOLUME_RATIO)):
+                        classification = WalletClassification.INSIDER
+                        rejection_reasons.append(
+                            f"Single-developer token concentration: {float(max_dev_vol/total_vol):.1%} volume (> {cls.MAX_SINGLE_DEV_VOLUME_RATIO:.0%}) on single developer"
+                        )
+
+        # Circular wash trading check
+        if classification == WalletClassification.APPROVED and cls.detect_circular_wash_trading(wallet_address, trades):
+            classification = WalletClassification.CIRCULAR_WASH
+            rejection_reasons.append("Circular fund routing / mixer clustering detected")
+
+        # Smart Money Score formula:
+        # S_wallet = (WinRate * 0.4) + (SharpeRatio * 0.3) + (HoldingDiscipline * 0.2) + (Longevity * 0.1)
+        rois = [t.roi_pct / 100.0 for t in trades]
+        if len(rois) > 1:
+            mean_roi = sum(rois) / len(rois)
+            try:
+                std_roi = statistics.stdev(rois)
+            except Exception:
+                std_roi = 0.0
+            raw_sharpe = (mean_roi / std_roi) if std_roi > 0 else 0.0
+            sharpe_norm = max(0.0, min(1.0, raw_sharpe / 3.0))
+        else:
+            sharpe_norm = 0.50 if (trades and trades[0].is_win) else 0.0
+
+        holding_discipline_norm = max(0.0, min(1.0, median_holding_time / 300.0))
+        longevity_norm = max(0.0, min(1.0, active_days / 60.0))
+        smart_money_score = cls.calculate_smart_money_score(
+            win_rate=win_rate_pct,
+            sharpe_ratio=sharpe_norm,
+            holding_discipline=holding_discipline_norm,
+            longevity=longevity_norm,
+        )
+
         is_whitelisted = (classification == WalletClassification.APPROVED)
 
         return WalletProfile(
@@ -223,6 +294,10 @@ class WalletEvaluator:
             cluster_tag=cluster_tag,
             funding_hops=detected_hops,
             rejection_reasons=rejection_reasons,
+            smart_money_score=smart_money_score,
+            sharpe_ratio=round(sharpe_norm, 4),
+            holding_discipline=round(holding_discipline_norm, 4),
+            longevity=round(longevity_norm, 4),
         )
 
     @classmethod
@@ -398,6 +473,51 @@ class WalletEvaluator:
                 f"Average holding time {avg_holding_time:.1f}s <= 180.0s (MEV bot filter)"
             )
 
+        # Single-developer volume concentration check (> 80%)
+        if trades_30d:
+            total_vol_30d = sum((t.invested_native for t in trades_30d), Decimal(0))
+            if total_vol_30d > Decimal(0):
+                dev_vols_30d: dict[str, Decimal] = defaultdict(Decimal)
+                has_dev_info = False
+                for t in trades_30d:
+                    dev = (
+                        (t.custom_metadata or {}).get("developer_address")
+                        or (t.custom_metadata or {}).get("dev_wallet")
+                        or (t.custom_metadata or {}).get("deployer_address")
+                    )
+                    if dev:
+                        has_dev_info = True
+                        dev_vols_30d[dev.lower().strip()] += t.invested_native
+                if has_dev_info and dev_vols_30d:
+                    max_dev_vol_30d = max(dev_vols_30d.values())
+                    if (max_dev_vol_30d / total_vol_30d) > Decimal(str(cls.MAX_SINGLE_DEV_VOLUME_RATIO)):
+                        classification = WalletClassification.INSIDER
+                        rejection_reasons.append(
+                            f"Single-developer token concentration: {float(max_dev_vol_30d/total_vol_30d):.1%} volume (> {cls.MAX_SINGLE_DEV_VOLUME_RATIO:.0%}) on single developer"
+                        )
+
+        # Smart Money Score formula:
+        rois = [t.roi_pct / 100.0 for t in trades_30d]
+        if len(rois) > 1:
+            mean_roi = sum(rois) / len(rois)
+            try:
+                std_roi = statistics.stdev(rois)
+            except Exception:
+                std_roi = 0.0
+            raw_sharpe = (mean_roi / std_roi) if std_roi > 0 else 0.0
+            sharpe_norm = max(0.0, min(1.0, raw_sharpe / 3.0))
+        else:
+            sharpe_norm = 0.50 if (trades_30d and trades_30d[0].is_win) else 0.0
+
+        holding_discipline_norm = max(0.0, min(1.0, avg_holding_time / 300.0))
+        longevity_norm = max(0.0, min(1.0, 30.0 / 60.0))
+        smart_money_score = cls.calculate_smart_money_score(
+            win_rate=win_rate_50pct,
+            sharpe_ratio=sharpe_norm,
+            holding_discipline=holding_discipline_norm,
+            longevity=longevity_norm,
+        )
+
         winning_trades = sum(1 for t in trades_30d if t.is_win)
         losing_trades = total_trades - winning_trades
         total_pnl_usd = sum((t.realized_pnl_usd for t in trades_30d), Decimal("0"))
@@ -426,6 +546,10 @@ class WalletEvaluator:
             cluster_tag=cluster_tag,
             funding_hops=detected_hops,
             rejection_reasons=rejection_reasons,
+            smart_money_score=smart_money_score,
+            sharpe_ratio=round(sharpe_norm, 4),
+            holding_discipline=round(holding_discipline_norm, 4),
+            longevity=round(longevity_norm, 4),
         )
 
 

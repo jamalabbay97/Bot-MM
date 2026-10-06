@@ -7,6 +7,7 @@ Re-exports all ingestion streaming and decoding definitions from alpha_engine.in
 from alpha_engine.ingestion import (
     _SWAP_TOPIC,
     _SYNC_TOPIC,
+    DEXMetricsAggregator,
     EVMIngester,
     EvmPoolMeta,
     ExponentialBackoff,
@@ -34,6 +35,7 @@ __all__ = [
     "TelegramIngester",
     "XStreamIngester",
     "IngestionCoordinator",
+    "DEXMetricsAggregator",
     "_SWAP_TOPIC",
     "_SYNC_TOPIC",
 ]

@@ -9,7 +9,9 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from collections import deque
+import time
+from collections import defaultdict, deque
+from dataclasses import dataclass
 from decimal import Decimal
 from typing import Any, Callable, Coroutine, Optional, Sequence, Set
 
@@ -26,6 +28,15 @@ from alpha_engine.profiler.whitelist_db import WhitelistDatabase
 from alpha_engine.rate_limiter.registry import RateLimiterRegistry
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class WalletTradeActivity:
+    wallet_address: str
+    timestamp_s: float
+    smart_money_score: float
+    cluster_tag: Optional[str] = None
+    funding_source: Optional[str] = None
 
 # Type alias for external transaction / funding fetcher callable
 FundingFetcher = Callable[
@@ -54,6 +65,8 @@ class SmartMoneyProfiler:
         self.whitelist_db = whitelist_db or WhitelistDatabase(db_path=db_path)
         self.evaluator = WalletEvaluator()
         self.funding_fetcher = funding_fetcher
+        # token_address -> list of WalletTradeActivity
+        self._recent_purchases: dict[str, list[WalletTradeActivity]] = defaultdict(list)
 
     async def initialize(self) -> None:
         """Initialize database tables and connections."""
@@ -399,4 +412,78 @@ class SmartMoneyProfiler:
         await self.initialize()
         await self.whitelist_db.update_status(wallet_address, status=actual_status)
         logger.warning("Wallet %s demoted/banned (%s): %s", wallet_address[:10], actual_status.value, reason)
+
+    def record_wallet_purchase(
+        self,
+        token_address: str,
+        wallet_address: str,
+        smart_money_score: float,
+        timestamp_s: Optional[float] = None,
+        cluster_tag: Optional[str] = None,
+        funding_source: Optional[str] = None,
+    ) -> tuple[bool, list[str]]:
+        """
+        Record a purchase by a smart money wallet and evaluate copy-trade gating.
+        Rule: Only execute copy-trade signals when at least 2 distinct, uncorrelated
+        high-scoring wallets (S_wallet >= 0.75) purchase the same asset within a 120-second window.
+        Returns (should_execute_copy_trade, qualifying_wallets).
+        """
+        now = timestamp_s if timestamp_s is not None else time.time()
+        tok = token_address.lower().strip()
+        wallet = wallet_address.lower().strip()
+
+        # Clean entries older than 120 seconds
+        cutoff = now - 120.0
+        self._recent_purchases[tok] = [
+            act for act in self._recent_purchases[tok] if act.timestamp_s >= cutoff
+        ]
+
+        # Record this purchase
+        activity = WalletTradeActivity(
+            wallet_address=wallet,
+            timestamp_s=now,
+            smart_money_score=smart_money_score,
+            cluster_tag=cluster_tag,
+            funding_source=funding_source,
+        )
+        self._recent_purchases[tok].append(activity)
+
+        # Filter for high-scoring wallets S >= 0.75
+        high_scorers = [
+            act for act in self._recent_purchases[tok] if act.smart_money_score >= 0.75
+        ]
+
+        # Check for at least 2 distinct, uncorrelated wallets
+        qualifying: list[WalletTradeActivity] = []
+        for act in high_scorers:
+            if not qualifying:
+                qualifying.append(act)
+                continue
+            is_correlated = False
+            for q in qualifying:
+                if q.wallet_address == act.wallet_address:
+                    is_correlated = True
+                    break
+                if q.cluster_tag and act.cluster_tag and q.cluster_tag.lower() == act.cluster_tag.lower():
+                    is_correlated = True
+                    break
+                if q.funding_source and act.funding_source and q.funding_source.lower() == act.funding_source.lower():
+                    is_correlated = True
+                    break
+            if not is_correlated:
+                qualifying.append(act)
+
+        if len(qualifying) >= 2:
+            wallet_addrs = [q.wallet_address for q in qualifying]
+            logger.info(
+                "COPY-TRADE TRIGGERED for token %s: %d distinct uncorrelated wallets (S >= 0.75) within 120s: %s",
+                tok[:10],
+                len(wallet_addrs),
+                wallet_addrs,
+            )
+            return True, wallet_addrs
+
+        return False, []
+
+    check_copy_trade_trigger = record_wallet_purchase
 

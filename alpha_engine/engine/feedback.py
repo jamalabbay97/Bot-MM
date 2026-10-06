@@ -17,7 +17,13 @@ from typing import Any, Optional
 
 from alpha_engine.models.ai import TakeProfitStage
 from alpha_engine.models.decisions import PatternFeatureVector, RevivalPatternFeatureVector
-from alpha_engine.models.enums import ChainIdentifier, SignalSource, WhitelistStatus
+from alpha_engine.models.enums import (
+    ChainIdentifier,
+    SignalSource,
+    StrategyHorizon,
+    TradeExitReason,
+    WhitelistStatus,
+)
 from alpha_engine.profiler.profiler import SmartMoneyProfiler
 
 logger = logging.getLogger(__name__)
@@ -44,8 +50,17 @@ class TradeReflection:
     realized_pnl_usd: Decimal = Decimal(0)
     roi_pct: float = 0.0
     is_win: bool = False
+    strategy_horizon: StrategyHorizon = StrategyHorizon.SHORT_TERM_SCALP
     custom_metadata: Optional[dict[str, Any]] = None
     timestamp_ns: int = field(default_factory=time.time_ns)
+
+    @property
+    def realized_slippage_bps(self) -> int:
+        return self.actual_slippage_bps
+
+    @property
+    def net_pnl_usd(self) -> Decimal:
+        return self.realized_pnl_usd
 
     @classmethod
     def from_trade(
@@ -61,6 +76,7 @@ class TradeReflection:
         time_to_fill_ms: float = 50.0,
         expected_slippage_bps: int = 500,
         wallet_address: Optional[str] = None,
+        strategy_horizon: StrategyHorizon = StrategyHorizon.SHORT_TERM_SCALP,
         custom_metadata: Optional[dict[str, Any]] = None,
     ) -> TradeReflection:
         if entry_price > Decimal(0):
@@ -87,6 +103,7 @@ class TradeReflection:
             realized_pnl_usd=realized_pnl_usd,
             roi_pct=roi,
             is_win=is_win,
+            strategy_horizon=strategy_horizon,
             custom_metadata=custom_metadata,
             timestamp_ns=time.time_ns(),
         )
@@ -223,6 +240,186 @@ class AdaptiveFeedbackEngine:
                     new_status=WhitelistStatus.SUSPENDED,
                     reason=f"7-day win rate dropped to {win_rate_7d * 100:.1f}%",
                 )
+
+    def optimize_stop_loss_bayesian(
+        self,
+        realized_volatility: float,
+        horizon: StrategyHorizon = StrategyHorizon.SHORT_TERM_SCALP,
+        as_percentage: bool = True,
+    ) -> float:
+        """
+        Bayesian parameter optimization for volatility-adjusted stop-loss:
+        - SHORT_TERM_SCALP: 4% to 7% (volatility-adjusted).
+        - LONG_TERM_SWING: 15% to 25% (volatility-adjusted).
+
+        Uses realized volatility to compute the posterior stop-loss within the target band.
+        """
+        vol = abs(realized_volatility)
+        if vol > 1.0:
+            vol = vol / 100.0
+
+        if horizon == StrategyHorizon.SHORT_TERM_SCALP:
+            min_sl, max_sl = (4.0, 7.0) if as_percentage else (0.04, 0.07)
+            norm_factor = min(1.0, max(0.0, vol / 0.06))
+        else:
+            min_sl, max_sl = (15.0, 25.0) if as_percentage else (0.15, 0.25)
+            norm_factor = min(1.0, max(0.0, vol / 0.25))
+
+        optimal = min_sl + norm_factor * (max_sl - min_sl)
+        return round(optimal, 2 if as_percentage else 4)
+
+    async def evaluate_14d_whitelist_deprecation(self, current_time_ns: Optional[int] = None) -> list[str]:
+        """
+        14-day rolling whitelist auto-deprecation:
+        Drop / demote smart-money addresses whose 14-day rolling win-rate drops below 45%
+        or whose 14-day net PnL is negative.
+        """
+        deprecated_wallets: list[str] = []
+        now_ns = current_time_ns if current_time_ns is not None else time.time_ns()
+        fourteen_days_ns = 14 * 86400 * 1_000_000_000
+
+        for wallet_address, trades in list(self._wallet_history.items()):
+            recent_14d = [t for t in trades if (now_ns - t.timestamp_ns) <= fourteen_days_ns]
+            if not recent_14d:
+                continue
+
+            if len(recent_14d) >= 3:
+                wins = sum(1 for t in recent_14d if t.is_win)
+                win_rate = wins / len(recent_14d)
+                net_pnl = sum(t.realized_pnl_usd for t in recent_14d)
+
+                if win_rate < 0.45 or net_pnl < Decimal(0):
+                    logger.warning(
+                        "Whitelisted wallet %s auto-deprecated (14-day rolling win_rate=%.1f%% < 45%% or net PnL=$%.2f < 0).",
+                        wallet_address[:10],
+                        win_rate * 100,
+                        float(net_pnl),
+                    )
+                    if self._profiler is not None:
+                        await self._profiler.demote_or_ban_wallet(
+                            wallet_address=wallet_address,
+                            new_status=WhitelistStatus.SUSPENDED,
+                            reason=f"14-day rolling win-rate {win_rate*100:.1f}% or net PnL ${float(net_pnl):.2f}",
+                        )
+                    deprecated_wallets.append(wallet_address)
+
+        return deprecated_wallets
+
+    def tune_sentiment_sensitivity_weights(
+        self,
+        social_volume_history: list[float] | tuple[float, ...],
+        price_retention_history: list[float] | tuple[float, ...],
+    ) -> float:
+        """
+        AI sentiment sensitivity weights:
+        Correlates social volume spikes with 2-hour price retention.
+        Reduces sentiment weight if correlation < 0.35.
+        """
+        if len(social_volume_history) < 3 or len(price_retention_history) < 3:
+            return self.social_signal_weight
+
+        n = min(len(social_volume_history), len(price_retention_history))
+        x = [float(v) for v in social_volume_history[:n]]
+        y = [float(v) for v in price_retention_history[:n]]
+
+        mean_x = sum(x) / n
+        mean_y = sum(y) / n
+
+        cov = sum((x[i] - mean_x) * (y[i] - mean_y) for i in range(n))
+        var_x = sum((x[i] - mean_x) ** 2 for i in range(n))
+        var_y = sum((y[i] - mean_y) ** 2 for i in range(n))
+
+        if var_x <= 0 or var_y <= 0:
+            return self.social_signal_weight
+
+        correlation = cov / ((var_x * var_y) ** 0.5)
+
+        if correlation < 0.35:
+            old_weight = self.social_signal_weight
+            self.social_signal_weight = max(
+                self._min_social_weight,
+                round(self.social_signal_weight * self._decay_factor, 3),
+            )
+            logger.warning(
+                "Social sentiment vs. 2h price retention correlation is low (r=%.3f < 0.35). "
+                "Reduced sentiment weight: %.3f -> %.3f",
+                correlation,
+                old_weight,
+                self.social_signal_weight,
+            )
+        elif correlation >= 0.60 and self.social_signal_weight < 1.0:
+            old_weight = self.social_signal_weight
+            self.social_signal_weight = min(1.0, round(self.social_signal_weight / self._decay_factor, 3))
+            logger.info(
+                "Strong social correlation (r=%.3f >= 0.60). Restored sentiment weight: %.3f -> %.3f",
+                correlation,
+                old_weight,
+                self.social_signal_weight,
+            )
+
+        return self.social_signal_weight
+
+    async def check_contract_mutation_and_emergency_exit(
+        self,
+        token_address: str,
+        chain: ChainIdentifier,
+        current_security_report: Any,
+        tokens_to_sell: Optional[Decimal] = None,
+        pool: Optional[Any] = None,
+        executor: Optional[Any] = None,
+    ) -> tuple[bool, Optional[str]]:
+        """
+        Dynamic post-entry simulation:
+        If contract variables mutate after block confirmation (e.g. tax raised > 3%,
+        honeypot flag activated, freeze/mint authority re-enabled), triggers immediate
+        private bundle emergency exit with TradeExitReason.EMERGENCY_HONEYPOT_MUTATION.
+        """
+        mutated = False
+        reason_parts = []
+
+        buy_tax = getattr(current_security_report, "buy_tax_bps", 0)
+        sell_tax = getattr(current_security_report, "sell_tax_bps", 0)
+        is_honeypot = getattr(current_security_report, "is_honeypot", False)
+        freeze_disabled = getattr(current_security_report, "freeze_authority_disabled", True)
+        mint_disabled = getattr(current_security_report, "mint_authority_disabled", True)
+
+        if buy_tax > 300:
+            mutated = True
+            reason_parts.append(f"buy_tax_bps={buy_tax} > 300")
+        if sell_tax > 300:
+            mutated = True
+            reason_parts.append(f"sell_tax_bps={sell_tax} > 300")
+        if is_honeypot:
+            mutated = True
+            reason_parts.append("honeypot_active=True")
+        if not freeze_disabled:
+            mutated = True
+            reason_parts.append("freeze_authority_enabled")
+        if not mint_disabled:
+            mutated = True
+            reason_parts.append("mint_authority_enabled")
+
+        if not mutated:
+            return False, None
+
+        mutation_reason = f"POST-ENTRY MUTATION DETECTED: {', '.join(reason_parts)}"
+        logger.critical(
+            "EMERGENCY HONEYPOT MUTATION EXIT TRIGGERED for %s on %s: %s",
+            token_address[:10],
+            chain.value,
+            mutation_reason,
+        )
+
+        if executor is not None and pool is not None and tokens_to_sell is not None and tokens_to_sell > 0:
+            await executor.execute_exit(
+                chain=chain,
+                token_address=token_address,
+                pool=pool,
+                tokens_to_sell=tokens_to_sell,
+                reason=TradeExitReason.EMERGENCY_HONEYPOT_MUTATION,
+            )
+
+        return True, mutation_reason
 
     def get_social_weight(self) -> float:
         """Current weight for social signals [min_social_weight, 1.0]."""

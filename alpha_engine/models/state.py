@@ -122,6 +122,7 @@ class SecurityReport(BaseModel):
     lp_burned_ratio: Annotated[float, Field(ge=0.0, le=1.0)] = 1.0
     top10_concentration: Annotated[float, Field(ge=0.0, le=1.0)] = 0.10
     mint_authority_disabled: bool = True
+    freeze_authority_disabled: bool = True
     verified_source_code: bool = False
     liquidity_usd: Optional[Decimal] = None
     top10_holder_fraction: Optional[float] = None
@@ -169,6 +170,28 @@ class SecurityReport(BaseModel):
         )
 
     @property
+    def passes_strict_hard_fails(self) -> bool:
+        """
+        Enterprise Strict Hard-Fails (Instant Disqualification):
+          - Mint Authority enabled or Freeze Authority not revoked (SVM).
+          - Honeypot / Transfer-Tax logic detected: Buy/Sell tax > 3% (300 bps).
+          - Liquidity Pool unlocked: LP burn or lock verified must be >= 99% (0.99) (or pump.fun).
+          - Sybil / Top-Holder Concentration: Top 10 non-DEX, non-burn wallets hold > 15% (0.15) of total supply.
+        """
+        if self.is_honeypot:
+            return False
+        if self.buy_tax_bps > 300 or self.sell_tax_bps > 300:
+            return False
+        if not self.mint_authority_disabled or not self.freeze_authority_disabled:
+            return False
+        if not self.is_pump_fun and self.lp_burned_ratio < 0.99:
+            return False
+        max_conc = 0.65 if self.is_pump_fun else 0.15
+        if self.top10_concentration > max_conc:
+            return False
+        return True
+
+    @property
     def buy_tax_pct(self) -> float:
         """Buy tax expressed as a percentage (e.g. 5.0 for 500 bps)."""
         return float(self.buy_tax_bps) / 100.0
@@ -186,7 +209,7 @@ class SecurityReport(BaseModel):
     @property
     def freeze_disabled(self) -> bool:
         """Alias indicating freeze authority is disabled."""
-        return True
+        return self.freeze_authority_disabled
 
     @property
     def lp_burned(self) -> bool:

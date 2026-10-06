@@ -540,6 +540,12 @@ class EngineConfig(BaseSettings):
             elif os.getenv("HELIUS_WS_URL") and "solana_rpc_ws" not in data:
                 data["solana_rpc_ws"] = os.environ["HELIUS_WS_URL"]
 
+            sol_ws = data.get("solana_rpc_ws") or os.getenv("SOLANA_RPC_WS", "")
+            if isinstance(sol_ws, str) and "solana-mainnet.g.alchemy.com" in sol_ws:
+                data["solana_rpc_ws"] = sol_ws.replace(
+                    "solana-mainnet.g.alchemy.com", "solana-mainnet.streaming.alchemy.com"
+                )
+
             # Failover RPC list mappings
             if "base_rpc_failover_urls" in data and "base_fallback_rpcs" not in data:
                 data["base_fallback_rpcs"] = data["base_rpc_failover_urls"]

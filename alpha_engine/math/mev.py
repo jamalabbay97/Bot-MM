@@ -120,3 +120,65 @@ def simulate_latency(
         frontrun_volume=frontrun_volume,
         adjusted_pool_state=adjusted_pool,
     )
+
+
+def calculate_sandwich_risk(
+    pool: PoolState,
+    trade_size_native: Decimal,
+    max_slippage_bps: int = 150,
+    mempool_is_public: bool = True,
+    risk_threshold: float = 0.50,
+) -> tuple[bool, float, str]:
+    """
+    Calculate sandwich-attack risk score in [0.0, 1.0] and evaluate against risk threshold.
+
+    Parameters
+    ----------
+    pool : PoolState
+        Current on-chain pool reserve state.
+    trade_size_native : Decimal
+        Planned trade size in native asset.
+    max_slippage_bps : int
+        User-configured maximum slippage in basis points.
+    mempool_is_public : bool
+        True if routed to public mempool (unprotected), False if routed via private bundle/relay.
+    risk_threshold : float
+        Threshold above which is_high_risk returns True.
+
+    Returns
+    -------
+    tuple[bool, float, str]
+        (is_high_risk, risk_score, reason)
+    """
+    if not mempool_is_public:
+        return False, 0.05, "PROTECTED_PRIVATE_RELAY: Zero public mempool exposure"
+
+    if pool.native_reserve <= Decimal("0") or trade_size_native <= Decimal("0"):
+        return True, 1.0, "INVALID_POOL_OR_TRADE_SIZE: Near-zero liquidity depth"
+
+    # 1. Depth fraction: trade_size / pool_native_reserve
+    depth_fraction = float(trade_size_native / pool.native_reserve)
+
+    # 2. Slippage vulnerability fraction (e.g. 100 bps = 1.0%, 300 bps = 3.0%)
+    slippage_fraction = max_slippage_bps / 10_000.0
+
+    # 3. Base composite risk calculation
+    # High depth fraction (>1%) or wide slippage (>150 bps) in public mempool attracts searchers
+    depth_risk = min(1.0, depth_fraction / 0.02)  # Max risk at 2% pool depth
+    slippage_risk = min(1.0, slippage_fraction / 0.03)  # Max risk at 3% slippage
+
+    raw_score = 0.60 * depth_risk + 0.40 * slippage_risk
+    score = round(max(0.0, min(1.0, raw_score)), 3)
+
+    is_high_risk = score >= risk_threshold
+
+    reasons: list[str] = []
+    if depth_fraction >= 0.01:
+        reasons.append(f"Trade size is {depth_fraction:.2%} of pool depth")
+    if max_slippage_bps > 200:
+        reasons.append(f"Wide slippage tolerance ({max_slippage_bps} bps)")
+    if is_high_risk and not reasons:
+        reasons.append("Composite MEV exploitability score exceeds safe threshold")
+
+    reason_str = " | ".join(reasons) if reasons else "Acceptable MEV risk"
+    return is_high_risk, score, reason_str

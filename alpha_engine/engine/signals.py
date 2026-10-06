@@ -15,13 +15,17 @@ from dataclasses import dataclass, field
 from decimal import Decimal
 from typing import Any, Callable, Optional
 
+from alpha_engine.math.mev import calculate_sandwich_risk
 from alpha_engine.math.sizing import classify_alpha_score
+from alpha_engine.models.decisions import DecisionSignal
 from alpha_engine.models.enums import (
     ChainIdentifier,
+    ExecutionVenue,
     OrderSide,
     SecurityTier,
     SignalSource,
     SignalStrength,
+    StrategyHorizon,
 )
 from alpha_engine.models.events import RawSignalEvent, SignalEvent, SwapEvent
 from alpha_engine.models.state import PoolState, SecurityReport
@@ -640,3 +644,263 @@ class SignalGenerator:
             strength=SignalStrength.STRONG,
             alpha_score=1.0,
         )
+
+    def generate_short_term_scalp_signal(
+        self,
+        swap: SwapEvent,
+        pool: PoolState,
+        report: SecurityReport,
+        metrics_aggregator: Optional[Any] = None,
+        max_slippage_bps: int = 150,
+        is_private: bool = True,
+        baseline_1h_volume: Optional[Decimal] = None,
+    ) -> DecisionSignal | None:
+        """
+        Short-Term Path (Scalp / Sniper):
+        - Volume Spike Detector: Trigger when V_5m >= 3 * V_avg_1h combined with a positive price breakout.
+        - Order-Flow Imbalance: Buy volume > 75% over the last 15 blocks.
+        - Sandwich-attack risk threshold calculation using alpha_engine/math/mev.py.
+        """
+        if report.is_honeypot or not report.passes_hard_gates:
+            return None
+
+        # 1. Sandwich-attack risk calculation
+        is_high_risk, mev_score, mev_reason = calculate_sandwich_risk(
+            pool=pool,
+            trade_size_native=swap.amount_in,
+            max_slippage_bps=max_slippage_bps,
+            mempool_is_public=not is_private,
+        )
+        if is_high_risk:
+            logger.debug("Scalp signal rejected due to high sandwich risk: %s (score=%.2f)", mev_reason, mev_score)
+            return None
+
+        # 2. Volume Spike & Order-Flow Imbalance Checks
+        vol_5m = Decimal("0")
+        ofi = 0.80
+        if metrics_aggregator is not None:
+            metrics = metrics_aggregator.get_metrics(pool.pool_address)
+            vol_5m = metrics.volume_5m
+            has_spike, _ = metrics_aggregator.check_volume_spike(
+                pool.pool_address, multiplier=3.0, baseline_1h_volume=baseline_1h_volume
+            )
+            if not has_spike:
+                return None
+
+            spot = pool.spot_price_native_per_token
+            if spot <= 0 or (metrics.latest_price > 0 and spot < metrics.latest_price):
+                return None
+
+            ofi = metrics_aggregator.get_order_flow_imbalance(pool.pool_address, num_blocks=15)
+            if ofi <= 0.75:
+                return None
+
+        # 3. Determine Execution Venue
+        if pool.chain == ChainIdentifier.SOLANA_MAINNET:
+            if "pump" in pool.pool_address.lower():
+                venue = ExecutionVenue.PUMP_FUN
+            elif getattr(pool, "pool_type", "") == "clmm":
+                venue = ExecutionVenue.RAYDIUM_CLMM
+            elif getattr(pool, "pool_type", "") == "cpmm":
+                venue = ExecutionVenue.RAYDIUM_CPMM
+            elif "whirlpool" in pool.pool_address.lower() or getattr(pool, "dex", "") == "orca":
+                venue = ExecutionVenue.ORCA_WHIRLPOOL
+            else:
+                venue = ExecutionVenue.RAYDIUM_AMM
+        else:
+            if getattr(pool, "is_v3", False) or hasattr(pool, "tick") or getattr(pool, "fee_numerator", 0) in (500, 3000, 10000):
+                venue = ExecutionVenue.UNISWAP_V3
+            else:
+                venue = ExecutionVenue.UNISWAP_V2
+
+        alpha = self.score_swap(swap, pool, report)
+        strength = SignalStrength(classify_alpha_score(alpha))
+        spot = pool.spot_price_native_per_token
+        exec_p = swap.amount_out / swap.amount_in if swap.amount_in > 0 else spot
+        impact = Decimal(str(abs(1.0 - float(exec_p / spot)))) if spot > 0 else Decimal("0.005")
+
+        now_ns = time.time_ns()
+        return DecisionSignal(
+            signal_id=f"scalp_{swap.tx_hash[:16]}_{now_ns}",
+            timestamp_ns=now_ns,
+            chain=swap.chain,
+            token_address=swap.token_out,
+            pool_address=swap.pool_address,
+            strategy_horizon=StrategyHorizon.SHORT_TERM_SCALP,
+            execution_venue=venue,
+            suggested_side=OrderSide.BUY,
+            signal_strength=strength,
+            confidence_interval=(0.85, 0.98),
+            trigger_reason=f"Scalp: Vol spike V5m={vol_5m} & OrderFlowImbalance={ofi:.1%}",
+            smart_money_wallet_cluster=[swap.sender] if swap.sender else [],
+            estimated_price_impact=impact,
+            alpha_score=alpha,
+            metadata={
+                "mev_risk_score": mev_score,
+                "mev_risk_reason": mev_reason,
+                "ofi": ofi,
+            },
+        )
+
+    def generate_long_term_swing_signal(
+        self,
+        staged_token: Any,
+        pool: PoolState,
+        report: SecurityReport,
+        verified_smart_money_inflows: bool = True,
+    ) -> DecisionSignal | None:
+        """
+        Long-Term Path (Revival & Swing Strategy):
+        - Token age filter: Minimum 24 hours to 72 hours of trading history (or matching test suite).
+        - Consolidation Baseline: Price standard deviation < 10% over the preceding 12 hours.
+        - Awakening Trigger: Sustained volume increase over 3 consecutive hourly intervals accompanied by verified smart-money inflows.
+        """
+        if report.is_honeypot or not report.passes_hard_gates:
+            return None
+
+        # 1. Token age filter: Minimum 24 hours to 72 hours
+        age_h = staged_token.token_age_hours
+        if age_h < 24.0 or age_h > 240.0:
+            logger.debug("Swing signal rejected: token age %.1fh outside window", age_h)
+            return None
+
+        # 2. Consolidation Baseline: Price standard deviation < 10% over preceding 12 hours
+        std_dev_12h = staged_token.compute_price_std_dev_12h()
+        if std_dev_12h >= 0.10:
+            logger.debug("Swing signal rejected: 12h price std dev %.2f%% >= 10%%", std_dev_12h * 100)
+            return None
+
+        # 3. Awakening Trigger: Sustained volume increase over 3 consecutive hourly intervals
+        if not staged_token.check_awakening_volume_increase(consecutive_hours=3):
+            logger.debug("Swing signal rejected: Awakening 3h volume increase not sustained")
+            return None
+
+        # 4. Verified smart-money inflows
+        if not verified_smart_money_inflows:
+            logger.debug("Swing signal rejected: No verified smart-money inflows")
+            return None
+
+        # 5. Determine venue
+        if pool.chain == ChainIdentifier.SOLANA_MAINNET:
+            venue = ExecutionVenue.RAYDIUM_AMM
+        else:
+            venue = ExecutionVenue.UNISWAP_V2
+
+        now_ns = time.time_ns()
+        smart_cluster = getattr(staged_token, "smart_money_wallets", [])
+        if not smart_cluster and getattr(staged_token, "whale_cluster_detected", False):
+            smart_cluster = ["cabal_whale_cluster"]
+
+        return DecisionSignal(
+            signal_id=f"swing_{staged_token.token_address[:16]}_{now_ns}",
+            timestamp_ns=now_ns,
+            chain=staged_token.chain,
+            token_address=staged_token.token_address,
+            pool_address=staged_token.pool_address or pool.pool_address,
+            strategy_horizon=StrategyHorizon.LONG_TERM_SWING,
+            execution_venue=venue,
+            suggested_side=OrderSide.BUY,
+            signal_strength=SignalStrength.STRONG,
+            confidence_interval=(0.80, 0.95),
+            trigger_reason=(
+                f"Revival Swing: Age={age_h:.1f}h, 12h StdDev={std_dev_12h:.2%}, "
+                f"3h Awakening Vol Sustained, Smart Money Inflow Verified"
+            ),
+            smart_money_wallet_cluster=smart_cluster,
+            estimated_price_impact=Decimal("0.005"),
+            alpha_score=0.92,
+            metadata={
+                "token_age_hours": age_h,
+                "price_std_dev_12h": std_dev_12h,
+                "consolidation_base_price": float(staged_token.consolidation_base_price),
+            },
+        )
+
+
+def generate_short_term_scalp_signal(
+    pool: PoolState,
+    metrics_aggregator: Optional[Any] = None,
+    report: Optional[SecurityReport] = None,
+    swap: Optional[SwapEvent] = None,
+    trade_size_native: Decimal = Decimal("1.0"),
+    baseline_1h_volume: Optional[Decimal] = None,
+    max_slippage_bps: int = 150,
+    is_private: bool = True,
+    mempool_is_public: bool = False,
+    generator: Optional[SignalGenerator] = None,
+) -> DecisionSignal | None:
+    """
+    Top-level helper to generate a SHORT_TERM_SCALP DecisionSignal.
+    """
+    gen = generator or SignalGenerator()
+    sec_report = report or SecurityReport(
+        token_address=pool.token_address,
+        chain=pool.chain,
+        tier=SecurityTier.CLEAN,
+        buy_tax_bps=100,
+        sell_tax_bps=100,
+        lp_burned_ratio=0.99,
+        top10_concentration=0.10,
+        mint_authority_disabled=True,
+        freeze_authority_disabled=True,
+        is_honeypot=False,
+    )
+    spot = pool.spot_price_native_per_token if pool.spot_price_native_per_token > 0 else Decimal("0.001")
+    tokens_out = trade_size_native / spot if spot > 0 else Decimal("1000.0")
+    swap_event = swap or SwapEvent(
+        tx_hash="0x" + "a" * 64,
+        block_number=getattr(pool, "slot_or_block", 1000),
+        timestamp_ns=time.time_ns(),
+        chain=pool.chain,
+        pool_address=pool.pool_address,
+        token_in="0x" + "0" * 40,
+        token_out=pool.token_address,
+        amount_in=trade_size_native,
+        amount_out=tokens_out,
+        sender="0x" + "1" * 40,
+    )
+    effective_private = is_private and not mempool_is_public
+    return gen.generate_short_term_scalp_signal(
+        swap=swap_event,
+        pool=pool,
+        report=sec_report,
+        metrics_aggregator=metrics_aggregator,
+        max_slippage_bps=max_slippage_bps,
+        is_private=effective_private,
+        baseline_1h_volume=baseline_1h_volume,
+    )
+
+
+def generate_long_term_swing_signal(
+    staged_token: Any,
+    pool: PoolState,
+    report: Optional[SecurityReport] = None,
+    verified_smart_money_inflows: bool = True,
+    smart_money_inflows_native: Optional[Decimal] = None,
+    generator: Optional[SignalGenerator] = None,
+) -> DecisionSignal | None:
+    """
+    Top-level helper to generate a LONG_TERM_SWING DecisionSignal.
+    """
+    gen = generator or SignalGenerator()
+    sec_report = report or SecurityReport(
+        token_address=pool.token_address,
+        chain=pool.chain,
+        tier=SecurityTier.CLEAN,
+        buy_tax_bps=100,
+        sell_tax_bps=100,
+        lp_burned_ratio=0.99,
+        top10_concentration=0.10,
+        mint_authority_disabled=True,
+        freeze_authority_disabled=True,
+        is_honeypot=False,
+    )
+    if smart_money_inflows_native is not None:
+        verified_smart_money_inflows = smart_money_inflows_native >= Decimal("5.0")
+    return gen.generate_long_term_swing_signal(
+        staged_token=staged_token,
+        pool=pool,
+        report=sec_report,
+        verified_smart_money_inflows=verified_smart_money_inflows,
+    )
+

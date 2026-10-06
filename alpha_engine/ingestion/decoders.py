@@ -46,6 +46,12 @@ _POOL_CREATED_TOPIC: str = (
     "0x783cca1c041245d8083164ea2cbd8e436ab6ae90824b2b740b02830204cc0415"
 )
 
+# Uniswap v3 Swap event topic
+# Swap(address,address,int256,int256,uint160,uint128,int24)
+_UNISWAP_V3_SWAP_TOPIC: str = (
+    "0xc42079f94a6350d7e6235f29174924f9d5fb82df4149629a43929c364c9cfa5d"
+)
+
 # Solana Program Constants
 PUMP_FUN_PROGRAM_ID: str = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"
 RAYDIUM_AMM_PROGRAM_ID: str = "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8"
@@ -131,6 +137,88 @@ def _decode_evm_swap_log(
         )
     except (KeyError, ValueError, IndexError, struct.error) as exc:
         logger.debug("Failed to decode EVM Swap log: %s", exc)
+        return None
+
+
+def _decode_evm_v3_swap_log(
+    log: dict[str, Any],
+    token0: str,
+    token1: str,
+    decimals0: int,
+    decimals1: int,
+    native_token: str,
+) -> tuple[SwapEvent, int, Decimal] | None:
+    """
+    Decode a Uniswap v3 / Concentrated Liquidity Swap log.
+    Returns (SwapEvent, tick, liquidity) or None.
+    """
+    try:
+        topics: list[str] = log.get("topics", [])
+        if len(topics) < 3:
+            return None
+        if topics[0].lower() != _UNISWAP_V3_SWAP_TOPIC:
+            return None
+
+        sender = "0x" + topics[1][-40:]
+        recipient = "0x" + topics[2][-40:]
+
+        data_hex = log.get("data", "0x")[2:]
+        if len(data_hex) < 320:  # 5 * 64 chars
+            logger.debug("V3 Swap log data too short: %d chars", len(data_hex))
+            return None
+
+        def _i256(chunk: str) -> int:
+            val = int(chunk, 16)
+            if val >= (1 << 255):
+                val -= (1 << 256)
+            return val
+
+        def _u256(chunk: str) -> int:
+            return int(chunk, 16)
+
+        amount0_raw = _i256(data_hex[0:64])
+        amount1_raw = _i256(data_hex[64:128])
+        sqrt_price_x96 = _u256(data_hex[128:192])
+        liquidity_raw = _u256(data_hex[192:256])
+        tick_raw = _i256(data_hex[256:320])
+
+        # If amount0 > 0: token0 deposited (sold into pool), token1 received
+        # If amount0 < 0: token0 received from pool, token1 deposited (sold into pool)
+        if amount0_raw > 0 and amount1_raw < 0:
+            token_in = token0
+            token_out = token1
+            amount_in = _normalise(amount0_raw, decimals0)
+            amount_out = _normalise(abs(amount1_raw), decimals1)
+        elif amount1_raw > 0 and amount0_raw < 0:
+            token_in = token1
+            token_out = token0
+            amount_in = _normalise(amount1_raw, decimals1)
+            amount_out = _normalise(abs(amount0_raw), decimals0)
+        else:
+            return None
+
+        pool_address = log.get("address", "").lower()
+        tx_hash = log.get("transactionHash", "")
+        block_hex = log.get("blockNumber", "0x0")
+        block_number = int(block_hex, 16) if isinstance(block_hex, str) else int(block_hex)
+        log_index = int(log.get("logIndex", "0x0"), 16)
+
+        swap = SwapEvent(
+            timestamp_ns=time.time_ns(),
+            block_number=block_number,
+            chain=ChainIdentifier.BASE_MAINNET,
+            pool_address=pool_address,
+            token_in=token_in.lower(),
+            token_out=token_out.lower(),
+            amount_in=amount_in,
+            amount_out=amount_out,
+            sender=sender.lower(),
+            tx_hash=tx_hash.lower(),
+            log_index=log_index,
+        )
+        return swap, tick_raw, Decimal(liquidity_raw)
+    except (KeyError, ValueError, IndexError, struct.error) as exc:
+        logger.debug("Failed to decode EVM V3 Swap log: %s", exc)
         return None
 
 

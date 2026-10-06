@@ -10,7 +10,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-from typing import Any, Sequence
+from typing import Any, Sequence, Optional
 
 import websockets
 from websockets.exceptions import ConnectionClosed, WebSocketException
@@ -20,12 +20,15 @@ from alpha_engine.ingestion.decoders import (
     _POOL_CREATED_TOPIC,
     _SWAP_TOPIC,
     _SYNC_TOPIC,
+    _UNISWAP_V3_SWAP_TOPIC,
     EvmPoolMeta,
     _decode_evm_pair_created_log,
     _decode_evm_pool_created_log,
     _decode_evm_swap_log,
     _decode_evm_sync_log,
+    _decode_evm_v3_swap_log,
 )
+from alpha_engine.ingestion.dex_metrics import DEXMetricsAggregator
 from alpha_engine.models.enums import ChainIdentifier, SignalSource
 from alpha_engine.models.events import (
     PoolStateUpdateEvent,
@@ -56,6 +59,7 @@ class EVMIngester:
         pool_watchlist: Sequence[tuple[str, str, str, int, int, str]],
         event_queue: asyncio.Queue[SwapEvent | PoolStateUpdateEvent | RawSignalEvent | ShutdownSentinel],
         limiter: RateLimiterRegistry,
+        metrics_aggregator: Optional[DEXMetricsAggregator] = None,
     ) -> None:
         if len(pool_watchlist) > 5:
             raise ValueError(
@@ -65,6 +69,7 @@ class EVMIngester:
         self._ws_url = ws_url
         self._queue = event_queue
         self._limiter = limiter
+        self._metrics_aggregator = metrics_aggregator
         self._running = False
 
         from alpha_engine.ingestion.coordinator import ExponentialBackoff
@@ -109,7 +114,7 @@ class EVMIngester:
 
             pool_addresses = list(self._pool_meta.keys())
 
-            # 1. Subscribe to watched pools for Swap and Sync events
+            # 1. Subscribe to watched pools for Swap, Sync, and V3 Swap events
             if pool_addresses:
                 subscribe_pools_msg = json.dumps({
                     "jsonrpc": "2.0",
@@ -119,7 +124,7 @@ class EVMIngester:
                         "logs",
                         {
                             "address": pool_addresses,
-                            "topics": [[_SWAP_TOPIC, _SYNC_TOPIC]],
+                            "topics": [[_SWAP_TOPIC, _SYNC_TOPIC, _UNISWAP_V3_SWAP_TOPIC]],
                         },
                     ],
                 })
@@ -220,10 +225,33 @@ class EVMIngester:
                         log_entry, token0, token1, dec0, dec1, native
                     )
                     if event is not None:
+                        if self._metrics_aggregator is not None:
+                            self._metrics_aggregator.record_swap(
+                                event, pool_state=self._live_pools.get(pool_addr)
+                            )
                         await self._queue.put(event)
                         logger.debug(
                             "EVM Swap queued: pool=%s tx=%s",
                             event.pool_address[:10], event.tx_hash[:12],
+                        )
+
+                elif topic0 == _UNISWAP_V3_SWAP_TOPIC:
+                    v3_result = _decode_evm_v3_swap_log(
+                        log_entry, token0, token1, dec0, dec1, native
+                    )
+                    if v3_result is not None:
+                        event, tick, liquidity = v3_result
+                        if self._metrics_aggregator is not None:
+                            self._metrics_aggregator.record_concentrated_tick(
+                                pool_addr, tick, liquidity
+                            )
+                            self._metrics_aggregator.record_swap(
+                                event, pool_state=self._live_pools.get(pool_addr)
+                            )
+                        await self._queue.put(event)
+                        logger.debug(
+                            "EVM V3 Swap queued: pool=%s tick=%d tx=%s",
+                            event.pool_address[:10], tick, event.tx_hash[:12],
                         )
 
                 elif topic0 == _SYNC_TOPIC:
@@ -234,6 +262,8 @@ class EVMIngester:
                     )
                     if update is not None:
                         self._live_pools[pool_addr] = update.new_pool_state
+                        if self._metrics_aggregator is not None:
+                            self._metrics_aggregator.record_pool_update_event(update)
                         await self._queue.put(update)
                         logger.debug(
                             "EVM Sync queued: pool=%s native_reserve=%s",

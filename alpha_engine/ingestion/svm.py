@@ -13,7 +13,7 @@ import json
 import logging
 import time
 from decimal import Decimal
-from typing import Any
+from typing import Any, Optional
 
 import websockets
 from websockets.exceptions import ConnectionClosed, WebSocketException
@@ -28,6 +28,7 @@ from alpha_engine.ingestion.decoders import (
     _parse_raydium_initialize2_logs,
     _parse_raydium_log_line,
 )
+from alpha_engine.ingestion.dex_metrics import DEXMetricsAggregator
 from alpha_engine.models.enums import ChainIdentifier, SignalSource
 from alpha_engine.models.events import (
     PoolStateUpdateEvent,
@@ -207,6 +208,7 @@ class SVMIngester:
         event_queue: asyncio.Queue[SwapEvent | PoolStateUpdateEvent | RawSignalEvent | ShutdownSentinel],
         limiter: RateLimiterRegistry,
         failover_urls: list[str] | None = None,
+        metrics_aggregator: Optional[DEXMetricsAggregator] = None,
     ) -> None:
         self._primary_ws_url = ws_url
         candidates = [ws_url]
@@ -224,6 +226,7 @@ class SVMIngester:
         self._monitored_pools: set[str] = set(pool_registry.keys())
         self._queue = event_queue
         self._limiter = limiter
+        self._metrics_aggregator = metrics_aggregator
         self._running = False
 
         from alpha_engine.dns_resolver import patch_dns_resolvers
@@ -632,6 +635,8 @@ class SVMIngester:
                                         has_authoritative_reserves=bool(pump_trade.get("has_authoritative_reserves", False)),
                                         slot=slot,
                                     )
+                                    if self._metrics_aggregator is not None:
+                                        self._metrics_aggregator.record_swap(swap_ev)
                                     await self._queue.put(swap_ev)
                                     logger.info(
                                         "SVM Pump.fun trade queued: %s mint=%s sol=%s buyer=%s slot=%d",
@@ -655,6 +660,8 @@ class SVMIngester:
                                         token_decimals=6,
                                         native_decimals=9,
                                     )
+                                    if self._metrics_aggregator is not None:
+                                        self._metrics_aggregator.record_pool_state(pool_state)
                                     await self._queue.put(
                                         PoolStateUpdateEvent(
                                             timestamp_ns=time.time_ns(),
@@ -667,6 +674,8 @@ class SVMIngester:
                     # 2. Check for Raydium Swap
                     event = self._parse_raydium_transaction(tx_sig, logs, pool_key)
                     if event is not None:
+                        if self._metrics_aggregator is not None:
+                            self._metrics_aggregator.record_swap(event)
                         await self._queue.put(event)
                         logger.debug(
                             "SVM Swap queued: pool=%s sig=%s",

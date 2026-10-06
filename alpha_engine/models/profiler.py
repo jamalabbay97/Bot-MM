@@ -122,6 +122,10 @@ class WalletProfile(BaseModel):
     cluster_tag: Optional[str] = Field(default=None, description="Optional cluster or syndicate tag")
     funding_hops: list[FundingHop] = Field(default_factory=list, description="Trace of initial funding hops")
     rejection_reasons: list[str] = Field(default_factory=list, description="Reasons for whitelist rejection if any")
+    smart_money_score: float = Field(default=0.0, description="Smart Money Score [0.0, 1.0]")
+    sharpe_ratio: float = Field(default=0.0, description="Sharpe ratio metric [0.0, 1.0]")
+    holding_discipline: float = Field(default=0.0, description="Holding discipline metric [0.0, 1.0]")
+    longevity: float = Field(default=0.0, description="Longevity metric [0.0, 1.0]")
     analyzed_at_ns: int = Field(default_factory=lambda: time.time_ns(), description="Analysis timestamp in nanoseconds")
     custom_metadata: dict[str, Any] = Field(default_factory=dict, description="Arbitrary custom metadata dict")
 
@@ -144,6 +148,7 @@ class WhitelistRecord(BaseModel):
     active_days: Annotated[float, Field(ge=0.0, description="Active days on-chain")]
     cluster_tag: Optional[str] = Field(default=None, description="Cluster or syndicate identifier")
     rejection_reasons: str = Field(default="", description="Rejection rationale string")
+    smart_money_score: float = Field(default=0.0, description="Smart Money Score [0.0, 1.0]")
     created_at_ns: int = Field(description="Record creation timestamp in nanoseconds")
     updated_at_ns: int = Field(description="Record update timestamp in nanoseconds")
     custom_metadata: Optional[dict[str, Any]] = Field(default=None, description="Custom metadata dict")
