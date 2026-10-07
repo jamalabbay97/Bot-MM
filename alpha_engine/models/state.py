@@ -26,6 +26,7 @@ from alpha_engine.models.enums import (
     OrderSide,
     SecurityTier,
     TradeExitReason,
+    resolve_trade_platform,
 )
 
 
@@ -253,6 +254,7 @@ class PaperFill(BaseModel):
     )
     kelly_fraction: Annotated[float, Field(ge=0.0, le=1.0)] = 0.05
     portfolio_equity_usd: Annotated[Decimal, Field(gt=Decimal(0))] = Decimal("10000.0")
+    platform: str = Field(default="DexScan", description="Platform source: Pump.fun or DexScan")
 
     @model_validator(mode="after")
     def fill_after_signal(self) -> "PaperFill":
@@ -293,6 +295,7 @@ class TradeRecord(BaseModel):
     realized_pnl_usd: Optional[Decimal] = None   # Set on SELL only
     exit_reason: Optional[TradeExitReason] = None
     exit_stage: Optional[ExitStage] = None
+    platform: str = Field(default="DexScan", description="Platform source: Pump.fun or DexScan")
     signal_timestamp_ns: int
     fill_timestamp_ns: int
 
@@ -300,10 +303,11 @@ class TradeRecord(BaseModel):
     def from_fill(
         cls,
         fill: "PaperFill",
-        signal_id: str,
+        signal_id: str = "",
         realized_pnl_usd: Optional[Decimal] = None,
         exit_reason: Optional[TradeExitReason] = None,
         exit_stage: Optional[ExitStage] = None,
+        platform: Optional[str] = None,
     ) -> "TradeRecord":
         """
         Construct a TradeRecord from a completed PaperFill and its signal ID.
@@ -318,9 +322,15 @@ class TradeRecord(BaseModel):
             native_spent = -fill.simulated_native_spent
             tokens_delta = -fill.tokens_acquired
 
+        resolved_platform = platform or getattr(fill, "platform", None) or resolve_trade_platform(
+            token_address=fill.token_address,
+            chain=fill.chain,
+            pool_address=fill.pool_address,
+        )
+
         return cls(
             order_id=fill.order_id,
-            signal_id=signal_id,
+            signal_id=signal_id or getattr(fill, "signal_id", "") or str(uuid.uuid4()),
             chain=fill.chain,
             token_address=fill.token_address,
             pool_address=fill.pool_address,
@@ -336,6 +346,7 @@ class TradeRecord(BaseModel):
             realized_pnl_usd=realized_pnl_usd,
             exit_reason=exit_reason,
             exit_stage=exit_stage,
+            platform=resolved_platform,
             signal_timestamp_ns=fill.signal_timestamp_ns,
             fill_timestamp_ns=fill.fill_timestamp_ns,
         )
@@ -367,6 +378,7 @@ class OpenPositionLot(BaseModel):
     peak_price: Decimal = Decimal(0)
     tp_stage: int = 0
     base_market_cap: Decimal = Decimal(0)
+    platform: str = Field(default="DexScan", description="Platform source: Pump.fun or DexScan")
 
 
 class ExitOrder(BaseModel):

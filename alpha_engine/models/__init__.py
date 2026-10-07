@@ -13,13 +13,16 @@ from alpha_engine.models.enums import (
     LotStatus,
     NewsSignalStatus,
     OrderSide,
+    PlatformSource,
     SecurityTier,
     SignalSource,
     SignalStrength,
     StrategyHorizon,
     TradeExitReason,
+    TradingPlatform,
     WalletClassification,
     WhitelistStatus,
+    resolve_trade_platform,
 )
 from alpha_engine.models.events import (
     PoolStateUpdateEvent,
@@ -74,6 +77,11 @@ from alpha_engine.models.decisions import (
     PatternFeatureVector,
     RevivalPatternFeatureVector,
 )
+from alpha_engine.models.observability import (
+    LifecycleEvent,
+    TraceStage,
+    TraceStatus,
+)
 
 __all__ = [
     # Base Config
@@ -92,6 +100,9 @@ __all__ = [
     "ExitStage",
     "LotStatus",
     "TradeExitReason",
+    "TradingPlatform",
+    "PlatformSource",
+    "resolve_trade_platform",
     # Ingestion & Pipeline Events
     "SwapEvent",
     "SignalEvent",
@@ -139,5 +150,9 @@ __all__ = [
     "DecisionSignal",
     "PatternFeatureVector",
     "RevivalPatternFeatureVector",
+    # Token Lifecycle Tracing Models
+    "TraceStage",
+    "TraceStatus",
+    "LifecycleEvent",
 ]
 

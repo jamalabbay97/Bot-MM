@@ -14,6 +14,7 @@ import sys
 
 from alpha_engine.config import EngineConfig
 from alpha_engine.engine.runner import PaperTradingEngine, _build_example_config
+from alpha_engine.models.enums import resolve_trade_platform
 
 
 def main(args: list[str] | None = None) -> int:
@@ -203,15 +204,26 @@ def main(args: list[str] | None = None) -> int:
             conn.row_factory = sqlite3.Row
             cur = conn.cursor()
             if parsed.trades or parsed.status:
-                cur.execute(
-                    "SELECT chain, token_address, side, effective_price, realized_pnl_usd, created_at "
-                    "FROM trades ORDER BY created_at DESC LIMIT 10"
-                )
+                cur.execute("PRAGMA table_info(trades)")
+                cols = [row["name"] for row in cur.fetchall()]
+                has_platform = "platform" in cols
+
+                if has_platform:
+                    cur.execute(
+                        "SELECT chain, token_address, side, effective_price, realized_pnl_usd, created_at, platform "
+                        "FROM trades ORDER BY created_at DESC LIMIT 10"
+                    )
+                else:
+                    cur.execute(
+                        "SELECT chain, token_address, side, effective_price, realized_pnl_usd, created_at "
+                        "FROM trades ORDER BY created_at DESC LIMIT 10"
+                    )
                 rows = cur.fetchall()
                 print(f"=== Last {len(rows)} Trades ({config.db_path}) ===")
                 for r in rows:
                     pnl = f"+${r['realized_pnl_usd']:.2f}" if r['realized_pnl_usd'] else "OPEN"
-                    print(f"{r['created_at']} | {r['chain']} | {r['side']} | {r['token_address'][:12]}.. | Fill: {r['effective_price']} | PnL: {pnl}")
+                    plat = r['platform'] if has_platform and r['platform'] else resolve_trade_platform(token_address=r['token_address'], chain=r['chain'])
+                    print(f"{r['created_at']} | {plat} | {r['chain']} | {r['side']} | {r['token_address'][:12]}.. | Fill: {r['effective_price']} | PnL: {pnl}")
             if parsed.signals or parsed.status:
                 cur.execute(
                     "SELECT signal_id, chain, token_address, suggested_side, alpha_score, strength, created_at "

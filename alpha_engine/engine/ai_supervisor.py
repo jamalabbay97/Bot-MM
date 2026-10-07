@@ -40,6 +40,8 @@ from alpha_engine.models.events import SignalEvent
 from alpha_engine.models.news import NewsEvent
 from alpha_engine.models.profiler import WalletProfile
 from alpha_engine.models.state import PoolState, SecurityReport
+from alpha_engine.tracer import tracer
+from alpha_engine.models.observability import TraceStage, TraceStatus
 
 logger = logging.getLogger(__name__)
 
@@ -666,178 +668,210 @@ class AlphaSupervisorAI:
             recent_profit_factor=recent_profit_factor,
         )
 
-        resp: Optional[AISupervisorResponse] = None
+        chain_str = chain.value if hasattr(chain, "value") else str(chain)
+        async with tracer.span(
+            target_token,
+            chain_str,
+            TraceStage.AI_ANALYSIS,
+            "AlphaSupervisorAI",
+            "audit_signal",
+            telemetry,
+        ) as span:
+            resp: Optional[AISupervisorResponse] = None
 
-        # 1. Check if token or initiator is already blacklisted
-        initiator = telemetry.get("initiator_wallet", "")
-        if target_token in self._blacklisted_entities or (initiator and initiator in self._blacklisted_entities):
-            logger.warning("AlphaSupervisor-AI veto: entity %s is blacklisted", target_token[:10])
-            resp = self._create_blacklist_veto_response(target_token, initiator)
+            # 1. Check if token or initiator is already blacklisted
+            initiator = telemetry.get("initiator_wallet", "")
+            if target_token in self._blacklisted_entities or (initiator and initiator in self._blacklisted_entities):
+                logger.warning("AlphaSupervisor-AI veto: entity %s is blacklisted", target_token[:10])
+                resp = self._create_blacklist_veto_response(target_token, initiator)
 
-        # 2. Try LLM inference if credentials exist and enabled
-        if resp is None and self._enabled and self._api_key:
-            try:
-                resp = await asyncio.wait_for(self._call_llm(telemetry), timeout=self._timeout_s)
-            except Exception as exc:  # noqa: BLE001
-                logger.debug("AlphaSupervisor-AI LLM call failed or timed out (%s); falling back to deterministic engine", exc)
-
-        # 3. Fallback to deterministic institutional heuristics engine
-        if resp is None:
-            resp = self.evaluate_deterministic(telemetry)
-
-        # Record telemetry and update closed-loop state
-        if resp.decision == AISupervisorDecisionEnum.PASS:
-            self._veto_count += 1
-            self._recent_vetoes.append({
-                "token": target_token,
-                "chain": chain.value,
-                "flags": list(resp.security_assessment.flags) if resp.security_assessment else [],
-                "rationale": resp.wallet_audit.rationale if resp.wallet_audit else "Security / Heuristic Veto",
-                "timestamp": time.time(),
-            })
-        elif resp.decision == AISupervisorDecisionEnum.EXECUTE_BUY:
-            self._buy_approval_count += 1
-
-        init_price = Decimal("0.000000028")
-        if pool_state and hasattr(pool_state, "spot_price_native_per_token") and pool_state.spot_price_native_per_token > 0:
-            init_price = pool_state.spot_price_native_per_token
-        elif getattr(signal, "spot_price", None) and signal.spot_price > 0:
-            init_price = Decimal(str(signal.spot_price))
-
-        decision_val = resp.decision.value if hasattr(resp.decision, "value") else str(resp.decision)
-        flags = list(resp.security_assessment.flags) if resp.security_assessment else []
-        self._outcome_tracker.record_audit(
-            token_address=target_token,
-            chain=chain.value,
-            decision=decision_val,
-            initial_price=init_price,
-            flags=flags,
-            confidence=resp.confidence_score,
-        )
-
-        if resp.feedback_tuning.blacklisted_entities:
-            for entity in resp.feedback_tuning.blacklisted_entities:
-                if entity and entity not in self._blacklisted_entities:
-                    self._blacklisted_entities.add(entity)
-                    logger.info("AlphaSupervisor-AI blacklisted toxic entity: %s", entity)
-
-        if resp.feedback_tuning.adjust_global_risk:
-            try:
-                self._global_risk_mode = GlobalRiskMode(resp.feedback_tuning.adjust_global_risk)
-            except Exception:
-                pass
-
-        if resp.feedback_tuning.insights_learned:
-            self._learned_insights.append(resp.feedback_tuning.insights_learned)
-
-        # Compute PatternMatchScore using PatternMemoryStore if available
-        pattern_match_score = 0.85
-        effective_sec = sec if sec is not None else (security_report or getattr(signal, "security_report", None))
-        if self._pattern_store is not None and hasattr(self._pattern_store, "calculate_pattern_match"):
-            try:
-                candidate_vector = PatternFeatureVector.from_signal(
-                    signal=signal,
-                    sec=effective_sec,
-                    wallet_profile=wallet_profile,
-                )
-                pattern_match_score = self._pattern_store.calculate_pattern_match(candidate_vector)
-            except AttributeError:
+            # 2. Try LLM inference if credentials exist and enabled
+            if resp is None and self._enabled and self._api_key:
                 try:
-                    top10 = getattr(effective_sec, "top10_concentration", 0.15) if effective_sec else 0.15
-                    candidate_vector = PatternFeatureVector(
-                        token_address=target_token,
-                        consolidation_duration_s=1800.0,
-                        dip_depth_pct=40.0,
-                        volume_surge_multiplier=2.5,
-                        net_buy_delta=0.70,
-                        top10_concentration=float(top10 if top10 is not None else 0.15),
-                        liquidity_to_mc_ratio=0.20,
-                        smart_wallet_inflows=5.0,
-                        peak_gain_multiplier=1.0,
+                    resp = await asyncio.wait_for(self._call_llm(telemetry), timeout=self._timeout_s)
+                except Exception as exc:  # noqa: BLE001
+                    logger.debug("AlphaSupervisor-AI LLM call failed or timed out (%s); falling back to deterministic engine", exc)
+
+            # 3. Fallback to deterministic institutional heuristics engine
+            if resp is None:
+                resp = self.evaluate_deterministic(telemetry)
+
+            # Record telemetry and update closed-loop state
+            if resp.decision == AISupervisorDecisionEnum.PASS:
+                self._veto_count += 1
+                self._recent_vetoes.append({
+                    "token": target_token,
+                    "chain": chain.value,
+                    "flags": list(resp.security_assessment.flags) if resp.security_assessment else [],
+                    "rationale": resp.wallet_audit.rationale if resp.wallet_audit else "Security / Heuristic Veto",
+                    "timestamp": time.time(),
+                })
+            elif resp.decision == AISupervisorDecisionEnum.EXECUTE_BUY:
+                self._buy_approval_count += 1
+
+            init_price = Decimal("0.000000028")
+            if pool_state and hasattr(pool_state, "spot_price_native_per_token") and pool_state.spot_price_native_per_token > 0:
+                init_price = pool_state.spot_price_native_per_token
+            elif getattr(signal, "spot_price", None) and signal.spot_price > 0:
+                init_price = Decimal(str(signal.spot_price))
+
+            decision_val = resp.decision.value if hasattr(resp.decision, "value") else str(resp.decision)
+            flags = list(resp.security_assessment.flags) if resp.security_assessment else []
+            self._outcome_tracker.record_audit(
+                token_address=target_token,
+                chain=chain.value,
+                decision=decision_val,
+                initial_price=init_price,
+                flags=flags,
+                confidence=resp.confidence_score,
+            )
+
+            if resp.feedback_tuning.blacklisted_entities:
+                for entity in resp.feedback_tuning.blacklisted_entities:
+                    if entity and entity not in self._blacklisted_entities:
+                        self._blacklisted_entities.add(entity)
+                        logger.info("AlphaSupervisor-AI blacklisted toxic entity: %s", entity)
+
+            if resp.feedback_tuning.adjust_global_risk:
+                try:
+                    self._global_risk_mode = GlobalRiskMode(resp.feedback_tuning.adjust_global_risk)
+                except Exception:
+                    pass
+
+            if resp.feedback_tuning.insights_learned:
+                self._learned_insights.append(resp.feedback_tuning.insights_learned)
+
+            # Compute PatternMatchScore using PatternMemoryStore if available
+            pattern_match_score = 0.85
+            effective_sec = sec if sec is not None else (security_report or getattr(signal, "security_report", None))
+            if self._pattern_store is not None and hasattr(self._pattern_store, "calculate_pattern_match"):
+                try:
+                    candidate_vector = PatternFeatureVector.from_signal(
+                        signal=signal,
+                        sec=effective_sec,
+                        wallet_profile=wallet_profile,
                     )
                     pattern_match_score = self._pattern_store.calculate_pattern_match(candidate_vector)
-                except Exception:
+                except AttributeError:
+                    try:
+                        top10 = getattr(effective_sec, "top10_concentration", 0.15) if effective_sec else 0.15
+                        candidate_vector = PatternFeatureVector(
+                            token_address=target_token,
+                            consolidation_duration_s=1800.0,
+                            dip_depth_pct=40.0,
+                            volume_surge_multiplier=2.5,
+                            net_buy_delta=0.70,
+                            top10_concentration=float(top10 if top10 is not None else 0.15),
+                            liquidity_to_mc_ratio=0.20,
+                            smart_wallet_inflows=5.0,
+                            peak_gain_multiplier=1.0,
+                        )
+                        pattern_match_score = self._pattern_store.calculate_pattern_match(candidate_vector)
+                    except Exception:
+                        pattern_match_score = 0.85
+                except Exception as exc:
+                    logger.debug("Failed computing pattern match score: %s", exc)
                     pattern_match_score = 0.85
-            except Exception as exc:
-                logger.debug("Failed computing pattern match score: %s", exc)
-                pattern_match_score = 0.85
 
-        # Apply dynamic parameter tuning if available
-        if self._parameter_tuner is not None and hasattr(self._parameter_tuner, "current_params"):
-            dyn_p = self._parameter_tuner.current_params
-            try:
-                new_action_params = resp.action_parameters.model_copy(
-                    update={
-                        "max_slippage_bps": dyn_p.max_slippage_bps,
-                        "hard_stop_loss_pct": dyn_p.hard_stop_loss_pct,
-                        "take_profit_ladder": dyn_p.get_take_profit_ladder(),
-                        "trailing_stop_activation_pct": dyn_p.trailing_stop_activation_pct,
-                    }
-                )
-                resp = resp.model_copy(update={"action_parameters": new_action_params})
-            except Exception:
+            # Apply dynamic parameter tuning if available
+            if self._parameter_tuner is not None and hasattr(self._parameter_tuner, "current_params"):
+                dyn_p = self._parameter_tuner.current_params
                 try:
-                    resp.action_parameters.max_slippage_bps = dyn_p.max_slippage_bps
-                    resp.action_parameters.hard_stop_loss_pct = dyn_p.hard_stop_loss_pct
-                    resp.action_parameters.take_profit_ladder = dyn_p.get_take_profit_ladder()
-                    resp.action_parameters.trailing_stop_activation_pct = dyn_p.trailing_stop_activation_pct
-                except Exception as ex_tuner:
-                    logger.debug("Failed applying dynamic tuner parameters: %s", ex_tuner)
+                    new_action_params = resp.action_parameters.model_copy(
+                        update={
+                            "max_slippage_bps": dyn_p.max_slippage_bps,
+                            "hard_stop_loss_pct": dyn_p.hard_stop_loss_pct,
+                            "take_profit_ladder": dyn_p.get_take_profit_ladder(),
+                            "trailing_stop_activation_pct": dyn_p.trailing_stop_activation_pct,
+                        }
+                    )
+                    resp = resp.model_copy(update={"action_parameters": new_action_params})
+                except Exception:
+                    try:
+                        resp.action_parameters.max_slippage_bps = dyn_p.max_slippage_bps
+                        resp.action_parameters.hard_stop_loss_pct = dyn_p.hard_stop_loss_pct
+                        resp.action_parameters.take_profit_ladder = dyn_p.get_take_profit_ladder()
+                        resp.action_parameters.trailing_stop_activation_pct = dyn_p.trailing_stop_activation_pct
+                    except Exception as ex_tuner:
+                        logger.debug("Failed applying dynamic tuner parameters: %s", ex_tuner)
 
-        # Construct and persist immutable DecisionRecord audit trail
-        decision_type = (
-            DecisionType.ENTER
-            if resp.decision == AISupervisorDecisionEnum.EXECUTE_BUY
-            else DecisionType.SKIP
-        )
-        if decision_type == DecisionType.ENTER:
-            explicit_reason = (
-                f"BUY APPROVED: AlphaScore={signal.alpha_score:.2f} | PatternMatch={pattern_match_score:.2f} | "
-                f"KellySize={resp.action_parameters.recommended_position_pct}% | MaxSlippage={resp.action_parameters.max_slippage_bps}bps | "
-                f"StopLoss={resp.action_parameters.hard_stop_loss_pct}% | {resp.wallet_audit.rationale}"
+            # Construct and persist immutable DecisionRecord audit trail
+            decision_type = (
+                DecisionType.ENTER
+                if resp.decision == AISupervisorDecisionEnum.EXECUTE_BUY
+                else DecisionType.SKIP
             )
-        else:
-            reasons = list(resp.security_assessment.flags) if resp.security_assessment else []
-            explicit_reason = f"VETO SKIP: [{', '.join(reasons) if reasons else 'Unmet criteria'}]; {resp.wallet_audit.rationale}"
+            if decision_type == DecisionType.ENTER:
+                explicit_reason = (
+                    f"BUY APPROVED: AlphaScore={signal.alpha_score:.2f} | PatternMatch={pattern_match_score:.2f} | "
+                    f"KellySize={resp.action_parameters.recommended_position_pct}% | MaxSlippage={resp.action_parameters.max_slippage_bps}bps | "
+                    f"StopLoss={resp.action_parameters.hard_stop_loss_pct}% | {resp.wallet_audit.rationale}"
+                )
+            else:
+                reasons = list(resp.security_assessment.flags) if resp.security_assessment else []
+                explicit_reason = f"VETO SKIP: [{', '.join(reasons) if reasons else 'Unmet criteria'}]; {resp.wallet_audit.rationale}"
 
-        decision_record = DecisionRecord(
-            token_address=target_token,
-            chain=chain.value,
-            decision_type=decision_type,
-            strategy_pattern=signal.source.value if hasattr(signal.source, "value") else str(signal.source),
-            market_cap_usd=None,
-            volume_5m_usd=None,
-            volume_1h_usd=None,
-            liquidity_pool_depth_usd=float(pool_state.native_reserve * 150) if pool_state and pool_state.native_reserve > 0 else None,
-            active_rules={
-                "WhaleInflow": wallet_profile.total_trades > 30 if wallet_profile else False,
-                "DevExitConfirmed": not (sec and not sec.mint_authority_disabled),
-                "PatternMatchScore": pattern_match_score,
-                "HoneypotSafe": not (sec and sec.is_honeypot),
-                "RejectionFlags": resp.security_assessment.flags if resp.security_assessment else [],
-            },
-            confidence_score=resp.confidence_score,
-            reason=explicit_reason,
-            metadata={"global_risk_mode": self._global_risk_mode.value},
-        )
+            decision_record = DecisionRecord(
+                token_address=target_token,
+                chain=chain.value,
+                decision_type=decision_type,
+                strategy_pattern=signal.source.value if hasattr(signal.source, "value") else str(signal.source),
+                market_cap_usd=None,
+                volume_5m_usd=None,
+                volume_1h_usd=None,
+                liquidity_pool_depth_usd=float(pool_state.native_reserve * 150) if pool_state and pool_state.native_reserve > 0 else None,
+                active_rules={
+                    "WhaleInflow": wallet_profile.total_trades > 30 if wallet_profile else False,
+                    "DevExitConfirmed": not (sec and not sec.mint_authority_disabled),
+                    "PatternMatchScore": pattern_match_score,
+                    "HoneypotSafe": not (sec and sec.is_honeypot),
+                    "RejectionFlags": resp.security_assessment.flags if resp.security_assessment else [],
+                },
+                confidence_score=resp.confidence_score,
+                reason=explicit_reason,
+                metadata={"global_risk_mode": self._global_risk_mode.value},
+            )
 
-        if self._ledger is not None and hasattr(self._ledger, "record_decision"):
+            if self._ledger is not None and hasattr(self._ledger, "record_decision"):
+                try:
+                    loop = asyncio.get_running_loop()
+                    loop.create_task(self._ledger.record_decision(decision_record))
+                except RuntimeError:
+                    pass
+
+            self._recent_audits.append({
+                "token": target_token,
+                "chain": chain.value,
+                "decision": str(resp.decision),
+                "confidence": resp.confidence_score,
+                "risk_mode": self._global_risk_mode.value,
+                "timestamp": time.time(),
+            })
+
+            # Update trace span status and output
+            if resp.decision == AISupervisorDecisionEnum.PASS:
+                span.status = TraceStatus.REJECTED
+                span.reason = (resp.wallet_audit.rationale if resp.wallet_audit else None) or "AI Veto"
+            else:
+                span.status = TraceStatus.PASSED
+                span.reason = "AI Approved"
+
             try:
-                loop = asyncio.get_running_loop()
-                loop.create_task(self._ledger.record_decision(decision_record))
-            except RuntimeError:
-                pass
+                out = resp.model_dump(mode="json")
+                out["decision"] = str(resp.decision.value if hasattr(resp.decision, "value") else resp.decision)
+                out["confidence_score"] = resp.confidence_score
+                out["rationale"] = resp.wallet_audit.rationale if resp.wallet_audit else ""
+                out["flags"] = list(resp.security_assessment.flags) if resp.security_assessment and resp.security_assessment.flags else []
+                span.output_data = out
+            except Exception:
+                span.output_data = {
+                    "decision": str(resp.decision),
+                    "confidence_score": resp.confidence_score,
+                    "rationale": resp.wallet_audit.rationale if resp.wallet_audit else "",
+                    "flags": list(resp.security_assessment.flags) if resp.security_assessment and resp.security_assessment.flags else [],
+                }
 
-        self._recent_audits.append({
-            "token": target_token,
-            "chain": chain.value,
-            "decision": str(resp.decision),
-            "confidence": resp.confidence_score,
-            "risk_mode": self._global_risk_mode.value,
-            "timestamp": time.time(),
-        })
-
-        return resp
+            return resp
 
     def _build_telemetry_payload(
         self,

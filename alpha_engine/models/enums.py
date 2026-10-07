@@ -6,6 +6,7 @@ Python 3.11+
 """
 
 from enum import Enum
+from typing import Any, Optional
 
 
 class ChainIdentifier(str, Enum):
@@ -179,5 +180,83 @@ class ExecutionVenue(str, Enum):
     RAYDIUM_CLMM = "raydium_clmm"
     ORCA_WHIRLPOOL = "orca_whirlpool"
     PUMP_FUN = "pump_fun"
+
+
+class TradingPlatform(str, Enum):
+    """
+    Identified trading platform and venue source.
+    PUMP_FUN: Pump.fun bonding curves on Solana.
+    DEX_SCAN: Decentralized exchange liquidity pools (Raydium, Orca, Uniswap, etc.) or DEX scanners.
+    """
+
+    PUMP_FUN = "Pump.fun"
+    DEX_SCAN = "DexScan"
+
+
+PlatformSource = TradingPlatform
+
+
+def resolve_trade_platform(
+    token_address: Optional[str] = None,
+    chain: Optional[Any] = None,
+    source: Optional[Any] = None,
+    execution_venue: Optional[Any] = None,
+    pool_address: Optional[str] = None,
+    bonding_curve_mode: bool = False,
+    is_pump_fun: Optional[bool] = None,
+    originating_channel: Optional[str] = None,
+    platform: Optional[str] = None,
+) -> str:
+    """
+    Deterministically resolves the trade's platform source to either 'Pump.fun' or 'DexScan'.
+    """
+    if platform:
+        p_clean = str(platform).strip()
+        if p_clean.lower() in ("pump.fun", "pump_fun", "pump"):
+            return TradingPlatform.PUMP_FUN.value
+        if p_clean.lower() in ("dexscan", "dex_scan", "dex"):
+            return TradingPlatform.DEX_SCAN.value
+        return p_clean
+
+    if is_pump_fun is True:
+        return TradingPlatform.PUMP_FUN.value
+    if is_pump_fun is False:
+        return TradingPlatform.DEX_SCAN.value
+
+    # Check execution venue
+    if execution_venue is not None:
+        v_str = str(getattr(execution_venue, "value", execution_venue)).lower()
+        if "pump" in v_str:
+            return TradingPlatform.PUMP_FUN.value
+
+    # Check signal source
+    if source is not None:
+        s_str = str(getattr(source, "value", source)).lower()
+        if "pump" in s_str:
+            return TradingPlatform.PUMP_FUN.value
+
+    # Check channel
+    if originating_channel and "pump" in str(originating_channel).lower():
+        return TradingPlatform.PUMP_FUN.value
+
+    # Check pool address
+    if pool_address and "pump" in str(pool_address).lower():
+        return TradingPlatform.PUMP_FUN.value
+
+    # Check token address (Pump.fun mint addresses end with 'pump' on Solana)
+    if token_address:
+        t_clean = str(token_address).strip().lower()
+        if t_clean.endswith("pump") or "pump" in t_clean:
+            chain_str = str(getattr(chain, "value", chain or "")).lower()
+            if not chain_str or "solana" in chain_str or not t_clean.startswith("0x"):
+                return TradingPlatform.PUMP_FUN.value
+
+    # Check bonding curve mode on Solana
+    if bonding_curve_mode:
+        chain_str = str(getattr(chain, "value", chain or "")).lower()
+        if not chain_str or "solana" in chain_str:
+            return TradingPlatform.PUMP_FUN.value
+
+    return TradingPlatform.DEX_SCAN.value
 
 

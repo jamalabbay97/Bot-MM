@@ -14,7 +14,14 @@ from collections import defaultdict
 from dataclasses import dataclass, field
 from decimal import Decimal
 from typing import Optional, Any
-from alpha_engine.models.enums import ChainIdentifier, ExitProfile, ExitStage, LotStatus, TradeExitReason
+from alpha_engine.models.enums import (
+    ChainIdentifier,
+    ExitProfile,
+    ExitStage,
+    LotStatus,
+    TradeExitReason,
+    resolve_trade_platform,
+)
 from alpha_engine.models.state import PaperFill
 
 logger = logging.getLogger(__name__)
@@ -74,6 +81,7 @@ class OpenLot:
     consolidation_length_hours: float = 0.0
     volume_surge_multiplier: float = 0.0
     net_buy_delta: float = 0.0
+    platform: str = "DexScan"
 
     def record_tick(
         self,
@@ -205,6 +213,7 @@ class PositionBook:
     _lots: dict[tuple[str, str], list[OpenLot]] = field(
         default_factory=lambda: defaultdict(list)
     )
+    _closed_lots: list[OpenLot] = field(default_factory=list)
 
     @staticmethod
     def compute_pearson_correlation(series_x: list[float], series_y: list[float]) -> float:
@@ -366,12 +375,19 @@ class PositionBook:
         consolidation_length_hours: float = 0.0,
         volume_surge_multiplier: float = 0.0,
         net_buy_delta: float = 0.0,
+        platform: Optional[str] = None,
     ) -> OpenLot:
         if fill.effective_price <= Decimal(0):
             raise ValueError(
                 f"Cannot open lot for {fill.token_address} with non-positive fill price: {fill.effective_price}"
             )
         entry_ts = fill.fill_timestamp_ns / 1e9 if fill.fill_timestamp_ns > 0 else 0.0
+        resolved_platform = platform or getattr(fill, "platform", None) or resolve_trade_platform(
+            token_address=fill.token_address,
+            chain=fill.chain,
+            pool_address=pool_address or fill.pool_address,
+            bonding_curve_mode=bonding_curve_mode,
+        )
         lot = OpenLot(
             token_address=fill.token_address,
             chain=fill.chain,
@@ -404,15 +420,17 @@ class PositionBook:
             consolidation_length_hours=consolidation_length_hours,
             volume_surge_multiplier=volume_surge_multiplier,
             net_buy_delta=net_buy_delta,
+            platform=resolved_platform,
             price_history=[(entry_ts, fill.effective_price, fill.simulated_native_spent)],
             tick_prices_5m=[(entry_ts, fill.effective_price)],
             tick_returns_5m=[],
         )
         key = (fill.chain.value, fill.token_address)
         self._lots[key].append(lot)
-        logger.debug(
-            "Opened lot %s: %s tokens of %s @ %s native (reserve=%s, status=%s, cluster=%s)",
+        logger.info(
+            "Opened lot %s | Platform=%s | %s tokens of %s @ %s native (reserve=%s, status=%s, cluster=%s)",
             lot.lot_id[:8],
+            lot.platform,
             lot.tokens_held,
             lot.token_address[:10],
             lot.entry_price,
@@ -444,6 +462,9 @@ class PositionBook:
                 matched += lot.tokens_held
                 remaining -= lot.tokens_held
                 lots.pop(i)
+                self._closed_lots.append(lot)
+                if len(self._closed_lots) > 100:
+                    self._closed_lots.pop(0)
                 logger.debug(
                     "Closed lot %s fully | PnL=%.8f native",
                     lot.lot_id[:8],
@@ -506,6 +527,10 @@ class PositionBook:
                 continue
             result.extend(lots)
         return result
+
+    def get_closed_lots(self) -> list[OpenLot]:
+        """Return recently closed lots tracked in-memory."""
+        return list(self._closed_lots)
 
     def is_position_open(
         self,

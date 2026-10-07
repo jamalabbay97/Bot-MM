@@ -24,7 +24,7 @@ import aiosqlite
 from alpha_engine.models.decisions import DecisionRecord, DecisionType, PatternFeatureVector
 from alpha_engine.models.enums import LotStatus, TradeExitReason
 from alpha_engine.models.events import SignalEvent
-from alpha_engine.models.state import PortfolioSnapshot, TradeRecord
+from alpha_engine.models.state import PaperFill, PortfolioSnapshot, TradeRecord
 
 logger = logging.getLogger(__name__)
 
@@ -93,7 +93,8 @@ class SQLiteLedger:
         realized_pnl_usd    TEXT,
         signal_timestamp_ns INTEGER NOT NULL,
         fill_timestamp_ns   INTEGER NOT NULL,
-        created_at          INTEGER NOT NULL
+        created_at          INTEGER NOT NULL,
+        platform            TEXT NOT NULL DEFAULT 'DexScan'
     )
     """
 
@@ -182,6 +183,23 @@ class SQLiteLedger:
     )
     """
 
+    _CREATE_TRACE_LOG = """
+    CREATE TABLE IF NOT EXISTS token_lifecycle_trace (
+        trace_id TEXT PRIMARY KEY,
+        token_address TEXT NOT NULL,
+        chain TEXT NOT NULL,
+        stage TEXT NOT NULL,
+        component TEXT NOT NULL,
+        function_name TEXT NOT NULL,
+        status TEXT NOT NULL,
+        reason TEXT,
+        input_data_json TEXT NOT NULL,
+        output_data_json TEXT NOT NULL,
+        duration_ms REAL NOT NULL,
+        timestamp_ns INTEGER NOT NULL
+    )
+    """
+
     def __init__(
         self,
         db_path: str | Path = "paper_trading.db",
@@ -241,8 +259,20 @@ class SQLiteLedger:
         await conn.execute(self._CREATE_LOT_LIFECYCLE)
         await conn.execute(self._CREATE_DECISION_AUDIT_LOG)
         await conn.execute(self._CREATE_PATTERN_STORE)
+        await conn.execute(self._CREATE_TRACE_LOG)
         await conn.execute("CREATE INDEX IF NOT EXISTS idx_trades_token ON trades(token_address);")
         await conn.execute("CREATE INDEX IF NOT EXISTS idx_trades_chain ON trades(chain);")
+        try:
+            cursor = await conn.execute("PRAGMA table_info(trades)")
+            cols = [row[1] for row in await cursor.fetchall()]
+            if cols:
+                if "realized_pnl_usd" not in cols:
+                    await conn.execute("ALTER TABLE trades ADD COLUMN realized_pnl_usd TEXT;")
+                if "platform" not in cols:
+                    await conn.execute("ALTER TABLE trades ADD COLUMN platform TEXT NOT NULL DEFAULT 'DexScan';")
+        except Exception as exc:
+            logger.debug("Migration check for trades.platform: %s", exc)
+        await conn.execute("CREATE INDEX IF NOT EXISTS idx_trades_platform ON trades(platform);")
         await conn.execute("CREATE INDEX IF NOT EXISTS idx_signals_ts ON signals(timestamp_ns);")
         await conn.execute("CREATE INDEX IF NOT EXISTS idx_lot_lifecycle_id ON lot_lifecycle(lot_id);")
         await conn.execute("CREATE INDEX IF NOT EXISTS idx_lot_lifecycle_status ON lot_lifecycle(status);")
@@ -251,19 +281,29 @@ class SQLiteLedger:
         await conn.execute("CREATE INDEX IF NOT EXISTS idx_decision_audit_ts ON decision_audit_log(timestamp_ns);")
         await conn.execute("CREATE INDEX IF NOT EXISTS idx_decision_audit_created ON decision_audit_log(created_at);")
         await conn.execute("CREATE INDEX IF NOT EXISTS idx_pattern_store_ts ON pattern_feature_store(timestamp_ns);")
+        await conn.execute("CREATE INDEX IF NOT EXISTS idx_trace_token ON token_lifecycle_trace(token_address);")
+        await conn.execute("CREATE INDEX IF NOT EXISTS idx_trace_ts ON token_lifecycle_trace(timestamp_ns DESC);")
         await conn.commit()
         logger.info("SQLite ledger initialised at %s (WAL mode)", self._db_path)
 
     @sqlite_retry(max_retries=5, base_delay=0.1)
-    async def record_trade(self, record: TradeRecord) -> None:
+    async def record_trade(self, record: TradeRecord | PaperFill) -> None:
         conn = self._conn
         if conn is None:
             logger.debug("SQLiteLedger connection is closed; skipping trade.")
             return
+        if not isinstance(record, TradeRecord):
+            record = TradeRecord.from_fill(record)
         await conn.execute(
             """
-            INSERT INTO trades VALUES (
-                ?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?
+            INSERT INTO trades (
+                trade_id, order_id, signal_id, chain, token_address, pool_address,
+                side, native_spent, tokens_delta, effective_price, price_impact_bps,
+                gas_cost_usd, fill_latency_ms, kelly_fraction, portfolio_equity_usd,
+                realized_pnl_usd, signal_timestamp_ns, fill_timestamp_ns, created_at,
+                platform
+            ) VALUES (
+                ?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?
             )
             """,
             (
@@ -286,10 +326,11 @@ class SQLiteLedger:
                 record.signal_timestamp_ns,
                 record.fill_timestamp_ns,
                 time.time_ns(),
+                getattr(record, "platform", "DexScan") or "DexScan",
             ),
         )
         await conn.commit()
-        logger.debug("Trade %s recorded in ledger.", record.trade_id[:8])
+        logger.debug("Trade %s recorded in ledger (%s).", record.trade_id[:8], getattr(record, "platform", "DexScan"))
 
     @sqlite_retry(max_retries=5, base_delay=0.1)
     async def record_signal(self, signal: SignalEvent) -> None:
@@ -392,6 +433,39 @@ class SQLiteLedger:
             "avg_loss_native": avg_loss,
             "total_trades": total,
         }
+
+    @sqlite_retry(max_retries=5, base_delay=0.1)
+    async def get_recent_trades(self, limit: int = 10) -> list[dict[str, Any]]:
+        """Retrieve the most recent executed trades with their platform identification."""
+        conn = self._conn
+        if conn is None:
+            return []
+        try:
+            cur = await conn.execute("PRAGMA table_info(trades)")
+            cols = [row[1] for row in await cur.fetchall()]
+            has_platform = "platform" in cols
+            plat_col = "platform" if has_platform else "'DexScan'"
+            query = (
+                f"SELECT chain, token_address, side, effective_price, realized_pnl_usd, created_at, {plat_col} "
+                f"FROM trades ORDER BY created_at DESC LIMIT ?"
+            )
+            async with conn.execute(query, (limit,)) as cursor:
+                rows = await cursor.fetchall()
+                res = []
+                for r in rows:
+                    res.append({
+                        "chain": r[0],
+                        "token_address": r[1],
+                        "side": r[2],
+                        "effective_price": r[3],
+                        "realized_pnl_usd": r[4],
+                        "created_at": r[5],
+                        "platform": r[6] or "DexScan",
+                    })
+                return res
+        except Exception as exc:
+            logger.debug("Failed to get recent trades from ledger: %s", exc)
+            return []
 
     @sqlite_retry(max_retries=5, base_delay=0.1)
     async def record_lot_transition(
@@ -818,6 +892,58 @@ class SQLiteLedger:
             except Exception as exc:
                 logger.debug("Error parsing PatternFeatureVector: %s", exc)
         return results
+
+    @sqlite_retry(max_retries=5, base_delay=0.1)
+    async def record_trace_event(self, event: Any) -> None:
+        """Persist a token lifecycle trace event asynchronously to SQLite."""
+        conn = self._conn
+        if conn is None:
+            return
+        stage_val = event.stage.value if hasattr(event.stage, "value") else str(event.stage)
+        status_val = event.status.value if hasattr(event.status, "value") else str(event.status)
+        await conn.execute(
+            """INSERT INTO token_lifecycle_trace VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (
+                event.trace_id,
+                event.token_address,
+                event.chain,
+                stage_val,
+                event.component,
+                event.function_name,
+                status_val,
+                event.reason,
+                json.dumps(event.input_data, default=str),
+                json.dumps(event.output_data, default=str),
+                event.duration_ms,
+                event.timestamp_ns,
+            ),
+        )
+        await conn.commit()
+
+    @sqlite_retry(max_retries=5, base_delay=0.1)
+    async def get_recent_assets(self, limit: int = 50) -> list[str]:
+        """Returns unique token addresses recently processed."""
+        if not self._conn:
+            return []
+        async with self._conn.execute(
+            "SELECT DISTINCT token_address FROM token_lifecycle_trace ORDER BY timestamp_ns DESC LIMIT ?",
+            (limit,),
+        ) as cursor:
+            rows = await cursor.fetchall()
+            return [r[0] for r in rows]
+
+    @sqlite_retry(max_retries=5, base_delay=0.1)
+    async def get_asset_trace(self, token_address: str) -> list[dict]:
+        """Returns chronological timeline for a specific token."""
+        if not self._conn:
+            return []
+        async with self._conn.execute(
+            "SELECT * FROM token_lifecycle_trace WHERE token_address = ? OR LOWER(token_address) = LOWER(?) ORDER BY timestamp_ns ASC",
+            (token_address, token_address),
+        ) as cursor:
+            cols = [d[0] for d in cursor.description] if cursor.description else []
+            rows = await cursor.fetchall()
+            return [dict(r) if hasattr(r, "keys") else dict(zip(cols, r)) for r in rows]
 
 
 __all__ = [

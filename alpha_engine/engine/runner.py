@@ -39,6 +39,7 @@ from alpha_engine.engine.staging import RevivalBreakoutBuffer, Wave2StagingBuffe
 from alpha_engine.execution.book import PositionBook, RunningMetrics
 from alpha_engine.execution.executor import PaperExecutor
 from alpha_engine.execution.ledger import SQLiteLedger
+from alpha_engine.tracer import tracer
 from alpha_engine.ingestion.coordinator import IngestionCoordinator
 from alpha_engine.logging_config import setup_production_logging
 from alpha_engine.math.cpmm import get_initial_bonding_curve_pool
@@ -51,6 +52,7 @@ from alpha_engine.models.enums import (
     OrderSide,
     SignalSource,
     SignalStrength,
+    resolve_trade_platform,
 )
 from alpha_engine.models.events import (
     PoolStateUpdateEvent,
@@ -138,6 +140,7 @@ class PaperTradingEngine:
         self._explainer: Optional[ConversationalSupervisor] = None
         self._executor: PaperExecutor | None = None
         self._ledger: SQLiteLedger | None = None
+        self.tracer = tracer
         self._gatekeeper: SecurityGatekeeper | None = None
         self._session: aiohttp.ClientSession | None = None
         self._telegram: Any = None
@@ -318,9 +321,15 @@ class PaperTradingEngine:
         is_win = exit_pnl_usd > 0
         dur_s = (time.time_ns() - lot.open_timestamp_ns) / 1e9 if getattr(lot, "open_timestamp_ns", 0) > 0 else 0.0
 
+        platform_name = getattr(lot, "platform", None) or getattr(exit_fill, "platform", None) or resolve_trade_platform(
+            token_address=lot.token_address,
+            chain=lot.chain,
+        )
+
         self._recent_closed_trades.append({
             "token_address": lot.token_address,
             "chain": lot.chain,
+            "platform": platform_name,
             "side": "SELL",
             "entry_price": ep,
             "exit_price": xp,
@@ -343,6 +352,20 @@ class PaperTradingEngine:
         chain_val = lot.chain.value if hasattr(lot.chain, "value") else str(lot.chain)
         is_swing = getattr(lot, "exit_profile", None) == ExitProfile.REVIVAL_SWING
 
+        logger.info(
+            "CLOSED TRADE | Platform=%s | Token=%s (%s) | Entry=%s | Exit=%s | PnL=%+.2f%% (%s$%.2f) | Reason=%s | Duration=%.1fs",
+            platform_name,
+            lot.token_address[:10],
+            chain_val,
+            ep_str,
+            xp_str,
+            pct,
+            usd_sign,
+            float(exit_pnl_usd),
+            decision_reason,
+            dur_s,
+        )
+
         if is_swing:
             peak_p = getattr(lot, "peak_price", ep)
             peak_roi = float((peak_p - ep) / ep * 100) if ep > 0 else 0.0
@@ -361,6 +384,7 @@ class PaperTradingEngine:
 
             exit_msg = (
                 f"{status_icon} **REVIVAL SWING EXIT ({title})**\n\n"
+                f"• **Platform:** `{platform_name}`\n"
                 f"• **Token:** `{t_str}` (`{lot.token_address}`)\n"
                 f"• **Chain:** {chain_val}\n"
                 f"• **Strategy Profile:** `REVIVAL_SWING`\n"
@@ -374,6 +398,7 @@ class PaperTradingEngine:
         else:
             exit_msg = (
                 f"{status_icon} **{title} (Paper Trade)**\n\n"
+                f"• **Platform:** `{platform_name}`\n"
                 f"• **Token:** `{t_str}` (`{lot.token_address}`)\n"
                 f"• **Chain:** {chain_val}\n"
                 f"• **Entry Price:** `{ep_str}`\n"
@@ -1064,10 +1089,26 @@ class PaperTradingEngine:
                             gas_cost_usd=exit_fill.simulated_gas_cost_usd,
                             current_equity_usd=new_equity,
                         )
+                        platform_name = getattr(lot, "platform", None) or getattr(exit_fill, "platform", None) or resolve_trade_platform(
+                            token_address=decision.token_address,
+                            chain=decision.chain,
+                            pool_address=getattr(pool, "pool_address", ""),
+                        )
+                        logger.info(
+                            "SWAP EXIT executed | Platform=%s | %s %s | reason=%s | exit_price=%s | PnL=%.4f USD | WR=%.1f%%",
+                            platform_name,
+                            decision.chain.value,
+                            decision.token_address[:10],
+                            decision.exit_reason.value if decision.exit_reason else "unknown",
+                            exit_fill.effective_price,
+                            float(exit_pnl_usd),
+                            self._metrics.win_rate_pct,
+                        )
                         rec = TradeRecord.from_fill(
                             fill=exit_fill,
                             signal_id=lot.signal_id,
                             realized_pnl_usd=exit_pnl_usd,
+                            platform=platform_name,
                         )
                         if ledger:
                             await ledger.record_trade(rec)
@@ -1410,6 +1451,13 @@ class PaperTradingEngine:
                     if signal_item.pool_state
                     else Decimal(0)
                 )
+                platform_name = getattr(fill, "platform", None) or resolve_trade_platform(
+                    token_address=fill.token_address,
+                    chain=fill.chain,
+                    source=getattr(signal_item, "source", None),
+                    execution_venue=getattr(signal_item, "execution_venue", None),
+                    pool_address=getattr(signal_item, "pool_address", ""),
+                )
                 lot = self._position_book.open_lot(
                     fill,
                     signal_item.signal_id,
@@ -1426,6 +1474,7 @@ class PaperTradingEngine:
                     consolidation_length_hours=float(getattr(signal_item, "consolidation_length_hours", 0.0) or 0.0),
                     volume_surge_multiplier=float(getattr(signal_item, "volume_surge_multiplier", 0.0) or 0.0),
                     net_buy_delta=float(getattr(signal_item, "net_buy_delta", 0.0) or 0.0),
+                    platform=platform_name,
                 )
 
                 if self._ledger:
@@ -1447,9 +1496,22 @@ class PaperTradingEngine:
                 spent_val = float(fill.simulated_native_spent)
                 tok_val = float(fill.tokens_acquired)
 
+                logger.info(
+                    "BUY fill [%s] | Platform=%s | Token=%s (%s) | price=%s | spent=%.4f %s | tokens=%.2f",
+                    fill.order_id[:8],
+                    platform_name,
+                    fill.token_address[:10],
+                    signal_item.chain.value,
+                    p_str,
+                    spent_val,
+                    unit,
+                    tok_val,
+                )
+
                 if getattr(signal_item, "exit_profile", None) == ExitProfile.REVIVAL_SWING:
                     buy_alert = (
                         f"🚀 **REVIVAL & CTO BREAKOUT DETECTED**\n\n"
+                        f"• **Platform:** `{platform_name}`\n"
                         f"• **Token:** `{t_str}` (`{fill.token_address}`)\n"
                         f"• **Chain:** {signal_item.chain.value}\n"
                         f"• **Strategy Profile:** `REVIVAL_SWING`\n"
@@ -1464,6 +1526,7 @@ class PaperTradingEngine:
                 else:
                     buy_alert = (
                         f"🟢 **BUY EXECUTED (Paper Trade)**\n\n"
+                        f"• **Platform:** `{platform_name}`\n"
                         f"• **Token:** `{t_str}` (`{fill.token_address}`)\n"
                         f"• **Chain:** {signal_item.chain.value}\n"
                         f"• **Buy Price:** `{p_str}`\n"
@@ -1502,8 +1565,18 @@ class PaperTradingEngine:
                 if self._trades_since_kelly_refresh >= self._kelly_refresh_interval:
                     await self._refresh_kelly(executor, ledger)
 
+                platform_name = getattr(fill, "platform", None) or resolve_trade_platform(
+                    token_address=signal_item.token_address,
+                    chain=signal_item.chain,
+                    source=getattr(signal_item, "source", None),
+                )
+
                 logger.info(
-                    "SELL fill | PnL=%.4f USD | MDD=%.2f%% | WinRate=%.1f%%",
+                    "SELL fill [%s] | Platform=%s | Token=%s (%s) | PnL=%.4f USD | MDD=%.2f%% | WinRate=%.1f%%",
+                    fill.order_id[:8],
+                    platform_name,
+                    fill.token_address[:10],
+                    signal_item.chain.value,
                     float(realized_pnl_usd),
                     self._metrics.max_drawdown_pct,
                     self._metrics.win_rate_pct,
@@ -1527,6 +1600,7 @@ class PaperTradingEngine:
                 self._recent_closed_trades.append({
                     "token_address": fill.token_address,
                     "chain": fill.chain,
+                    "platform": platform_name,
                     "side": "SELL",
                     "entry_price": xp,
                     "exit_price": xp,
@@ -1544,6 +1618,7 @@ class PaperTradingEngine:
                 xp_str = self._format_price_clean(xp, native_price, unit)
                 sell_alert = (
                     f"{icon} **SELL EXECUTED (Paper Trade)**\n\n"
+                    f"• **Platform:** `{platform_name}`\n"
                     f"• **Token:** `{fill.token_address[:4]}..{fill.token_address[-4:]}` (`{fill.token_address}`)\n"
                     f"• **Chain:** {fill.chain.value}\n"
                     f"• **Exit Price:** `{xp_str}`\n"
@@ -1556,6 +1631,7 @@ class PaperTradingEngine:
                 fill=fill,
                 signal_id=signal_item.signal_id,
                 realized_pnl_usd=realized_pnl_usd,
+                platform=platform_name,
             )
             await ledger.record_trade(trade_record)
 
@@ -1826,6 +1902,7 @@ class PaperTradingEngine:
             open_trades_info.append({
                 "token_address": lot.token_address,
                 "chain": lot.chain,
+                "platform": getattr(lot, "platform", None) or resolve_trade_platform(token_address=lot.token_address, chain=lot.chain),
                 "entry_price": lot.entry_price,
                 "current_price": curr_p,
                 "unrealized_pnl_usd": unrealized_usd,
@@ -2057,8 +2134,13 @@ class PaperTradingEngine:
                                 exit_pnl_usd=exit_pnl_usd,
                                 pnl_native=pnl_native,
                             )
+                            platform_name = getattr(lot, "platform", None) or getattr(exit_fill, "platform", None) or resolve_trade_platform(
+                                token_address=decision.token_address,
+                                chain=decision.chain,
+                            )
                             logger.info(
-                                "DYNAMIC EXIT executed | %s %s | reason=%s | exit_price=%s | PnL=%.4f USD | WR=%.1f%% | impact=%d bps",
+                                "DYNAMIC EXIT executed | Platform=%s | %s %s | reason=%s | exit_price=%s | PnL=%.4f USD | WR=%.1f%% | impact=%d bps",
+                                platform_name,
                                 decision.chain.value,
                                 decision.token_address[:10],
                                 decision.exit_reason.value if decision.exit_reason else "unknown",
@@ -2135,6 +2217,8 @@ class PaperTradingEngine:
         ):
             self._session = session
             self._ledger = ledger
+            self.tracer.ledger = self._ledger
+            self.tracer.start_worker()
 
             self._gatekeeper = SecurityGatekeeper(
                 session=session,
@@ -2218,8 +2302,19 @@ class PaperTradingEngine:
                     ai_supervisor=self._ai_supervisor,
                     metrics=self._metrics,
                 )
-                if self._telegram is not None and hasattr(self._telegram, "set_chat_explainer"):
-                    self._telegram.set_chat_explainer(self._explainer)
+                if self._telegram is not None:
+                    if hasattr(self._telegram, "set_chat_explainer"):
+                        self._telegram.set_chat_explainer(self._explainer)
+                    if hasattr(self._telegram, "set_status_provider"):
+                        self._telegram.set_status_provider(self._get_engine_status)
+                    if hasattr(self._telegram, "set_execution_target"):
+                        self._telegram.set_execution_target(self)
+                    else:
+                        self._telegram.execution_target = self
+                    if hasattr(self._telegram, "set_ai_supervisor"):
+                        self._telegram.set_ai_supervisor(self._ai_supervisor)
+                    else:
+                        self._telegram._ai_supervisor = self._ai_supervisor
 
                 async def _on_launch_buffer_removal(token_addr: str) -> None:
                     if coordinator.svm_ingester:
@@ -2308,7 +2403,11 @@ class PaperTradingEngine:
                     shutdown_waiter.cancel()
                     await asyncio.gather(poller_task, snapshot_task, heartbeat_task, buffer_task, missed_opp_task, return_exceptions=True)
 
-                    # 4. Flush and checkpoint SQLite database
+                    # 4. Flush traces and checkpoint SQLite database
+                    try:
+                        await self.tracer.stop_worker()
+                    except Exception:
+                        pass
                     await ledger.checkpoint()
 
         logger.info(

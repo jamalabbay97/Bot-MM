@@ -61,6 +61,7 @@ class ConversationalSupervisor:
         self.parameter_tuner = parameter_tuner
         self.metrics = metrics
         self.config = config or EngineConfig()
+        self._asset_map: dict[str, str] = {}
 
     # =========================================================================
     # RAG / Tool-Calling Implementations
@@ -215,14 +216,22 @@ class ConversationalSupervisor:
         if self.position_book:
             for lot in self.position_book.get_closed_lots():
                 if clean_id.lower() in (lot.lot_id.lower(), lot.token_address.lower()):
-                    pnl_pct = float((lot.highest_price_observed - lot.entry_price) / lot.entry_price * 100) if lot.entry_price > 0 else 0.0
+                    peak_p = getattr(lot, "peak_price", getattr(lot, "highest_price_observed", lot.entry_price))
+                    pnl_pct = float((peak_p - lot.entry_price) / lot.entry_price * 100) if lot.entry_price > 0 else 0.0
+                    platform_str = getattr(lot, "platform", "DexScan")
+                    stage = getattr(lot, "exit_stage", getattr(lot, "current_stage", None))
+                    stage_str = stage.value if hasattr(stage, "value") else str(stage or "NONE")
+                    sl_floor = getattr(lot, "trailing_stop_price", getattr(lot, "trailing_sl_price", Decimal(0)))
+                    tp1 = getattr(lot, "scaled_out_50_pct", getattr(lot, "tp1_sold", False))
+                    tp2 = getattr(lot, "ai_tp2_sold", getattr(lot, "tp2_sold", False))
                     return (
                         f"### 🛑 Closed Position Lot [{lot.lot_id[:8]}] for `{lot.token_address[:10]}`\n"
-                        f"- **Current Stage:** `{lot.current_stage.value}`\n"
-                        f"- **Entry Price:** `{lot.entry_price}` | **Highest Peak:** `{lot.highest_price_observed}`\n"
-                        f"- **Trailing Stop Floor:** `{lot.trailing_sl_price}`\n"
+                        f"- **Platform:** `{platform_str}`\n"
+                        f"- **Current Stage:** `{stage_str}`\n"
+                        f"- **Entry Price:** `{lot.entry_price}` | **Highest Peak:** `{peak_p}`\n"
+                        f"- **Trailing Stop Floor:** `{sl_floor}`\n"
                         f"- **Peak Gain:** `+{pnl_pct:.1f}%`\n"
-                        f"- **TP1 Executed:** `{lot.tp1_sold}` | **TP2 Executed:** `{lot.tp2_sold}`\n"
+                        f"- **TP1 Executed:** `{tp1}` | **TP2 Executed:** `{tp2}`\n"
                     )
 
         return f"ℹ️ No specific exit event found for `{clean_id}`."
@@ -339,6 +348,66 @@ class ConversationalSupervisor:
 
         return f"Unknown override action `{action}`. Supported: risk, blacklist, whitelist, ttl, stage, strict_veto."
 
+    async def tool_list_assets(self) -> str:
+        """List recently detected assets with a numerical ID for easy investigation."""
+        tokens = await self.ledger.get_recent_assets(limit=30)
+        if not tokens:
+            return "📭 لا توجد عملات تم معالجتها مؤخراً (No assets processed recently)."
+
+        self._asset_map.clear()
+        lines = ["### 🔍 العملات المكتشفة مؤخراً (Recently Processed Assets)\n"]
+        lines.append("قم بإرسال `/investigate <الرقم>` لعرض التتبع الكامل للعملة.\n")
+
+        for idx, token in enumerate(tokens, 1):
+            self._asset_map[str(idx)] = token
+            lines.append(f"**{idx}.** `{token}`")
+
+        return "\n".join(lines)
+
+    async def tool_investigate_asset(self, identifier: str) -> str:
+        """Provides the full lifecycle trace of a token."""
+        # Check if identifier is a mapped number or direct address
+        token_ca = self._asset_map.get(identifier.strip(), identifier.strip())
+
+        traces = await self.ledger.get_asset_trace(token_ca)
+        if not traces:
+            return f"❌ لم يتم العثور على تتبع للعملة (No trace found for): `{token_ca}`"
+
+        lines = [f"### 🔬 تحقيق شامل حول العملة (Lifecycle Trace for) `{token_ca}`\n"]
+
+        for t in traces:
+            dt = datetime.fromtimestamp(t['timestamp_ns'] / 1e9, tz=timezone.utc).strftime("%H:%M:%S.%f")[:-3]
+
+            # Icon styling based on status
+            status = t['status']
+            icon = "🟢" if status == "PASSED" else "🔴" if status == "REJECTED" else "🟡" if status == "IGNORED" else "⚠️"
+
+            lines.append(f"**{icon} [{dt}] {t['stage']}**")
+            lines.append(f"- **Component:** `{t['component']} -> {t['function_name']}()` [{t['duration_ms']:.1f}ms]")
+
+            if status == "REJECTED" and t.get('reason'):
+                lines.append(f"- **❌ Rejection Reason:** {t['reason']}")
+
+            if t.get('output_data_json') and t['output_data_json'] != "{}":
+                try:
+                    out = json.loads(t['output_data_json'])
+                    decision = out.get('decision')
+                    conf = out.get('confidence_score')
+                    if decision:
+                        conf_str = f" (Confidence: {float(conf):.2f})" if conf is not None else ""
+                        lines.append(f"- **AI Decision:** `{decision}`{conf_str}")
+                    flags = out.get('flags') or (out.get('security_assessment', {}).get('flags') if isinstance(out.get('security_assessment'), dict) else [])
+                    if flags:
+                        lines.append(f"- **Security Flags:** {', '.join(flags)}")
+                    rationale = out.get('rationale') or (out.get('wallet_audit', {}).get('rationale') if isinstance(out.get('wallet_audit'), dict) else '')
+                    if rationale:
+                        lines.append(f"- **AI Rationale:** {rationale}")
+                except Exception:
+                    pass
+            lines.append("")
+
+        return "\n".join(lines)
+
     # =========================================================================
     # Conversational RAG Router
     # =========================================================================
@@ -364,23 +433,44 @@ class ConversationalSupervisor:
         ):
             return await self.tool_list_staged_tokens()
 
+        # 2b. Check for asset listing
+        if (
+            any(w in lower_q for w in ("/assets", "/tokens", "العملات المكتشفة", "العملات المعالجة", "أحدث العملات"))
+            or lower_q in ("العملات", "عملات", "قائمة العملات", "عرض العملات")
+        ):
+            return await self.tool_list_assets()
+
+        # 2c. Check for investigation
+        if lower_q.startswith("/investigate") or lower_q.startswith("investigate ") or lower_q.startswith("تحقيق"):
+            target = re.sub(r"^(/investigate|investigate|تحقيق)\s*", "", q, flags=re.IGNORECASE).strip()
+            if target:
+                return await self.tool_investigate_asset(target)
+            return "الرجاء إدخال رقم العملة أو عنوان العقد. مثال: `/investigate 3`"
+
         # 2b. Check for revival breakout buffer
         if any(w in lower_q for w in ("revival", "cto", "swing", "/revival", "انبعاث", "سوانغ")):
             return await self.tool_list_revival_tokens()
 
         # 3. Check for strategy performance / best pattern
-        if any(w in lower_q for w in ("highest win rate", "best strategy", "best pattern", "strategy performance", "win rate", "/perf", "أعلى نسبة فوز", "أفضل استراتيجية", "أداء الاستراتيجية", "نسبة الفوز", "أفضل نمط")):
+        if (
+            any(w in lower_q for w in ("highest win rate", "best strategy", "best pattern", "strategy performance", "win rate", "/perf", "perf", "performance", "أعلى نسبة فوز", "أفضل استراتيجية", "أداء الاستراتيجية", "أداء", "الأداء", "نسبة الفوز", "أفضل نمط"))
+        ):
             # Extract hours if specified (e.g. "past 12 hours" or "last 12 hours" or "خلال 12 ساعة")
             match = re.search(r"(\d+(\.\d+)?)\s*(?:hours?|ساعات?|ساعة)", lower_q)
             hrs = float(match.group(1)) if match else 12.0
             return await self.tool_strategy_performance(hours=hrs)
 
         # 4. Check for exit decision queries
-        if any(w in lower_q for w in ("why did you exit", "explain exit", "exit decision", "/exit", "لماذا خرجت", "سبب الخروج", "شرح الخروج", "قرار الخروج")):
+        if (
+            any(w in lower_q for w in ("why did you exit", "explain exit", "exit decision", "/exit", "لماذا خرجت", "سبب الخروج", "شرح الخروج", "قرار الخروج", "خروج"))
+        ):
             # Extract token address or trade id (ASCII hex / base58 / lot id only)
             ca_match = re.search(r"\b([1-9A-HJ-NP-za-km-z]{32,44}|0x[a-fA-F0-9]{40}|[a-f0-9]{8})\b", q)
             if ca_match:
                 return await self.tool_explain_exit(ca_match.group(1))
+            arg_after = re.sub(r"^(/exit|exit|خروج)\s*", "", q, flags=re.IGNORECASE).strip()
+            if arg_after:
+                return await self.tool_explain_exit(arg_after)
 
         # 5. Check for "why did you skip / enter" queries with specific CA
         if any(w in lower_q for w in ("why did you skip", "why did you pass", "why entered", "why did you enter", "/why", "لماذا تجاوزت", "لماذا تخطيت", "لماذا اشتريت", "لماذا دخلت")):
@@ -443,6 +533,8 @@ class ConversationalSupervisor:
             "- *'Which strategy or pattern had the highest win rate in the past 12 hours?'* (ما هي أفضل استراتيجية خلال 12 ساعة؟)\n"
             "- *'List all tokens currently in the staging buffer and their accumulation scores.'* (عرض العملات قيد المراقبة والتجميع)\n"
             "- *'Explain the exit decision on trade [CA].'* (اشرح قرار الخروج من الصفقة)\n"
+            "- *'/assets'* (عرض العملات المكتشفة مؤخراً للتحقيق)\n"
+            "- *'/investigate <id|CA>'* (تحقيق شامل وتتبع دورة حياة العملة)\n"
             "- *'/override risk <EXPAND|DEFENSIVE|NEUTRAL>'* (تعديل وضع المخاطرة)\n"
             "- *'/override blacklist <CA>'* (حظر عنوان عقد)\n"
             "- *'/override stage <CA>'* (إضافة عقد لمرحلة المراقبة)"

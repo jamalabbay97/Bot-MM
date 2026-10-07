@@ -24,6 +24,8 @@ from alpha_engine.security.constants import (
 from alpha_engine.security.goplus import _fetch_goplus_report, _parse_goplus_report
 from alpha_engine.security.preflight import _tier2_evm_preflight
 from alpha_engine.security.rugcheck import _fetch_rugcheck_report, _parse_rugcheck_report
+from alpha_engine.tracer import tracer
+from alpha_engine.models.observability import TraceStage, TraceStatus
 
 import time
 
@@ -348,68 +350,101 @@ class SecurityGatekeeper:
         token_age_s: float | None = None,
     ) -> SecurityReport:
         """Run the full dual-tier screening pipeline for a token with negative cache lookup."""
-        # Static fast-path blacklist lookup: ignore WSOL, native base/quote and system tokens
-        if self.is_blacklisted(token_address, chain):
-            logger.debug(
-                "Fast-path filter: token %s is a blacklisted/quote/system token on %s; skipping evaluation.",
-                token_address,
-                chain.value,
-            )
-            return _build_fallback_report(
-                token_address,
-                chain,
-                SecurityTier.TIER1_REJECTED,
-                reason="Blacklisted native/wrapped token",
-            )
-
-        # Fast-path negative cache lookup: immediately drop already rejected tokens with zero latency
-        cached_rejection = self._negative_cache.get_rejection(token_address, chain)
-        if cached_rejection is not None:
-            logger.debug(
-                "Fast-path negative cache hit: token %s already rejected; returning cached rejection with zero latency.",
-                token_address[:10],
-            )
-            return cached_rejection
-
-        tier1_report = await self._run_tier1(
-            token_address, chain, pool_address, token_age_s=token_age_s
-        )
-
-        if tier1_report.tier == SecurityTier.TIER1_REJECTED or not tier1_report.passes_hard_gates:
-            self._negative_cache.record_rejection(token_address, chain, tier1_report)
-            logger.info(
-                "Token %s REJECTED at Tier 1 (sell_tax=%d bps, lp_burned=%.2f, "
-                "mint_disabled=%s, top10=%.2f)",
-                token_address,
-                tier1_report.sell_tax_bps,
-                tier1_report.lp_burned_ratio,
-                tier1_report.mint_authority_disabled,
-                tier1_report.top10_concentration,
-            )
-            return tier1_report
-
-        if self._enable_tier2 and chain == ChainIdentifier.BASE_MAINNET and pool_address:
-            is_clean = await _tier2_evm_preflight(
-                token_address=token_address,
-                pool_address=pool_address,
-                weth_address=self._weth,
-                router_address=self._evm_router,
-                rpc_url=self._evm_rpc_url,
-                limiter=self._limiter,
-            )
-
-            if not is_clean:
-                honeypot_report = tier1_report.model_copy(
-                    update={
-                        "is_honeypot": True,
-                        "tier": SecurityTier.TIER2_HONEYPOT,
-                    }
+        chain_str = chain.value if hasattr(chain, "value") else str(chain)
+        async with tracer.span(
+            token_address,
+            chain_str,
+            TraceStage.SECURITY_SCREENING,
+            "SecurityGatekeeper",
+            "screen_token",
+            {"pool_address": pool_address, "token_age_s": token_age_s},
+        ) as span:
+            # Static fast-path blacklist lookup: ignore WSOL, native base/quote and system tokens
+            if self.is_blacklisted(token_address, chain):
+                logger.debug(
+                    "Fast-path filter: token %s is a blacklisted/quote/system token on %s; skipping evaluation.",
+                    token_address,
+                    chain_str,
                 )
-                self._negative_cache.record_rejection(token_address, chain, honeypot_report)
-                return honeypot_report
+                span.status = TraceStatus.IGNORED
+                span.reason = "Blacklisted native/wrapped token"
+                return _build_fallback_report(
+                    token_address,
+                    chain,
+                    SecurityTier.TIER1_REJECTED,
+                    reason="Blacklisted native/wrapped token",
+                )
 
-        logger.info("Token %s PASSED all security tiers.", token_address)
-        return tier1_report
+            # Fast-path negative cache lookup: immediately drop already rejected tokens with zero latency
+            cached_rejection = self._negative_cache.get_rejection(token_address, chain)
+            if cached_rejection is not None:
+                logger.debug(
+                    "Fast-path negative cache hit: token %s already rejected; returning cached rejection with zero latency.",
+                    token_address[:10],
+                )
+                span.status = TraceStatus.REJECTED
+                span.reason = "Negative rejection cache hit"
+                span.output_data = {"tier": cached_rejection.tier.value if hasattr(cached_rejection.tier, "value") else str(cached_rejection.tier)}
+                return cached_rejection
+
+            tier1_report = await self._run_tier1(
+                token_address, chain, pool_address, token_age_s=token_age_s
+            )
+
+            if tier1_report.tier == SecurityTier.TIER1_REJECTED or not tier1_report.passes_hard_gates:
+                self._negative_cache.record_rejection(token_address, chain, tier1_report)
+                logger.info(
+                    "Token %s REJECTED at Tier 1 (sell_tax=%d bps, lp_burned=%.2f, "
+                    "mint_disabled=%s, top10=%.2f)",
+                    token_address,
+                    tier1_report.sell_tax_bps,
+                    tier1_report.lp_burned_ratio,
+                    tier1_report.mint_authority_disabled,
+                    tier1_report.top10_concentration,
+                )
+                span.status = TraceStatus.REJECTED
+                span.reason = "Failed Tier 1 Hard Gates"
+                span.output_data = {
+                    "buy_tax": tier1_report.buy_tax_bps,
+                    "sell_tax": tier1_report.sell_tax_bps,
+                    "lp_burned": tier1_report.lp_burned_ratio,
+                    "top10": tier1_report.top10_concentration,
+                    "flags": tier1_report.warning_flags or [],
+                }
+                return tier1_report
+
+            if self._enable_tier2 and chain == ChainIdentifier.BASE_MAINNET and pool_address:
+                is_clean = await _tier2_evm_preflight(
+                    token_address=token_address,
+                    pool_address=pool_address,
+                    weth_address=self._weth,
+                    router_address=self._evm_router,
+                    rpc_url=self._evm_rpc_url,
+                    limiter=self._limiter,
+                )
+
+                if not is_clean:
+                    honeypot_report = tier1_report.model_copy(
+                        update={
+                            "is_honeypot": True,
+                            "tier": SecurityTier.TIER2_HONEYPOT,
+                        }
+                    )
+                    self._negative_cache.record_rejection(token_address, chain, honeypot_report)
+                    span.status = TraceStatus.REJECTED
+                    span.reason = "Tier 2 ETH Call Simulation Honeypot Revert"
+                    span.output_data = {"is_honeypot": True, "tier": SecurityTier.TIER2_HONEYPOT.value}
+                    return honeypot_report
+
+            logger.info("Token %s PASSED all security tiers.", token_address)
+            span.status = TraceStatus.PASSED
+            span.output_data = {
+                "tier": tier1_report.tier.value if hasattr(tier1_report.tier, "value") else str(tier1_report.tier),
+                "sell_tax": tier1_report.sell_tax_bps,
+                "lp_burned": tier1_report.lp_burned_ratio,
+                "top10": tier1_report.top10_concentration,
+            }
+            return tier1_report
 
     async def _run_tier1(
         self,

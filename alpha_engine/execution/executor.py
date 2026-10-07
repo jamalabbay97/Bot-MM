@@ -32,6 +32,7 @@ from alpha_engine.models.enums import (
     ChainIdentifier,
     OrderSide,
     TradeExitReason,
+    resolve_trade_platform,
 )
 from alpha_engine.models.events import SignalEvent
 from alpha_engine.models.state import PaperFill, PoolState
@@ -186,6 +187,13 @@ class PaperExecutor:
                 )
 
         gas = gas_cost_usd(signal.chain)
+        platform = resolve_trade_platform(
+            token_address=signal.token_address,
+            chain=signal.chain,
+            source=getattr(signal, "source", None),
+            execution_venue=getattr(signal, "execution_venue", None),
+            pool_address=getattr(signal, "pool_address", ""),
+        )
 
         fill = PaperFill(
             token_address=signal.token_address,
@@ -202,12 +210,15 @@ class PaperExecutor:
             fill_timestamp_ns=latency_result.fill_timestamp_ns,
             kelly_fraction=sizing.capped_fraction,
             portfolio_equity_usd=portfolio_equity_usd,
+            platform=platform,
         )
 
         logger.info(
-            "PaperFill [%s] %s: %s native <-> %s tokens @ %s | impact=%d bps | gas=$%s",
+            "PaperFill [%s] %s | Platform=%s | Token=%s | %s native <-> %s tokens @ %s | impact=%d bps | gas=$%s",
             fill.order_id[:8],
             fill.side.value.upper(),
+            fill.platform,
+            fill.token_address[:10],
             fill.simulated_native_spent,
             fill.tokens_acquired,
             fill.effective_price,
@@ -274,6 +285,11 @@ class PaperExecutor:
             )
 
         gas = gas_cost_usd(chain)
+        platform = resolve_trade_platform(
+            token_address=token_address,
+            chain=chain,
+            pool_address=pool.pool_address,
+        )
         fill = PaperFill(
             token_address=token_address,
             pool_address=pool.pool_address,
@@ -289,11 +305,13 @@ class PaperExecutor:
             fill_timestamp_ns=latency_result.fill_timestamp_ns,
             kelly_fraction=0.0,
             portfolio_equity_usd=portfolio_equity_usd,
+            platform=platform,
         )
         logger.info(
-            "Exit PaperFill [%s] %s: %s tokens @ %s native | reason=%s | impact=%d bps",
+            "Exit PaperFill [%s] %s | Platform=%s | %s tokens @ %s native | reason=%s | impact=%d bps",
             fill.order_id[:8],
             token_address[:10],
+            fill.platform,
             tokens_acquired,
             effective_price,
             reason.value if reason else "manual",
@@ -331,8 +349,10 @@ class PaperExecutor:
             priority_percentile=priority_percentile,
         )
         logger.info(
-            "Scalping Pipeline: Executed via %s | Status=%s | Tip=%s",
+            "Scalping Pipeline: Executed via %s | Platform=%s | Token=%s | Status=%s | Tip=%s",
             relay_result.get("relay", "private_builder"),
+            fill.platform,
+            fill.token_address[:10],
             relay_result.get("status"),
             relay_result.get("tip_sol", 0.0),
         )

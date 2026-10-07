@@ -33,6 +33,8 @@ from alpha_engine.models.events import (
 )
 from alpha_engine.rate_limiter.registry import RateLimiterRegistry
 from alpha_engine.security.constants import is_blacklisted_token
+from alpha_engine.tracer import tracer
+from alpha_engine.models.observability import TraceStage, TraceStatus
 
 logger = logging.getLogger(__name__)
 
@@ -340,31 +342,54 @@ class IngestionCoordinator:
 
             # Fast-path blacklist and deduplication filters for RawSignalEvent
             if isinstance(item, RawSignalEvent):
-                # 1. Fast-path blacklist filter
-                if is_blacklisted_token(item.token_address, item.chain):
-                    logger.debug(
-                        "IngestionCoordinator._process_ingestion_queue: Dropping blacklisted %s (%s)",
-                        item.token_address[:10],
-                        item.chain.value,
-                    )
-                    continue
+                chain_str = item.chain.value if hasattr(item.chain, "value") else str(item.chain)
+                src_str = item.source.value if hasattr(item.source, "value") else str(item.source)
 
-                # 2. Gatekeeper negative rejection cache check
-                if self._gatekeeper is not None and getattr(self._gatekeeper, "is_rejected", None):
-                    if self._gatekeeper.is_rejected(item.token_address, item.chain) is True:
+                # 1. Ingestion stage span (blacklist and negative cache filters)
+                async with tracer.span(
+                    item.token_address,
+                    chain_str,
+                    TraceStage.INGESTION,
+                    "IngestionCoordinator",
+                    "_process_ingestion_queue",
+                    {"source": src_str},
+                ) as span:
+                    if is_blacklisted_token(item.token_address, item.chain):
                         logger.debug(
-                            "IngestionCoordinator._process_ingestion_queue: Dropping cached rejected token %s",
+                            "IngestionCoordinator._process_ingestion_queue: Dropping blacklisted %s (%s)",
                             item.token_address[:10],
+                            chain_str,
                         )
+                        span.status = TraceStatus.IGNORED
+                        span.reason = "Blacklisted/Quote Token"
                         continue
 
-                # 3. In-memory sliding-window TTL cache deduplication (60s window)
-                if await self._dedup_cache.is_duplicate_or_add(item.token_address):
-                    logger.debug(
-                        "IngestionCoordinator._process_ingestion_queue: Dropping duplicate token %s within TTL",
-                        item.token_address[:10],
-                    )
-                    continue
+                    if self._gatekeeper is not None and getattr(self._gatekeeper, "is_rejected", None):
+                        if self._gatekeeper.is_rejected(item.token_address, item.chain) is True:
+                            logger.debug(
+                                "IngestionCoordinator._process_ingestion_queue: Dropping cached rejected token %s",
+                                item.token_address[:10],
+                            )
+                            span.status = TraceStatus.REJECTED
+                            span.reason = "Negative rejection cache hit"
+                            continue
+
+                # 2. Deduplication stage span (sliding-window TTL cache)
+                async with tracer.span(
+                    item.token_address,
+                    chain_str,
+                    TraceStage.DEDUPLICATION,
+                    "TokenTTLCache",
+                    "is_duplicate_or_add",
+                ) as span:
+                    if await self._dedup_cache.is_duplicate_or_add(item.token_address):
+                        logger.debug(
+                            "IngestionCoordinator._process_ingestion_queue: Dropping duplicate token %s within TTL",
+                            item.token_address[:10],
+                        )
+                        span.status = TraceStatus.IGNORED
+                        span.reason = "Duplicate detected within 60s TTL"
+                        continue
 
                 # Spawn parallel screening worker via bounded concurrency gate
                 task = asyncio.create_task(
@@ -443,31 +468,54 @@ class IngestionCoordinator:
                 raise StopAsyncIteration
 
             if isinstance(item, RawSignalEvent):
-                # 1. Fast-path blacklist filter: drop WSOL, native base/quote and system tokens
-                if is_blacklisted_token(item.token_address, item.chain):
-                    logger.debug(
-                        "IngestionCoordinator: Dropping RawSignalEvent for blacklisted/quote token %s (%s)",
-                        item.token_address,
-                        item.chain.value,
-                    )
-                    continue
+                chain_str = item.chain.value if hasattr(item.chain, "value") else str(item.chain)
+                src_str = item.source.value if hasattr(item.source, "value") else str(item.source)
 
-                # Fast-path check: drop if already in negative rejection cache
-                if self._gatekeeper is not None and getattr(self._gatekeeper, "is_rejected", None):
-                    if self._gatekeeper.is_rejected(item.token_address, item.chain) is True:
+                # 1. Ingestion stage span (blacklist and negative cache filters)
+                async with tracer.span(
+                    item.token_address,
+                    chain_str,
+                    TraceStage.INGESTION,
+                    "IngestionCoordinator",
+                    "__anext__",
+                    {"source": src_str},
+                ) as span:
+                    if is_blacklisted_token(item.token_address, item.chain):
                         logger.debug(
-                            "IngestionCoordinator: Dropping RawSignalEvent for cached rejected token %s",
-                            item.token_address[:10],
+                            "IngestionCoordinator: Dropping RawSignalEvent for blacklisted/quote token %s (%s)",
+                            item.token_address,
+                            chain_str,
                         )
+                        span.status = TraceStatus.IGNORED
+                        span.reason = "Blacklisted/Quote Token"
                         continue
 
-                # 2. In-memory sliding-window TTL cache deduplication (60s window)
-                if await self._dedup_cache.is_duplicate_or_add(item.token_address):
-                    logger.debug(
-                        "IngestionCoordinator: Dropping duplicate RawSignalEvent for token %s within 60s TTL window",
-                        item.token_address,
-                    )
-                    continue
+                    if self._gatekeeper is not None and getattr(self._gatekeeper, "is_rejected", None):
+                        if self._gatekeeper.is_rejected(item.token_address, item.chain) is True:
+                            logger.debug(
+                                "IngestionCoordinator: Dropping RawSignalEvent for cached rejected token %s",
+                                item.token_address[:10],
+                            )
+                            span.status = TraceStatus.REJECTED
+                            span.reason = "Negative rejection cache hit"
+                            continue
+
+                # 2. Deduplication stage span (sliding-window TTL cache)
+                async with tracer.span(
+                    item.token_address,
+                    chain_str,
+                    TraceStage.DEDUPLICATION,
+                    "TokenTTLCache",
+                    "is_duplicate_or_add",
+                ) as span:
+                    if await self._dedup_cache.is_duplicate_or_add(item.token_address):
+                        logger.debug(
+                            "IngestionCoordinator: Dropping duplicate RawSignalEvent for token %s within 60s TTL window",
+                            item.token_address,
+                        )
+                        span.status = TraceStatus.IGNORED
+                        span.reason = "Duplicate detected within 60s TTL"
+                        continue
 
             elif isinstance(item, SwapEvent):
                 # Fast-path check: drop incoming swaps for tokens already rejected in negative cache

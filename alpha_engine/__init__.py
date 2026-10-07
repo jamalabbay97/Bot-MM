@@ -30,6 +30,7 @@ from alpha_engine.execution import (
     RunningMetrics,
     SQLiteLedger,
 )
+from alpha_engine.tracer import LifecycleTracer, tracer
 from alpha_engine.ingestion import (
     EVMIngester,
     IngestionCoordinator,
@@ -76,11 +77,14 @@ from alpha_engine.models import (
     TelegramMessage,
     TradeExitReason,
     TradeRecord,
+    TradingPlatform,
+    PlatformSource,
     WalletClassification,
     WalletProfile,
     WalletTradeRecord,
     WhitelistRecord,
     WhitelistStatus,
+    resolve_trade_platform,
 )
 from alpha_engine.profiler import (
     SmartMoneyProfiler,
@@ -115,6 +119,9 @@ __all__ = [
     "SignalSource",
     "ExitStage",
     "TradeExitReason",
+    "TradingPlatform",
+    "PlatformSource",
+    "resolve_trade_platform",
     "SwapEvent",
     "SignalEvent",
     "RawSignalEvent",
@@ -171,4 +178,6 @@ __all__ = [
     "RunningMetrics",
     "PaperExecutor",
     "SQLiteLedger",
+    "tracer",
+    "LifecycleTracer",
 ]

@@ -35,6 +35,7 @@ from alpha_engine.models import (
     OutcomeTrackerMetrics,
     PaperFill,
     PatternFeatureVector,
+    PlatformSource,
     PoolState,
     PoolStateUpdateEvent,
     PortfolioSnapshot,
@@ -55,6 +56,7 @@ from alpha_engine.models import (
     TelegramMessage,
     TradeExitReason,
     TradeRecord,
+    TradingPlatform,
     WalletAudit,
     WalletClassification,
     WalletProfile,
@@ -62,6 +64,7 @@ from alpha_engine.models import (
     WalletTradeRecord,
     WhitelistRecord,
     WhitelistStatus,
+    resolve_trade_platform,
 )
 
 __all__ = [
@@ -77,6 +80,9 @@ __all__ = [
     "ExitStage",
     "LotStatus",
     "TradeExitReason",
+    "TradingPlatform",
+    "PlatformSource",
+    "resolve_trade_platform",
     "SwapEvent",
     "SignalEvent",
     "RawSignalEvent",

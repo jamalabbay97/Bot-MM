@@ -122,10 +122,12 @@ async def _connect_aiosqlite(db_path: str):
     finally:
         await conn.close()
 
-from alpha_engine.models.enums import ChainIdentifier, NewsSignalStatus, SignalSource
+from alpha_engine.models.enums import ChainIdentifier, NewsSignalStatus, SignalSource, resolve_trade_platform, TradingPlatform
 from alpha_engine.models.events import RawSignalEvent, ShutdownSentinel
 from alpha_engine.models.news import NewsEvent
 from alpha_engine.rate_limiter.registry import RateLimiterRegistry
+from alpha_engine.tracer import tracer
+from alpha_engine.models.observability import TraceStage, TraceStatus
 
 logger = logging.getLogger(__name__)
 
@@ -331,6 +333,26 @@ class TelegramIngester:
         """Register ConversationalSupervisor instance for DM RAG and interactive overrides."""
         self._chat_explainer = explainer
 
+    def set_execution_target(self, target: Any) -> None:
+        """Assign or update trading engine / governor execution target."""
+        self._execution_target = target
+
+    def set_ai_supervisor(self, supervisor: Any) -> None:
+        """Assign or update AI supervisor instance."""
+        self._ai_supervisor = supervisor
+
+    @property
+    def execution_target(self) -> Any | None:
+        if getattr(self, "_execution_target", None) is not None:
+            return self._execution_target
+        if self._status_provider is not None:
+            return getattr(self._status_provider, "__self__", None)
+        return None
+
+    @execution_target.setter
+    def execution_target(self, target: Any) -> None:
+        self._execution_target = target
+
     @property
     def is_dormant(self) -> bool:
         """Returns True if the ingester is in dormant fallback mode."""
@@ -341,10 +363,12 @@ class TelegramIngester:
         """Access AI supervisor instance directly or through status provider target."""
         if self._ai_supervisor is not None:
             return self._ai_supervisor
-        if self._status_provider is not None:
-            target = getattr(self._status_provider, "__self__", None)
-            if target is not None and hasattr(target, "ai_supervisor"):
+        target = self.execution_target
+        if target is not None:
+            if hasattr(target, "ai_supervisor") and target.ai_supervisor is not None:
                 return target.ai_supervisor
+            if hasattr(target, "_ai_supervisor") and target._ai_supervisor is not None:
+                return target._ai_supervisor
         return None
 
     @property
@@ -521,10 +545,87 @@ class TelegramIngester:
         try:
             from telethon import Button
             return [
-                [Button.text("📊 Status", resize=True), Button.text("🧠 AI Supervisor", resize=True)],
-                [Button.text("📋 Trades", resize=True), Button.text("🛡️ AI Vetoes", resize=True)],
-                [Button.text("📰 Alpha News", resize=True), Button.text("🐋 Whales", resize=True)],
-                [Button.text("📡 Signals", resize=True), Button.text("❓ Help", resize=True)],
+                [Button.text("📊 Status", resize=True), Button.text("🧠 AI Supervisor", resize=True), Button.text("📋 Trades", resize=True)],
+                [Button.text("🔍 Assets", resize=True), Button.text("🌊 Staging", resize=True), Button.text("🔄 Revival", resize=True)],
+                [Button.text("🛡️ AI Vetoes", resize=True), Button.text("📈 Performance", resize=True), Button.text("📡 Signals", resize=True)],
+                [Button.text("📰 News", resize=True), Button.text("🐋 Whales", resize=True), Button.text("❓ Help", resize=True)],
+            ]
+        except Exception:
+            return None
+
+    def get_welcome_inline_buttons(self) -> Any:
+        """Inline interactive buttons under welcome message."""
+        if not TELETHON_AVAILABLE:
+            return None
+        try:
+            from telethon import Button
+            return [
+                [Button.inline("📊 Live Status", data=b"cmd:status"), Button.inline("🧠 AI Control", data=b"cmd:ai"), Button.inline("📋 Trades", data=b"cmd:trades")],
+                [Button.inline("🔍 Recent Assets", data=b"cmd:assets"), Button.inline("🌊 Staging", data=b"cmd:staging"), Button.inline("🔄 Revival", data=b"cmd:revival")],
+                [Button.inline("📈 Performance", data=b"cmd:perf"), Button.inline("🛡️ Vetoes", data=b"cmd:vetoes"), Button.inline("📡 Signals", data=b"cmd:signals")],
+            ]
+        except Exception:
+            return None
+
+    def _get_assets_inline_buttons(self) -> Any:
+        """Quick 1-tap investigation inline buttons under /assets output."""
+        if not TELETHON_AVAILABLE or not self._chat_explainer:
+            return None
+        try:
+            from telethon import Button
+            asset_map = getattr(self._chat_explainer, "_asset_map", {})
+            buttons = []
+            if asset_map:
+                row = []
+                for num in list(asset_map.keys())[:6]:
+                    row.append(Button.inline(f"🔬 #{num}", data=f"inv:{num}".encode("utf-8")))
+                    if len(row) == 3:
+                        buttons.append(row)
+                        row = []
+                if row:
+                    buttons.append(row)
+            buttons.append([
+                Button.inline("🔄 Refresh Assets", data=b"cmd:assets"),
+                Button.inline("🌊 Staging Watchlist", data=b"cmd:staging"),
+            ])
+            return buttons
+        except Exception:
+            return None
+
+    def get_status_inline_buttons(self) -> Any:
+        """Inline interactive buttons under /status telemetry card."""
+        if not TELETHON_AVAILABLE:
+            return None
+        try:
+            from telethon import Button
+            return [
+                [Button.inline("🔄 Refresh", data=b"cmd:status"), Button.inline("📋 Trades", data=b"cmd:trades"), Button.inline("🔍 Assets", data=b"cmd:assets")],
+                [Button.inline("🧠 AI Control", data=b"cmd:ai"), Button.inline("🌊 Staging", data=b"cmd:staging"), Button.inline("📈 Perf", data=b"cmd:perf")],
+            ]
+        except Exception:
+            return None
+
+    def get_trades_inline_buttons(self) -> Any:
+        """Inline interactive buttons under /trades card."""
+        if not TELETHON_AVAILABLE:
+            return None
+        try:
+            from telethon import Button
+            return [
+                [Button.inline("🔄 Refresh Trades", data=b"cmd:trades"), Button.inline("📊 Status", data=b"cmd:status")],
+                [Button.inline("📈 Performance", data=b"cmd:perf"), Button.inline("🌊 Staging", data=b"cmd:staging")],
+            ]
+        except Exception:
+            return None
+
+    def get_ai_inline_buttons(self) -> Any:
+        """Inline interactive buttons under /ai supervisor card."""
+        if not TELETHON_AVAILABLE:
+            return None
+        try:
+            from telethon import Button
+            return [
+                [Button.inline("🛡️ Vetoes", data=b"cmd:vetoes"), Button.inline("📊 Status", data=b"cmd:status"), Button.inline("📈 Perf", data=b"cmd:perf")],
             ]
         except Exception:
             return None
@@ -628,6 +729,83 @@ class TelegramIngester:
             except Exception as exc:
                 logger.warning("[TelegramIngester] Failed to send trade alert to %s: %s", chat_id, exc)
 
+    async def _handle_callback_query(self, event: Any) -> None:
+        """Handle inline button callback queries (e.g. data=b'cmd:status', data=b'inv:1')."""
+        sender_id = getattr(event, "sender_id", None)
+        if sender_id is None:
+            sender = getattr(event, "sender", None)
+            sender_id = getattr(sender, "id", None)
+
+        if not self._is_authorized(sender_id):
+            if hasattr(event, "answer"):
+                try:
+                    res = event.answer("⚠️ غير مصرح (Unauthorized)", alert=True)
+                    if asyncio.iscoroutine(res):
+                        await res
+                except Exception:
+                    pass
+            return
+
+        raw_data = getattr(event, "data", b"")
+        data = raw_data.decode("utf-8", errors="ignore") if isinstance(raw_data, (bytes, bytearray)) else str(raw_data)
+
+        try:
+            if data.startswith("cmd:"):
+                cmd = data[4:].strip().lower()
+                if cmd == "status":
+                    await self._cmd_status(event)
+                elif cmd == "ai":
+                    await self._cmd_ai(event)
+                elif cmd == "trades":
+                    await self._cmd_trades(event)
+                elif cmd == "assets":
+                    if self._chat_explainer and hasattr(self._chat_explainer, "tool_list_assets"):
+                        resp = await self._chat_explainer.tool_list_assets()
+                        await self._safe_reply(event, resp, buttons=self._get_assets_inline_buttons())
+                    elif self._chat_explainer:
+                        resp = await self._chat_explainer.ask("/assets")
+                        await self._safe_reply(event, resp)
+                elif cmd == "staging":
+                    if self._chat_explainer and hasattr(self._chat_explainer, "tool_list_staged_tokens"):
+                        resp = await self._chat_explainer.tool_list_staged_tokens()
+                        await self._safe_reply(event, resp)
+                    elif self.ai_supervisor and hasattr(self.ai_supervisor, "answer_user_query"):
+                        resp = await self.ai_supervisor.answer_user_query("قائمة العملات في الستيجينغ staging")
+                        await self._safe_reply(event, resp)
+                elif cmd == "revival":
+                    if self._chat_explainer and hasattr(self._chat_explainer, "tool_list_revival_tokens"):
+                        resp = await self._chat_explainer.tool_list_revival_tokens()
+                        await self._safe_reply(event, resp)
+                elif cmd == "perf":
+                    if self._chat_explainer and hasattr(self._chat_explainer, "tool_strategy_performance"):
+                        resp = await self._chat_explainer.tool_strategy_performance(hours=12.0)
+                        await self._safe_reply(event, resp)
+                elif cmd == "vetoes":
+                    await self._cmd_ai(event, "vetoes")
+                elif cmd == "signals":
+                    await self._cmd_signals(event)
+                elif cmd == "news":
+                    await self._cmd_news(event)
+                elif cmd == "whales":
+                    await self._cmd_whales(event)
+                elif cmd == "help":
+                    await self._cmd_start_help(event)
+            elif data.startswith("inv:"):
+                target_id = data[4:].strip()
+                if self._chat_explainer and hasattr(self._chat_explainer, "tool_investigate_asset"):
+                    resp = await self._chat_explainer.tool_investigate_asset(target_id)
+                    await self._safe_reply(event, resp)
+        except Exception as exc:
+            logger.warning("[TelegramIngester] Callback query error: %s", exc)
+        finally:
+            if hasattr(event, "answer"):
+                try:
+                    res = event.answer()
+                    if asyncio.iscoroutine(res):
+                        await res
+                except Exception:
+                    pass
+
     def _is_authorized(self, sender_id: Optional[int | str]) -> bool:
         """
         Check if sender is an authorized admin.
@@ -721,35 +899,51 @@ class TelegramIngester:
             return
 
         for chain, ca in cas:
-            is_sybil, channel_count = self.check_anti_sybil(ca, str(channel_id))
-            if is_sybil:
-                logger.warning(
-                    "[Anti-Sybil] Dropped COORDINATED_DUMP for CA %s (seen across %d channels in <=15s)",
-                    ca,
-                    channel_count,
-                )
-                continue
-
-            raw_signal = RawSignalEvent(
-                timestamp_ns=time.time_ns(),
-                chain=chain,
-                token_address=ca,
-                source=SignalSource.TELEGRAM_SCRAPER,
-                originating_channel=channel_title or str(channel_id),
-                channel_id=channel_id,
-                message_id=message_id,
-                raw_text=text,
-                status=NewsSignalStatus.VALID,
-                sybil_channel_count=channel_count,
-                is_edit=False,
-            )
-            logger.info(
-                "[TelegramIngester] Valid signal detected: %s on %s from channel '%s'",
+            chain_str = chain.value if hasattr(chain, "value") else str(chain)
+            async with tracer.span(
                 ca,
-                chain.value,
-                channel_title,
-            )
-            await self._enqueue_event(raw_signal)
+                chain_str,
+                TraceStage.DETECTION,
+                "TelegramIngester",
+                "_handle_channel_message",
+                {
+                    "channel": channel_title or str(channel_id),
+                    "channel_id": channel_id,
+                    "message_id": message_id,
+                },
+            ) as span:
+                is_sybil, channel_count = self.check_anti_sybil(ca, str(channel_id))
+                if is_sybil:
+                    span.status = TraceStatus.REJECTED
+                    span.reason = f"Anti-Sybil: seen across {channel_count} channels in <=15s"
+                    logger.warning(
+                        "[Anti-Sybil] Dropped COORDINATED_DUMP for CA %s (seen across %d channels in <=15s)",
+                        ca,
+                        channel_count,
+                    )
+                    continue
+
+                raw_signal = RawSignalEvent(
+                    timestamp_ns=time.time_ns(),
+                    chain=chain,
+                    token_address=ca,
+                    source=SignalSource.TELEGRAM_SCRAPER,
+                    originating_channel=channel_title or str(channel_id),
+                    channel_id=channel_id,
+                    message_id=message_id,
+                    raw_text=text,
+                    status=NewsSignalStatus.VALID,
+                    sybil_channel_count=channel_count,
+                    is_edit=False,
+                )
+                logger.info(
+                    "[TelegramIngester] Valid signal detected: %s on %s from channel '%s'",
+                    ca,
+                    chain.value,
+                    channel_title,
+                )
+                await self._enqueue_event(raw_signal)
+                span.status = TraceStatus.PASSED
 
     async def _handle_channel_edited_message(self, event: Any) -> None:
         """
@@ -769,9 +963,20 @@ class TelegramIngester:
         original_cas = self._seen_messages.get(msg_key)
 
         for chain, ca in cas:
+            chain_str = chain.value if hasattr(chain, "value") else str(chain)
             # If the CA was not present in the original message, it is a bait-and-switch insertion
             is_injected = (original_cas is None) or (ca.lower() not in original_cas)
             if is_injected:
+                async with tracer.span(
+                    ca,
+                    chain_str,
+                    TraceStage.DETECTION,
+                    "TelegramIngester",
+                    "_handle_channel_edited_message",
+                    {"channel": channel_title or str(channel_id), "is_edit": True},
+                ) as span:
+                    span.status = TraceStatus.REJECTED
+                    span.reason = "Bait-and-Switch Honeypot: CA inserted in edited message"
                 logger.warning(
                     "[Bait-and-Switch] Rejected edited post inserting CA %s on %s in '%s' (msg_id=%d)",
                     ca,
@@ -844,7 +1049,29 @@ class TelegramIngester:
             await self._cmd_audit(event, args)
         elif first_token in ("/trades", "trades", "صفقات", "الصفقات"):
             await self._cmd_trades(event)
-        elif first_token in ("/staging", "staging", "مراقبة", "المراقبة", "ستيج"):
+        elif first_token in ("/assets", "/tokens", "assets", "tokens", "العملات", "عملات", "العملات المكتشفة"):
+            if self._chat_explainer and hasattr(self._chat_explainer, "tool_list_assets"):
+                resp = await self._chat_explainer.tool_list_assets()
+                await self._safe_reply(event, resp, buttons=self._get_assets_inline_buttons())
+            elif self._chat_explainer:
+                resp = await self._chat_explainer.ask(clean_text)
+                await self._safe_reply(event, resp)
+            else:
+                await self._safe_reply(event, "📭 لا يمكن جلب العملات حالياً.")
+        elif first_token in ("/investigate", "investigate", "تحقيق", "تتبع"):
+            args = clean_text[len(clean_text.split()[0]):].strip() if len(clean_text.split()) > 1 else ""
+            if self._chat_explainer and hasattr(self._chat_explainer, "tool_investigate_asset"):
+                if args:
+                    resp = await self._chat_explainer.tool_investigate_asset(args)
+                else:
+                    resp = "الرجاء إدخال رقم العملة أو عنوان العقد. مثال: `/investigate 1`"
+                await self._safe_reply(event, resp)
+            elif self._chat_explainer:
+                resp = await self._chat_explainer.ask(clean_text)
+                await self._safe_reply(event, resp)
+            else:
+                await self._safe_reply(event, "🔬 محرك التحقيق غير متصل حالياً.")
+        elif first_token in ("/staging", "staging", "staged", "مراقبة", "المراقبة", "ستيج"):
             if self._chat_explainer:
                 resp = await self._chat_explainer.tool_list_staged_tokens()
                 await self._safe_reply(event, resp)
@@ -853,13 +1080,40 @@ class TelegramIngester:
                 await self._safe_reply(event, resp)
             else:
                 await self._safe_reply(event, "🌊 قائمة المراقبة التجميعية (Staging buffer) غير متصلة حالياً.")
-        elif first_token in ("/revival", "revival", "انبعاث", "سوانغ"):
+        elif first_token in ("/revival", "revival", "انبعاث", "الانبعاث", "سوانغ"):
             if self._chat_explainer and hasattr(self._chat_explainer, "tool_list_revival_tokens"):
                 resp = await self._chat_explainer.tool_list_revival_tokens()
                 await self._safe_reply(event, resp)
             else:
                 await self._safe_reply(event, "🔄 محرك مراقبة الانبعاث والتجميع (RevivalBreakoutBuffer) غير متصل حالياً.")
-        elif first_token in ("/reset_governor", "/governor_reset", "reset_governor"):
+        elif first_token in ("/perf", "/performance", "perf", "performance", "أداء", "الأداء", "النمط", "نسبة الفوز"):
+            hours = 12.0
+            if len(parts) > 1:
+                try:
+                    hours = float(parts[1])
+                except ValueError:
+                    pass
+            if self._chat_explainer and hasattr(self._chat_explainer, "tool_strategy_performance"):
+                resp = await self._chat_explainer.tool_strategy_performance(hours=hours)
+                await self._safe_reply(event, resp)
+            elif self._chat_explainer:
+                resp = await self._chat_explainer.ask(clean_text)
+                await self._safe_reply(event, resp)
+            else:
+                await self._safe_reply(event, "📈 محرك أداء الاستراتيجيات غير متاح حالياً.")
+        elif first_token in ("/exit", "exit", "خروج", "الخروج", "شرح الخروج"):
+            args = clean_text[len(clean_text.split()[0]):].strip() if len(clean_text.split()) > 1 else ""
+            if not args:
+                await self._safe_reply(event, "🛑 يرجى تزويد عنوان العقد أو معرف الصفقة: `/exit <CA|LOT_ID>`")
+            elif self._chat_explainer and hasattr(self._chat_explainer, "tool_explain_exit"):
+                resp = await self._chat_explainer.tool_explain_exit(args)
+                await self._safe_reply(event, resp)
+            elif self._chat_explainer:
+                resp = await self._chat_explainer.ask(clean_text)
+                await self._safe_reply(event, resp)
+            else:
+                await self._safe_reply(event, f"🛑 لا يوجد تفاصيل خروج متاحة لـ `{args}`.")
+        elif first_token in ("/reset_governor", "/governor_reset", "reset_governor", "تصفير_الحاكم"):
             target = self.execution_target
             if target and hasattr(target, "reset_trade_frequency_governor"):
                 target.reset_trade_frequency_governor()
@@ -877,7 +1131,7 @@ class TelegramIngester:
                 await self._safe_reply(event, resp)
             else:
                 await self._safe_reply(event, "🤖 المساعد الذكي غير مهيأ حالياً.")
-        elif first_token in ("/why", "why", "لماذا"):
+        elif first_token in ("/why", "why", "لماذا", "تفسير"):
             args = clean_text[len(clean_text.split()[0]):].strip() if len(clean_text.split()) > 1 else ""
             is_ca = bool(re.match(r"^([1-9A-HJ-NP-za-km-z]{32,44}|0x[a-fA-F0-9]{40})$", args))
             if is_ca and self._chat_explainer:
@@ -891,7 +1145,7 @@ class TelegramIngester:
                 await self._safe_reply(event, resp)
             else:
                 await self._safe_reply(event, "🤖 المساعد الذكي غير مهيأ حالياً.")
-        elif first_token in ("/override", "override", "تعديل"):
+        elif first_token in ("/override", "override", "تعديل", "تجاوز"):
             args = clean_text[len(clean_text.split()[0]):].strip() if len(clean_text.split()) > 1 else ""
             if self._chat_explainer:
                 resp = await self._chat_explainer.tool_override_parameter(args)
@@ -914,22 +1168,35 @@ class TelegramIngester:
         """Handle /start and /help command in DMs."""
         msg = (
             "🤖 **Bot-MM Alpha Engine & Trading Terminal (محطة التداول ونظام ألفا)**\n\n"
-            "**الحالة (Status):** متصل (Online) 🟢\n"
-            "**وضع المحرك (Engine Mode):** تداول تجريبي بدون رأس مال حقيقي (Paper Trading)\n"
-            "**المشرف الذكي (Supervisor):** AlphaSupervisor-AI نشط 🧠\n\n"
-            "**التحكم السريع:**\n"
-            "• اضغط على أي زر أدناه لعرض القياسات المباشرة، المخاطر، أو الصفقات فوراً.\n\n"
-            "**الأوامر المتاحة (Available Commands):**\n"
-            "• `/status` — عرض مدة التشغيل (Uptime)، استهلاك الذاكرة (Memory RSS)، رأس المال (Portfolio Equity)، والأرباح (PnL).\n"
-            "• `/ai` — فحص حالة المشرف الذكي AlphaSupervisor-AI، وضع المخاطرة، والتحليلات المكتسبة.\n"
-            "• `/audit <CA>` — إجراء تدقيق جنائي عميق بالذكاء الاصطناعي على أي عقد في Solana أو Base.\n"
-            "• `/scan <CA>` — فحص عقد فوري وتمريره إلى محرك الأمان والتنفيذ.\n"
-            "• `/trades` — استعراض المراكز المفتوحة (OPEN) والصفقات المغلقة (CLOSED) مع الأسعار وPnL.\n"
-            "• `/news` — آخر 5 أخبار عاجلة تم رصدها مع تحليل المشاعر والوقت المنقضي.\n"
-            "• `/whales` — تنبيهات حركة الحيتان والمحافظ الذكية من @lookonchain و@bubblemaps.\n"
-            "• `/signals` — آخر 5 إشارات تم تقييمها بواسطة حارس البوابة مع أسباب القبول والرفض.\n"
-            "• `/help` — عرض دليل الأوامر.\n\n"
-            "💡 *ملاحظة:* يمكنك أيضاً إرسال عنوان العقد مباشرة (EVM `0x...` أو Solana Base58) لبدء الفحص الفوري."
+            "**الحالة (Status):** متصل (Online) 🟢 | **الوضع:** Paper Trading 📄\n"
+            "**المشرف الذكي:** AlphaSupervisor-AI نشط 🧠\n\n"
+            "📊 **المراقبة والقياسات (Telemetry & Performance):**\n"
+            "• `/status` — تقرير مباشر: Uptime، الذاكرة، رأس المال، PnL، والقوائم.\n"
+            "• `/trades` — المراكز المفتوحة النشطة والصفقات المغلقة مع الأسعار.\n"
+            "• `/perf [hours]` — أداء الاستراتيجيات وأنماط التداول الأعلى فوزاً (Win Rate).\n"
+            "• `/exit <CA|ID>` — شرح سبب إغلاق صفقة معينة وتفاصيل الوقف المتحرك.\n\n"
+            "🧠 **المشرف الذكي والتدقيق (AI Risk & Forensics):**\n"
+            "• `/ai` — حالة المشرف الذكي، نمط المخاطرة، ونتائج التعلم الذاتي.\n"
+            "• `/ai stance <DEFENSIVE|NEUTRAL|EXPAND>` — ضبط نمط إدارة المخاطر.\n"
+            "• `/ai strict <on|off>` — تفعيل/تعطيل الحظر الصارم.\n"
+            "• `/vetoes` — استعراض العملات المرفوضة من الذكاء الاصطناعي مع الأسباب.\n"
+            "• `/audit <CA>` — تدقيق جنائي وأمني عميق بالذكاء الاصطناعي على أي عقد.\n"
+            "• `/why <CA>` — تفسير أسباب اتخاذ القرار (دخول أو تخطي) لعملة معينة.\n"
+            "• `/ask <سؤال>` — محادثة حرة مع المشرف الذكي بالعربية أو الإنجليزية.\n\n"
+            "🔍 **رصد الفرص ودورة الحياة (Discovery & Tracing):**\n"
+            "• `/assets` — عرض العملات المكتشفة مؤخراً مع ترقيم للتحقيق السريع.\n"
+            "• `/investigate <id|CA>` — تتبع دورة حياة العملة ومخطط الفحص الكامل.\n"
+            "• `/staging` — قائمة العملات قيد المراقبة والتجميع (Wave-2 Staging).\n"
+            "• `/revival` — قائمة عملات الانبعاث والـ CTO بعد الركود (Revival Buffer).\n"
+            "• `/signals` — آخر الإشارات المفحوصة أمنياً مع أسباب القبول والرفض.\n"
+            "• `/scan <CA>` — فحص عقد فوري وتمريره لخط الأمان والتنفيذ.\n"
+            "• `/news` — آخر الأخبار العاجلة وتحليل المشاعر اللحظي.\n"
+            "• `/whales` — تنبيهات حركة الحيتان والمحافظ الذكية.\n\n"
+            "⚙️ **التحكم والحوكمة (Engine Controls):**\n"
+            "• `/override <param> <val>` — تعديل المعاملات (risk, blacklist, ttl, surge_k).\n"
+            "• `/reset_governor` — إعادة ضبط حاكم وتيرة التداول (Trading Governor).\n"
+            "• `/help` — عرض هذا الدليل الشامل.\n\n"
+            "💡 *ملاحظة:* استخدم أزرار لوحة التحكم أدناه، أو أرسل عنوان عقد مباشرة للبدء."
         )
         await self._safe_reply(event, msg, buttons=self.get_default_keyboard_markup())
 
@@ -1564,12 +1831,29 @@ class TelegramIngester:
                     table_row = await cursor.fetchone()
                     if table_row:
                         table_name = table_row[0]
-                        async with db.execute(
-                            f"SELECT chain, token_address, side, effective_price, realized_pnl_usd "
-                            f"FROM {table_name} "
-                            f"ORDER BY created_at DESC LIMIT 5"
-                        ) as cur:
-                            trade_rows = await cur.fetchall()
+                        # Check whether table has platform column
+                        has_platform_col = False
+                        try:
+                            async with db.execute(f"PRAGMA table_info({table_name})") as cur_pragma:
+                                col_rows = await cur_pragma.fetchall()
+                                has_platform_col = any(col[1] == "platform" for col in col_rows)
+                        except Exception:
+                            has_platform_col = False
+
+                        if has_platform_col:
+                            async with db.execute(
+                                f"SELECT chain, token_address, side, effective_price, realized_pnl_usd, platform "
+                                f"FROM {table_name} "
+                                f"ORDER BY created_at DESC LIMIT 5"
+                            ) as cur:
+                                trade_rows = await cur.fetchall()
+                        else:
+                            async with db.execute(
+                                f"SELECT chain, token_address, side, effective_price, realized_pnl_usd "
+                                f"FROM {table_name} "
+                                f"ORDER BY created_at DESC LIMIT 5"
+                            ) as cur:
+                                trade_rows = await cur.fetchall()
             except Exception as exc:
                 logger.debug("[TelegramIngester] DB trades query error: %s", exc)
 
@@ -1590,6 +1874,13 @@ class TelegramIngester:
                 token_str = str(t.get("token_address", ""))
                 short_token = f"{token_str[:4]}..{token_str[-4:]}" if len(token_str) > 10 else token_str
                 chain_str = str(t.get("chain", "")).replace("ChainIdentifier.", "").replace("_mainnet", "")[:5]
+                platform_str = str(t.get("platform") or resolve_trade_platform(
+                    token_address=token_str,
+                    chain=t.get("chain"),
+                    pool_address=t.get("pool_address"),
+                    source=t.get("source"),
+                    execution_venue=t.get("execution_venue"),
+                ))
                 ep_raw = t.get("entry_price", 0)
                 cp_raw = t.get("current_price", 0)
                 entry_p = self._format_price(ep_raw)
@@ -1634,8 +1925,8 @@ class TelegramIngester:
                 pos_val = float(t.get("position_value_usd", 0.0))
                 val_str = f" | Value: ${pos_val:.3f}" if pos_val > 0 else ""
 
-                open_lines.append(f"• {state_icon} {short_token} ({chain_str})")
-                open_lines.append(f"  ENTRY: {entry_p} | CURRENT: {curr_p}{val_str}")
+                open_lines.append(f"• {state_icon} {short_token} [{platform_str}] ({chain_str})")
+                open_lines.append(f"  PLATFORM: {platform_str} | ENTRY: {entry_p} | CURRENT: {curr_p}{val_str}")
                 open_lines.append(f"  PNL %: {pnl_display} | DUR: {dur_str} | TRAILING: {ts_status}")
                 open_lines.append("-" * 40)
             if open_lines and open_lines[-1] == "-" * 40:
@@ -1652,6 +1943,13 @@ class TelegramIngester:
                 token_str = str(ct.get("token_address", ""))
                 short_token = f"{token_str[:4]}..{token_str[-4:]}" if len(token_str) > 10 else token_str
                 chain_str = str(ct.get("chain", "")).replace("ChainIdentifier.", "").replace("_mainnet", "")[:5]
+                platform_str = str(ct.get("platform") or resolve_trade_platform(
+                    token_address=token_str,
+                    chain=ct.get("chain"),
+                    pool_address=ct.get("pool_address"),
+                    source=ct.get("source"),
+                    execution_venue=ct.get("execution_venue"),
+                ))
                 ep_raw = ct.get("entry_price", 0)
                 xp_raw = ct.get("exit_price", 0)
                 entry_p = self._format_price(ep_raw)
@@ -1667,8 +1965,8 @@ class TelegramIngester:
                 dur_s = int(float(ct.get("duration_s", 0.0)))
                 dur_str = f"{dur_s}s" if dur_s > 0 else "<1s"
 
-                closed_lines.append(f"• {status_icon} {short_token} ({chain_str}) | {reason}")
-                closed_lines.append(f"  ENTRY: {entry_p} | EXIT: {exit_p}")
+                closed_lines.append(f"• {status_icon} {short_token} [{platform_str}] ({chain_str}) | {reason}")
+                closed_lines.append(f"  PLATFORM: {platform_str} | ENTRY: {entry_p} | EXIT: {exit_p}")
                 closed_lines.append(f"  PNL %: {pnl_display} | DUR: {dur_str}")
                 closed_lines.append("-" * 40)
             if closed_lines and closed_lines[-1] == "-" * 40:
@@ -1679,8 +1977,8 @@ class TelegramIngester:
             lines = [
                 "📋 **Last 5 Executed Paper Trades**\n",
                 "```",
-                f"{'TOKEN':<12} | {'CHAIN':<6} | {'SIDE':<4} | {'FILL PRICE':<12} | {'PNL':<9}",
-                "-" * 53,
+                f"{'TOKEN':<12} | {'PLATFORM':<8} | {'CHAIN':<6} | {'SIDE':<4} | {'FILL PRICE':<12} | {'PNL':<9}",
+                "-" * 65,
             ]
             for r in trade_rows:
                 chain_str = str(r[0]).replace("_mainnet", "")[:6]
@@ -1689,6 +1987,11 @@ class TelegramIngester:
                 side_str = str(r[2]).upper()
                 fill_p = self._format_price(r[3])
                 pnl_raw = r[4]
+                if len(r) > 5 and r[5]:
+                    platform_str = str(r[5])[:8]
+                else:
+                    platform_str = str(resolve_trade_platform(token_address=token_str, chain=chain_str))[:8]
+
                 if pnl_raw is not None and str(pnl_raw) != "":
                     try:
                         pnl_f = float(pnl_raw)
@@ -1699,7 +2002,7 @@ class TelegramIngester:
                     pnl_str = "OPEN"
 
                 lines.append(
-                    f"{short_token:<12} | {chain_str:<6} | {side_str:<4} | {fill_p:<12} | {pnl_str:<9}"
+                    f"{short_token:<12} | {platform_str:<8} | {chain_str:<6} | {side_str:<4} | {fill_p:<12} | {pnl_str:<9}"
                 )
             lines.append("```")
             response_sections.append("\n".join(lines))
@@ -1820,6 +2123,12 @@ class TelegramIngester:
                     self._handle_dm_message,
                     events.NewMessage(incoming=True, func=lambda e: bool(getattr(e, "is_private", False))),
                 )
+                # Interactive Inline Callback Queries
+                if hasattr(events, "CallbackQuery"):
+                    self._client.add_event_handler(
+                        self._handle_callback_query,
+                        events.CallbackQuery(),
+                    )
 
             # 4. Register Bot Commands with Telegram API so the [/] Menu button appears
             if self._client is not None and self._bot_token:
@@ -1828,15 +2137,26 @@ class TelegramIngester:
                     from telethon.tl.types import BotCommand, BotCommandScopeDefault
 
                     commands = [
-                        BotCommand(command="status", description="Live Engine Health & PnL"),
-                        BotCommand(command="ai", description="AlphaSupervisor-AI Control & Risk"),
-                        BotCommand(command="trades", description="Active Positions & Closed Ledger"),
-                        BotCommand(command="audit", description="Deep Forensics Audit on Token CA"),
-                        BotCommand(command="scan", description="Scan & Ingest Token CA"),
-                        BotCommand(command="signals", description="Recent Signals & Evaluations"),
-                        BotCommand(command="news", description="Live Alpha News Headlines"),
-                        BotCommand(command="whales", description="On-Chain Whale & Smart Money Alerts"),
-                        BotCommand(command="help", description="Full Command Reference"),
+                        BotCommand(command="status", description="📊 Live Engine Telemetry & PnL"),
+                        BotCommand(command="ai", description="🧠 AlphaSupervisor-AI Control & Risk"),
+                        BotCommand(command="trades", description="📋 Active Positions & Closed Ledger"),
+                        BotCommand(command="assets", description="🔍 Recently Detected Assets & IDs"),
+                        BotCommand(command="investigate", description="🔬 Deep Lifecycle Trace for Token <id|CA>"),
+                        BotCommand(command="staging", description="🌊 Wave-2 Accumulation Watchlist"),
+                        BotCommand(command="revival", description="🔄 Revival & CTO Breakout Watchlist"),
+                        BotCommand(command="perf", description="📈 Strategy Performance & Win Rates"),
+                        BotCommand(command="audit", description="🛡️ Deep Forensics Audit on Token CA"),
+                        BotCommand(command="scan", description="⚡ Scan & Ingest Token CA into Pipeline"),
+                        BotCommand(command="signals", description="📡 Recent Security Screenings & Gates"),
+                        BotCommand(command="vetoes", description="🚫 Recent AI Vetoes & Rejection Reasons"),
+                        BotCommand(command="news", description="📰 Live Alpha News & Sentiment"),
+                        BotCommand(command="whales", description="🐋 On-Chain Whale & Smart Money Alerts"),
+                        BotCommand(command="why", description="❓ Explain Entry/Skip Decision for Token"),
+                        BotCommand(command="exit", description="🛑 Explain Exit Rationale for Position"),
+                        BotCommand(command="override", description="⚙️ Tune Risk, TTL, Blacklist, Hyperparams"),
+                        BotCommand(command="reset_governor", description="🔄 Reset Trading Frequency Governor"),
+                        BotCommand(command="ask", description="💬 Ask Supervisor AI Anything (AR/EN)"),
+                        BotCommand(command="help", description="📖 Full Command Reference & Usage"),
                     ]
                     set_cmd_res = self._client(
                         SetBotCommandsRequest(
