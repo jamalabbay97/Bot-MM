@@ -155,7 +155,7 @@ class EngineConfig(BaseSettings):
     )
     ai_provider: str = Field(
         default="gemini",
-        description="AI provider for AlphaSupervisor-AI (gemini, openai, openrouter)",
+        description="AI provider for AlphaSupervisor-AI (gemini, openai, openrouter, anthropic)",
     )
     gemini_api_key: Optional[str] = Field(
         default=None,
@@ -168,6 +168,10 @@ class EngineConfig(BaseSettings):
     openai_api_key: Optional[str] = Field(
         default=None,
         description="OpenAI / OpenRouter API key for supervisor engine",
+    )
+    anthropic_api_key: Optional[str] = Field(
+        default=None,
+        description="Anthropic API key for Claude 3.5 Supervisor",
     )
     ai_model: str = Field(
         default="gemini-2.5-flash",
@@ -205,6 +209,10 @@ class EngineConfig(BaseSettings):
         default=60.0,
         gt=0.0,
         description="Seconds between periodic portfolio snapshots and telemetry heartbeats",
+    )
+    asyncio_debug: bool = Field(
+        default=False,
+        description="Enable strict asyncio event loop debugging",
     )
 
     # -------------------------------------------------------------------------

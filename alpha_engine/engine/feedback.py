@@ -713,47 +713,38 @@ class DynamicParameterTuner:
         total_trades_24h: int = 10,
     ) -> DynamicHyperparameters:
         """
-        Update hyperparameters using EMA smoothing across trailing win rate and PnL.
+        Update hyperparameters using Asymmetric EMA smoothing across trailing win rate and PnL.
+        Fast to cut risk (alpha=0.35), Slow to expand risk (alpha=0.10).
         """
         pnl_float = float(realized_pnl_usd)
 
-        # 1. Update decaying moving averages
-        self._smoothed_win_rate = self._alpha * win_rate_24h + (1.0 - self._alpha) * self._smoothed_win_rate
-        self._smoothed_pnl_usd = self._alpha * pnl_float + (1.0 - self._alpha) * self._smoothed_pnl_usd
+        # Asymmetric EMA: Fast to cut risk (alpha=0.35), Slow to expand risk (alpha=0.10)
+        is_losing_regime = win_rate_24h < self._smoothed_win_rate or pnl_float < self._smoothed_pnl_usd
+        effective_alpha = 0.35 if is_losing_regime else 0.10
+
+        # 1. Update decaying moving averages using dynamic alpha
+        self._smoothed_win_rate = effective_alpha * win_rate_24h + (1.0 - effective_alpha) * self._smoothed_win_rate
+        self._smoothed_pnl_usd = effective_alpha * pnl_float + (1.0 - effective_alpha) * self._smoothed_pnl_usd
 
         # 2. Compute dynamic adjustments based on regime
-        old_params = DynamicHyperparameters(**self._params.__dict__)
-
         if total_trades_24h >= 3:
             if self._smoothed_win_rate >= 70.0 and self._smoothed_pnl_usd > 0:
                 # Strong winning regime: Expand risk appetite, loosen surge k to capture wave-2 earlier
-                target_conf = 1.15
-                target_slippage = 200
-                target_surge_k = 2.2
-                target_net_buy = 60.0
-                target_tp1 = 2.2
+                target_conf, target_slippage, target_surge_k, target_net_buy, target_tp1 = 1.15, 200, 2.2, 60.0, 2.2
             elif self._smoothed_win_rate < 45.0 or self._smoothed_pnl_usd < -50.0:
                 # Losing regime: Defensive contraction, tighten stop loss, require higher surge
-                target_conf = 0.85
-                target_slippage = 100
-                target_surge_k = 2.9
-                target_net_buy = 70.0
-                target_tp1 = 1.6
+                target_conf, target_slippage, target_surge_k, target_net_buy, target_tp1 = 0.85, 100, 2.9, 70.0, 1.6
             else:
                 # Balanced neutral regime
-                target_conf = 1.0
-                target_slippage = 150
-                target_surge_k = 2.5
-                target_net_buy = 65.0
-                target_tp1 = 2.0
+                target_conf, target_slippage, target_surge_k, target_net_buy, target_tp1 = 1.0, 150, 2.5, 65.0, 2.0
 
             # 3. Apply EMA smoothing to target parameter values
             p = self._params
-            p.confidence_multiplier = round(self._alpha * target_conf + (1.0 - self._alpha) * p.confidence_multiplier, 3)
-            p.max_slippage_bps = int(self._alpha * target_slippage + (1.0 - self._alpha) * p.max_slippage_bps)
-            p.wave2_surge_k = round(self._alpha * target_surge_k + (1.0 - self._alpha) * p.wave2_surge_k, 2)
-            p.wave2_net_buy_delta_pct = round(self._alpha * target_net_buy + (1.0 - self._alpha) * p.wave2_net_buy_delta_pct, 1)
-            p.tp1_trigger_multiplier = round(self._alpha * target_tp1 + (1.0 - self._alpha) * p.tp1_trigger_multiplier, 2)
+            p.confidence_multiplier = round(effective_alpha * target_conf + (1.0 - effective_alpha) * p.confidence_multiplier, 3)
+            p.max_slippage_bps = int(effective_alpha * target_slippage + (1.0 - effective_alpha) * p.max_slippage_bps)
+            p.wave2_surge_k = round(effective_alpha * target_surge_k + (1.0 - effective_alpha) * p.wave2_surge_k, 2)
+            p.wave2_net_buy_delta_pct = round(effective_alpha * target_net_buy + (1.0 - effective_alpha) * p.wave2_net_buy_delta_pct, 1)
+            p.tp1_trigger_multiplier = round(effective_alpha * target_tp1 + (1.0 - effective_alpha) * p.tp1_trigger_multiplier, 2)
 
             # 4. Strictly enforce hard safety boundaries
             p.confidence_multiplier = max(0.70, min(1.40, p.confidence_multiplier))

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import signal
 import sys
 import time
@@ -79,6 +80,15 @@ class PaperTradingEngine:
         self.config = config
         self._shutdown_event = asyncio.Event()
         self._start_time = time.time()
+
+        if getattr(config, "asyncio_debug", False):
+            os.environ["PYTHONASYNCIODEBUG"] = "1"
+            logging.getLogger("asyncio").setLevel(logging.DEBUG)
+            try:
+                loop = asyncio.get_running_loop()
+                loop.set_debug(True)
+            except RuntimeError:
+                pass
 
         self._limiter = RateLimiterRegistry.default()
         self._pool_registry = PoolRegistry()
@@ -1662,6 +1672,19 @@ class PaperTradingEngine:
                 self._metrics.max_drawdown_pct,
             )
 
+            # Calculate queue saturation percentage
+            ingest_max = self._ingestion_q.maxsize if self._ingestion_q.maxsize > 0 else 1
+            signal_max = self._signal_q.maxsize if self._signal_q.maxsize > 0 else 1
+            ingest_saturation = (self._ingestion_q.qsize() / ingest_max) * 100
+            signal_saturation = (self._signal_q.qsize() / signal_max) * 100
+
+            if ingest_saturation > 80.0 or signal_saturation > 80.0:
+                logger.warning(
+                    "⚠️ BACKPRESSURE DETECTED: Ingestion Queue: %d%% | Signal Queue: %d%%. "
+                    "Workers may be blocked by slow I/O or AI API rate limits.",
+                    int(ingest_saturation), int(signal_saturation)
+                )
+
     async def _pending_buffer_watchdog(self) -> None:
         """
         Monitors PendingLaunchBuffer: logs progress telemetry every 15s
@@ -2460,6 +2483,9 @@ def _build_example_config() -> tuple[
 
 async def _async_main() -> None:
     cfg = EngineConfig()
+    if cfg.asyncio_debug:
+        os.environ["PYTHONASYNCIODEBUG"] = "1"
+        logging.getLogger("asyncio").setLevel(logging.DEBUG)
     engine = PaperTradingEngine(cfg)
     watchlist, svm_reg, seed_states = _build_example_config()
     await engine.run(

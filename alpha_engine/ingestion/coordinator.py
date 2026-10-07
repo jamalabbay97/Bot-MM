@@ -310,6 +310,18 @@ class IngestionCoordinator:
         await self._queue.put(ShutdownSentinel())
         logger.info("IngestionCoordinator stopped.")
 
+    def _on_screening_task_done(self, task: asyncio.Task[Any]) -> None:
+        """Callback to log hidden exceptions in background screening tasks."""
+        self._background_tasks.discard(task)
+        if not task.cancelled():
+            exc = task.exception()
+            if exc:
+                logger.error(
+                    "Background screening task failed with unhandled exception: %s",
+                    exc,
+                    exc_info=exc,
+                )
+
     async def _process_ingestion_queue(self) -> None:
         """
         Processes incoming ingestion queue events with bounded parallel asynchronous
@@ -360,7 +372,7 @@ class IngestionCoordinator:
                     name=f"screen_candidate_{item.token_address[:8]}",
                 )
                 self._background_tasks.add(task)
-                task.add_done_callback(self._background_tasks.discard)
+                task.add_done_callback(self._on_screening_task_done)
                 continue
 
             # Forward other events directly

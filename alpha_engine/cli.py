@@ -8,6 +8,8 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import logging
+import os
 import sys
 
 from alpha_engine.config import EngineConfig
@@ -82,6 +84,10 @@ def main(args: list[str] | None = None) -> int:
     except EnvironmentError as e:
         print(f"Configuration error: {e}", file=sys.stderr)
         return 1
+
+    if config.asyncio_debug:
+        os.environ["PYTHONASYNCIODEBUG"] = "1"
+        logging.getLogger("asyncio").setLevel(logging.DEBUG)
 
     if parsed.chat:
         from alpha_engine.chat_interface import cli_chat

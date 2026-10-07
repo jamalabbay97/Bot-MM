@@ -323,13 +323,25 @@ class AlphaSupervisorAI:
         # Provider and credentials
         self._enabled: bool = getattr(config, "ai_supervisor_enabled", True)
         self._provider: str = getattr(config, "ai_provider", "gemini").lower()
+        provider_key: Optional[str] = None
+        if self._provider == "anthropic":
+            provider_key = getattr(config, "anthropic_api_key", None)
+        elif self._provider in ("openai", "openrouter"):
+            provider_key = getattr(config, "openai_api_key", None)
+        elif self._provider == "gemini":
+            provider_key = getattr(config, "gemini_api_key", None)
+
         self._api_key: Optional[str] = (
-            getattr(config, "gemini_api_key", None)
-            or getattr(config, "ai_api_key", None)
+            provider_key
+            or getattr(config, "gemini_api_key", None)
             or getattr(config, "openai_api_key", None)
+            or getattr(config, "anthropic_api_key", None)
+            or getattr(config, "ai_api_key", None)
         )
         model_val = getattr(config, "ai_model", "gemini-2.5-flash")
-        if model_val in ("gemini", "default", ""):
+        if self._provider == "anthropic" and model_val in ("gemini", "gemini-2.5-flash", "default", ""):
+            model_val = "claude-3-5-sonnet-latest"
+        elif model_val in ("gemini", "default", ""):
             model_val = "gemini-2.5-flash"
         self._model: str = model_val
         self._timeout_s: float = getattr(config, "ai_timeout_s", 4.0)
@@ -967,6 +979,30 @@ class AlphaSupervisorAI:
                     raise RuntimeError(f"{self._provider} API returned status {response.status}: {text[:200]}")
                 data = await response.json()
                 raw_json = data["choices"][0]["message"]["content"]
+                return AISupervisorResponse.from_strict_json(raw_json)
+
+        elif self._provider == "anthropic":
+            url = "https://api.anthropic.com/v1/messages"
+            headers = {
+                "x-api-key": self._api_key or "",
+                "anthropic-version": "2023-06-01",
+                "content-type": "application/json",
+            }
+            body = {
+                "model": self._model,
+                "max_tokens": 1024,
+                "temperature": 0.1,
+                "system": ALPHA_SUPERVISOR_SYSTEM_PROMPT,
+                "messages": [
+                    {"role": "user", "content": f"Telemetry Input:\n{payload_text}"}
+                ],
+            }
+            async with session.post(url, json=body, headers=headers, timeout=self._timeout_s) as response:
+                if response.status != 200:
+                    text = await response.text()
+                    raise RuntimeError(f"Anthropic API returned status {response.status}: {text[:200]}")
+                data = await response.json()
+                raw_json = data["content"][0]["text"]
                 return AISupervisorResponse.from_strict_json(raw_json)
 
         raise ValueError(f"Unsupported AI provider: {self._provider}")
