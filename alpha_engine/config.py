@@ -280,10 +280,10 @@ class EngineConfig(BaseSettings):
         description="Consecutive losses triggering circuit breaker freeze (default: 3)",
     )
     circuit_breaker_drawdown_pct: float = Field(
-        default=0.08,
+        default=0.15,
         ge=0.01,
         le=0.50,
-        description="Rolling daily drawdown triggering circuit breaker (default: 8%)",
+        description="Rolling daily drawdown triggering circuit breaker (default: 15%)",
     )
     circuit_breaker_freeze_duration_s: float = Field(
         default=3600.0,

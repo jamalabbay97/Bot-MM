@@ -47,9 +47,8 @@ class ExitEngine:
         if pnl_pct >= self.config.tp3_pct:
             return True, TradeExitReason.TP_2X
         elif pnl_pct >= self.config.tp2_pct:
-            # Here we might want to scale out, but for now we just exit or hold
-            pass 
+            return True, TradeExitReason.TP_50
         elif pnl_pct >= self.config.tp1_pct:
-            pass
+            return True, TradeExitReason.TP_25
 
         return False, TradeExitReason.MANUAL_CLOSE

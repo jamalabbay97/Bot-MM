@@ -690,6 +690,9 @@ class TelegramIngester:
                             res = self._client.send_message(sender_id, chunk)
                         if asyncio.iscoroutine(res):
                             await res
+            except FloodWaitError as exc:
+                logger.warning("[TelegramIngester] FloodWaitError: %s. Aborting reply.", exc)
+                break
             except Exception as exc:
                 logger.warning("[TelegramIngester] First reply attempt failed (%s), retrying as raw text...", exc)
                 try:
@@ -707,6 +710,9 @@ class TelegramIngester:
                             res = self._client.send_message(sender_id, chunk, parse_mode=None, **kwargs)
                             if asyncio.iscoroutine(res):
                                 await res
+                except FloodWaitError as final_exc:
+                    logger.warning("[TelegramIngester] FloodWaitError on raw text retry: %s. Aborting.", final_exc)
+                    break
                 except Exception as final_exc:
                     logger.warning("[TelegramIngester] Failed to send reply: %s", final_exc)
 
@@ -726,6 +732,8 @@ class TelegramIngester:
                     res = self._client.send_message(chat_id, message)
                     if asyncio.iscoroutine(res):
                         await res
+            except FloodWaitError as exc:
+                logger.warning("[TelegramIngester] FloodWaitError on trade alert to %s: %s", chat_id, exc)
             except Exception as exc:
                 logger.warning("[TelegramIngester] Failed to send trade alert to %s: %s", chat_id, exc)
 

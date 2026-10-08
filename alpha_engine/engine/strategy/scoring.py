@@ -68,12 +68,46 @@ class ScoringEngine:
 
     def evaluate_smart_money(self, staging_data: Any) -> float:
         """Score out of 100 for smart money."""
-        # Stub for smart money wallet profiler integration
-        return 60.0
+        score = 50.0
+        
+        # Check for whale cluster in wave2 StagedToken
+        if hasattr(staging_data, "whale_cluster_detected"):
+            if not staging_data.whale_cluster_detected:
+                score += 20.0
+            else:
+                score -= 20.0
 
-    def evaluate_narrative(self) -> float:
-        """Score out of 100 for narrative/AI sentiment (stub)."""
-        return 50.0
+        raw = getattr(staging_data, "raw_signal", None)
+        if raw and hasattr(raw, "smart_money_score"):
+            # assuming smart_money_score is between 0 and 1
+            score += getattr(raw, "smart_money_score", 0.0) * 30.0
+
+        return max(0.0, min(100.0, score))
+
+    def evaluate_narrative(self, staging_data: Any) -> float:
+        """Score out of 100 for narrative/AI sentiment."""
+        score = 50.0
+        cluster = None
+        
+        if hasattr(staging_data, "narrative_cluster") and staging_data.narrative_cluster:
+            cluster = staging_data.narrative_cluster
+        else:
+            raw = getattr(staging_data, "raw_signal", None)
+            if raw and hasattr(raw, "narrative_cluster") and raw.narrative_cluster:
+                cluster = raw.narrative_cluster
+                
+        if cluster:
+            cluster_lower = cluster.lower()
+            if "ai" in cluster_lower:
+                score += 30.0
+            elif "dog" in cluster_lower or "cat" in cluster_lower:
+                score += 20.0
+            elif "utility" in cluster_lower:
+                score += 10.0
+            else:
+                score += 5.0
+            
+        return max(0.0, min(100.0, score))
 
     def compute_score(self, staging_data: Any, security_report: Any) -> Dict[str, Any]:
         """
@@ -84,7 +118,7 @@ class ScoringEngine:
         sec_score = self.evaluate_security(security_report)
         struct_score = self.evaluate_structure(staging_data)
         smart_score = self.evaluate_smart_money(staging_data)
-        narrative_score = self.evaluate_narrative()
+        narrative_score = self.evaluate_narrative(staging_data)
 
         # Apply weights from config
         w_sec = self.config.score_weight_security
