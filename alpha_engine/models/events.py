@@ -23,6 +23,7 @@ from pydantic import (
 from alpha_engine.models.base import _STRICT_MODEL_CFG
 from alpha_engine.models.enums import (
     ChainIdentifier,
+    ExecutionVenue,
     ExitProfile,
     NewsSignalStatus,
     OrderSide,
@@ -109,6 +110,7 @@ class SignalEvent(BaseModel):
     consolidation_length_hours: Optional[float] = Field(default=None, description="Consolidation duration in hours")
     volume_surge_multiplier: Optional[float] = Field(default=None, description="Volume surge over SMA")
     net_buy_delta: Optional[float] = Field(default=None, description="Net buy volume ratio")
+    execution_venue: Optional[ExecutionVenue] = Field(default=None, description="Execution venue (e.g. RAYDIUM_AMM, UNISWAP_V3)")
 
     @property
     def signal_source(self) -> SignalSource:

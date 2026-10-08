@@ -110,6 +110,7 @@ class SecurityReport(BaseModel):
     mint_authority_disabled : True only if mint authority is renounced/disabled.
     verified_source_code    : Contract source code verified on-chain explorer.
     external_api_raw        : Raw JSON blob from external API (stored verbatim).
+    warning_flags           : List of soft warning flags identified during evaluation.
     """
 
     model_config = _STRICT_MODEL_CFG
@@ -129,6 +130,7 @@ class SecurityReport(BaseModel):
     top10_holder_fraction: Optional[float] = None
     dev_balance_ratio: Optional[float] = None
     external_api_raw: Optional[str] = None  # JSON string, not parsed dict
+    warning_flags: list[str] = Field(default_factory=list)
 
     @model_validator(mode="before")
     @classmethod

@@ -236,6 +236,7 @@ class PaperExecutor:
         reason: TradeExitReason | None = None,
         apply_drag: bool = False,
         portfolio_equity_usd: Decimal = Decimal("10000.0"),
+        platform: Optional[str] = None,
     ) -> PaperFill | None:
         """
         Produce a PaperFill for a dynamic exit SELL order (TP ladder, trailing stop, emergency drain).
@@ -285,7 +286,7 @@ class PaperExecutor:
             )
 
         gas = gas_cost_usd(chain)
-        platform = resolve_trade_platform(
+        resolved_platform = platform or resolve_trade_platform(
             token_address=token_address,
             chain=chain,
             pool_address=pool.pool_address,
@@ -305,7 +306,7 @@ class PaperExecutor:
             fill_timestamp_ns=latency_result.fill_timestamp_ns,
             kelly_fraction=0.0,
             portfolio_equity_usd=portfolio_equity_usd,
-            platform=platform,
+            platform=resolved_platform,
         )
         logger.info(
             "Exit PaperFill [%s] %s | Platform=%s | %s tokens @ %s native | reason=%s | impact=%d bps",

@@ -250,4 +250,30 @@ class DecisionSignal(BaseModel):
     pool_state: Optional[Any] = None
     metadata: dict[str, Any] = Field(default_factory=dict)
 
+    @property
+    def strength(self) -> SignalStrength:
+        return self.signal_strength
+
+    def to_signal_event(self, pool_state: Any, security_report: Any) -> Any:
+        from alpha_engine.models.enums import ExitProfile, SignalSource
+        from alpha_engine.models.events import SignalEvent
+
+        return SignalEvent(
+            signal_id=self.signal_id,
+            timestamp_ns=self.timestamp_ns,
+            chain=self.chain,
+            pool_address=self.pool_address,
+            token_address=self.token_address,
+            suggested_side=self.suggested_side,
+            pool_state=pool_state,
+            security_report=security_report,
+            strength=self.signal_strength,
+            alpha_score=self.alpha_score,
+            source=SignalSource.DEX_SWAP,
+            execution_venue=self.execution_venue,
+            exit_profile=ExitProfile.FAST_SNIPE,
+            strategy_pattern="dex_scalp",
+        )
+
+
 

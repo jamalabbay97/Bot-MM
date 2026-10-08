@@ -405,7 +405,7 @@ async def test_chat_interface_explain_exit_platform():
         side=OrderSide.BUY,
         platform="Pump.fun",
     )
-    lot = book.open_lot(fill=fill, signal_id="sig_test_1")
+    book.open_lot(fill=fill, signal_id="sig_test_1")
     book.close_lots_fifo(
         chain=fill.chain,
         token_address=fill.token_address,

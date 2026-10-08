@@ -160,7 +160,7 @@ def _decode_evm_v3_swap_log(
             return None
 
         sender = "0x" + topics[1][-40:]
-        recipient = "0x" + topics[2][-40:]
+        _ = "0x" + topics[2][-40:]
 
         data_hex = log.get("data", "0x")[2:]
         if len(data_hex) < 320:  # 5 * 64 chars
@@ -178,7 +178,7 @@ def _decode_evm_v3_swap_log(
 
         amount0_raw = _i256(data_hex[0:64])
         amount1_raw = _i256(data_hex[64:128])
-        sqrt_price_x96 = _u256(data_hex[128:192])
+        _ = _u256(data_hex[128:192])
         liquidity_raw = _u256(data_hex[192:256])
         tick_raw = _i256(data_hex[256:320])
 
@@ -345,6 +345,19 @@ class PumpFunResult(PumpMintEvent):
 
 class RaydiumInitResult(dict):
     """Dictionary representing Raydium Initialize2 logs that also equals open_time when compared with an int."""
+    @property
+    def pool_address(self) -> str:
+        return self.get("pool_address", "")
+
+    @property
+    def token_address(self) -> str:
+        return self.get("token_address", "")
+
+    def __getattr__(self, name: str) -> Any:
+        if name in self:
+            return self[name]
+        raise AttributeError(f"'RaydiumInitResult' object has no attribute '{name}'")
+
     def __eq__(self, other: Any) -> bool:
         if isinstance(other, int):
             return self.get("open_time") == other
@@ -624,28 +637,46 @@ def _parse_raydium_initialize2_logs(logs: list[str], tx_sig: str = "") -> dict[s
     pool_address: str | None = None
     open_time: int = 0
 
+    valid_all: list[str] = []
+    token_address: str | None = None
+
     for line in logs:
         line_lower = line.lower()
         if "initialize2" in line_lower or "createpool" in line_lower:
             is_raydium_init = True
-            matches = b58_re.findall(line)
-            valid = [m for m in matches if m not in SOLANA_SYSTEM_PROGRAM_IDS and not m.startswith("11111111")]
-            if valid:
-                pool_address = valid[0]
-            if "open_time" in line_lower:
-                tokens = line.replace(":", " ").replace(",", " ").split()
-                for i, tok in enumerate(tokens):
-                    if tok.lower() == "open_time" and i + 1 < len(tokens):
-                        try:
-                            open_time = int(tokens[i + 1])
-                        except ValueError:
-                            pass
+
+        matches = b58_re.findall(line)
+        for m in matches:
+            if (
+                m not in SOLANA_SYSTEM_PROGRAM_IDS
+                and not m.startswith("11111111")
+                and m != RAYDIUM_AMM_PROGRAM_ID
+                and m not in valid_all
+            ):
+                valid_all.append(m)
+
+        if "open_time" in line_lower:
+            tokens = line.replace(":", " ").replace(",", " ").split()
+            for i, tok in enumerate(tokens):
+                if tok.lower() == "open_time" and i + 1 < len(tokens):
+                    try:
+                        open_time = int(tokens[i + 1])
+                    except ValueError:
+                        pass
 
     if not is_raydium_init:
         return None
 
+    if valid_all:
+        pool_address = valid_all[0]
+        WSOL = "So11111111111111111111111111111111111111112"
+        candidates = [m for m in valid_all[1:] if m != WSOL]
+        if candidates:
+            token_address = candidates[0]
+
     return RaydiumInitResult({
         "pool_address": pool_address or tx_sig[:44],
+        "token_address": token_address or pool_address or tx_sig[:44],
         "tx_hash": tx_sig,
         "open_time": open_time,
     })

@@ -228,20 +228,32 @@ def resolve_trade_platform(
         v_str = str(getattr(execution_venue, "value", execution_venue)).lower()
         if "pump" in v_str:
             return TradingPlatform.PUMP_FUN.value
+        if any(d in v_str for d in ("raydium", "uniswap", "orca", "aerodrome")):
+            return TradingPlatform.DEX_SCAN.value
 
     # Check signal source
     if source is not None:
         s_str = str(getattr(source, "value", source)).lower()
         if "pump" in s_str:
             return TradingPlatform.PUMP_FUN.value
-
-    # Check channel
-    if originating_channel and "pump" in str(originating_channel).lower():
-        return TradingPlatform.PUMP_FUN.value
+        if s_str in ("dex_swap", "pair_created"):
+            return TradingPlatform.DEX_SCAN.value
 
     # Check pool address
-    if pool_address and "pump" in str(pool_address).lower():
-        return TradingPlatform.PUMP_FUN.value
+    if pool_address:
+        p_str = str(pool_address).lower()
+        if "pump" in p_str:
+            return TradingPlatform.PUMP_FUN.value
+        if any(d in p_str for d in ("raydium", "uniswap", "orca", "aerodrome")):
+            return TradingPlatform.DEX_SCAN.value
+
+    # Check channel
+    if originating_channel:
+        c_str = str(originating_channel).lower()
+        if "pump" in c_str:
+            return TradingPlatform.PUMP_FUN.value
+        if any(d in c_str for d in ("raydium", "dex", "uniswap")):
+            return TradingPlatform.DEX_SCAN.value
 
     # Check token address (Pump.fun mint addresses end with 'pump' on Solana)
     if token_address:

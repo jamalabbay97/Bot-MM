@@ -45,8 +45,10 @@ from alpha_engine.logging_config import setup_production_logging
 from alpha_engine.math.cpmm import get_initial_bonding_curve_pool
 from alpha_engine.models.ai import ActionParameters, AISupervisorDecisionEnum
 from alpha_engine.models.decisions import DecisionRecord, DecisionType, PatternFeatureVector, RevivalPatternFeatureVector
+from alpha_engine.ingestion.dex_metrics import DEXMetricsAggregator
 from alpha_engine.models.enums import (
     ChainIdentifier,
+    ExecutionVenue,
     ExitProfile,
     LotStatus,
     OrderSide,
@@ -57,6 +59,7 @@ from alpha_engine.models.enums import (
 from alpha_engine.models.events import (
     PoolStateUpdateEvent,
     PumpMintEvent,
+    PumpSwapEvent,
     RawSignalEvent,
     ShutdownSentinel,
     SignalEvent,
@@ -96,6 +99,7 @@ class PaperTradingEngine:
         self._pool_registry = PoolRegistry()
         self._position_book = PositionBook()
         self._metrics = RunningMetrics(peak_equity_usd=config.initial_equity_usd)
+        self._metrics_aggregator = DEXMetricsAggregator()
 
         self._cash_sol = config.initial_sol
         self._cash_eth = config.initial_eth
@@ -597,6 +601,7 @@ class PaperTradingEngine:
 
             if isinstance(item, PoolStateUpdateEvent):
                 self._pool_registry.set(item.pool_address, item.new_pool_state)
+                self._metrics_aggregator.record_pool_state(item.new_pool_state)
                 logger.debug(
                     "Pool registry refreshed from Sync: pool=%s native=%s",
                     item.pool_address[:10],
@@ -692,11 +697,18 @@ class PaperTradingEngine:
             if gk.is_rejected(target_token, swap.chain) is True:
                 continue
 
-            # Auto-discovery fallback: If a buy trade >= 0.5 SOL arrives for an unstaged token
-            # that is NOT in the negative cache, trigger an immediate async security evaluation and stage if clean.
+            is_pump = (
+                isinstance(swap, PumpSwapEvent)
+                or (
+                    swap.chain == ChainIdentifier.SOLANA_MAINNET
+                    and "pump" in swap.pool_address.lower()
+                )
+            )
+            auto_min_vol = Decimal("0.02") if swap.chain == ChainIdentifier.BASE_MAINNET else Decimal("0.5")
             if (
-                is_buy
-                and sol_amount >= Decimal("0.5")
+                is_pump
+                and is_buy
+                and sol_amount >= auto_min_vol
                 and not self._pending_launch_buffer.is_staged(target_token)
                 and not self.is_position_open(target_token, swap.chain)
                 and not is_blacklisted_token(target_token, swap.chain)
@@ -747,6 +759,7 @@ class PaperTradingEngine:
                 continue
 
             updated_pool = self._pool_registry.update_from_swap(swap, pool)
+            self._metrics_aggregator.record_swap(swap, pool_state=updated_pool)
             self._ai_supervisor.record_price_update(
                 target_token,
                 updated_pool.spot_price_native_per_token,
@@ -854,6 +867,56 @@ class PaperTradingEngine:
                     signal_event.alpha_score,
                     signal_event.strength.value,
                 )
+            elif not gk.is_rejected(target_token, swap.chain):
+                # Unstaged DEX swap path: evaluate security and check for DEX scalp or buy signal
+                try:
+                    dex_report = await gk.evaluate_token(
+                        token_address=target_token,
+                        chain=swap.chain,
+                        pool_address=swap.pool_address,
+                    )
+                    reason = self._extract_gatekeeper_rejection_reason(dex_report)
+                    self._record_gatekeeper_eval(target_token, swap.chain, reason, passed=dex_report.passes_hard_gates)
+                except Exception as exc:  # noqa: BLE001
+                    logger.error("DEX swap security screening failed for %s: %s", target_token[:10], exc)
+                    dex_report = None
+
+                if dex_report is not None and dex_report.passes_hard_gates:
+                    scalp_decision = self._signal_gen.generate_short_term_scalp_signal(
+                        swap=swap,
+                        pool=updated_pool,
+                        report=dex_report,
+                        metrics_aggregator=self._metrics_aggregator,
+                    )
+                    signal_event = None
+                    if scalp_decision is not None:
+                        signal_event = scalp_decision.to_signal_event(updated_pool, dex_report)
+                    else:
+                        venue = (
+                            ExecutionVenue.RAYDIUM_AMM
+                            if swap.chain == ChainIdentifier.SOLANA_MAINNET
+                            else ExecutionVenue.UNISWAP_V2
+                        )
+                        signal_event = self._signal_gen.generate_buy_signal(
+                            swap, updated_pool, dex_report, execution_venue=venue
+                        )
+                        if signal_event is not None and signal_event.execution_venue != venue:
+                            signal_event = signal_event.model_copy(update={"execution_venue": venue})
+
+                    if signal_event is not None:
+                        if not self.is_position_open(signal_event.token_address, signal_event.chain):
+                            if self._ledger:
+                                await self._ledger.record_signal(signal_event)
+                            await self._signal_q.put(signal_event)
+                            logger.info(
+                                "DEX Signal [%s] generated: %s %s alpha=%.3f strength=%s (venue=%s)",
+                                signal_event.signal_id[:8],
+                                signal_event.suggested_side.value.upper(),
+                                signal_event.token_address[:10],
+                                signal_event.alpha_score,
+                                signal_event.strength.value,
+                                getattr(signal_event.execution_venue, "value", signal_event.execution_venue),
+                            )
 
     async def _async_screen_and_process_news(self, news_event: NewsSignalEvent, gk: Any) -> None:
         async with self._screening_semaphore:
@@ -903,7 +966,7 @@ class PaperTradingEngine:
             )
             if signal_event is not None:
                 if getattr(news_event, "narrative_cluster", None):
-                    signal_event.narrative_cluster = news_event.narrative_cluster
+                    signal_event = signal_event.model_copy(update={"narrative_cluster": news_event.narrative_cluster})
                 if self._ledger:
                     await self._ledger.record_signal(signal_event)
                 await self._signal_q.put(signal_event)
@@ -1019,15 +1082,27 @@ class PaperTradingEngine:
             if signal_event is None:
                 return
 
+            updates: dict[str, Any] = {}
+            if raw_sig.source == SignalSource.PAIR_CREATED:
+                updates["source"] = SignalSource.PAIR_CREATED
+                updates["execution_venue"] = (
+                    ExecutionVenue.RAYDIUM_AMM
+                    if raw_sig.chain == ChainIdentifier.SOLANA_MAINNET
+                    else ExecutionVenue.UNISWAP_V2
+                )
+
             if getattr(raw_sig, "narrative_cluster", None):
-                signal_event.narrative_cluster = raw_sig.narrative_cluster
+                updates["narrative_cluster"] = raw_sig.narrative_cluster
+
+            if updates:
+                signal_event = signal_event.model_copy(update=updates)
 
             if self._ledger:
                 await self._ledger.record_signal(signal_event)
 
             await self._signal_q.put(signal_event)
             logger.info(
-                "Social Signal [%s] queued: %s (source=%s, sybil_count=%d, weight=%.2f)",
+                "Signal [%s] queued: %s (source=%s, sybil_count=%d, weight=%.2f)",
                 signal_event.signal_id[:8],
                 raw_sig.token_address[:10],
                 signal_event.source.value,
@@ -1067,6 +1142,7 @@ class PaperTradingEngine:
                         reason=decision.exit_reason,
                         apply_drag=True,
                         portfolio_equity_usd=max(Decimal("1.0"), self._current_equity_usd()),
+                        platform=getattr(lot, "platform", None),
                     )
                     if exit_fill is not None:
                         native_price = (
@@ -1463,7 +1539,7 @@ class PaperTradingEngine:
                     signal_item.signal_id,
                     initial_pool_reserve_native=initial_reserve,
                     pool_address=getattr(signal_item, "pool_address", "") or "",
-                    bonding_curve_mode=True,
+                    bonding_curve_mode=(platform_name == "Pump.fun"),
                     ai_hard_stop_loss_pct=ai_action_params.hard_stop_loss_pct if ai_action_params else None,
                     ai_trailing_stop_activation_pct=ai_action_params.trailing_stop_activation_pct if ai_action_params else None,
                     ai_time_exit_minutes=ai_action_params.time_exit_minutes if ai_action_params else None,
@@ -2022,6 +2098,7 @@ class PaperTradingEngine:
                             reason=decision.exit_reason,
                             apply_drag=True,
                             portfolio_equity_usd=max(Decimal("1.0"), self._current_equity_usd()),
+                            platform=getattr(lot, "platform", None),
                         )
                         if exit_fill is not None and exit_fill.effective_price > Decimal(0):
                             native_price = (
@@ -2080,6 +2157,7 @@ class PaperTradingEngine:
                                     fill=exit_fill,
                                     signal_id=lot.signal_id,
                                     realized_pnl_usd=exit_pnl_usd,
+                                    platform=getattr(lot, "platform", None) or getattr(exit_fill, "platform", None),
                                 )
                                 await self._ledger.record_trade(rec)
                                 poller_exit_type = DecisionType.TRAIL_STOP if "trail" in str(decision.exit_reason).lower() else DecisionType.EXIT
@@ -2267,6 +2345,7 @@ class PaperTradingEngine:
                 gatekeeper=self._gatekeeper,
                 ai_supervisor=self._ai_supervisor,
                 svm_failover_urls=svm_failovers,
+                metrics_aggregator=self._metrics_aggregator,
             )
 
             self._ai_supervisor.set_ledger(self._ledger)
@@ -2551,16 +2630,26 @@ def _build_example_config() -> tuple[
     USDC = "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913"
     AERO_WETH_USDC = "0x6c561b446416e1a00e8e93e221854d6eA4171372"
 
+    # Tradeable tokens on Base: BRETT
+    BRETT = "0x532f27101965dd16442e59d40670faf5ebb142e4"
+    AERO_BRETT_WETH = "0x94cc044155b9e1d88258525b6a37887e2261543b"
+
     evm_watchlist: list[tuple[str, str, str, int, int, str]] = [
         (AERO_WETH_USDC, WETH, USDC, 18, 6, WETH),
+        (AERO_BRETT_WETH, BRETT, WETH, 18, 18, WETH),
     ]
 
     SOL_USDC_POOL = "8sLbNZoA1cfnvMJLPfp98ZLAnFSYCFApfJKMbiXNLwxj"
     SOL_MINT = "So11111111111111111111111111111111111111112"
     USDC_MINT = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
 
+    # Tradeable token on Solana: BONK
+    BONK_MINT = "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263"
+    RAYDIUM_BONK_SOL_POOL = "HVbpJAhmZj5ffHGsqP71BBvsnoQTmnTabmMoDs29imEt"
+
     svm_registry: dict[str, tuple[str, str, int, int]] = {
         SOL_USDC_POOL: (SOL_MINT, USDC_MINT, 9, 6),
+        RAYDIUM_BONK_SOL_POOL: (BONK_MINT, SOL_MINT, 5, 9),
     }
 
     seed_states: dict[str, PoolState] = {
@@ -2574,6 +2663,28 @@ def _build_example_config() -> tuple[
             last_updated_block=20_000_000,
             token_decimals=6,
             native_decimals=18,
+        ),
+        AERO_BRETT_WETH: PoolState(
+            pool_address=AERO_BRETT_WETH,
+            chain=ChainIdentifier.BASE_MAINNET,
+            token_reserve=Decimal("100_000_000_000_000_000_000_000_000"),
+            native_reserve=Decimal("50_000_000_000_000_000_000"),
+            fee_numerator=3,
+            fee_denominator=1000,
+            last_updated_block=20_000_000,
+            token_decimals=18,
+            native_decimals=18,
+        ),
+        RAYDIUM_BONK_SOL_POOL: PoolState(
+            pool_address=RAYDIUM_BONK_SOL_POOL,
+            chain=ChainIdentifier.SOLANA_MAINNET,
+            token_reserve=Decimal("50_000_000_000_00000"),
+            native_reserve=Decimal("5_000_000_000_000"),
+            fee_numerator=25,
+            fee_denominator=10000,
+            last_updated_block=280_000_000,
+            token_decimals=5,
+            native_decimals=9,
         ),
     }
 

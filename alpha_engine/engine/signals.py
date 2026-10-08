@@ -528,6 +528,7 @@ class SignalGenerator:
         report: SecurityReport,
         source: SignalSource = SignalSource.DEX_SWAP,
         min_strength: Optional[SignalStrength] = None,
+        execution_venue: Optional[ExecutionVenue] = None,
     ) -> SignalEvent | None:
         """Generate a BUY SignalEvent for a qualifying swap."""
         alpha = self.score_swap(swap, pool, report)
@@ -542,6 +543,13 @@ class SignalGenerator:
         strength_str = classify_alpha_score(alpha)
         strength = SignalStrength(strength_str)
 
+        venue = execution_venue
+        if venue is None:
+            if pool.chain == ChainIdentifier.SOLANA_MAINNET:
+                venue = ExecutionVenue.PUMP_FUN if "pump" in pool.pool_address.lower() else ExecutionVenue.RAYDIUM_AMM
+            else:
+                venue = ExecutionVenue.UNISWAP_V2
+
         signal = SignalEvent(
             timestamp_ns=time.time_ns(),
             chain=swap.chain,
@@ -554,6 +562,7 @@ class SignalGenerator:
             strength=strength,
             alpha_score=alpha,
             source=source,
+            execution_venue=venue,
         )
 
         if not self.validate_signal_strength(signal, min_strength=min_strength):
@@ -620,6 +629,7 @@ class SignalGenerator:
             strength=strength,
             alpha_score=alpha,
             source=SignalSource.PUMP_FUN_MINT,
+            execution_venue=ExecutionVenue.PUMP_FUN,
         )
 
     def generate_sell_signal(

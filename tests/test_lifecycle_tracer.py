@@ -8,7 +8,6 @@ persistence, and Conversational Investigation UI (/assets & /investigate).
 from __future__ import annotations
 
 import asyncio
-import os
 import tempfile
 import time
 from decimal import Decimal
@@ -365,8 +364,9 @@ async def test_ai_supervisor_auditing_traces():
                 token_decimals=18,
                 native_decimals=18,
             )
+            test_token = "0x1111111111111111111111111111111111111111"
             sec_rep = SecurityReport(
-                token_address="0x4200000000000000000000000000000000000006",
+                token_address=test_token,
                 chain=ChainIdentifier.BASE_MAINNET,
                 tier=SecurityTier.CLEAN,
                 is_honeypot=False,
@@ -380,7 +380,7 @@ async def test_ai_supervisor_auditing_traces():
             signal = SignalEvent(
                 timestamp_ns=time.time_ns(),
                 chain=ChainIdentifier.BASE_MAINNET,
-                token_address="0x4200000000000000000000000000000000000006",
+                token_address=test_token,
                 pool_address="0x6c561b446416e1a00e8e93e221854d6eA4171372",
                 suggested_side=OrderSide.BUY,
                 strength=SignalStrength.STRONG,
@@ -395,10 +395,13 @@ async def test_ai_supervisor_auditing_traces():
 
             await tracer.stop_worker()
 
-            traces = await ledger.get_asset_trace("0x4200000000000000000000000000000000000006")
+            traces = await ledger.get_asset_trace(test_token)
             assert len(traces) >= 1
-            ai_trace = traces[0]
+            ai_traces = [t for t in traces if t["stage"] == "AI_ANALYSIS"]
+            assert len(ai_traces) >= 1
+            ai_trace = ai_traces[0]
             assert ai_trace["stage"] == "AI_ANALYSIS"
             assert ai_trace["component"] == "AlphaSupervisorAI"
             assert ai_trace["function_name"] == "audit_signal"
             assert ai_trace["status"] in ("PASSED", "REJECTED")
+            await supervisor.close()

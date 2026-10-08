@@ -763,22 +763,29 @@ class SVMIngester:
                     ray_init = _parse_raydium_initialize2_logs(logs, tx_sig)
                     if ray_init is not None:
                         pool_addr = sanitize_solana_pubkey(ray_init.get("pool_address"))
+                        token_addr = sanitize_solana_pubkey(ray_init.get("token_address")) or pool_addr
                         if (
                             pool_addr
                             and pool_addr not in SOLANA_SYSTEM_PROGRAM_IDS
                             and not pool_addr.startswith("11111111")
                         ):
+                            self._pool_registry[pool_addr] = (
+                                token_addr,
+                                "So11111111111111111111111111111111111111112",
+                                9,
+                                9,
+                            )
                             await self._queue.put(
                                 RawSignalEvent(
                                     chain=ChainIdentifier.SOLANA_MAINNET,
-                                    token_address=pool_addr,
+                                    token_address=token_addr,
                                     pool_address=pool_addr,
                                     source=SignalSource.PAIR_CREATED,
                                     originating_channel="raydium_stream",
-                                    raw_text=f"Raydium AMM CreatePool: {pool_addr}",
+                                    raw_text=f"Raydium AMM CreatePool: {pool_addr} mint={token_addr}",
                                 )
                             )
-                            logger.info("SVM Raydium CreatePool detected: %s", pool_addr[:10])
+                            logger.info("SVM Raydium CreatePool detected: pool=%s mint=%s", pool_addr[:10], token_addr[:10])
             finally:
                 if self._sweep_task and not self._sweep_task.done():
                     self._sweep_task.cancel()
@@ -802,6 +809,34 @@ class SVMIngester:
         pool_pubkey: str,
     ) -> SwapEvent | None:
         meta = self._pool_registry.get(pool_pubkey)
+        logs_str = " ".join(logs)
+        if meta is None:
+            for p_addr, p_meta in self._pool_registry.items():
+                if p_addr in logs_str:
+                    meta = p_meta
+                    pool_pubkey = p_addr
+                    break
+
+        if meta is None:
+            import re
+            b58_re = re.compile(r"\b[1-9A-HJ-NP-Za-km-z]{32,44}\b")
+            WSOL = "So11111111111111111111111111111111111111112"
+            candidates = [
+                m for m in b58_re.findall(logs_str)
+                if m not in SOLANA_SYSTEM_PROGRAM_IDS
+                and m != RAYDIUM_AMM_PROGRAM_ID
+                and not m.startswith("11111111")
+            ]
+            if candidates:
+                pool_pubkey = candidates[0]
+                non_wsol = [m for m in candidates if m != WSOL and m != pool_pubkey]
+                coin_mint = non_wsol[0] if non_wsol else candidates[-1]
+                pc_mint = WSOL
+                coin_dec = 9
+                pc_dec = 9
+                meta = (coin_mint, pc_mint, coin_dec, pc_dec)
+                self._pool_registry[pool_pubkey] = meta
+
         if meta is None:
             return None
 
@@ -828,6 +863,8 @@ class SVMIngester:
             if amount_in <= Decimal(0) or amount_out <= Decimal(0):
                 continue
 
+            sender_val = tx_signature[:44] if len(tx_signature) >= 32 else (tx_signature + "1" * 32)[:44]
+            hash_val = tx_signature if len(tx_signature) >= 32 else (tx_signature + "0" * 32)[:44]
             return SwapEvent(
                 timestamp_ns=time.time_ns(),
                 block_number=0,
@@ -837,8 +874,8 @@ class SVMIngester:
                 token_out=token_out,
                 amount_in=amount_in,
                 amount_out=amount_out,
-                sender=tx_signature[:44],
-                tx_hash=tx_signature,
+                sender=sender_val,
+                tx_hash=hash_val,
                 log_index=None,
             )
 

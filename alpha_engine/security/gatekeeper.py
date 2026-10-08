@@ -409,7 +409,7 @@ class SecurityGatekeeper:
                     "sell_tax": tier1_report.sell_tax_bps,
                     "lp_burned": tier1_report.lp_burned_ratio,
                     "top10": tier1_report.top10_concentration,
-                    "flags": tier1_report.warning_flags or [],
+                    "flags": getattr(tier1_report, "warning_flags", []) or [],
                 }
                 return tier1_report
 
