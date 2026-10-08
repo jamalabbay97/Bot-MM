@@ -54,6 +54,7 @@ from alpha_engine.models.enums import (
     OrderSide,
     SignalSource,
     SignalStrength,
+    TradeExitReason,
     resolve_trade_platform,
 )
 from alpha_engine.models.events import (
@@ -139,6 +140,12 @@ class PaperTradingEngine:
         self._consecutive_trade_count: int = 0
         self._cooldown_until: float = 0.0
         self._in_paced_mode: bool = False
+        
+        # Strategy V2 Engines
+        from alpha_engine.engine.strategy.risk_manager import RiskEngine
+        from alpha_engine.engine.strategy.exit_engine import ExitEngine
+        self.risk_engine = RiskEngine(config)
+        self.exit_engine = ExitEngine(config)
         self._last_pnl_cycle_ts: float = time.time()
 
         self._explainer: Optional[ConversationalSupervisor] = None
@@ -1133,6 +1140,35 @@ class PaperTradingEngine:
                     trade_volume_native=vol,
                     is_sell=is_sell,
                 )
+                
+                # V2 Exit Logic
+                if (decision is None or not decision.should_exit) and self.config.strategy_v2_enabled:
+                    entry_ts = getattr(lot, "entry_timestamp_s", None) or lot.last_tick_timestamp_s
+                    age_seconds = time.time() - entry_ts if entry_ts else 0.0
+                    liquidity_drop = 0.0
+                    if lot.peak_pool_reserve_native > 0:
+                        liquidity_drop = float((lot.peak_pool_reserve_native - pool.native_reserve) / lot.peak_pool_reserve_native)
+                    should_exit, reason = self.exit_engine.check_exit_conditions(
+                        current_price=pool.spot_price_native_per_token,
+                        entry_price=lot.entry_price,
+                        liquidity_drop_pct=liquidity_drop,
+                        age_seconds=age_seconds
+                    )
+                    if should_exit:
+                        from alpha_engine.models.state import ExitDecision, ExitStage
+                        decision = ExitDecision(
+                            lot_id=lot.lot_id,
+                            token_address=lot.token_address,
+                            chain=lot.chain,
+                            should_exit=True,
+                            exit_reason=reason,
+                            exit_stage=ExitStage.RUGPULL if reason == TradeExitReason.LIQUIDITY_RUG else ExitStage.TARGET_HIT,
+                            tokens_to_sell=lot.tokens_held,
+                            current_price=pool.spot_price_native_per_token,
+                            pnl_estimate_native=lot.tokens_held * (pool.spot_price_native_per_token - lot.entry_price),
+                            prioritized=True,
+                        )
+
                 if decision is not None and decision.should_exit:
                     exit_fill = await executor.execute_exit(
                         chain=decision.chain,
@@ -1437,7 +1473,27 @@ class PaperTradingEngine:
                 )
                 equity_usd = self._current_equity_usd()
                 equity_native = equity_usd / native_p if native_p > Decimal(0) else Decimal(0)
-                preliminary_cost = equity_native * Decimal("0.015")
+                
+                if self._cfg.strategy_v2_enabled:
+                    metrics_dict = {
+                        "consecutive_losses": self._metrics.consecutive_losses,
+                        "daily_drawdown_pct": getattr(self._metrics, "daily_drawdown_pct", 0.0) 
+                    }
+                    if not self.risk_engine.check_daily_limits(metrics_dict):
+                        logger.warning("V2 RiskEngine: Daily limits breached. Dropping BUY signal.")
+                        continue
+                        
+                    prelim_native = self.risk_engine.calculate_position_size(
+                        current_capital=equity_native,
+                        score=signal_item.alpha_score * 100.0
+                    )
+                    preliminary_cost = prelim_native
+                    
+                    if preliminary_cost <= Decimal(0):
+                        logger.info("V2 RiskEngine: Position size calculated as 0 (score too low). Dropping BUY.")
+                        continue
+                else:
+                    preliminary_cost = equity_native * Decimal("0.015")
 
                 can_open, reject_reason = self._position_book.can_open_position(
                     token_address=signal_item.token_address,

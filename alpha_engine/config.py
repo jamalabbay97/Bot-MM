@@ -408,6 +408,34 @@ class EngineConfig(BaseSettings):
     )
 
     # -------------------------------------------------------------------------
+    # 5d. Strategy V2 & Scoring Weights
+    # -------------------------------------------------------------------------
+    strategy_v2_enabled: bool = Field(
+        default=True,
+        description="Enable V2 Deterministic Strategy Engine (0-100 Score)",
+    )
+    score_weight_security: float = Field(default=10.0)
+    score_weight_liquidity: float = Field(default=15.0)
+    score_weight_volume: float = Field(default=20.0)
+    score_weight_flow: float = Field(default=15.0)
+    score_weight_holders: float = Field(default=10.0)
+    score_weight_smart_money: float = Field(default=15.0)
+    score_weight_structure: float = Field(default=10.0)
+    score_weight_narrative: float = Field(default=5.0)
+    min_entry_score: float = Field(
+        default=70.0,
+        description="Minimum 0-100 score required to trigger a buy signal",
+    )
+    
+    tp1_pct: float = Field(default=0.20, description="Take Profit 1 (+20%)")
+    tp2_pct: float = Field(default=0.50, description="Take Profit 2 (+50%)")
+    tp3_pct: float = Field(default=1.00, description="Take Profit 3 (+100%)")
+    emergency_exit_liquidity_drop_pct: float = Field(
+        default=0.40,
+        description="Emergency exit if liquidity drops >40% in 5m",
+    )
+
+    # -------------------------------------------------------------------------
     # 6. Starting Balances & Price Baseline
     # -------------------------------------------------------------------------
     initial_sol: Decimal = Field(

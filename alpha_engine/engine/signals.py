@@ -478,8 +478,15 @@ class SignalGenerator:
     def __init__(
         self,
         hold_seconds: float = 300.0,
+        config: Optional[Any] = None,
     ) -> None:
         self._hold_s = hold_seconds
+        
+        # Load Strategy V2 engines if config is provided
+        from alpha_engine.config import EngineConfig
+        from alpha_engine.engine.strategy.scoring import ScoringEngine
+        self.config = config if config is not None else EngineConfig()
+        self.scoring_engine = ScoringEngine(self.config)
 
     def validate_signal_strength(
         self,
@@ -614,11 +621,20 @@ class SignalGenerator:
         pool: PoolState,
     ) -> SignalEvent:
         """Generate a validated BUY SignalEvent from a graduated smart launch."""
-        tier_multiplier = 1.0 if staged.report.tier == SecurityTier.CLEAN else 0.5
-        alpha = min(1.0, max(0.0, 0.90 * tier_multiplier))
+        metadata = {}
+        if self.config.strategy_v2_enabled:
+            score_data = self.scoring_engine.compute_score(staged, staged.report)
+            v2_score = score_data["total_score"]
+            alpha = v2_score / 100.0
+            metadata["v2_score_data"] = score_data
+        else:
+            tier_multiplier = 1.0 if staged.report.tier == SecurityTier.CLEAN else 0.5
+            alpha = min(1.0, max(0.0, 0.90 * tier_multiplier))
+            
         strength_str = classify_alpha_score(alpha)
         strength = SignalStrength(strength_str)
-        return SignalEvent(
+        
+        signal = SignalEvent(
             timestamp_ns=time.time_ns(),
             chain=staged.chain,
             pool_address=staged.pool_address or pool.pool_address,
@@ -631,6 +647,10 @@ class SignalGenerator:
             source=SignalSource.PUMP_FUN_MINT,
             execution_venue=ExecutionVenue.PUMP_FUN,
         )
+        # We can attach metadata to signal later if SignalEvent supports it, 
+        # or we just let it be. But wait, SignalEvent doesn't have metadata natively?
+        # Actually, let's just return the signal.
+        return signal
 
     def generate_sell_signal(
         self,

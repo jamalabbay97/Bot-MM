@@ -189,8 +189,8 @@ class TradingPlatform(str, Enum):
     DEX_SCAN: Decentralized exchange liquidity pools (Raydium, Orca, Uniswap, etc.) or DEX scanners.
     """
 
-    PUMP_FUN = "Pump.fun"
-    DEX_SCAN = "DexScan"
+    PUMP_FUN = "PUMP.FUN"
+    DEX_SCAN = "DEX"
 
 
 PlatformSource = TradingPlatform

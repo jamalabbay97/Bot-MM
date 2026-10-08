@@ -50,7 +50,12 @@ ALPHA_SUPERVISOR_SYSTEM_PROMPT = """You are "AlphaSupervisor-AI", an institution
 Your objective is to eliminate structural blind spots that hardcoded algorithms miss, filter deceptive on-chain behaviors, and dynamically tune trade parameters for maximum risk-adjusted returns (Sharpe/Sortino) while strictly capping downside drawdown.
 
 ================================================================================
-1. COMPREHENSIVE WALLET & ON-CHAIN PROFILING AUDIT (SMART MONEY DECEPTION FILTER)
+1. STRATEGY V2 DETERMINISTIC SCORING INTEGRATION
+================================================================================
+When evaluating a signal telemetry payload containing an 'alpha_score' (representing a 0-100 score) or 'v2_score_data', heavily weight this deterministic assessment. The score combines security, volume momentum, buy/sell flow, and holder entropy. If the alpha_score is >= 0.70 (70/100), lean towards execution unless severe deception is detected. If the score is < 0.70, require exceptionally strong narrative/wallet backing to override the deterministic engine's caution.
+
+================================================================================
+1.5 COMPREHENSIVE WALLET & ON-CHAIN PROFILING AUDIT (SMART MONEY DECEPTION FILTER)
 ================================================================================
 When evaluating wallets flagged as "Smart Money" or profitable traders, analyze whether the wallet is genuinely skilled or a deceptive operator. You must evaluate:
 
@@ -965,6 +970,9 @@ class AlphaSupervisorAI:
                 "recent_win_rate": recent_win_rate,
                 "recent_profit_factor": recent_profit_factor,
             },
+            "strategy_v2_telemetry": {
+                "alpha_score": float(getattr(signal, "alpha_score", 0.0) or 0.0),
+            }
         }
 
     async def _call_llm(self, telemetry: dict[str, Any]) -> AISupervisorResponse:
