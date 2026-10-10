@@ -549,6 +549,7 @@ class TelegramIngester:
                 [Button.text("🔍 Assets", resize=True), Button.text("🌊 Staging", resize=True), Button.text("🔄 Revival", resize=True)],
                 [Button.text("🛡️ AI Vetoes", resize=True), Button.text("📈 Performance", resize=True), Button.text("📡 Signals", resize=True)],
                 [Button.text("📰 News", resize=True), Button.text("🐋 Whales", resize=True), Button.text("❓ Help", resize=True)],
+                [Button.text("🩺 Doctor", resize=True), Button.text("🌐 Research", resize=True)],
             ]
         except Exception:
             return None
@@ -563,6 +564,7 @@ class TelegramIngester:
                 [Button.inline("📊 Live Status", data=b"cmd:status"), Button.inline("🧠 AI Control", data=b"cmd:ai"), Button.inline("📋 Trades", data=b"cmd:trades")],
                 [Button.inline("🔍 Recent Assets", data=b"cmd:assets"), Button.inline("🌊 Staging", data=b"cmd:staging"), Button.inline("🔄 Revival", data=b"cmd:revival")],
                 [Button.inline("📈 Performance", data=b"cmd:perf"), Button.inline("🛡️ Vetoes", data=b"cmd:vetoes"), Button.inline("📡 Signals", data=b"cmd:signals")],
+                [Button.inline("🩺 Doctor", data=b"cmd:doctor"), Button.inline("🌐 Research", data=b"cmd:research")],
             ]
         except Exception:
             return None
@@ -796,6 +798,12 @@ class TelegramIngester:
                     await self._cmd_news(event)
                 elif cmd == "whales":
                     await self._cmd_whales(event)
+                elif cmd == "doctor":
+                    if self._chat_explainer and hasattr(self._chat_explainer, "tool_system_doctor"):
+                        resp = await self._chat_explainer.tool_system_doctor()
+                        await self._safe_reply(event, resp)
+                elif cmd == "research":
+                    await self._safe_reply(event, "Please use /research <target> command for deep web research.")
                 elif cmd == "help":
                     await self._cmd_start_help(event)
             elif data.startswith("inv:"):
@@ -1166,6 +1174,24 @@ class TelegramIngester:
             await self._cmd_whales(event)
         elif first_token in ("/signals", "signals", "إشارات", "الإشارات"):
             await self._cmd_signals(event)
+        elif first_token in ("/doctor", "doctor", "فحص النظام", "فحص"):
+            if self._chat_explainer and hasattr(self._chat_explainer, "tool_system_doctor"):
+                resp = await self._chat_explainer.tool_system_doctor()
+                await self._safe_reply(event, resp)
+            elif self._chat_explainer:
+                resp = await self._chat_explainer.ask(clean_text)
+                await self._safe_reply(event, resp)
+        elif first_token in ("/research", "research", "بحث"):
+            args = clean_text[len(clean_text.split()[0]):].strip() if len(clean_text.split()) > 1 else ""
+            if self._chat_explainer and hasattr(self._chat_explainer, "tool_deep_research"):
+                if args:
+                    resp = await self._chat_explainer.tool_deep_research(args)
+                else:
+                    resp = "Please provide a target. Example: `/research $TOKEN`"
+                await self._safe_reply(event, resp)
+            elif self._chat_explainer:
+                resp = await self._chat_explainer.ask(clean_text)
+                await self._safe_reply(event, resp)
         elif first_token in ("/scan", "scan", "سكان"):
             args = clean_text[len(clean_text.split()[0]):].strip() if len(clean_text.split()) > 1 else ""
             await self._cmd_scan(event, args, sender_id)

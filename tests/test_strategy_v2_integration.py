@@ -10,7 +10,7 @@ from alpha_engine.engine.strategy.scoring import ScoringEngine
 
 
 
-@pytest.mark.asyncio
+@pytest.mark.anyio
 async def test_v2_strategy_enabled():
     config = EngineConfig(strategy_v2_enabled=True)
     

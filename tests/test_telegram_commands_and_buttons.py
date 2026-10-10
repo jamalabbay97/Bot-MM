@@ -62,10 +62,13 @@ async def test_persistent_reply_keyboard_and_inline_helpers(tmp_path):
 
     kb = ingester.get_default_keyboard_markup()
     assert kb is not None
-    # 4 rows of 3 buttons
-    assert len(kb) == 4
-    for row in kb:
-        assert len(row) == 3
+    # 5 rows (first 4 have 3 buttons, last has 2)
+    assert len(kb) == 5
+    for i, row in enumerate(kb):
+        if i < 4:
+            assert len(row) == 3
+        else:
+            assert len(row) == 2
 
     # Flatten button texts
     labels = [(btn.button.text if hasattr(btn, "button") else btn.text) for row in kb for btn in row]
@@ -81,6 +84,8 @@ async def test_persistent_reply_keyboard_and_inline_helpers(tmp_path):
     assert "📰 News" in labels
     assert "🐋 Whales" in labels
     assert "❓ Help" in labels
+    assert "🩺 Doctor" in labels
+    assert "🌐 Research" in labels
 
     # Test inline button helpers
     status_btn = ingester.get_status_inline_buttons()

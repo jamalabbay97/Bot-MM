@@ -428,14 +428,38 @@ class XStreamIngester:
         token_valid = self.verify_token_validity()
         if not token_valid:
             logger.warning(
-                "X_BEARER_TOKEN is unset or invalid. X-Stream falling back gracefully to dormant mode; "
-                "sentiment and discovery signals will be ingested via RSS/Telegram scraping."
+                "[Agent-Reach Mode Active]: Routing via zero-fee ReachEngine"
             )
+            from alpha_engine.reach.engine import ReachEngine
+            import uuid
+            import time
+            reach_engine = ReachEngine()
             while self._running:
                 try:
+                    mentions = await reach_engine.search_reddit("solana token launch OR base memecoin", limit=5)
+                    mentions += await reach_engine.search_x_fallback("solana token launch OR base memecoin", limit=5)
+                    for mention in mentions:
+                        tweet_id = str(uuid.uuid4())
+                        tweet = TweetPayload(
+                            tweet_id=tweet_id,
+                            author_id="reach_engine",
+                            author_username=mention.source,
+                            account_age_days=100.0,
+                            followers_count=1000,
+                            text=mention.text,
+                            created_at_timestamp=time.time(),
+                            impressions_count=0,
+                            retweet_count=0,
+                            reply_count=0,
+                            quote_count=0,
+                        )
+                        await self.ingest_tweet(tweet)
                     await asyncio.sleep(self._poll_interval)
                 except asyncio.CancelledError:
                     break
+                except Exception as e:
+                    logger.error(f"ReachEngine fallback error: {e}")
+                    await asyncio.sleep(self._poll_interval)
             return
 
         logger.info("XStreamIngester started with Anti-Sybil and Engagement Velocity filters.")

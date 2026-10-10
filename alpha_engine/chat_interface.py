@@ -408,6 +408,24 @@ class ConversationalSupervisor:
 
         return "\n".join(lines)
 
+    async def tool_system_doctor(self) -> str:
+        try:
+            from alpha_engine.reach.doctor import SystemDoctor
+            doctor = SystemDoctor()
+            report = await doctor.run_diagnostics()
+            return doctor.format_cli_summary(report)
+        except Exception as e:
+            return f"System Doctor encountered an error: {e}"
+            
+    async def tool_deep_research(self, query: str) -> str:
+        try:
+            if not self.supervisor:
+                return "AlphaSupervisorAI is not attached, cannot perform deep web audit."
+            result = await self.supervisor.deep_web_audit(query, query)
+            return f"### 🌐 Deep Research Report for {query}\n\n{result}"
+        except Exception as e:
+            return f"Deep Research encountered an error: {e}"
+
     # =========================================================================
     # Conversational RAG Router
     # =========================================================================
@@ -424,6 +442,17 @@ class ConversationalSupervisor:
         if q.startswith("/override") or lower_q.startswith("override ") or lower_q.startswith("تعديل ") or lower_q.startswith("تجاوز "):
             cmd = q.replace("/override", "").replace("override", "").replace("تعديل", "").replace("تجاوز", "").strip()
             return await self.tool_override_parameter(cmd)
+            
+        # 1b. Check for system doctor
+        if lower_q in ("/doctor", "doctor", "فحص النظام", "فحص"):
+            return await self.tool_system_doctor()
+            
+        # 1c. Check for deep research
+        if lower_q.startswith("/research") or lower_q.startswith("research ") or lower_q.startswith("بحث"):
+            target = re.sub(r"^(/research|research|بحث)\s*", "", q, flags=re.IGNORECASE).strip()
+            if target:
+                return await self.tool_deep_research(target)
+            return "Please provide a target for research. Example: `/research $TOKEN`"
 
         # 2. Check for staging queries
         if (

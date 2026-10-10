@@ -78,6 +78,11 @@ def main(args: list[str] | None = None) -> int:
         action="store_true",
         help="Manually reset the trade frequency and pacing governor cooldown and trade counter",
     )
+    parser.add_argument(
+        "--doctor",
+        action="store_true",
+        help="Run system doctor diagnostics",
+    )
     parsed = parser.parse_args(args)
 
     try:
@@ -93,6 +98,13 @@ def main(args: list[str] | None = None) -> int:
     if parsed.chat:
         from alpha_engine.chat_interface import cli_chat
         return asyncio.run(cli_chat(config.db_path))
+
+    if parsed.doctor:
+        from alpha_engine.reach.doctor import SystemDoctor
+        doctor = SystemDoctor()
+        report = asyncio.run(doctor.run_diagnostics())
+        print(doctor.format_cli_summary(report))
+        return 0
 
     if parsed.decisions:
         import sqlite3

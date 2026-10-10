@@ -455,6 +455,22 @@ class AlphaSupervisorAI:
             "outcome_tracker": metrics.model_dump(),
         }
 
+    async def deep_web_audit(self, token_ca: str, token_symbol: str = "", website_url: Optional[str] = None) -> str:
+        """Deep research and due diligence using ReachEngine."""
+        try:
+            from alpha_engine.reach.engine import ReachEngine
+            reach = ReachEngine()
+            report = await reach.perform_deep_research(token_symbol, token_ca, website_url)
+            
+            flags_str = ", ".join(report.flags) if report.flags else "None"
+            audit_result = f"Summary: {report.summary}\nFlags: {flags_str}\nMentions: {len(report.mentions)}"
+            return audit_result
+        except Exception as e:
+            import logging
+            logging.getLogger(__name__).error(f"deep_web_audit error: {e}")
+            return "Audit failed"
+
+
     async def answer_user_query(self, query: str, context: Optional[dict[str, Any]] = None) -> str:
         """
         Conversational endpoint for user queries, explanations, and risk guidance.
@@ -683,6 +699,14 @@ class AlphaSupervisorAI:
             telemetry,
         ) as span:
             resp: Optional[AISupervisorResponse] = None
+
+            try:
+                from alpha_engine.reach.engine import ReachEngine
+                reach = ReachEngine()
+                report = await reach.perform_deep_research(target_token, target_token)
+                telemetry["deep_research_flags"] = report.flags
+            except Exception:
+                pass
 
             # 1. Check if token or initiator is already blacklisted
             initiator = telemetry.get("initiator_wallet", "")
@@ -1070,6 +1094,11 @@ class AlphaSupervisorAI:
         is_secure = True
         honeypot_risk = HoneypotRisk.NONE
         liquidity_health = LiquidityHealth.OPTIMAL
+
+        deep_flags = telemetry.get("deep_research_flags", [])
+        if "PAID_PROMOTION_DETECTED" in deep_flags or "HOLLOW_LANDING_PAGE" in deep_flags:
+            rejection_flags.extend(deep_flags)
+            is_secure = False
 
         # =========================================================================
         # SECTION 1: WALLET & ON-CHAIN PROFILING AUDIT
