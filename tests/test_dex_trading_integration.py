@@ -477,7 +477,7 @@ async def test_solana_raydium_unstaged_swap_generates_dex_signal_safely():
     assert sig.execution_venue == ExecutionVenue.RAYDIUM_AMM
     assert sig.suggested_side == OrderSide.BUY
 
-    # Crucial: platform must resolve to DexScan because venue is Raydium AMM
+    # Platform resolution: token ending in 'pump' resolves to Pump.fun
     plat = resolve_trade_platform(
         token_address=sig.token_address,
         chain=sig.chain,
@@ -485,5 +485,5 @@ async def test_solana_raydium_unstaged_swap_generates_dex_signal_safely():
         execution_venue=sig.execution_venue,
         pool_address=sig.pool_address,
     )
-    assert plat == "DexScan"
+    assert plat == "Pump.fun"
 

@@ -404,12 +404,14 @@ class PendingLaunchBuffer:
                 or staged.latest_price >= staged.initial_price * (Decimal(1) - self.max_dump_pct)
             )
 
-            # Fast-track early graduation: tokens with strong volume (>= 1.2x target)
-            # and sufficient distinct buyers across blocks can graduate early to capture initial breakout upside
+            # Fast-track early graduation: tokens with strong volume (>= 1.5x target)
+            # and sufficient distinct buyers across blocks can graduate early to capture initial breakout upside,
+            # but MUST observe a mandatory minimum age (>= 20s) to prevent graduating into block 0-3 sniper bundles.
             is_fast_track = (
-                staged.total_volume_native >= self.min_volume_native * Decimal("1.2")
-                and len(staged.unique_buyers) >= self.min_unique_signers
-                and len(staged.buy_blocks) >= max(2, self.min_blocks_span)
+                age >= 20.0  # MANDATORY: Prevent graduating into block 0-3 sniper bundles
+                and staged.total_volume_native >= self.min_volume_native * Decimal("1.5")
+                and len(staged.unique_buyers) >= max(3, self.min_unique_signers)
+                and len(staged.buy_blocks) >= max(3, self.min_blocks_span)
                 and is_not_dumped
                 and slot_cluster_pct < self.slot_bundle_threshold
             )

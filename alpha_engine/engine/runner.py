@@ -708,29 +708,17 @@ class PaperTradingEngine:
                     can_reassess = gk.can_reassess(target_token, swap.chain, sol_amount=sol_amount)
                 if (is_buy and sol_amount >= Decimal("0.25")) or can_reassess:
                     logger.info(
-                        "Runner: Previously soft-rejected token %s received impactful buy (%s native). Triggering dynamic reassessment...",
+                        "Runner: Previously soft-rejected token %s received impactful buy (%s native). Spawning dynamic reassessment...",
                         target_token[:10],
                         sol_amount,
                     )
-                    try:
-                        reassessed_rep = await gk.reassess_token(
-                            token_address=target_token,
-                            chain=swap.chain,
-                            pool_address=swap.pool_address,
-                        )
-                        self._record_gatekeeper_eval(
-                            target_token,
-                            swap.chain,
-                            self._extract_gatekeeper_rejection_reason(reassessed_rep),
-                            passed=reassessed_rep.passes_hard_gates,
-                        )
-                        if not reassessed_rep.passes_hard_gates:
-                            continue
-                    except Exception as exc:  # noqa: BLE001
-                        logger.error("Failed dynamic reassessment for %s: %s", target_token[:10], exc)
-                        continue
-                else:
-                    continue
+                    task = asyncio.create_task(
+                        self._async_reassess_token(target_token, swap.chain, swap.pool_address, sol_amount, gk),
+                        name=f"reassess_{target_token[:8]}",
+                    )
+                    self._screening_tasks.add(task)
+                    task.add_done_callback(self._screening_tasks.discard)
+                continue
 
             is_pump = (
                 isinstance(swap, PumpSwapEvent)
@@ -749,36 +737,21 @@ class PaperTradingEngine:
                 and not is_blacklisted_token(target_token, swap.chain)
                 and not gk.is_rejected(target_token, swap.chain)
             ):
-                try:
-                    disc_report = await gk.evaluate_token(
-                        token_address=target_token,
-                        chain=swap.chain,
-                        pool_address=swap.pool_address,
-                    )
-                    disc_reason = self._extract_gatekeeper_rejection_reason(disc_report)
-                    self._record_gatekeeper_eval(target_token, swap.chain, disc_reason, passed=disc_report.passes_hard_gates)
-                    if disc_report.passes_hard_gates:
-                        initial_pool = self.get_or_create_initial_pool_state(swap.chain, target_token, swap.pool_address)
-                        init_price = initial_pool.spot_price_native_per_token if initial_pool else Decimal("0.000000028")
-                        self._pending_launch_buffer.stage_token(
-                            token_address=target_token,
-                            chain=swap.chain,
-                            pool_address=swap.pool_address,
-                            initial_price=init_price,
-                            report=disc_report,
-                            t_0=time.time(),
-                        )
-                        logger.info(
-                            "Auto-discovery fallback: staged %s in PendingLaunchBuffer on buy of %s SOL",
-                            target_token[:10],
-                            sol_amount,
-                        )
-                except Exception as exc:  # noqa: BLE001
-                    logger.error(
-                        "Auto-discovery security evaluation failed for %s: %s",
-                        target_token[:10],
-                        exc,
-                    )
+                # Spawn non-blocking background discovery task
+                task = asyncio.create_task(
+                    self._async_auto_discover_token(
+                        target_token,
+                        swap.chain,
+                        swap.pool_address,
+                        sol_amount,
+                        gk,
+                        buyer=getattr(swap, "buyer", "") or getattr(swap, "sender", ""),
+                        slot=getattr(swap, "slot", 0) or getattr(swap, "block_number", 0),
+                    ),
+                    name=f"auto_discover_{target_token[:8]}",
+                )
+                self._screening_tasks.add(task)
+                task.add_done_callback(self._screening_tasks.discard)
 
             pool = self._pool_registry.get(swap.pool_address)
             if pool is None:
@@ -952,6 +925,84 @@ class PaperTradingEngine:
                                 signal_event.strength.value,
                                 getattr(signal_event.execution_venue, "value", signal_event.execution_venue),
                             )
+
+    async def _async_auto_discover_token(
+        self,
+        token_address: str,
+        chain: ChainIdentifier,
+        pool_address: str,
+        sol_amount: Decimal,
+        gk: Any,
+        buyer: str = "",
+        slot: int = 0,
+    ) -> None:
+        async with self._screening_semaphore:
+            try:
+                disc_report = await gk.evaluate_token(
+                    token_address=token_address, chain=chain, pool_address=pool_address
+                )
+                disc_reason = self._extract_gatekeeper_rejection_reason(disc_report)
+                self._record_gatekeeper_eval(token_address, chain, disc_reason, passed=disc_report.passes_hard_gates)
+                if disc_report.passes_hard_gates and not self._pending_launch_buffer.is_staged(token_address):
+                    initial_pool = self.get_or_create_initial_pool_state(chain, token_address, pool_address)
+                    init_price = initial_pool.spot_price_native_per_token if initial_pool else Decimal("0.000000028")
+                    staged = self._pending_launch_buffer.stage_token(
+                        token_address=token_address,
+                        chain=chain,
+                        pool_address=pool_address,
+                        initial_price=init_price,
+                        report=disc_report,
+                        t_0=time.time(),
+                    )
+                    if staged is not None and sol_amount > Decimal(0):
+                        staged.total_volume_native += sol_amount
+                        staged.buy_count += 1
+                        staged.buy_volumes.append(sol_amount)
+                        if buyer:
+                            staged.unique_buyers.add(buyer)
+                        if slot > 0:
+                            staged.slot_buy_counts[slot] += 1
+                            staged.buy_blocks.add(slot)
+                    logger.info(
+                        "Auto-discovery staged %s in PendingLaunchBuffer (volume: %s native)",
+                        token_address[:10], sol_amount
+                    )
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("Auto-discovery failed for %s: %s", token_address[:10], exc)
+
+    async def _async_reassess_token(
+        self, token_address: str, chain: ChainIdentifier, pool_address: str, sol_amount: Decimal, gk: Any
+    ) -> None:
+        async with self._screening_semaphore:
+            try:
+                reassessed_rep = await gk.reassess_token(
+                    token_address=token_address,
+                    chain=chain,
+                    pool_address=pool_address,
+                )
+                self._record_gatekeeper_eval(
+                    token_address,
+                    chain,
+                    self._extract_gatekeeper_rejection_reason(reassessed_rep),
+                    passed=reassessed_rep.passes_hard_gates,
+                )
+                if reassessed_rep.passes_hard_gates and not self._pending_launch_buffer.is_staged(token_address):
+                    initial_pool = self.get_or_create_initial_pool_state(chain, token_address, pool_address)
+                    init_price = initial_pool.spot_price_native_per_token if initial_pool else Decimal("0.000000028")
+                    self._pending_launch_buffer.stage_token(
+                        token_address=token_address,
+                        chain=chain,
+                        pool_address=pool_address,
+                        initial_price=init_price,
+                        report=reassessed_rep,
+                        t_0=time.time(),
+                    )
+                    logger.info(
+                        "Reassessment staged %s in PendingLaunchBuffer (volume: %s native)",
+                        token_address[:10], sol_amount
+                    )
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("Failed dynamic reassessment for %s: %s", token_address[:10], exc)
 
     async def _async_screen_and_process_news(self, news_event: NewsSignalEvent, gk: Any) -> None:
         async with self._screening_semaphore:
@@ -1473,7 +1524,16 @@ class PaperTradingEngine:
             signal_item: SignalEvent = item
 
             if signal_item.suggested_side == OrderSide.BUY:
-                # 0. Trade Frequency & Cooldown Governor
+                # 0. Reject weak signals or scores below quality threshold
+                min_score = getattr(self._cfg, "min_entry_score", 65.0) / 100.0
+                if signal_item.strength == SignalStrength.WEAK or signal_item.alpha_score < min_score:
+                    logger.debug(
+                        "Dropping BUY signal for %s: alpha_score=%.3f (strength=%s) below threshold %.2f",
+                        signal_item.token_address[:10], signal_item.alpha_score, signal_item.strength.value, min_score
+                    )
+                    continue
+
+                # 0b. Trade Frequency & Cooldown Governor
                 if self.is_trading_paused_by_governor():
                     remaining_cd = max(0.0, self._cooldown_until - time.time())
                     logger.warning(

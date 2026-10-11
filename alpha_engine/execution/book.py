@@ -656,14 +656,15 @@ class PositionBook:
                 if reserve_loss >= Decimal("1.50") or (reserve_loss / lot.peak_pool_reserve_native) >= Decimal("0.05"):
                     reserve_dump_confirmed = True
 
-            # Emergency Liquidity Drain Trigger (> 30% reserve collapse)
+            # Emergency Liquidity Drain Trigger (> 35% reserve collapse with absolute threshold)
             if lot.last_pool_reserve_native > 0 and current_pool_reserve_native < lot.last_pool_reserve_native:
-                drain_pct = (
-                    lot.last_pool_reserve_native - current_pool_reserve_native
-                ) / lot.last_pool_reserve_native
-                if drain_pct > Decimal("0.30"):
+                reserve_drop_abs = lot.last_pool_reserve_native - current_pool_reserve_native
+                drain_pct = reserve_drop_abs / lot.last_pool_reserve_native
+                # For bonding curves, require significant absolute drop (>= 2.5 SOL) to prevent micro-tick false drains
+                min_drop_required = Decimal("2.5") if is_bc else Decimal("0.05")
+                if drain_pct >= Decimal("0.35") and reserve_drop_abs >= min_drop_required:
                     logger.warning(
-                        "LIQUIDITY DRAIN DETECTED for lot %s (%s): reserve dropped %.2f%% from %s to %s. Front-running dump 100%%!",
+                        "LIQUIDITY DRAIN DETECTED for lot %s (%s): reserve dropped %.2f%% (%s -> %s).",
                         lot.lot_id[:8],
                         lot.token_address[:10],
                         float(drain_pct * 100),

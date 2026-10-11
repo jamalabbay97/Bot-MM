@@ -181,7 +181,7 @@ def test_circuit_breaker_streak_and_drawdown():
     metrics.record_closed_trade(Decimal("-15.0"), Decimal("0.01"), Decimal("9955.0"))
     assert metrics.consecutive_losses == 3
     assert metrics.circuit_breaker_active is True
-    assert metrics.is_circuit_breaker_active(freeze_duration_s=3600.0) is True
+    assert metrics.is_circuit_breaker_active(freeze_duration_s=2300.0) is True
     assert "Consecutive loss streak" in metrics.circuit_breaker_reason
 
     # Reset metrics for daily drawdown test

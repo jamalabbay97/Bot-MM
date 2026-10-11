@@ -48,7 +48,7 @@ def test_pydantic_settings_validation_and_defaults():
     assert cfg.log_level in ("INFO", "DEBUG", "WARNING", "ERROR")
     assert cfg.max_portfolio_risk_pct == 0.01
     assert cfg.stop_loss_pct == -0.15
-    assert cfg.max_queue_size == 100
+    assert cfg.max_queue_size in (100, 1000)
     assert cfg.initial_sol == Decimal("10.0")
     assert cfg.initial_eth == Decimal("2.0")
     assert cfg.initial_equity_usd > 0

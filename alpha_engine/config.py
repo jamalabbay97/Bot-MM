@@ -14,6 +14,8 @@ from typing import Any, Optional, Sequence
 from pydantic import AliasChoices, Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from alpha_engine.models.enums import SignalStrength
+
 # Risk and Portfolio State Machine Constants
 MAX_ACTIVE_POSITIONS: int = 4
 MAX_PORTFOLIO_EXPOSURE_PCT: float = 0.05
@@ -196,7 +198,7 @@ class EngineConfig(BaseSettings):
         description="Application logging level (DEBUG, INFO, WARNING, ERROR)",
     )
     max_queue_size: int = Field(
-        default=100,
+        default=1000,
         ge=10,
         le=10000,
         description="Bounded queue limit for event bus to enforce drop_oldest backpressure",
@@ -423,8 +425,12 @@ class EngineConfig(BaseSettings):
     score_weight_structure: float = Field(default=10.0)
     score_weight_narrative: float = Field(default=5.0)
     min_entry_score: float = Field(
-        default=70.0,
+        default=65.0,
         description="Minimum 0-100 score required to trigger a buy signal",
+    )
+    min_signal_strength: SignalStrength = Field(
+        default=SignalStrength.MODERATE,
+        description="Minimum qualitative signal strength required for entry (WEAK, MODERATE, STRONG)",
     )
     
     tp1_pct: float = Field(default=0.20, description="Take Profit 1 (+20%)")
