@@ -124,6 +124,7 @@ class ExitStage(str, Enum):
 
     NONE = "none"
     TP1 = "tp1"             # Scale out 50% (+25% gain or 2x)
+    TARGET_HIT = "tp1"      # Alias for strategy V2
     TP2 = "tp2"             # Sell remaining 50% (+50% gain or 3x)
     TP3 = "tp3"             # Incremental sell at 5x
     TP4 = "tp4"             # Incremental sell at 10x
@@ -151,6 +152,7 @@ class TradeExitReason(str, Enum):
     TIMEOUT = "timeout"                            # Alias for timeout decay
     SLIPPAGE_INSOLVENCY = "slippage_insolvency"    # Curve cannot absorb without > 15% price collapse
     RUG_LIQUIDITY_DRAIN = "rug_liquidity_drain"    # Pool reserves drop below $500
+    LIQUIDITY_RUG = "rug_liquidity_drain"          # Alias for strategy V2
     EMERGENCY_DRAIN = "emergency_drain"            # Pool reserves dropped >30% or insolvency collapse
     EMERGENCY_HONEYPOT_MUTATION = "emergency_honeypot_mutation"  # Contract variables mutated post-entry
     MANUAL_CLOSE = "manual_close"

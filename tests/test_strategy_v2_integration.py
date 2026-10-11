@@ -103,5 +103,67 @@ async def test_v2_strategy_enabled():
     print(f"ExitEngine decision: {should_exit}, {reason}")
     assert should_exit is True
 
+
+@pytest.mark.anyio
+async def test_v2_dynamic_exits_for_swap_execution():
+    from decimal import Decimal
+    import time
+    from alpha_engine.models.events import SwapEvent
+    from alpha_engine.models.enums import ChainIdentifier, OrderSide, LotStatus
+    from alpha_engine.models.state import PoolState, PaperFill, ExitDecision
+    from alpha_engine.execution.executor import PaperExecutor
+
+    config = EngineConfig(strategy_v2_enabled=True)
+    runner = PaperTradingEngine(config)
+    runner._executor = PaperExecutor(position_book=runner._position_book, native_price_usd=Decimal("150.0"))
+
+    token = "FakeTokenAddressFakeTokenAddress123"
+    pool_addr = "FakePoolAddressFakePoolAddress1234"
+
+    fill = PaperFill(
+        order_id="ord_v2_1",
+        chain=ChainIdentifier.SOLANA_MAINNET,
+        token_address=token,
+        pool_address=pool_addr,
+        side=OrderSide.BUY,
+        tokens_acquired=Decimal("1000.0"),
+        effective_price=Decimal("1.0"),
+        simulated_native_spent=Decimal("1000.0"),
+    )
+    lot = runner._position_book.open_lot(fill, signal_id="sig_v2_1", pool_address=pool_addr)
+    lot.peak_pool_reserve_native = Decimal("100.0")
+
+    pool = PoolState(
+        pool_address=pool_addr,
+        chain=ChainIdentifier.SOLANA_MAINNET,
+        token_reserve=Decimal("1000000.0"),
+        native_reserve=Decimal("10.0"),
+        fee_numerator=3000,
+        fee_denominator=1000000,
+        last_updated_block=123456,
+        token_decimals=6,
+        native_decimals=9,
+        token_address=token,
+    )
+
+    swap = SwapEvent(
+        chain=ChainIdentifier.SOLANA_MAINNET,
+        pool_address=pool_addr,
+        token_in=token,
+        token_out="So11111111111111111111111111111111111111112",
+        amount_in=Decimal("100.0"),
+        amount_out=Decimal("1.0"),
+        sender="MakerWallet123MakerWallet123MakerWallet123",
+        timestamp_ns=time.time_ns(),
+        block_number=123456,
+        tx_hash="txhash123txhash123txhash123txhash123",
+    )
+
+    await runner._check_dynamic_exits_for_swap(swap, pool)
+    assert lot.tokens_held == Decimal("0")
+    assert lot.status == LotStatus.CLOSED
+
+
 if __name__ == '__main__':
     asyncio.run(test_v2_strategy_enabled())
+

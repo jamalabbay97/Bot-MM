@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import time
 import uuid
+from dataclasses import dataclass
 from decimal import Decimal
 from typing import Annotated, Any, Optional
 
@@ -401,6 +402,23 @@ class ExitOrder(BaseModel):
     timestamp_ns: int
 
 
+@dataclass
+class ExitDecision:
+    """Represents an autonomous exit decision for a position lot."""
+
+    lot_id: str
+    token_address: str
+    chain: ChainIdentifier
+    should_exit: bool
+    exit_reason: TradeExitReason | None = None
+    exit_stage: ExitStage = ExitStage.NONE
+    tokens_to_sell: Decimal = Decimal(0)
+    current_price: Decimal = Decimal(0)
+    pnl_estimate_native: Decimal = Decimal(0)
+    prioritized: bool = False
+    action: str = "CLOSE"
+
+
 class PortfolioSnapshot(BaseModel):
     """
     Point-in-time snapshot of portfolio state.
@@ -423,4 +441,17 @@ class PortfolioSnapshot(BaseModel):
     sharpe_ratio: float = 0.0
     win_loss_ratio: float = 0.0
     total_gas_spent_usd: Annotated[Decimal, Field(ge=Decimal(0))]
+
+
+__all__ = [
+    "PoolState",
+    "SecurityReport",
+    "PaperFill",
+    "TradeRecord",
+    "OpenPositionLot",
+    "ExitDecision",
+    "ExitOrder",
+    "PortfolioSnapshot",
+]
+
 

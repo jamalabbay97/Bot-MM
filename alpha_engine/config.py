@@ -289,7 +289,7 @@ class EngineConfig(BaseSettings):
     )
     circuit_breaker_freeze_duration_s: float = Field(
         default=3600.0,
-        ge=60.0,
+        ge=0.0,
         description="Duration in seconds to freeze new buys when circuit breaker trips (60 mins)",
     )
     max_portfolio_risk_pct: float = Field(

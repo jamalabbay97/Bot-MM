@@ -272,6 +272,20 @@ class PaperTradingEngine:
         return self._pending_launch_buffer
 
     @staticmethod
+    def _is_new_launch_signal(signal_item: SignalEvent) -> bool:
+        """يحدد إذا كانت العملة إطلاقاً حديثاً أو عملة قديمة/مستقرة."""
+        # عملات الـ Revival وعملات الـ Wave-2 المتماسكة ليست إطلاقاً حديثاً
+        if getattr(signal_item, "exit_profile", None) == ExitProfile.REVIVAL_SWING or str(getattr(signal_item, "exit_profile", "")).lower() == "revival_swing":
+            return False
+        if getattr(signal_item, "source", None) in (SignalSource.REVIVAL_BREAKOUT, SignalSource.WAVE2_BREAKOUT, "revival_breakout", "wave2_breakout"):
+            return False
+        if getattr(signal_item, "token_age_hours", 0.0) and signal_item.token_age_hours > 0.5:
+            return False
+        if getattr(signal_item, "token_age_s", 0.0) and signal_item.token_age_s > 1800.0:
+            return False
+        return True
+
+    @staticmethod
     def _format_number_subscript(price: Any) -> str:
         try:
             val = float(price)
@@ -756,7 +770,8 @@ class PaperTradingEngine:
             pool = self._pool_registry.get(swap.pool_address)
             if pool is None:
                 pool = self._pool_registry.get(target_token)
-            if pool is None and (self._pending_launch_buffer.is_staged(target_token) or self.is_position_open(target_token, swap.chain)):
+            if pool is None:
+                # إنشاء حوض أولي تلقائياً للعملة القديمة لمتابعة صفقاتها بدلاً من إسقاطها
                 pool = self.get_or_create_initial_pool_state(swap.chain, target_token, swap.pool_address)
 
             if pool is None:
@@ -1234,14 +1249,19 @@ class PaperTradingEngine:
                         age_seconds=age_seconds
                     )
                     if should_exit:
-                        from alpha_engine.models.state import ExitDecision, ExitStage
+                        from alpha_engine.models.state import ExitDecision
+                        from alpha_engine.models.enums import ExitStage, TradeExitReason
+                        
+                        is_rug = reason in (TradeExitReason.RUG_LIQUIDITY_DRAIN, TradeExitReason.LIQUIDITY_RUG)
+                        is_sl = reason in (TradeExitReason.SL_HARD, TradeExitReason.SL_INITIAL)
+                        
                         decision = ExitDecision(
                             lot_id=lot.lot_id,
                             token_address=lot.token_address,
                             chain=lot.chain,
                             should_exit=True,
                             exit_reason=reason,
-                            exit_stage=ExitStage.RUGPULL if reason == TradeExitReason.LIQUIDITY_RUG else ExitStage.TARGET_HIT,
+                            exit_stage=ExitStage.RUGPULL if is_rug else (ExitStage.SL if is_sl else ExitStage.TP1),
                             tokens_to_sell=lot.tokens_held,
                             current_price=pool.spot_price_native_per_token,
                             pnl_estimate_native=lot.tokens_held * (pool.spot_price_native_per_token - lot.entry_price),
@@ -1275,10 +1295,13 @@ class PaperTradingEngine:
                             self._cash_sol += exit_fill.simulated_native_spent
 
                         new_equity = self._current_equity_usd()
+                        is_launch = (getattr(lot, "exit_profile", None) != ExitProfile.REVIVAL_SWING and 
+                                     getattr(lot, "bonding_curve_mode", False) is True)
                         self._metrics.record_closed_trade(
                             realized_pnl_usd=exit_pnl_usd,
                             gas_cost_usd=exit_fill.simulated_gas_cost_usd,
                             current_equity_usd=new_equity,
+                            is_new_launch=is_launch,
                         )
                         platform_name = getattr(lot, "platform", None) or getattr(exit_fill, "platform", None) or resolve_trade_platform(
                             token_address=decision.token_address,
@@ -1522,6 +1545,7 @@ class PaperTradingEngine:
                 continue
 
             signal_item: SignalEvent = item
+            is_new_launch = self._is_new_launch_signal(signal_item)
 
             if signal_item.suggested_side == OrderSide.BUY:
                 # 0. Reject weak signals or scores below quality threshold
@@ -1533,22 +1557,29 @@ class PaperTradingEngine:
                     )
                     continue
 
-                # 0b. Trade Frequency & Cooldown Governor
-                if self.is_trading_paused_by_governor():
+                # 0b. تطبيق حاكم الوتيرة على العملات الجديدة فقط
+                if is_new_launch and self.is_trading_paused_by_governor():
                     remaining_cd = max(0.0, self._cooldown_until - time.time())
                     logger.warning(
-                        "Trading Frequency Governor ACTIVE: Pausing BUY signal for %s (cooldown remaining: %.1f minutes).",
+                        "Governor ACTIVE: Pausing NEW LAUNCH signal for %s (Older coins unaffected, cd: %.1fm).",
                         signal_item.token_address[:10],
                         remaining_cd / 60.0,
                     )
                     continue
 
-                # 1. Daily Drawdown & Streak Circuit Breakers (Directive 1)
+                # 1. تطبيق قاطع الدائرة الخاص بالعملات الجديدة فقط دون إيقاف العملات القديمة
                 freeze_dur = getattr(self._cfg, "circuit_breaker_freeze_duration_s", 3600.0)
                 if self._metrics.is_circuit_breaker_active(freeze_duration_s=freeze_dur):
                     logger.warning(
                         "CIRCUIT BREAKER ACTIVE (%s) - Freezing BUY signal for %s",
                         self._metrics.circuit_breaker_reason,
+                        signal_item.token_address[:10],
+                    )
+                    continue
+
+                if is_new_launch and self._metrics.is_launch_circuit_breaker_active(freeze_duration_s=freeze_dur):
+                    logger.warning(
+                        "LAUNCH CIRCUIT BREAKER ACTIVE: Freezing NEW LAUNCH signal for %s (Older/DEX coins continue normally).",
                         signal_item.token_address[:10],
                     )
                     continue
@@ -1564,29 +1595,13 @@ class PaperTradingEngine:
                 
                 if self._cfg.strategy_v2_enabled:
                     metrics_dict = {
-                        "consecutive_losses": self._metrics.consecutive_losses,
+                        "consecutive_losses": self._metrics.consecutive_launch_losses if is_new_launch else self._metrics.consecutive_losses,
                         "daily_drawdown_pct": getattr(self._metrics, "daily_drawdown_pct", 0.0) 
                     }
                     if not self.risk_engine.check_daily_limits(metrics_dict):
                         logger.warning("V2 RiskEngine: Daily limits breached. Dropping BUY signal.")
                         continue
                         
-                    launch_sources = {
-                        SignalSource.PUMP_FUN_MINT,
-                        SignalSource.PAIR_CREATED,
-                        getattr(SignalSource, "RAYDIUM_NEW_POOL", None),
-                        getattr(SignalSource, "MEME_RADAR_BURST", None),
-                        "pump_fun_mint",
-                        "pair_created",
-                        "raydium_new_pool",
-                        "meme_radar_burst",
-                    } - {None}
-                    is_new_launch = (
-                        getattr(signal_item, "source", None) in launch_sources
-                        or str(getattr(signal_item, "source", "")).lower() in ("pump_fun_mint", "pair_created", "raydium_new_pool", "meme_radar_burst")
-                        or "pump" in str(getattr(signal_item, "execution_venue", "")).lower()
-                        or bool(getattr(signal_item, "is_new_launch", False))
-                    )
                     prelim_native = self.risk_engine.calculate_position_size(
                         current_capital=equity_native,
                         score=signal_item.alpha_score * 100.0,
@@ -1682,7 +1697,8 @@ class PaperTradingEngine:
             realized_pnl_usd: Decimal | None = None
 
             if fill.side == OrderSide.BUY:
-                self.record_governor_trade()
+                if is_new_launch:
+                    self.record_governor_trade()
                 initial_reserve = (
                     signal_item.pool_state.native_reserve
                     if signal_item.pool_state
@@ -1796,6 +1812,7 @@ class PaperTradingEngine:
                     realized_pnl_usd=realized_pnl_usd,
                     gas_cost_usd=fill.simulated_gas_cost_usd,
                     current_equity_usd=new_equity,
+                    is_new_launch=is_new_launch,
                 )
 
                 self._trades_since_kelly_refresh += 1
@@ -2277,10 +2294,13 @@ class PaperTradingEngine:
                                 self._cash_sol += exit_fill.simulated_native_spent
 
                             new_equity = self._current_equity_usd()
+                            is_launch = (getattr(lot, "exit_profile", None) != ExitProfile.REVIVAL_SWING and 
+                                         getattr(lot, "bonding_curve_mode", False) is True)
                             self._metrics.record_closed_trade(
                                 realized_pnl_usd=exit_pnl_usd,
                                 gas_cost_usd=exit_fill.simulated_gas_cost_usd,
                                 current_equity_usd=new_equity,
+                                is_new_launch=is_launch,
                             )
 
                             if self._ledger:

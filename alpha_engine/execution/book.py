@@ -22,7 +22,7 @@ from alpha_engine.models.enums import (
     TradeExitReason,
     resolve_trade_platform,
 )
-from alpha_engine.models.state import PaperFill
+from alpha_engine.models.state import ExitDecision, PaperFill
 
 logger = logging.getLogger(__name__)
 
@@ -183,24 +183,6 @@ class OpenLot:
             return True
         return False
 
-
-@dataclass
-class ExitDecision:
-    """
-    Represents an autonomous exit decision for a position lot.
-    """
-
-    lot_id: str
-    token_address: str
-    chain: ChainIdentifier
-    should_exit: bool
-    exit_reason: TradeExitReason | None = None
-    exit_stage: ExitStage = ExitStage.NONE
-    tokens_to_sell: Decimal = Decimal(0)
-    current_price: Decimal = Decimal(0)
-    pnl_estimate_native: Decimal = Decimal(0)
-    prioritized: bool = False
-    action: str = "CLOSE"
 
 
 @dataclass
@@ -1361,17 +1343,20 @@ class RunningMetrics:
     total_gas_usd: Decimal = field(default_factory=lambda: Decimal(0))
     cumulative_realized_usd: Decimal = field(default_factory=lambda: Decimal(0))
 
-    # Circuit Breaker & Streak Tracking (Directive 1)
+    # Circuit Breakers & Streak Tracking (Directive 1)
     consecutive_losses: int = 0
+    consecutive_launch_losses: int = 0  # خاص بالعملات الجديدة فقط
     daily_peak_equity_usd: Decimal = field(default_factory=lambda: Decimal(0))
     daily_start_equity_usd: Decimal = field(default_factory=lambda: Decimal(0))
     daily_drawdown_pct: float = 0.0
     circuit_breaker_active: bool = False
+    launch_circuit_breaker_active: bool = False
     circuit_breaker_tripped_at: float = 0.0
+    launch_circuit_breaker_tripped_at: float = 0.0
     circuit_breaker_reason: str = ""
 
     def is_circuit_breaker_active(self, freeze_duration_s: float = 3600.0) -> bool:
-        """Check if circuit breaker is actively freezing BUY executions."""
+        """Check if global circuit breaker is actively freezing BUY executions."""
         if not self.circuit_breaker_active:
             return False
         import time
@@ -1383,7 +1368,7 @@ class RunningMetrics:
         return True
 
     def trip_circuit_breaker(self, reason: str) -> None:
-        """Trip circuit breaker flag and log critical alert."""
+        """Trip global circuit breaker flag and log critical alert."""
         import time
         self.circuit_breaker_active = True
         self.circuit_breaker_tripped_at = time.time()
@@ -1393,11 +1378,34 @@ class RunningMetrics:
             reason,
         )
 
+    def is_launch_circuit_breaker_active(self, freeze_duration_s: float = 3600.0) -> bool:
+        """يفحص إذا كان تجميد العملات الجديدة فقط نشطاً."""
+        if not self.launch_circuit_breaker_active:
+            return False
+        import time
+        if time.time() - self.launch_circuit_breaker_tripped_at > freeze_duration_s:
+            self.launch_circuit_breaker_active = False
+            self.consecutive_launch_losses = 0
+            logger.info("New-launch circuit breaker freeze elapsed. Resuming launch trades.")
+            return False
+        return True
+
+    def trip_launch_circuit_breaker(self, reason: str) -> None:
+        """تجميد صفقات الإطلاق الجديد فقط مع استمرار العملات القديمة."""
+        import time
+        self.launch_circuit_breaker_active = True
+        self.launch_circuit_breaker_tripped_at = time.time()
+        logger.warning(
+            "LAUNCH_CIRCUIT_BREAKER TRIPPED: %s. Freezing NEW LAUNCHES only. Older/DEX coins will continue trading normally.",
+            reason,
+        )
+
     def record_closed_trade(
         self,
         realized_pnl_usd: Decimal,
         gas_cost_usd: Decimal,
         current_equity_usd: Decimal,
+        is_new_launch: bool = False,
     ) -> None:
         net_pnl = realized_pnl_usd - gas_cost_usd
         self.cumulative_realized_usd += net_pnl
@@ -1407,10 +1415,16 @@ class RunningMetrics:
         if realized_pnl_usd > 0:
             self.gross_profit_usd += realized_pnl_usd
             self.winning_trades += 1
-            self.consecutive_losses = 0
+            if is_new_launch:
+                self.consecutive_launch_losses = 0
+            else:
+                self.consecutive_losses = 0
         elif realized_pnl_usd < 0:
             self.gross_loss_usd += abs(realized_pnl_usd)
-            self.consecutive_losses += 1
+            if is_new_launch:
+                self.consecutive_launch_losses += 1
+            else:
+                self.consecutive_losses += 1
 
         if current_equity_usd > self.peak_equity_usd:
             self.peak_equity_usd = current_equity_usd
@@ -1437,8 +1451,10 @@ class RunningMetrics:
             )
             self.daily_drawdown_pct = max(self.daily_drawdown_pct, daily_dd)
 
-        # Trip circuit breaker if consecutive_losses >= 3 OR daily_drawdown >= 8.0%
-        if self.consecutive_losses >= 3:
+        # تجميد العملات الجديدة فقط عند 3 خسائر متتالية فيها
+        if is_new_launch and self.consecutive_launch_losses >= 3:
+            self.trip_launch_circuit_breaker(f"New launches reached {self.consecutive_launch_losses} consecutive losses")
+        elif not is_new_launch and self.consecutive_losses >= 3:
             self.trip_circuit_breaker(f"Consecutive loss streak reached {self.consecutive_losses}")
         elif self.daily_drawdown_pct >= 8.0:
             self.trip_circuit_breaker(f"Daily drawdown reached {self.daily_drawdown_pct:.2f}% (>= 8.0%)")

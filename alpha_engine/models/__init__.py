@@ -62,6 +62,7 @@ from alpha_engine.models.ai import (
     WalletRiskClassification,
 )
 from alpha_engine.models.state import (
+    ExitDecision,
     ExitOrder,
     OpenPositionLot,
     PaperFill,
@@ -127,6 +128,7 @@ __all__ = [
     "PaperFill",
     "TradeRecord",
     "OpenPositionLot",
+    "ExitDecision",
     "ExitOrder",
     "PortfolioSnapshot",
     # AI Supervisor Models
