@@ -35,21 +35,39 @@ class RiskEngine:
 
         return True
 
-    def calculate_position_size(self, current_capital: Decimal, score: float) -> Decimal:
+    def calculate_position_size(
+        self,
+        current_capital: Decimal,
+        score: float,
+        is_new_launch: bool = False,
+    ) -> Decimal:
         """
         Calculates position size dynamically based on the 0-100 score.
+        Adaptive entry threshold: New launches qualify with score >= 50.0,
+        established setups qualify with >= 55.0.
+        Replaces hard zero-size cutoff with scaled exploratory sizing
+        (0.35-1.0x risk) for moderate-confidence signals.
         """
         max_risk_pct = Decimal(str(self.config.max_per_token_risk_pct))
-        
-        # Scale risk by score. e.g. Score 100 = 100% of max_risk_pct. Score 70 = 70%
-        # Below min_entry_score (e.g. 70), risk is 0.
-        min_score = self.config.min_entry_score
+
+        # Adaptive qualification threshold
+        min_score = 50.0 if is_new_launch else 55.0
         if score < min_score:
             return Decimal("0.0")
 
-        scaling_factor = Decimal(str(score / 100.0))
+        # Scaled sizing:
+        # For scores >= 70.0: standard high-confidence sizing (0.70x - 1.0x max risk)
+        # For scores between min_score and 70.0: scaled exploratory sizing (0.35x - 0.70x max risk)
+        if score >= 70.0:
+            scaling_factor = Decimal(str(min(1.0, score / 100.0)))
+        else:
+            # Linear interpolation from 0.35 at min_score to 0.70 at 70.0
+            score_range = max(1.0, 70.0 - min_score)
+            interp = (score - min_score) / score_range
+            factor = 0.35 + 0.35 * interp
+            scaling_factor = Decimal(str(factor))
+
         target_risk_pct = max_risk_pct * scaling_factor
-        
         return current_capital * target_risk_pct
 
     def check_portfolio_exposure(self, total_exposure: Decimal, current_capital: Decimal) -> bool:

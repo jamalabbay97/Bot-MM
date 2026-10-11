@@ -6,11 +6,10 @@ Enforces Kelly Criterion sizing, dynamic Take-Profit ladders, and absolute veto 
 from __future__ import annotations
 
 import logging
-from decimal import Decimal
 from typing import Any, Optional
 
 from alpha_engine.council.forensic_agent import ChainForensicAgent
-from alpha_engine.council.models import AgentVerdict, AgentVote, CouncilConsensusResult
+from alpha_engine.council.models import AgentVote, CouncilConsensusResult
 from alpha_engine.council.quant_agent import QuantTechnicalsAgent
 from alpha_engine.council.reach_agent import ReachAnalystAgent
 from alpha_engine.models.enums import ChainIdentifier, ExitProfile
@@ -40,10 +39,33 @@ class CouncilArbiterCRO:
         """
         Orchestrates parallel multi-agent evaluation and conducts debate.
         """
-        # 1. Parallel evaluation by Reach, Forensic, and Quant agents
+        # 1. Lifecycle detection
+        is_swing = getattr(signal, "exit_profile", None) == ExitProfile.REVIVAL_SWING
+        token_age_s = getattr(signal, "token_age_s", None)
+        token_age_h = getattr(signal, "token_age_hours", None)
+        sig_source = getattr(signal, "source", None)
+        sig_source_val = getattr(sig_source, "value", str(sig_source)) if sig_source else ""
+
+        is_new_launch = False
+        if not is_swing:
+            if token_age_s is not None and token_age_s <= 1800.0:
+                is_new_launch = True
+            elif token_age_h is not None and token_age_h <= 0.5:
+                is_new_launch = True
+            elif sig_source_val in ("pump_fun_mint", "dex_swap", "dex_discovery", "launch_stage") or "pump" in str(token_ca).lower():
+                is_new_launch = True
+            elif staged_data is not None and hasattr(staged_data, "t_0"):
+                is_new_launch = True
+            elif token_age_s is None and token_age_h is None:
+                # Default for fast token signals without historical age is new launch
+                is_new_launch = True
+
+        # Parallel evaluation by Reach, Forensic, and Quant agents
         reach_task = self.reach_agent.audit_social_narrative(token_ca=token_ca, symbol=symbol, website_url=website_url)
         forensic_res = self.forensic_agent.audit_contract_and_liquidity(token_ca=token_ca, chain=chain, pool=pool, report=report)
-        quant_res = self.quant_agent.analyze_market_dynamics(pool=pool, signal=signal, staged_data=staged_data)
+        quant_res = self.quant_agent.analyze_market_dynamics(
+            pool=pool, signal=signal, staged_data=staged_data, is_revival_swing=is_swing, is_new_launch=is_new_launch
+        )
 
         reach_res = await reach_task
 
@@ -72,12 +94,31 @@ class CouncilArbiterCRO:
             fatal_agent = "QuantTechnicalsAgent"
             debate.append("⚖️ [CRO Arbiter] VETO: Quant Analyst detected vertical green candle FOMO wick.")
 
-        # 4. Consensus Score & Voting
+        # 4. Differentiated Lifecycle Scoring & Voting
+        if is_new_launch:
+            # Fast-Launch Early Momentum Strategy: 60% Forensic, 30% Quant, 10% Reach
+            w_forensic = 0.60
+            w_quant = 0.30
+            w_reach = 0.10
+            strategy_name = "Fast-Launch Early Momentum Strategy"
+        else:
+            # Professional Market Strategy: 35% Forensic, 45% Quant, 20% Reach
+            w_forensic = 0.35
+            w_quant = 0.45
+            w_reach = 0.20
+            strategy_name = "Professional Market Strategy"
+
+        avg_score = (forensic_res.score * w_forensic) + (quant_res.score * w_quant) + (reach_res.score * w_reach)
+        debate.append(f"⚖️ [CRO Arbiter] Strategy: {strategy_name} (Forensic {w_forensic:.0%}, Quant {w_quant:.0%}, Reach {w_reach:.0%}) -> Score {avg_score:.1f}/100")
+
         approvals = sum(1 for v in verdicts.values() if v.vote == AgentVote.APPROVE)
         rejections = sum(1 for v in verdicts.values() if v.vote == AgentVote.REJECT)
-        avg_score = (forensic_res.score * 0.40) + (quant_res.score * 0.35) + (reach_res.score * 0.25)
 
-        should_buy = (fatal_agent is None) and (approvals >= 2) and (rejections == 0) and (avg_score >= 65.0)
+        if is_new_launch:
+            forensic_passed = forensic_res.vote == AgentVote.APPROVE or forensic_res.score >= 70.0
+            should_buy = (fatal_agent is None) and (rejections == 0) and forensic_passed and (avg_score >= 60.0)
+        else:
+            should_buy = (fatal_agent is None) and (approvals >= 2) and (rejections == 0) and (avg_score >= 65.0)
 
         # 5. Position Sizing via Fractional Kelly Criterion
         win_prob = max(0.40, min(0.80, recent_win_rate / 100.0))

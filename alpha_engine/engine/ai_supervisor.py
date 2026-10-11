@@ -310,6 +310,67 @@ class AIOutcomeTracker:
             o.outcome_label = None
 
 
+class DynamicBlacklistTracker:
+    """
+    Dynamic blacklist tracker replacing static sets.
+    Allows non-fatal entities (e.g. temporary volume dryout, soft suspicion) to be re-evaluated
+    when verified market data (CTO, volume surge >= 2x, dev exit) emerges, while permanently
+    blocking confirmed fatal malicious entities (honeypots, drainers).
+    """
+
+    def __init__(self) -> None:
+        self._entries: dict[str, dict[str, Any]] = {}
+
+    def add(self, entity: str, is_fatal: bool = False, reason: str = "") -> None:
+        if not entity:
+            return
+        e_key = entity.lower().strip()
+        self._entries[e_key] = {
+            "is_fatal": is_fatal,
+            "timestamp": time.time(),
+            "reason": reason,
+        }
+
+    def remove(self, entity: str) -> None:
+        if not entity:
+            return
+        self._entries.pop(entity.lower().strip(), None)
+
+    def is_blacklisted(self, entity: str, market_data: Optional[dict[str, Any]] = None) -> bool:
+        if not entity:
+            return False
+        e_key = entity.lower().strip()
+        entry = self._entries.get(e_key)
+        if entry is None:
+            return False
+
+        # Fatal entities are strictly and permanently blacklisted
+        if entry.get("is_fatal", False):
+            return True
+
+        # Non-fatal entities can be re-evaluated if verified market data emerges
+        if market_data:
+            has_cto = bool(market_data.get("is_cto") or market_data.get("community_takeover"))
+            volume_surge = float(market_data.get("volume_surge_multiplier", 1.0) or 1.0) >= 2.0
+            dev_exit = bool(market_data.get("dev_exit_confirmed") or market_data.get("dev_balance_zero"))
+            if has_cto or volume_surge or dev_exit:
+                return False  # Re-evaluation permitted!
+
+        return True
+
+    def __contains__(self, entity: str) -> bool:
+        return self.is_blacklisted(entity)
+
+    def __iter__(self):
+        return iter(self._entries.keys())
+
+    def __len__(self) -> int:
+        return len(self._entries)
+
+    def clear(self) -> None:
+        self._entries.clear()
+
+
 class AlphaSupervisorAI:
     """
     AlphaSupervisor-AI Engine:
@@ -355,7 +416,7 @@ class AlphaSupervisorAI:
         self._strict_veto: bool = getattr(config, "ai_strict_veto", True)
 
         # Dynamic state & memory
-        self._blacklisted_entities: set[str] = set()
+        self._blacklisted_entities: DynamicBlacklistTracker = DynamicBlacklistTracker()
         self._global_risk_mode: GlobalRiskMode = GlobalRiskMode.NEUTRAL
         self._recent_audits: deque[dict[str, Any]] = deque(maxlen=50)
         self._recent_vetoes: deque[dict[str, Any]] = deque(maxlen=50)
@@ -368,6 +429,7 @@ class AlphaSupervisorAI:
         # Extended persistence, pattern memory & dynamic tuning
         self._ledger: Optional[Any] = None
         self._pattern_store: Optional[Any] = None
+        self._parameter_tuner: Optional[Any] = None
 
         # Council Integration
         from alpha_engine.council.arbiter_cro import CouncilArbiterCRO
@@ -392,7 +454,6 @@ class AlphaSupervisorAI:
             symbol=symbol,
             recent_win_rate=self._outcome_tracker.get_metrics().win_rate_pct or 65.0,
         )
-        self._parameter_tuner: Optional[Any] = None
 
     def set_ledger(self, ledger: Any) -> None:
         """Register the SQLite ledger for structured decision audit trail persistence."""
@@ -727,52 +788,65 @@ class AlphaSupervisorAI:
             try:
                 from alpha_engine.reach.engine import ReachEngine
                 reach = ReachEngine()
-                report = await reach.perform_deep_research(target_token, target_token)
+                report = await asyncio.wait_for(
+                    reach.perform_deep_research(target_token, target_token),
+                    timeout=1.5,
+                )
                 telemetry["deep_research_flags"] = report.flags
             except Exception:
                 pass
 
-        # استشارة مجلس الوكلاء الأربعة:
-        council_result = await self.run_council_debate(
-            token_ca=target_token,
-            chain=chain,
-            pool=pool_state,
-            report=security_report,
-            signal=signal,
-        )
-
-        # إذا أصدر مجلس المخاطر فيتو، يتم الرفض فوراً مع تسجيل المناظرة
-        if council_result.decision == "PASS":
-            return AISupervisorResponse(
-                decision=AISupervisorDecisionEnum.PASS,
-                confidence_score=council_result.confidence,
-                action_parameters=ActionParameters(
-                    target_token_address=target_token,
-                    recommended_position_pct=0.0,
-                ),
-                wallet_audit=WalletAudit(
-                    is_wallet_reputable=council_result.fatal_veto_agent is None,
-                    risk_classification=WalletRiskClassification.CABAL_INSIDER if council_result.fatal_veto_agent == "ChainForensicAgent" else WalletRiskClassification.NOVICE_LUCKY,
-                    rationale=f"Council Veto: {council_result.debate_transcript[-1]}",
-                ),
-                security_assessment=SecurityAssessment(
-                    is_secure=council_result.fatal_veto_agent != "ChainForensicAgent",
-                    honeypot_risk=HoneypotRisk.CONFIRMED if council_result.fatal_veto_agent == "ChainForensicAgent" else HoneypotRisk.SUSPICIOUS,
-                    liquidity_health=LiquidityHealth.THIN if council_result.fatal_veto_agent else LiquidityHealth.OPTIMAL,
-                    flags=council_result.verdicts["ChainForensic"].flags + council_result.verdicts["QuantTechnicals"].flags + council_result.verdicts["ReachAnalyst"].flags,
-                ),
-                feedback_tuning=FeedbackTuning(
-                    adjust_global_risk=self._global_risk_mode,
-                    blacklisted_entities=[target_token] if council_result.fatal_veto_agent == "ChainForensicAgent" else [],
-                    insights_learned=council_result.debate_transcript[-1],
-                ),
+            # استشارة مجلس الوكلاء الأربعة:
+            council_result = await self.run_council_debate(
+                token_ca=target_token,
+                chain=chain,
+                pool=pool_state,
+                report=security_report,
+                signal=signal,
             )
 
-            # 1. Check if token or initiator is already blacklisted
+            # Check if Council issued a TRUE FATAL security veto (e.g. ChainForensicAgent honeypot/contract breach)
+            if council_result.fatal_veto_agent is not None:
+                resp = AISupervisorResponse(
+                    decision=AISupervisorDecisionEnum.PASS,
+                    confidence_score=council_result.confidence,
+                    action_parameters=ActionParameters(
+                        target_token_address=target_token,
+                        recommended_position_pct=0.0,
+                        max_slippage_bps=council_result.max_slippage_bps,
+                        hard_stop_loss_pct=council_result.hard_stop_loss_pct,
+                        trailing_stop_activation_pct=council_result.trailing_stop_activation_pct,
+                        time_exit_minutes=council_result.time_exit_minutes,
+                    ),
+                    wallet_audit=WalletAudit(
+                        is_wallet_reputable=False,
+                        risk_classification=WalletRiskClassification.CABAL_INSIDER if council_result.fatal_veto_agent == "ChainForensicAgent" else WalletRiskClassification.NOVICE_LUCKY,
+                        rationale=f"Council Fatal Veto: {council_result.debate_transcript[-1]}",
+                    ),
+                    security_assessment=SecurityAssessment(
+                        is_secure=False,
+                        honeypot_risk=HoneypotRisk.CONFIRMED if council_result.fatal_veto_agent == "ChainForensicAgent" else HoneypotRisk.SUSPICIOUS,
+                        liquidity_health=LiquidityHealth.THIN if council_result.fatal_veto_agent else LiquidityHealth.OPTIMAL,
+                        flags=council_result.verdicts["ChainForensic"].flags + council_result.verdicts["QuantTechnicals"].flags + council_result.verdicts["ReachAnalyst"].flags,
+                    ),
+                    feedback_tuning=FeedbackTuning(
+                        adjust_global_risk=self._global_risk_mode,
+                        blacklisted_entities=[target_token] if council_result.fatal_veto_agent == "ChainForensicAgent" else [],
+                        insights_learned=council_result.debate_transcript[-1],
+                    ),
+                )
+
+            # 1. Check if token or initiator is blacklisted via dynamic tracker
             initiator = telemetry.get("initiator_wallet", "")
-            if target_token in self._blacklisted_entities or (initiator and initiator in self._blacklisted_entities):
-                logger.warning("AlphaSupervisor-AI veto: entity %s is blacklisted", target_token[:10])
-                resp = self._create_blacklist_veto_response(target_token, initiator)
+            if resp is None:
+                market_data = {
+                    "is_cto": getattr(signal, "exit_profile", None) == ExitProfile.REVIVAL_SWING or getattr(signal, "is_cto", False),
+                    "volume_surge_multiplier": getattr(signal, "volume_surge_multiplier", 1.0),
+                    "dev_exit_confirmed": getattr(signal, "dev_exit_confirmed", False) or getattr(sec, "dev_balance_zero", False),
+                }
+                if self._blacklisted_entities.is_blacklisted(target_token, market_data) or (initiator and self._blacklisted_entities.is_blacklisted(initiator, market_data)):
+                    logger.warning("AlphaSupervisor-AI veto: entity %s is blacklisted", target_token[:10])
+                    resp = self._create_blacklist_veto_response(target_token, initiator)
 
             # 2. Try LLM inference if credentials exist and enabled
             if resp is None and self._enabled and self._api_key:
@@ -784,6 +858,28 @@ class AlphaSupervisorAI:
             # 3. Fallback to deterministic institutional heuristics engine
             if resp is None:
                 resp = self.evaluate_deterministic(telemetry)
+
+            # 4. Integrate constructive insights from Council (fractional Kelly sizing & dynamic TP/SL ladders)
+            if council_result.fatal_veto_agent is None and council_result.decision == "EXECUTE_BUY" and resp.decision == AISupervisorDecisionEnum.EXECUTE_BUY:
+                try:
+                    if not resp.action_parameters.take_profit_ladder and council_result.take_profit_ladder:
+                        tp_stages = [
+                            TakeProfitStage(trigger_multiplier=tp["trigger_multiplier"], sell_pct=tp["sell_pct"])
+                            for tp in council_result.take_profit_ladder
+                        ]
+                        updated_action = resp.action_parameters.model_copy(update={"take_profit_ladder": tp_stages})
+                        resp = resp.model_copy(update={"action_parameters": updated_action})
+                except Exception as ex_council:
+                    logger.debug("Failed merging council parameters: %s", ex_council)
+
+            if council_result.debate_transcript:
+                learned = resp.feedback_tuning.insights_learned or ""
+                new_insights = f"{learned}; {council_result.debate_transcript[-1]}".strip("; ")
+                try:
+                    updated_feedback = resp.feedback_tuning.model_copy(update={"insights_learned": new_insights})
+                    resp = resp.model_copy(update={"feedback_tuning": updated_feedback})
+                except Exception as ex_ft:
+                    logger.debug("Failed updating feedback tuning insights: %s", ex_ft)
 
             # Record telemetry and update closed-loop state
             if resp.decision == AISupervisorDecisionEnum.PASS:
@@ -1473,7 +1569,11 @@ class AlphaSupervisorAI:
 
         self._learned_insights.append(insight)
         for b in blacklisted:
-            self._blacklisted_entities.add(b)
+            self._blacklisted_entities.add(
+                b,
+                is_fatal=(attribution in (LossAttribution.RUG_PULL, LossAttribution.MEV_SANDWICH, LossAttribution.CABAL_DUMP)),
+                reason=attribution.value,
+            )
 
         return FeedbackTuning(
             adjust_global_risk=self._global_risk_mode,

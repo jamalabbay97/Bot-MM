@@ -141,15 +141,21 @@ class ReachAnalystAgent:
             score += 10.0  # Legitimate site exists
         score = max(0.0, min(100.0, score))
 
-        if "PAID_BOT_RAID_DETECTED" in flags or score < 40.0:
-            vote = AgentVote.REJECT
-            rationale = f"Unfavorable social momentum: {len(all_posts)} mentions analyzed. Flags: {', '.join(flags) or 'Low sentiment'}"
-        elif score >= 65.0:
+        if len(all_posts) == 0:
+            # Newly launched tokens with no web mentions receive a clean-slate score (65.0)
+            score = 65.0
             vote = AgentVote.APPROVE
-            rationale = f"Strong organic sentiment ({sentiment:+.2f}) across {len(all_posts)} posts on Reddit/X with verified project identity."
+            rationale = "Clean-slate reputation: newly launched token with zero web mentions and clean sentiment slate."
         else:
-            vote = AgentVote.NEUTRAL
-            rationale = f"Moderate sentiment ({sentiment:+.2f}) with limited mentions ({len(all_posts)} posts)."
+            if "PAID_BOT_RAID_DETECTED" in flags or score < 40.0:
+                vote = AgentVote.REJECT
+                rationale = f"Unfavorable social momentum: {len(all_posts)} mentions analyzed. Flags: {', '.join(flags) or 'Low sentiment'}"
+            elif score >= 65.0:
+                vote = AgentVote.APPROVE
+                rationale = f"Strong organic sentiment ({sentiment:+.2f}) across {len(all_posts)} posts on Reddit/X with verified project identity."
+            else:
+                vote = AgentVote.NEUTRAL
+                rationale = f"Moderate sentiment ({sentiment:+.2f}) with limited mentions ({len(all_posts)} posts)."
 
         duration_ms = (time.perf_counter() - t0) * 1000
         return AgentVerdict(

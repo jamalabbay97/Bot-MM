@@ -11,6 +11,7 @@ import asyncio
 import logging
 import random
 import time
+from decimal import Decimal
 from typing import Any, Optional, Sequence
 
 from alpha_engine.ingestion.decoders import SvmPoolMeta
@@ -518,15 +519,26 @@ class IngestionCoordinator:
                         continue
 
             elif isinstance(item, SwapEvent):
-                # Fast-path check: drop incoming swaps for tokens already rejected in negative cache
-                target_token = item.token_in if is_blacklisted_token(item.token_out, item.chain) else item.token_out
+                # Fast-path check: drop incoming swaps for tokens already rejected in negative cache,
+                # unless an impactful buy (>= 0.25 SOL/ETH) or dynamic reassessment eligibility arrives
+                out_is_native = is_blacklisted_token(item.token_out, item.chain)
+                target_token = item.token_in if out_is_native else item.token_out
+                is_buy = not out_is_native
+                sol_amount = item.amount_in if is_buy else item.amount_out
+
                 if self._gatekeeper is not None and getattr(self._gatekeeper, "is_rejected", None):
                     if self._gatekeeper.is_rejected(target_token, item.chain) is True:
-                        logger.debug(
-                            "IngestionCoordinator: Dropping SwapEvent for cached rejected token %s with zero latency",
-                            target_token[:10],
-                        )
-                        continue
+                        can_reassess = False
+                        if hasattr(self._gatekeeper, "can_reassess"):
+                            can_reassess = self._gatekeeper.can_reassess(
+                                target_token, item.chain, sol_amount=sol_amount
+                            )
+                        if not can_reassess and not (is_buy and sol_amount >= Decimal("0.25")):
+                            logger.debug(
+                                "IngestionCoordinator: Dropping SwapEvent for cached rejected token %s with zero latency",
+                                target_token[:10],
+                            )
+                            continue
                 self._metrics_aggregator.record_swap(item)
 
             elif isinstance(item, PoolStateUpdateEvent):

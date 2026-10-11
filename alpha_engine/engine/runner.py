@@ -700,9 +700,37 @@ class PaperTradingEngine:
             is_buy = not out_is_native
             sol_amount = swap.amount_in if is_buy else swap.amount_out
 
-            # Fast-path check: immediately drop swap if token is in negative rejection cache
+            # Fast-path check: immediately drop swap if token is in negative rejection cache,
+            # unless an impactful buy arrives (>= 0.25 SOL/ETH) or it is eligible for dynamic reassessment
             if gk.is_rejected(target_token, swap.chain) is True:
-                continue
+                can_reassess = False
+                if hasattr(gk, "can_reassess"):
+                    can_reassess = gk.can_reassess(target_token, swap.chain, sol_amount=sol_amount)
+                if (is_buy and sol_amount >= Decimal("0.25")) or can_reassess:
+                    logger.info(
+                        "Runner: Previously soft-rejected token %s received impactful buy (%s native). Triggering dynamic reassessment...",
+                        target_token[:10],
+                        sol_amount,
+                    )
+                    try:
+                        reassessed_rep = await gk.reassess_token(
+                            token_address=target_token,
+                            chain=swap.chain,
+                            pool_address=swap.pool_address,
+                        )
+                        self._record_gatekeeper_eval(
+                            target_token,
+                            swap.chain,
+                            self._extract_gatekeeper_rejection_reason(reassessed_rep),
+                            passed=reassessed_rep.passes_hard_gates,
+                        )
+                        if not reassessed_rep.passes_hard_gates:
+                            continue
+                    except Exception as exc:  # noqa: BLE001
+                        logger.error("Failed dynamic reassessment for %s: %s", target_token[:10], exc)
+                        continue
+                else:
+                    continue
 
             is_pump = (
                 isinstance(swap, PumpSwapEvent)
@@ -1483,9 +1511,26 @@ class PaperTradingEngine:
                         logger.warning("V2 RiskEngine: Daily limits breached. Dropping BUY signal.")
                         continue
                         
+                    launch_sources = {
+                        SignalSource.PUMP_FUN_MINT,
+                        SignalSource.PAIR_CREATED,
+                        getattr(SignalSource, "RAYDIUM_NEW_POOL", None),
+                        getattr(SignalSource, "MEME_RADAR_BURST", None),
+                        "pump_fun_mint",
+                        "pair_created",
+                        "raydium_new_pool",
+                        "meme_radar_burst",
+                    } - {None}
+                    is_new_launch = (
+                        getattr(signal_item, "source", None) in launch_sources
+                        or str(getattr(signal_item, "source", "")).lower() in ("pump_fun_mint", "pair_created", "raydium_new_pool", "meme_radar_burst")
+                        or "pump" in str(getattr(signal_item, "execution_venue", "")).lower()
+                        or bool(getattr(signal_item, "is_new_launch", False))
+                    )
                     prelim_native = self.risk_engine.calculate_position_size(
                         current_capital=equity_native,
-                        score=signal_item.alpha_score * 100.0
+                        score=signal_item.alpha_score * 100.0,
+                        is_new_launch=is_new_launch,
                     )
                     preliminary_cost = prelim_native
                     
@@ -2452,6 +2497,19 @@ class PaperTradingEngine:
                         self._telegram._ai_supervisor = self._ai_supervisor
 
                 async def _on_launch_buffer_removal(token_addr: str) -> None:
+                    # Do not unsubscribe if actively monitored in Wave2StagingBuffer, RevivalBreakoutBuffer, or an open position
+                    in_wave2 = bool(self._wave2_buffer and self._wave2_buffer.is_staged(token_addr))
+                    in_revival = bool(self._revival_buffer and self._revival_buffer.is_staged(token_addr))
+                    is_open = bool(self.is_position_open(token_addr))
+                    if in_wave2 or in_revival or is_open:
+                        logger.debug(
+                            "Runner._on_launch_buffer_removal: Retaining WebSocket telemetry for %s (wave2=%s, revival=%s, open_pos=%s)",
+                            token_addr[:10],
+                            in_wave2,
+                            in_revival,
+                            is_open,
+                        )
+                        return
                     if coordinator.svm_ingester:
                         await coordinator.svm_ingester.unsubscribe(token_addr)
 

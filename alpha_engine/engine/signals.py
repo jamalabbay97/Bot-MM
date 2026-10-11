@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import time
 from collections import defaultdict
 from dataclasses import dataclass, field
@@ -394,24 +395,43 @@ class PendingLaunchBuffer:
                 logger.info("PendingLaunchBuffer -> Wave2StagingBuffer: Forwarded expired token %s for dip-reversal monitoring.", staged.token_address[:10])
             return None
 
-        # Graduation criteria check:
-        if age >= self.min_age_s and not staged.is_dev_bundled:
+        # Graduation criteria check (including Fast-Track Early Graduation):
+        if not staged.is_dev_bundled:
             max_slot_buys = max(staged.slot_buy_counts.values()) if staged.slot_buy_counts else 0
             slot_cluster_pct = (max_slot_buys / staged.buy_count) if staged.buy_count > 0 else 0.0
+            is_not_dumped = (
+                staged.initial_price <= Decimal(0)
+                or staged.latest_price >= staged.initial_price * (Decimal(1) - self.max_dump_pct)
+            )
 
-            if (
-                staged.buy_count >= self.min_buys
+            # Fast-track early graduation: tokens with strong volume (>= 1.2x target)
+            # and sufficient distinct buyers across blocks can graduate early to capture initial breakout upside
+            is_fast_track = (
+                staged.total_volume_native >= self.min_volume_native * Decimal("1.2")
+                and len(staged.unique_buyers) >= self.min_unique_signers
+                and len(staged.buy_blocks) >= max(2, self.min_blocks_span)
+                and is_not_dumped
+                and slot_cluster_pct < self.slot_bundle_threshold
+            )
+
+            is_standard_grad = (
+                age >= self.min_age_s
+                and staged.buy_count >= self.min_buys
                 and staged.total_volume_native >= self.min_volume_native
-                and staged.latest_price >= staged.initial_price * (Decimal(1) - self.max_dump_pct)
+                and is_not_dumped
                 and len(staged.unique_buyers) >= self.min_unique_signers
                 and slot_cluster_pct < self.slot_bundle_threshold
                 and len(staged.buy_blocks) >= self.min_blocks_span
-            ):
+            )
+
+            if is_fast_track or is_standard_grad:
                 staged.graduated = True
                 self._notify_removal(staged.token_address)
+                grad_type = "FAST-TRACK" if (is_fast_track and age < self.min_age_s) else "STANDARD"
                 logger.info(
-                    "PendingLaunchBuffer: GRADUATING launch %s! Age=%.1fs, buys=%d, unique_buyers=%d, blocks=%d, vol=%s native",
+                    "PendingLaunchBuffer: GRADUATING launch %s (%s)! Age=%.1fs, buys=%d, unique_buyers=%d, blocks=%d, vol=%s native",
                     staged.token_address[:10],
+                    grad_type,
                     age,
                     staged.buy_count,
                     len(staged.unique_buyers),
@@ -515,9 +535,13 @@ class SignalGenerator:
         report: SecurityReport,
     ) -> float:
         """Compute a normalised alpha score [0.0, 1.0] for a swap event."""
-        volume_ratio = float(
-            min(Decimal("1"), swap.amount_in / pool.native_reserve)
-        )
+        if pool.native_reserve > Decimal(0) and swap.amount_in > Decimal(0):
+            r = float(swap.amount_in / pool.native_reserve)
+            # Logarithmic scaling curve mapping 0.5%-5% pool reserves to 0.45-0.85 volume score,
+            # generating healthy, tradeable alpha scores (65-85) for realistic market trades
+            volume_ratio = min(1.0, max(0.0, (math.log(1.0 + r * 1500.0) / 4.331) * 0.85))
+        else:
+            volume_ratio = 0.0
         spot = pool.spot_price_native_per_token
         exec_p = swap.amount_out / swap.amount_in if swap.amount_in > 0 else spot
         impact_raw = abs(1.0 - float(exec_p / spot)) if float(spot) > 0 else 0.0

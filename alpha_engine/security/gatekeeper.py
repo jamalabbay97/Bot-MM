@@ -7,6 +7,7 @@ Python 3.11+ | aiohttp + web3.py
 
 from __future__ import annotations
 
+from decimal import Decimal
 import logging
 from typing import Any, Optional
 
@@ -93,18 +94,46 @@ def _build_fallback_report(
     )
 
 
+class CachedRejectionEntry(tuple):
+    """
+    Tuple subclass (exp, report) with dynamic probation and reassessment metadata.
+    Preserves backward compatibility for code unpacking (exp, rep).
+    """
+
+    def __new__(
+        cls,
+        exp: float,
+        report: SecurityReport,
+        is_fatal: bool = False,
+        recorded_at: float = 0.0,
+        reason: str = "",
+        unique_buyers: set[str] | None = None,
+        volume_native: Decimal | None = None,
+    ):
+        instance = super().__new__(cls, (exp, report))
+        instance.exp = exp
+        instance.report = report
+        instance.is_fatal = is_fatal
+        instance.recorded_at = recorded_at or time.monotonic()
+        instance.reason = reason
+        instance.unique_buyers = unique_buyers if unique_buyers is not None else set()
+        instance.volume_native = volume_native if volume_native is not None else Decimal("0")
+        return instance
+
+
 class NegativeRejectionCache:
     """
     In-memory sliding-window TTL/LRU Negative Cache for rejected tokens.
-    Prevents repeated expensive external API and RPC security audits on incoming
-    swaps or duplicate discovery signals for already-rejected tokens.
+    Differentiates between Fatal Scams (CONFIRMED_HONEYPOT) and Soft Suspicious / Transitory Flags
+    (unindexed mints, temporary concentration, pending LP burns, unverified metadata).
+    Provides can_reassess() and clear_rejection() to allow dynamic reassessment on market momentum.
     """
 
     def __init__(self, maxsize: int = 5000, ttl_seconds: float = 300.0) -> None:
         self._maxsize = maxsize
         self._ttl = ttl_seconds
-        # maps (token_address.lower(), chain_str) -> (expiry_monotonic, SecurityReport)
-        self._cache: dict[tuple[str, str], tuple[float, SecurityReport]] = {}
+        # maps (token_address.lower(), chain_str) -> CachedRejectionEntry
+        self._cache: dict[tuple[str, str], CachedRejectionEntry] = {}
 
     def _make_key(self, token_address: str, chain: ChainIdentifier | str | None) -> tuple[str, str]:
         c_str = chain.value if isinstance(chain, ChainIdentifier) else (str(chain) if chain else "")
@@ -146,8 +175,12 @@ class NegativeRejectionCache:
         chain: ChainIdentifier | str | None,
         report: SecurityReport | None = None,
         reason: str = "",
+        is_fatal: bool | None = None,
     ) -> None:
-        """Record token rejection status with TTL expiration."""
+        """
+        Record token rejection status with TTL expiration.
+        Differentiates Fatal Scams (full TTL) from Soft Suspicious Flags (probation window 45-60s).
+        """
         if not token_address:
             return
         now = time.monotonic()
@@ -155,11 +188,11 @@ class NegativeRejectionCache:
 
         # LRU eviction if full
         if len(self._cache) >= self._maxsize:
-            expired = [key for key, (exp, _) in self._cache.items() if now >= exp]
+            expired = [key for key, entry in self._cache.items() if now >= entry.exp]
             for exp_k in expired:
                 del self._cache[exp_k]
             if len(self._cache) >= self._maxsize:
-                sorted_keys = sorted(self._cache, key=lambda key: self._cache[key][0])
+                sorted_keys = sorted(self._cache, key=lambda key: self._cache[key].exp)
                 for old_key in sorted_keys[: max(1, self._maxsize // 5)]:
                     self._cache.pop(old_key, None)
 
@@ -170,7 +203,108 @@ class NegativeRejectionCache:
             tier=SecurityTier.TIER1_REJECTED,
             reason=reason or "Negative cache gatekeeper rejection",
         )
-        self._cache[k] = (now + self._ttl, rep)
+
+        reason_lower = (reason or "").lower()
+        report_raw = str(getattr(rep, "external_api_raw", "") or "").lower()
+        is_honeypot = bool(getattr(rep, "is_honeypot", False))
+        sell_tax = getattr(rep, "sell_tax_bps", 0) or 0
+
+        fatal = (
+            is_fatal
+            if is_fatal is not None
+            else (
+                is_honeypot
+                or "confirmed_honeypot" in reason_lower
+                or "honeypot" in reason_lower
+                or "honeypot" in report_raw
+                or "drainer" in reason_lower
+                or sell_tax >= 9000
+            )
+        )
+
+        # Soft-flagged tokens are given a shorter probation window (45-1200s)
+        # In unit tests with small ttl_seconds (< 1200), respect self._ttl
+        ttl = self._ttl if fatal else min(self._ttl, 1200.0)
+
+        self._cache[k] = CachedRejectionEntry(
+            exp=now + ttl,
+            report=rep,
+            is_fatal=fatal,
+            recorded_at=now,
+            reason=reason,
+        )
+
+    def can_reassess(
+        self,
+        token_address: str,
+        chain: ChainIdentifier | str | None = None,
+        sol_amount: Decimal | float | None = None,
+        new_buyers_count: int | None = None,
+    ) -> bool:
+        """
+        Check if a soft-rejected token is eligible for dynamic reassessment.
+        Returns True if not a fatal scam and probation window has passed or significant market interest arrived.
+        """
+        if not token_address:
+            return False
+        k = self._make_key(token_address, chain)
+        entry = self._cache.get(k)
+        if entry is None:
+            return False
+
+        if entry.is_fatal:
+            return False
+
+        now = time.monotonic()
+        # Probation window 45-1200s elapsed
+        if (now - entry.recorded_at) >= 45.0 or now >= entry.exp:
+            return True
+
+        # Significant market momentum arrives (>= 0.25 SOL/ETH)
+        if sol_amount is not None:
+            try:
+                if Decimal(str(sol_amount)) >= Decimal("0.25"):
+                    return True
+            except Exception:
+                pass
+
+        # >= 3 new buyers
+        if new_buyers_count is not None and new_buyers_count >= 3:
+            return True
+        if len(entry.unique_buyers) >= 3:
+            return True
+        if entry.volume_native >= Decimal("0.25"):
+            return True
+
+        return False
+
+    def clear_rejection(self, token_address: str, chain: ChainIdentifier | str | None = None) -> bool:
+        """Clear probation rejection to allow fresh security screening."""
+        if not token_address:
+            return False
+        k = self._make_key(token_address, chain)
+        return self._cache.pop(k, None) is not None
+
+    def record_telemetry(
+        self,
+        token_address: str,
+        chain: ChainIdentifier | str | None = None,
+        sol_amount: Decimal | float | None = None,
+        buyer: str = "",
+    ) -> None:
+        """Record buyer activity and volume for probation monitoring."""
+        if not token_address:
+            return
+        k = self._make_key(token_address, chain)
+        entry = self._cache.get(k)
+        if entry is not None and not entry.is_fatal:
+            if buyer:
+                entry.unique_buyers.add(buyer)
+            if sol_amount is not None:
+                try:
+                    entry.volume_native += Decimal(str(sol_amount))
+                except Exception:
+                    pass
 
     def clear(self) -> None:
         self._cache.clear()
@@ -244,9 +378,49 @@ class SecurityGatekeeper:
         chain: ChainIdentifier | str | None,
         report: SecurityReport | None = None,
         reason: str = "",
+        is_fatal: bool | None = None,
     ) -> None:
         """Explicitly record a rejected token in the negative cache."""
-        self._negative_cache.record_rejection(token_address, chain, report=report, reason=reason)
+        self._negative_cache.record_rejection(token_address, chain, report=report, reason=reason, is_fatal=is_fatal)
+
+    def can_reassess(
+        self,
+        token_address: str,
+        chain: ChainIdentifier | str | None = None,
+        sol_amount: Decimal | float | None = None,
+        new_buyers_count: int | None = None,
+    ) -> bool:
+        """Check if a soft-flagged token is eligible for dynamic reassessment."""
+        return self._negative_cache.can_reassess(
+            token_address, chain, sol_amount=sol_amount, new_buyers_count=new_buyers_count
+        )
+
+    def clear_rejection(
+        self,
+        token_address: str,
+        chain: ChainIdentifier | str | None = None,
+    ) -> bool:
+        """Clear probation rejection to allow fresh security screening."""
+        return self._negative_cache.clear_rejection(token_address, chain)
+
+    async def reassess_token(
+        self,
+        token_address: str,
+        chain: ChainIdentifier = ChainIdentifier.SOLANA_MAINNET,
+        pool_address: str = "",
+        token_age_s: float | None = None,
+    ) -> SecurityReport:
+        """
+        Re-verify whether the token has since locked LP, revoked authorities, or experienced a dev-dump CTO.
+        Clears probation rejection and performs fresh security screening.
+        """
+        self.clear_rejection(token_address, chain)
+        return await self.screen_token(
+            token_address=token_address,
+            chain=chain,
+            pool_address=pool_address,
+            token_age_s=token_age_s,
+        )
 
     @staticmethod
     def evaluate_bundle_heuristics(

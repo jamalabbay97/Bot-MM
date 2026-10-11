@@ -105,6 +105,8 @@ class SignalSource(str, Enum):
     DYNAMIC_EXIT = "dynamic_exit"
     WAVE2_BREAKOUT = "wave2_breakout"
     REVIVAL_BREAKOUT = "revival_breakout"
+    RAYDIUM_NEW_POOL = "raydium_new_pool"
+    MEME_RADAR_BURST = "meme_radar_burst"
 
 
 class LotStatus(str, Enum):

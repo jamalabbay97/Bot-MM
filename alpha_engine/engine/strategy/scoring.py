@@ -52,61 +52,60 @@ class ScoringEngine:
             init_price = float(staging_data.initial_price)
             last_price = float(staging_data.latest_price)
         except AttributeError:
-            return 50.0
+            return 65.0
 
         if init_price == 0:
-            return 50.0
-            
+            return 65.0
+
         growth = (last_price - init_price) / init_price
         if growth > 0.5:
             return 100.0
         if growth > 0.2:
-            return 80.0
-        if growth > 0:
-            return 60.0
-        return 40.0
+            return 85.0
+        if growth >= 0:
+            return 70.0
+        return 50.0
 
     def evaluate_smart_money(self, staging_data: Any) -> float:
         """Score out of 100 for smart money."""
-        score = 50.0
-        
+        score = 65.0
+
         # Check for whale cluster in wave2 StagedToken
         if hasattr(staging_data, "whale_cluster_detected"):
             if not staging_data.whale_cluster_detected:
-                score += 20.0
+                score += 15.0
             else:
-                score -= 20.0
+                score -= 25.0
 
         raw = getattr(staging_data, "raw_signal", None)
         if raw and hasattr(raw, "smart_money_score"):
-            # assuming smart_money_score is between 0 and 1
-            score += getattr(raw, "smart_money_score", 0.0) * 30.0
+            score += getattr(raw, "smart_money_score", 0.0) * 20.0
 
         return max(0.0, min(100.0, score))
 
     def evaluate_narrative(self, staging_data: Any) -> float:
         """Score out of 100 for narrative/AI sentiment."""
-        score = 50.0
+        score = 65.0
         cluster = None
-        
+
         if hasattr(staging_data, "narrative_cluster") and staging_data.narrative_cluster:
             cluster = staging_data.narrative_cluster
         else:
             raw = getattr(staging_data, "raw_signal", None)
             if raw and hasattr(raw, "narrative_cluster") and raw.narrative_cluster:
                 cluster = raw.narrative_cluster
-                
+
         if cluster:
             cluster_lower = cluster.lower()
             if "ai" in cluster_lower:
-                score += 30.0
+                score += 25.0
             elif "dog" in cluster_lower or "cat" in cluster_lower:
-                score += 20.0
+                score += 15.0
             elif "utility" in cluster_lower:
                 score += 10.0
             else:
                 score += 5.0
-            
+
         return max(0.0, min(100.0, score))
 
     def compute_score(self, staging_data: Any, security_report: Any) -> Dict[str, Any]:

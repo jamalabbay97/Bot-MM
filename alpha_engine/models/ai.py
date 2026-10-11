@@ -130,7 +130,13 @@ class SecurityAssessment(BaseModel):
 class FeedbackTuning(BaseModel):
     """Closed-loop feedback and hyperparameter auto-tuning directives."""
 
-    model_config = _STRICT_MODEL_CFG
+    model_config = ConfigDict(
+        frozen=False,
+        arbitrary_types_allowed=True,
+        str_strip_whitespace=True,
+        validate_default=True,
+        populate_by_name=True,
+    )
 
     adjust_global_risk: GlobalRiskMode | str = Field(description="EXPAND, NEUTRAL, or DEFENSIVE")
     blacklisted_entities: list[str] = Field(default_factory=list, description="Toxic addresses or cabal identifiers to blacklist")

@@ -548,8 +548,8 @@ class TelegramIngester:
                 [Button.text("📊 Status", resize=True), Button.text("🧠 AI Supervisor", resize=True), Button.text("📋 Trades", resize=True)],
                 [Button.text("🔍 Assets", resize=True), Button.text("🌊 Staging", resize=True), Button.text("🔄 Revival", resize=True)],
                 [Button.text("🛡️ AI Vetoes", resize=True), Button.text("📈 Performance", resize=True), Button.text("📡 Signals", resize=True)],
-                [Button.text("📰 News", resize=True), Button.text("🐋 Whales", resize=True), Button.text("🏛️ Council", resize=True)],
-                [Button.text("🩺 Doctor", resize=True), Button.text("🌐 Research", resize=True), Button.text("❓ Help", resize=True)],
+                [Button.text("📰 News", resize=True), Button.text("🐋 Whales", resize=True), Button.text("❓ Help", resize=True)],
+                [Button.text("🩺 Doctor", resize=True), Button.text("🌐 Research", resize=True)],
             ]
         except Exception:
             return None
