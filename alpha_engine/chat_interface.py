@@ -430,6 +430,32 @@ class ConversationalSupervisor:
     # Conversational RAG Router
     # =========================================================================
 
+    async def tool_council_debate(self, token_ca: str) -> str:
+        """Runs the 4-agent Council deliberation and formats transcript."""
+        clean_ca = token_ca.strip()
+        if not clean_ca:
+            return "الرجاء إدخال عنوان العقد. مثال: `/council 7xKXtg...`"
+
+        is_evm = clean_ca.startswith("0x") and len(clean_ca) == 42
+        from alpha_engine.models.enums import ChainIdentifier
+        chain = ChainIdentifier.BASE_MAINNET if is_evm else ChainIdentifier.SOLANA_MAINNET
+
+        from alpha_engine.council.arbiter_cro import CouncilArbiterCRO
+        council = CouncilArbiterCRO()
+        res = await council.deliberate(token_ca=clean_ca, chain=chain)
+
+        status_icon = "🟢 APPROVED" if res.decision == "EXECUTE_BUY" else "🔴 VETO / REJECT"
+        lines = [
+            f"### 🏛️ مجلس الوكلاء الأربعة: تقرير المناظرة لعقد `{clean_ca[:12]}...`\n",
+            f"**القرار النهائي للمجلس:** `{status_icon}` | **درجة الإجماع:** `{res.consensus_score*100:.1f}%`",
+            f"**حجم الصفقة المعتمد (Kelly Size):** `{res.recommended_position_pct}%`\n",
+            "**محضر مناظرة الوكلاء (Council Debate Transcript):**",
+        ]
+        for line in res.debate_transcript:
+            lines.append(f"- {line}")
+
+        return "\n".join(lines)
+
     async def ask(self, query: str) -> str:
         """
         Process a natural language question or command using RAG over the
@@ -437,6 +463,10 @@ class ConversationalSupervisor:
         """
         q = query.strip()
         lower_q = q.lower()
+
+        if lower_q.startswith("/council") or lower_q.startswith("/debate") or lower_q.startswith("مناظرة") or lower_q.startswith("المجلس"):
+            target = re.sub(r"^(/council|/debate|مناظرة|المجلس)\s*", "", q, flags=re.IGNORECASE).strip()
+            return await self.tool_council_debate(target)
 
         # 1. Check for command overrides
         if q.startswith("/override") or lower_q.startswith("override ") or lower_q.startswith("تعديل ") or lower_q.startswith("تجاوز "):

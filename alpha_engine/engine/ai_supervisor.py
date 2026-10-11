@@ -368,6 +368,30 @@ class AlphaSupervisorAI:
         # Extended persistence, pattern memory & dynamic tuning
         self._ledger: Optional[Any] = None
         self._pattern_store: Optional[Any] = None
+
+        # Council Integration
+        from alpha_engine.council.arbiter_cro import CouncilArbiterCRO
+        self._council = CouncilArbiterCRO()
+
+    async def run_council_debate(
+        self,
+        token_ca: str,
+        chain: ChainIdentifier,
+        symbol: str = "",
+        pool: Optional[PoolState] = None,
+        report: Optional[SecurityReport] = None,
+        signal: Optional[Any] = None,
+    ) -> Any:
+        """Runs the 4-agent Council deliberation and returns transcript & verdicts."""
+        return await self._council.deliberate(
+            token_ca=token_ca,
+            chain=chain,
+            pool=pool,
+            report=report,
+            signal=signal,
+            symbol=symbol,
+            recent_win_rate=self._outcome_tracker.get_metrics().win_rate_pct or 65.0,
+        )
         self._parameter_tuner: Optional[Any] = None
 
     def set_ledger(self, ledger: Any) -> None:
@@ -707,6 +731,42 @@ class AlphaSupervisorAI:
                 telemetry["deep_research_flags"] = report.flags
             except Exception:
                 pass
+
+        # استشارة مجلس الوكلاء الأربعة:
+        council_result = await self.run_council_debate(
+            token_ca=target_token,
+            chain=chain,
+            pool=pool_state,
+            report=security_report,
+            signal=signal,
+        )
+
+        # إذا أصدر مجلس المخاطر فيتو، يتم الرفض فوراً مع تسجيل المناظرة
+        if council_result.decision == "PASS":
+            return AISupervisorResponse(
+                decision=AISupervisorDecisionEnum.PASS,
+                confidence_score=council_result.confidence,
+                action_parameters=ActionParameters(
+                    target_token_address=target_token,
+                    recommended_position_pct=0.0,
+                ),
+                wallet_audit=WalletAudit(
+                    is_wallet_reputable=council_result.fatal_veto_agent is None,
+                    risk_classification=WalletRiskClassification.CABAL_INSIDER if council_result.fatal_veto_agent == "ChainForensicAgent" else WalletRiskClassification.NOVICE_LUCKY,
+                    rationale=f"Council Veto: {council_result.debate_transcript[-1]}",
+                ),
+                security_assessment=SecurityAssessment(
+                    is_secure=council_result.fatal_veto_agent != "ChainForensicAgent",
+                    honeypot_risk=HoneypotRisk.CONFIRMED if council_result.fatal_veto_agent == "ChainForensicAgent" else HoneypotRisk.SUSPICIOUS,
+                    liquidity_health=LiquidityHealth.THIN if council_result.fatal_veto_agent else LiquidityHealth.OPTIMAL,
+                    flags=council_result.verdicts["ChainForensic"].flags + council_result.verdicts["QuantTechnicals"].flags + council_result.verdicts["ReachAnalyst"].flags,
+                ),
+                feedback_tuning=FeedbackTuning(
+                    adjust_global_risk=self._global_risk_mode,
+                    blacklisted_entities=[target_token] if council_result.fatal_veto_agent == "ChainForensicAgent" else [],
+                    insights_learned=council_result.debate_transcript[-1],
+                ),
+            )
 
             # 1. Check if token or initiator is already blacklisted
             initiator = telemetry.get("initiator_wallet", "")
