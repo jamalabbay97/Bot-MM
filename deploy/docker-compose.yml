@@ -1,37 +1,55 @@
 # ==============================================================================
-# docker-compose.yml — Bot-MM 24/7 Autonomous Daemon Deployment
+# docker-compose.yml — Bot-MM 24/7 Autonomous Daemon & Management Suite
+# Production Hardened | Resource Constrained | Non-Root (UID 10001)
 # ==============================================================================
-version: '3.8'
+
+name: bot-mm-stack
 
 services:
+  # ----------------------------------------------------------------------------
+  # 1. Main Autonomous Trading & Analytics Daemon
+  # ----------------------------------------------------------------------------
   bot-mm:
     build:
-      context: .
+      context: ..
       dockerfile: Dockerfile
       target: runner
+      args:
+        PYTHON_VERSION: "3.12"
+    image: bot-mm:latest
     container_name: bot-mm-engine
     restart: unless-stopped
     user: "10001:10001"
+
+    # Strict Sandboxing & Least-Privilege Capabilities
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+
+    # Trusted Anycast DNS Upstreams (Anti-Sinkhole)
     dns:
       - 1.1.1.1
       - 8.8.8.8
+      - 9.9.9.9
     
     # Secret & Environment Management
-    # Centralized .env file loaded into container environment
     env_file:
-      - .env
+      - ../.env
     environment:
       - PYTHONUNBUFFERED=1
+      - PYTHONFAULTHANDLER=1
       - DB_PATH=/app/data/paper_trading.db
       - LOG_LEVEL=INFO
     
     # Persistent Volume Mappings (SQLite WAL Database & Rotated Logs)
     volumes:
-      - ./data:/app/data:rw
-      - ./logs:/app/logs:rw
-      - ./.env:/app/.env:ro
+      - ../data:/app/data:rw
+      - ../logs:/app/logs:rw
 
-    # Resource Constraints to Prevent Host Exhaustion
+    # Resource Constraints & Capping
+    mem_limit: 1024M
+    cpus: 1.50
     deploy:
       resources:
         limits:
@@ -48,5 +66,51 @@ services:
         max-size: "20m"
         max-file: "5"
 
-    # Stop grace period to allow queue draining & WAL checkpointing
+    # Graceful Shutdown (Allows WAL checkpointing & task cancellation)
+    stop_signal: SIGTERM
     stop_grace_period: 30s
+
+    # Container Health Monitoring
+    healthcheck:
+      test: ["CMD", "python", "-c", "import sys, alpha_engine; sys.exit(0)"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
+
+    networks:
+      - botmm-net
+
+  # ----------------------------------------------------------------------------
+  # 2. Interactive Operator CLI Service
+  # Usage: docker compose run --rm cli --status
+  #        docker compose run --rm cli --doctor
+  #        docker compose run --rm cli --trades
+  # ----------------------------------------------------------------------------
+  cli:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+      target: runner
+      args:
+        PYTHON_VERSION: "3.12"
+    image: bot-mm:latest
+    user: "10001:10001"
+    env_file:
+      - ../.env
+    environment:
+      - PYTHONUNBUFFERED=1
+      - DB_PATH=/app/data/paper_trading.db
+      - LOG_LEVEL=INFO
+    volumes:
+      - ../data:/app/data:rw
+      - ../logs:/app/logs:rw
+    entrypoint: ["/usr/bin/tini", "--", "alpha-engine"]
+    profiles:
+      - tools
+    networks:
+      - botmm-net
+
+networks:
+  botmm-net:
+    driver: bridge

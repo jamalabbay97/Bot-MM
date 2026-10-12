@@ -741,10 +741,9 @@ class PaperTradingEngine:
                     and "pump" in swap.pool_address.lower()
                 )
             )
-            auto_min_vol = Decimal("0.02") if swap.chain == ChainIdentifier.BASE_MAINNET else Decimal("0.5")
+            auto_min_vol = Decimal("0.02") if swap.chain == ChainIdentifier.BASE_MAINNET else (Decimal("0.5") if is_pump else Decimal("1.5"))
             if (
-                is_pump
-                and is_buy
+                is_buy
                 and sol_amount >= auto_min_vol
                 and not self._pending_launch_buffer.is_staged(target_token)
                 and not self.is_position_open(target_token, swap.chain)
@@ -891,55 +890,70 @@ class PaperTradingEngine:
                     signal_event.strength.value,
                 )
             elif not gk.is_rejected(target_token, swap.chain):
-                # Unstaged DEX swap path: evaluate security and check for DEX scalp or buy signal
-                try:
-                    dex_report = await gk.evaluate_token(
-                        token_address=target_token,
-                        chain=swap.chain,
-                        pool_address=swap.pool_address,
-                    )
-                    reason = self._extract_gatekeeper_rejection_reason(dex_report)
-                    self._record_gatekeeper_eval(target_token, swap.chain, reason, passed=dex_report.passes_hard_gates)
-                except Exception as exc:  # noqa: BLE001
-                    logger.error("DEX swap security screening failed for %s: %s", target_token[:10], exc)
-                    dex_report = None
+                # Unstaged DEX swap path: spawn background task to prevent blocking the ingestion queue
+                task = asyncio.create_task(
+                    self._async_evaluate_unstaged_swap(swap, updated_pool, target_token, gk),
+                    name=f"eval_unstaged_{target_token[:8]}"
+                )
+                self._screening_tasks.add(task)
+                task.add_done_callback(self._screening_tasks.discard)
 
-                if dex_report is not None and dex_report.passes_hard_gates:
-                    scalp_decision = self._signal_gen.generate_short_term_scalp_signal(
-                        swap=swap,
-                        pool=updated_pool,
-                        report=dex_report,
-                        metrics_aggregator=self._metrics_aggregator,
-                    )
-                    signal_event = None
-                    if scalp_decision is not None:
-                        signal_event = scalp_decision.to_signal_event(updated_pool, dex_report)
-                    else:
-                        venue = (
-                            ExecutionVenue.RAYDIUM_AMM
-                            if swap.chain == ChainIdentifier.SOLANA_MAINNET
-                            else ExecutionVenue.UNISWAP_V2
-                        )
-                        signal_event = self._signal_gen.generate_buy_signal(
-                            swap, updated_pool, dex_report, execution_venue=venue
-                        )
-                        if signal_event is not None and signal_event.execution_venue != venue:
-                            signal_event = signal_event.model_copy(update={"execution_venue": venue})
+    async def _async_evaluate_unstaged_swap(
+        self,
+        swap: SwapEvent,
+        updated_pool: PoolState,
+        target_token: str,
+        gk: Any,
+    ) -> None:
+        async with self._screening_semaphore:
+            try:
+                dex_report = await gk.evaluate_token(
+                    token_address=target_token,
+                    chain=swap.chain,
+                    pool_address=swap.pool_address,
+                )
+                reason = self._extract_gatekeeper_rejection_reason(dex_report)
+                self._record_gatekeeper_eval(target_token, swap.chain, reason, passed=dex_report.passes_hard_gates)
+            except Exception as exc:  # noqa: BLE001
+                logger.error("DEX swap security screening failed for %s: %s", target_token[:10], exc)
+                return
 
-                    if signal_event is not None:
-                        if not self.is_position_open(signal_event.token_address, signal_event.chain):
-                            if self._ledger:
-                                await self._ledger.record_signal(signal_event)
-                            await self._signal_q.put(signal_event)
-                            logger.info(
-                                "DEX Signal [%s] generated: %s %s alpha=%.3f strength=%s (venue=%s)",
-                                signal_event.signal_id[:8],
-                                signal_event.suggested_side.value.upper(),
-                                signal_event.token_address[:10],
-                                signal_event.alpha_score,
-                                signal_event.strength.value,
-                                getattr(signal_event.execution_venue, "value", signal_event.execution_venue),
-                            )
+            if dex_report is not None and dex_report.passes_hard_gates:
+                scalp_decision = self._signal_gen.generate_short_term_scalp_signal(
+                    swap=swap,
+                    pool=updated_pool,
+                    report=dex_report,
+                    metrics_aggregator=self._metrics_aggregator,
+                )
+                signal_event = None
+                if scalp_decision is not None:
+                    signal_event = scalp_decision.to_signal_event(updated_pool, dex_report)
+                else:
+                    venue = (
+                        ExecutionVenue.RAYDIUM_AMM
+                        if swap.chain == ChainIdentifier.SOLANA_MAINNET
+                        else ExecutionVenue.UNISWAP_V2
+                    )
+                    signal_event = self._signal_gen.generate_buy_signal(
+                        swap, updated_pool, dex_report, execution_venue=venue
+                    )
+                    if signal_event is not None and signal_event.execution_venue != venue:
+                        signal_event = signal_event.model_copy(update={"execution_venue": venue})
+
+                if signal_event is not None:
+                    if not self.is_position_open(signal_event.token_address, signal_event.chain):
+                        if self._ledger:
+                            await self._ledger.record_signal(signal_event)
+                        await self._signal_q.put(signal_event)
+                        logger.info(
+                            "DEX Signal [%s] generated: %s %s alpha=%.3f strength=%s (venue=%s)",
+                            signal_event.signal_id[:8],
+                            signal_event.suggested_side.value.upper(),
+                            signal_event.token_address[:10],
+                            signal_event.alpha_score,
+                            signal_event.strength.value,
+                            getattr(signal_event.execution_venue, "value", signal_event.execution_venue),
+                        )
 
     async def _async_auto_discover_token(
         self,

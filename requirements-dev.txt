@@ -1,0 +1,9 @@
+# ==============================================================================
+# requirements-dev.txt — Development & Test Dependencies for Bot-MM
+# ==============================================================================
+-r requirements.txt
+
+# --- Test Framework & Async Plugins ---
+pytest>=8.0.0,<10.0.0
+pytest-asyncio>=0.23.0,<2.0.0
+anyio>=4.0.0,<5.0.0

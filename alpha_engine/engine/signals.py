@@ -539,9 +539,15 @@ class SignalGenerator:
         """Compute a normalised alpha score [0.0, 1.0] for a swap event."""
         if pool.native_reserve > Decimal(0) and swap.amount_in > Decimal(0):
             r = float(swap.amount_in / pool.native_reserve)
-            # Logarithmic scaling curve mapping 0.5%-5% pool reserves to 0.45-0.85 volume score,
-            # generating healthy, tradeable alpha scores (65-85) for realistic market trades
-            volume_ratio = min(1.0, max(0.0, (math.log(1.0 + r * 1500.0) / 4.331) * 0.85))
+            # Logarithmic scaling curve mapping 0.5%-5% pool reserves to 0.45-0.85 volume score
+            rel_volume_ratio = min(1.0, max(0.0, (math.log(1.0 + r * 1500.0) / 4.331) * 0.85))
+
+            # Absolute volume heuristic for established pools with massive reserves
+            # 1 SOL -> ~0.36, 3 SOL -> ~0.64, 10 SOL -> 1.0
+            abs_vol = float(swap.amount_in)
+            abs_volume_ratio = min(1.0, max(0.0, math.log(1.0 + abs_vol * 2.0) / 3.0))
+
+            volume_ratio = max(rel_volume_ratio, abs_volume_ratio)
         else:
             volume_ratio = 0.0
         spot = pool.spot_price_native_per_token

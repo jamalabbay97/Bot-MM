@@ -1,0 +1,80 @@
+# ==============================================================================
+# .dockerignore — Bot-MM Multi-Chain Engine Zero-Leak Build Context Filter
+# ==============================================================================
+
+# Git and Version Control
+.git/
+.gitignore
+.gitattributes
+.github/
+
+# Python Virtual Environments & Packages
+.venv/
+venv/
+env/
+ENV/
+virtualenv/
+.env_exec/
+*.egg-info/
+.eggs/
+build/
+dist/
+
+# Bytecode & Caches
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Sensitive Credentials, Sessions & Environment Configs
+.env
+.env.*
+*.env
+!.env.example
+*.session
+*.session-journal
+*.session.lock
+*.session-shm
+*.session-wal
+
+# SQLite Databases & Storage Artifacts
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+*.sqlite3-wal
+*.sqlite3-shm
+data/
+paper_trading.db*
+paper_trading.jsonl
+
+# Logs & Runtime Dumps
+logs/
+*.log
+*.log.*
+
+# Testing & Quality Assurance
+tests/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+.nox/
+.tox/
+
+# IDE, Editor & OS Temporary Files
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# Documentation & Markdown (except README.md needed for build metadata)
+docs/
+*.md
+!README.md

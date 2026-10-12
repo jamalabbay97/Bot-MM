@@ -325,8 +325,11 @@ Authorized operators receive an interactive 14-button reply keyboard:
 ```text
 Bot-MM/
 ├── pyproject.toml                         # Package build metadata & dependencies
-├── Dockerfile                             # Multi-stage hardened production Dockerfile
-├── docker-compose.yml                     # 24/7 autonomous daemon deployment spec
+├── requirements.txt                       # Categorized production dependencies
+├── requirements-dev.txt                   # Development & testing dependencies
+├── Dockerfile                             # Multi-stage hardened production Dockerfile (Python 3.12)
+├── docker-compose.yml                     # 24/7 autonomous daemon & CLI deployment spec
+├── .dockerignore                          # Build context sanitization & zero-leak security
 ├── README.md                              # System architecture documentation
 ├── .env.example                           # Template environment configuration
 │
@@ -560,24 +563,35 @@ The repository includes a production-hardened multi-stage `Dockerfile` and a `do
 
 ### Deploy 24/7 with Docker Compose:
 ```bash
-# 1. Build and start the container in the background
+# 1. Build and start the autonomous engine daemon in background
 docker compose up -d --build
 
 # 2. View real-time streaming engine logs
 docker compose logs -f bot-mm
 
-# 3. Check container resource utilization
+# 3. Check container resource utilization & health status
+docker compose ps
 docker stats bot-mm-engine
 
-# 4. Graceful stop (allows 30-second WAL checkpointing)
+# 4. Run interactive operator CLI commands without interrupting the daemon
+docker compose run --rm cli --status
+docker compose run --rm cli --doctor
+docker compose run --rm cli --trades
+
+# 5. Graceful stop (allows 30-second WAL checkpointing & task drain)
 docker compose down
 ```
 
-### Container Hardening Features:
-- **Non-Root Execution**: Runs under unprivileged UID `10001`.
+### Production Container Features:
+- **Fast Layer Caching**: Builds dependencies from `requirements.txt` independently of source code changes.
+- **Process Supervisor (Tini)**: Proper PID 1 init system preventing zombie processes and guaranteeing signal forwarding (`SIGTERM`/`SIGINT`).
+- **Non-Root Execution**: Runs under unprivileged UID/GID `10001:10001` with nologin shell.
+- **Kernel Sandboxing**: Drops all capabilities (`cap_drop: ALL`) and enforces `no-new-privileges:true`.
+- **Healthcheck & Telemetry**: Periodic 30s engine import healthchecks with container health monitoring.
 - **Resource Constraints**: Capped at `1.5` CPUs and `1024 MB` RAM to prevent host starvation.
 - **Log Rotation**: Built-in JSON log rotation (`20MB` max per file, 5 backups).
 - **Persistent Storage**: Maps `./data` and `./logs` volumes for uninterrupted WAL checkpointing.
+- **Zero-Leak Build Context**: Rigorous `.dockerignore` filters secrets, database WALs, and session tokens.
 
 ---
 
