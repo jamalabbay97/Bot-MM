@@ -94,7 +94,8 @@ class SQLiteLedger:
         signal_timestamp_ns INTEGER NOT NULL,
         fill_timestamp_ns   INTEGER NOT NULL,
         created_at          INTEGER NOT NULL,
-        platform            TEXT NOT NULL DEFAULT 'DexScan'
+        platform            TEXT NOT NULL DEFAULT 'DexScan',
+        is_new_launch       INTEGER NOT NULL DEFAULT 0
     )
     """
 
@@ -270,8 +271,10 @@ class SQLiteLedger:
                     await conn.execute("ALTER TABLE trades ADD COLUMN realized_pnl_usd TEXT;")
                 if "platform" not in cols:
                     await conn.execute("ALTER TABLE trades ADD COLUMN platform TEXT NOT NULL DEFAULT 'DexScan';")
+                if "is_new_launch" not in cols:
+                    await conn.execute("ALTER TABLE trades ADD COLUMN is_new_launch INTEGER NOT NULL DEFAULT 0;")
         except Exception as exc:
-            logger.debug("Migration check for trades.platform: %s", exc)
+            logger.debug("Migration check for trades schema: %s", exc)
         await conn.execute("CREATE INDEX IF NOT EXISTS idx_trades_platform ON trades(platform);")
         await conn.execute("CREATE INDEX IF NOT EXISTS idx_signals_ts ON signals(timestamp_ns);")
         await conn.execute("CREATE INDEX IF NOT EXISTS idx_lot_lifecycle_id ON lot_lifecycle(lot_id);")
@@ -301,9 +304,9 @@ class SQLiteLedger:
                 side, native_spent, tokens_delta, effective_price, price_impact_bps,
                 gas_cost_usd, fill_latency_ms, kelly_fraction, portfolio_equity_usd,
                 realized_pnl_usd, signal_timestamp_ns, fill_timestamp_ns, created_at,
-                platform
+                platform, is_new_launch
             ) VALUES (
-                ?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?
+                ?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?
             )
             """,
             (
@@ -327,6 +330,7 @@ class SQLiteLedger:
                 record.fill_timestamp_ns,
                 time.time_ns(),
                 getattr(record, "platform", "DexScan") or "DexScan",
+                1 if getattr(record, "is_new_launch", False) else 0,
             ),
         )
         await conn.commit()
@@ -444,9 +448,11 @@ class SQLiteLedger:
             cur = await conn.execute("PRAGMA table_info(trades)")
             cols = [row[1] for row in await cur.fetchall()]
             has_platform = "platform" in cols
+            has_new_launch = "is_new_launch" in cols
             plat_col = "platform" if has_platform else "'DexScan'"
+            nl_col = "is_new_launch" if has_new_launch else "0"
             query = (
-                f"SELECT chain, token_address, side, effective_price, realized_pnl_usd, created_at, {plat_col} "
+                f"SELECT chain, token_address, side, effective_price, realized_pnl_usd, created_at, {plat_col}, {nl_col} "
                 f"FROM trades ORDER BY created_at DESC LIMIT ?"
             )
             async with conn.execute(query, (limit,)) as cursor:
@@ -461,6 +467,7 @@ class SQLiteLedger:
                         "realized_pnl_usd": r[4],
                         "created_at": r[5],
                         "platform": r[6] or "DexScan",
+                        "is_new_launch": bool(r[7]),
                     })
                 return res
         except Exception as exc:

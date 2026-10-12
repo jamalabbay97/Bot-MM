@@ -82,6 +82,7 @@ class OpenLot:
     volume_surge_multiplier: float = 0.0
     net_buy_delta: float = 0.0
     platform: str = "DexScan"
+    is_new_launch: bool = False
 
     def record_tick(
         self,
@@ -403,6 +404,7 @@ class PositionBook:
             volume_surge_multiplier=volume_surge_multiplier,
             net_buy_delta=net_buy_delta,
             platform=resolved_platform,
+            is_new_launch=getattr(fill, "is_new_launch", False),
             price_history=[(entry_ts, fill.effective_price, fill.simulated_native_spent)],
             tick_prices_5m=[(entry_ts, fill.effective_price)],
             tick_returns_5m=[],

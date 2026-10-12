@@ -355,6 +355,7 @@ class PaperTradingEngine:
             "token_address": lot.token_address,
             "chain": lot.chain,
             "platform": platform_name,
+            "is_new_launch": getattr(lot, "is_new_launch", False),
             "side": "SELL",
             "entry_price": ep,
             "exit_price": xp,
@@ -1698,7 +1699,11 @@ class PaperTradingEngine:
                     logger.error("AlphaSupervisor-AI audit raised for %s: %s", signal_item.token_address[:10], exc)
 
             equity = self._current_equity_usd()
-            fill = await executor.execute_signal(signal_item, portfolio_equity_usd=equity)
+            fill = await executor.execute_signal(
+                signal_item,
+                portfolio_equity_usd=equity,
+                is_new_launch=is_new_launch,
+            )
             if fill is None or fill.effective_price <= Decimal(0):
                 if fill is not None and fill.effective_price <= Decimal(0):
                     logger.warning(
@@ -1869,6 +1874,7 @@ class PaperTradingEngine:
                     "token_address": fill.token_address,
                     "chain": fill.chain,
                     "platform": platform_name,
+                    "is_new_launch": getattr(fill, "is_new_launch", False),
                     "side": "SELL",
                     "entry_price": xp,
                     "exit_price": xp,
@@ -2181,6 +2187,7 @@ class PaperTradingEngine:
                 "trailing_stop_status": trailing_status,
                 "tokens_held": lot.tokens_held,
                 "status": lot.status.value,
+                "is_new_launch": getattr(lot, "is_new_launch", False),
             })
 
         return {

@@ -1871,29 +1871,27 @@ class TelegramIngester:
                     table_row = await cursor.fetchone()
                     if table_row:
                         table_name = table_row[0]
-                        # Check whether table has platform column
+                        # Check whether table has platform and is_new_launch columns
                         has_platform_col = False
+                        has_new_launch_col = False
                         try:
                             async with db.execute(f"PRAGMA table_info({table_name})") as cur_pragma:
                                 col_rows = await cur_pragma.fetchall()
-                                has_platform_col = any(col[1] == "platform" for col in col_rows)
+                                cols = [col[1] for col in col_rows]
+                                has_platform_col = "platform" in cols
+                                has_new_launch_col = "is_new_launch" in cols
                         except Exception:
                             has_platform_col = False
+                            has_new_launch_col = False
 
-                        if has_platform_col:
-                            async with db.execute(
-                                f"SELECT chain, token_address, side, effective_price, realized_pnl_usd, platform "
-                                f"FROM {table_name} "
-                                f"ORDER BY created_at DESC LIMIT 5"
-                            ) as cur:
-                                trade_rows = await cur.fetchall()
-                        else:
-                            async with db.execute(
-                                f"SELECT chain, token_address, side, effective_price, realized_pnl_usd "
-                                f"FROM {table_name} "
-                                f"ORDER BY created_at DESC LIMIT 5"
-                            ) as cur:
-                                trade_rows = await cur.fetchall()
+                        plat_col = "platform" if has_platform_col else "'DexScan'"
+                        nl_col = "is_new_launch" if has_new_launch_col else "0"
+                        async with db.execute(
+                            f"SELECT chain, token_address, side, effective_price, realized_pnl_usd, created_at, {plat_col}, {nl_col} "
+                            f"FROM {table_name} "
+                            f"ORDER BY created_at DESC LIMIT 5"
+                        ) as cur:
+                            trade_rows = await cur.fetchall()
             except Exception as exc:
                 logger.debug("[TelegramIngester] DB trades query error: %s", exc)
 
@@ -1965,7 +1963,8 @@ class TelegramIngester:
                 pos_val = float(t.get("position_value_usd", 0.0))
                 val_str = f" | Value: ${pos_val:.3f}" if pos_val > 0 else ""
 
-                open_lines.append(f"• {state_icon} {short_token} [{platform_str}] ({chain_str})")
+                type_str = "🆕 NEW" if t.get("is_new_launch", False) else "🏛️ ESTAB"
+                open_lines.append(f"• {state_icon} {short_token} [{platform_str}] [{type_str}] ({chain_str})")
                 open_lines.append(f"  PLATFORM: {platform_str} | ENTRY: {entry_p} | CURRENT: {curr_p}{val_str}")
                 open_lines.append(f"  PNL %: {pnl_display} | DUR: {dur_str} | TRAILING: {ts_status}")
                 open_lines.append("-" * 40)
@@ -2005,7 +2004,8 @@ class TelegramIngester:
                 dur_s = int(float(ct.get("duration_s", 0.0)))
                 dur_str = f"{dur_s}s" if dur_s > 0 else "<1s"
 
-                closed_lines.append(f"• {status_icon} {short_token} [{platform_str}] ({chain_str}) | {reason}")
+                type_str = "🆕 NEW" if ct.get("is_new_launch", False) else "🏛️ ESTAB"
+                closed_lines.append(f"• {status_icon} {short_token} [{platform_str}] [{type_str}] ({chain_str}) | {reason}")
                 closed_lines.append(f"  PLATFORM: {platform_str} | ENTRY: {entry_p} | EXIT: {exit_p}")
                 closed_lines.append(f"  PNL %: {pnl_display} | DUR: {dur_str}")
                 closed_lines.append("-" * 40)
@@ -2017,7 +2017,7 @@ class TelegramIngester:
             lines = [
                 "📋 **Last 5 Executed Paper Trades**\n",
                 "```",
-                f"{'TOKEN':<12} | {'PLATFORM':<8} | {'CHAIN':<6} | {'SIDE':<4} | {'FILL PRICE':<12} | {'PNL':<9}",
+                f"{'TOKEN':<10} | {'PLATFORM':<8} | {'TYPE':<5} | {'SIDE':<4} | {'FILL PRICE':<11} | {'PNL':<8}",
                 "-" * 65,
             ]
             for r in trade_rows:
@@ -2027,10 +2027,16 @@ class TelegramIngester:
                 side_str = str(r[2]).upper()
                 fill_p = self._format_price(r[3])
                 pnl_raw = r[4]
-                if len(r) > 5 and r[5]:
+                if len(r) > 6 and r[6]:
+                    platform_str = str(r[6])[:8]
+                elif len(r) > 5 and r[5]:
                     platform_str = str(r[5])[:8]
                 else:
                     platform_str = str(resolve_trade_platform(token_address=token_str, chain=chain_str))[:8]
+
+                type_str = "NEW"
+                if len(r) > 7:
+                    type_str = "NEW" if r[7] else "ESTAB"
 
                 if pnl_raw is not None and str(pnl_raw) != "":
                     try:
@@ -2042,7 +2048,7 @@ class TelegramIngester:
                     pnl_str = "OPEN"
 
                 lines.append(
-                    f"{short_token:<12} | {platform_str:<8} | {chain_str:<6} | {side_str:<4} | {fill_p:<12} | {pnl_str:<9}"
+                    f"{short_token:<10} | {platform_str:<8} | {type_str:<5} | {side_str:<4} | {fill_p:<11} | {pnl_str:<8}"
                 )
             lines.append("```")
             response_sections.append("\n".join(lines))

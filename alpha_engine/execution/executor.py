@@ -82,6 +82,7 @@ class PaperExecutor:
         portfolio_equity_usd: Decimal,
         max_position_fraction: Decimal | None = None,
         apply_drag: bool = False,
+        is_new_launch: bool = False,
     ) -> PaperFill | None:
         """
         Produce a PaperFill for the given signal, or return None if skipped.
@@ -211,6 +212,7 @@ class PaperExecutor:
             kelly_fraction=sizing.capped_fraction,
             portfolio_equity_usd=portfolio_equity_usd,
             platform=platform,
+            is_new_launch=is_new_launch,
         )
 
         logger.info(

@@ -258,6 +258,7 @@ class PaperFill(BaseModel):
     kelly_fraction: Annotated[float, Field(ge=0.0, le=1.0)] = 0.05
     portfolio_equity_usd: Annotated[Decimal, Field(gt=Decimal(0))] = Decimal("10000.0")
     platform: str = Field(default="DexScan", description="Platform source: Pump.fun or DexScan")
+    is_new_launch: bool = False
 
     @model_validator(mode="after")
     def fill_after_signal(self) -> "PaperFill":
@@ -299,6 +300,7 @@ class TradeRecord(BaseModel):
     exit_reason: Optional[TradeExitReason] = None
     exit_stage: Optional[ExitStage] = None
     platform: str = Field(default="DexScan", description="Platform source: Pump.fun or DexScan")
+    is_new_launch: bool = False
     signal_timestamp_ns: int
     fill_timestamp_ns: int
 
@@ -350,6 +352,7 @@ class TradeRecord(BaseModel):
             exit_reason=exit_reason,
             exit_stage=exit_stage,
             platform=resolved_platform,
+            is_new_launch=getattr(fill, "is_new_launch", False),
             signal_timestamp_ns=fill.signal_timestamp_ns,
             fill_timestamp_ns=fill.fill_timestamp_ns,
         )
@@ -382,6 +385,7 @@ class OpenPositionLot(BaseModel):
     tp_stage: int = 0
     base_market_cap: Decimal = Decimal(0)
     platform: str = Field(default="DexScan", description="Platform source: Pump.fun or DexScan")
+    is_new_launch: bool = False
 
 
 class ExitOrder(BaseModel):

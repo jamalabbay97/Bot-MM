@@ -776,6 +776,15 @@ class SignalGenerator:
                 venue = ExecutionVenue.UNISWAP_V2
 
         alpha = self.score_swap(swap, pool, report)
+
+        # Boost alpha for valid scalps based on aggregate momentum, not just the single trigger swap
+        if vol_5m >= Decimal("10.0"):
+            alpha = max(alpha, 0.90)
+        elif vol_5m >= Decimal("3.0"):
+            alpha = max(alpha, 0.75)
+        elif vol_5m >= Decimal("1.0"):
+            alpha = max(alpha, 0.68)
+
         strength = SignalStrength(classify_alpha_score(alpha))
         spot = pool.spot_price_native_per_token
         exec_p = swap.amount_out / swap.amount_in if swap.amount_in > 0 else spot
