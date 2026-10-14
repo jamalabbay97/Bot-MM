@@ -238,6 +238,65 @@ EVM_SYSTEM_ADDRESSES: Set[str] = {
 }
 
 
+def parse_trade_amount_input(text: str) -> tuple[Optional[Decimal], str, Optional[str]]:
+    """
+    Parses trade amount and currency from user input.
+    Supports formats like:
+      - "0.1" -> (0.1, "SOL", None)
+      - "0.1 SOL" -> (0.1, "SOL", None)
+      - "25 USD" or "$25" -> (25.0, "USD", None)
+      - "0.02 ETH" -> (0.02, "ETH", None)
+    Returns: (amount_decimal, currency_str, error_message)
+    """
+    clean = text.strip()
+    # Remove command prefix if present
+    clean = re.sub(r"^/(setamount|amount|tradeamount|تحديد_المبلغ|تحديد المبلغ)\s*", "", clean, flags=re.IGNORECASE).strip()
+    if not clean:
+        return None, "SOL", "❌ يرجى إدخال مبلغ صحيح (مثال: `0.1 SOL` أو `25 USD`)."
+
+    curr = "SOL"
+    lower = clean.lower()
+
+    if "$" in clean or "usd" in lower or "usdt" in lower or "usdc" in lower or "dollar" in lower or "دولار" in lower:
+        curr = "USD"
+    elif "eth" in lower or "ethereum" in lower or "ايثيريوم" in lower:
+        curr = "ETH"
+    elif "sol" in lower or "solana" in lower or "سولانا" in lower:
+        curr = "SOL"
+
+    # Extract numeric part
+    num_str = re.sub(r"[^\d.]", "", clean)
+    if not num_str:
+        return None, curr, "❌ لم يتم العثور على قيمة رقمية صالحة في الإدخال."
+
+    try:
+        amt = Decimal(num_str)
+    except Exception:
+        return None, curr, f"❌ تعذر تحليل الرقم: `{num_str}`. يرجى إدخال قيمة رقمية صحيحة."
+
+    if amt <= Decimal(0):
+        return None, curr, "❌ لا يمكن أن يكون مبلغ التداول صفراً أو سالباً. يجب إدخال قيمة موجبة."
+
+    # Bounds check
+    if curr == "SOL":
+        if amt < Decimal("0.001"):
+            return None, curr, "❌ الحد الأدنى لمبلغ التداول هو 0.001 SOL لتغطية رسوم الشبكة."
+        if amt > Decimal("500.0"):
+            return None, curr, "❌ الحد الأقصى المسموح به هو 500.0 SOL لحماية رصيد المحفظة."
+    elif curr == "USD":
+        if amt < Decimal("0.50"):
+            return None, curr, "❌ الحد الأدنى لمبلغ التداول هو $0.50 USD."
+        if amt > Decimal("100000.0"):
+            return None, curr, "❌ الحد الأقصى المسموح به هو $100,000.0 USD."
+    elif curr == "ETH":
+        if amt < Decimal("0.0001"):
+            return None, curr, "❌ الحد الأدنى لمبلغ التداول هو 0.0001 ETH."
+        if amt > Decimal("50.0"):
+            return None, curr, "❌ الحد الأقصى المسموح به هو 50.0 ETH."
+
+    return amt, curr, None
+
+
 class TelegramIngester:
     """
     Micro-service for scraping Telegram alpha signals and interactive bot management.
@@ -319,6 +378,11 @@ class TelegramIngester:
 
         # Conversational supervisor explainer for RAG & natural language queries
         self._chat_explainer: Optional[Any] = None
+
+        # Interactive state management for direct messages (e.g. sender_id -> "waiting_for_trade_amount")
+        self._pending_user_states: dict[int | str, str] = {}
+        self._manual_trade_amount: Optional[Decimal] = None
+        self._manual_trade_currency: str = "SOL"
 
         # Determine if running in dormant/mock mode
         self._is_dormant = False
@@ -549,7 +613,8 @@ class TelegramIngester:
                 [Button.text("🔍 Assets", resize=True), Button.text("🌊 Staging", resize=True), Button.text("🔄 Revival", resize=True)],
                 [Button.text("🛡️ AI Vetoes", resize=True), Button.text("📈 Performance", resize=True), Button.text("📡 Signals", resize=True)],
                 [Button.text("📰 News", resize=True), Button.text("🐋 Whales", resize=True), Button.text("❓ Help", resize=True)],
-                [Button.text("🩺 Doctor", resize=True), Button.text("🌐 Research", resize=True)],
+                [Button.text("🩺 Doctor", resize=True), Button.text("🌐 Research", resize=True), Button.text("🎯 Strategies", resize=True)],
+                [Button.text("💰 Trade Amount", resize=True), Button.text("💳 Balance", resize=True)],
             ]
         except Exception:
             return None
@@ -562,9 +627,39 @@ class TelegramIngester:
             from telethon import Button
             return [
                 [Button.inline("📊 Live Status", data=b"cmd:status"), Button.inline("🧠 AI Control", data=b"cmd:ai"), Button.inline("📋 Trades", data=b"cmd:trades")],
+                [Button.inline("💰 Trade Amount", data=b"cmd:amount"), Button.inline("💳 Balance", data=b"cmd:balance"), Button.inline("🎯 Strategies", data=b"cmd:strategy")],
                 [Button.inline("🔍 Recent Assets", data=b"cmd:assets"), Button.inline("🌊 Staging", data=b"cmd:staging"), Button.inline("🔄 Revival", data=b"cmd:revival")],
                 [Button.inline("📈 Performance", data=b"cmd:perf"), Button.inline("🛡️ Vetoes", data=b"cmd:vetoes"), Button.inline("📡 Signals", data=b"cmd:signals")],
-                [Button.inline("🩺 Doctor", data=b"cmd:doctor"), Button.inline("🌐 Research", data=b"cmd:research")],
+                [Button.inline("🩺 Doctor", data=b"cmd:doctor"), Button.inline("🌐 Research", data=b"cmd:research"), Button.inline("❓ Help", data=b"cmd:help")],
+            ]
+        except Exception:
+            return None
+
+    def _get_amount_inline_buttons(self) -> Any:
+        """Inline interactive buttons for selecting trade amount presets."""
+        if not TELETHON_AVAILABLE:
+            return None
+        try:
+            from telethon import Button
+            return [
+                [Button.inline("0.05 SOL ⚡", data=b"amt:set_0.05_SOL"), Button.inline("0.1 SOL ⚡", data=b"amt:set_0.1_SOL"), Button.inline("0.25 SOL ⚡", data=b"amt:set_0.25_SOL")],
+                [Button.inline("0.5 SOL 💎", data=b"amt:set_0.5_SOL"), Button.inline("1.0 SOL 💎", data=b"amt:set_1.0_SOL"), Button.inline("2.0 SOL 💎", data=b"amt:set_2.0_SOL")],
+                [Button.inline("$25 USD 💵", data=b"amt:set_25_USD"), Button.inline("$50 USD 💵", data=b"amt:set_50_USD"), Button.inline("$100 USD 💵", data=b"amt:set_100_USD")],
+                [Button.inline("💳 فحص الرصيد", data=b"cmd:balance"), Button.inline("❌ إلغاء /cancel", data=b"amt:cancel")],
+            ]
+        except Exception:
+            return None
+
+    def _get_strategy_inline_buttons(self) -> Any:
+        """Inline interactive buttons for managing trading strategies."""
+        if not TELETHON_AVAILABLE:
+            return None
+        try:
+            from telethon import Button
+            return [
+                [Button.inline("🚀 Peak Trail 50% (+50% TP)", data=b"strat:peak50"), Button.inline("🦅 Peak Trail 60% (+60% TP)", data=b"strat:peak60")],
+                [Button.inline("🏛️ Default Strategy", data=b"strat:default"), Button.inline("🔄 Auto-Trade On/Off", data=b"strat:toggle_auto")],
+                [Button.inline("🎯 Screener Exclusive", data=b"strat:toggle_screener"), Button.inline("📊 Live Status", data=b"cmd:status")],
             ]
         except Exception:
             return None
@@ -804,8 +899,18 @@ class TelegramIngester:
                         await self._safe_reply(event, resp)
                 elif cmd == "research":
                     await self._safe_reply(event, "Please use /research <target> command for deep web research.")
+                elif cmd in ("strategy", "strategies"):
+                    await self._cmd_strategies(event, "")
+                elif cmd in ("amount", "setamount", "tradeamount"):
+                    await self._cmd_set_amount(event, "", sender_id)
+                elif cmd in ("balance", "wallet"):
+                    await self._cmd_balance(event)
                 elif cmd == "help":
                     await self._cmd_start_help(event)
+            elif data.startswith("strat:"):
+                await self._handle_strategy_callback(event, data)
+            elif data.startswith("amt:"):
+                await self._handle_amount_callback(event, data, sender_id)
             elif data.startswith("inv:"):
                 target_id = data[4:].strip()
                 if self._chat_explainer and hasattr(self._chat_explainer, "tool_investigate_asset"):
@@ -1051,7 +1156,33 @@ class TelegramIngester:
         parts = lower_clean.split()
         first_token = parts[0].split("@")[0] if parts else ""
 
-        if first_token in ("/start", "/help", "help", "start", "مساعدة", "تعليمات"):
+        # Check pending interactive state (e.g. waiting for trade amount input)
+        if sender_id is not None and self._pending_user_states.get(sender_id) == "waiting_for_trade_amount":
+            if first_token in ("/cancel", "cancel", "إلغاء", "الغاء"):
+                await self._cmd_cancel(event, sender_id)
+                return
+            elif not first_token.startswith("/") or first_token in ("/setamount", "/amount", "/tradeamount"):
+                await self._handle_pending_trade_amount_input(event, clean_text, sender_id)
+                return
+            else:
+                self._pending_user_states.pop(sender_id, None)
+
+        if first_token in ("/cancel", "cancel", "إلغاء", "الغاء"):
+            await self._cmd_cancel(event, sender_id)
+        elif lower_clean.startswith(("trade amount", "مبلغ التداول", "تحديد المبلغ")) or first_token in (
+            "/setamount", "/amount", "/tradeamount", "setamount", "amount", "trade_amount", "مبلغ_التداول", "تحديد_المبلغ"
+        ):
+            args = ""
+            if not lower_clean.startswith(("trade amount", "مبلغ التداول", "تحديد المبلغ")):
+                parts_clean = clean_text.split()
+                if len(parts_clean) > 1:
+                    args = clean_text[len(parts_clean[0]):].strip()
+            await self._cmd_set_amount(event, args, sender_id)
+        elif first_token in ("/getamount", "/currentamount", "getamount", "currentamount", "المبلغ الحالي", "المبلغ_الحالي"):
+            await self._cmd_get_amount(event)
+        elif first_token in ("/balance", "/wallet", "balance", "wallet", "الرصيد", "المحفظة", "رصيد", "محفظة"):
+            await self._cmd_balance(event)
+        elif first_token in ("/start", "/help", "help", "start", "مساعدة", "تعليمات"):
             await self._cmd_start_help(event)
         elif first_token in ("/status", "status", "حالة", "الحالة"):
             await self._cmd_status(event)
@@ -1198,6 +1329,9 @@ class TelegramIngester:
             elif self._chat_explainer:
                 resp = await self._chat_explainer.ask(clean_text)
                 await self._safe_reply(event, resp)
+        elif first_token in ("/strategy", "/strategies", "strategy", "strategies", "استراتيجية", "الاستراتيجية", "الاستراتيجيات"):
+            args = clean_text[len(clean_text.split()[0]):].strip() if len(clean_text.split()) > 1 else ""
+            await self._cmd_strategies(event, args)
         elif first_token in ("/scan", "scan", "سكان"):
             args = clean_text[len(clean_text.split()[0]):].strip() if len(clean_text.split()) > 1 else ""
             await self._cmd_scan(event, args, sender_id)
@@ -1212,6 +1346,7 @@ class TelegramIngester:
             "**المشرف الذكي:** AlphaSupervisor-AI نشط 🧠\n\n"
             "📊 **المراقبة والقياسات (Telemetry & Performance):**\n"
             "• `/status` — تقرير مباشر: Uptime، الذاكرة، رأس المال، PnL، والقوائم.\n"
+            "• `/strategy` — إعدادات واستراتيجيات التداول (Trailing Stop 50%/60%, Take-Profit, Auto-Trade).\n"
             "• `/trades` — المراكز المفتوحة النشطة والصفقات المغلقة مع الأسعار.\n"
             "• `/perf [hours]` — أداء الاستراتيجيات وأنماط التداول الأعلى فوزاً (Win Rate).\n"
             "• `/exit <CA|ID>` — شرح سبب إغلاق صفقة معينة وتفاصيل الوقف المتحرك.\n\n"
@@ -1232,6 +1367,11 @@ class TelegramIngester:
             "• `/scan <CA>` — فحص عقد فوري وتمريره لخط الأمان والتنفيذ.\n"
             "• `/news` — آخر الأخبار العاجلة وتحليل المشاعر اللحظي.\n"
             "• `/whales` — تنبيهات حركة الحيتان والمحافظ الذكية.\n\n"
+            "💰 **مبلغ التداول وإدارة المحفظة (Trade Sizing & Wallet):**\n"
+            "• `/setamount [amount]` — تحديد وتثبيت مبلغ التداول (مثال: `0.1 SOL` أو `$50 USD`).\n"
+            "• `/getamount` — عرض مبلغ التداول المعتمد حالياً وحالته.\n"
+            "• `/balance` — فحص الرصيد المتاح، كفاية السيولة، ومخاطر الغاز.\n"
+            "• `/cancel` — إلغاء إدخال المبلغ الحالي والعودة للوضع الطبيعي.\n\n"
             "⚙️ **التحكم والحوكمة (Engine Controls):**\n"
             "• `/override <param> <val>` — تعديل المعاملات (risk, blacklist, ttl, surge_k).\n"
             "• `/reset_governor` — إعادة ضبط حاكم وتيرة التداول (Trading Governor).\n"
@@ -1322,7 +1462,8 @@ class TelegramIngester:
             f"📈 **الأرباح المحققة (Realized PnL):** `{pnl_str}`\n"
             f"📦 **المراكز النشطة - Active Lots:** `{open_lots_val}`\n"
             f"🎯 **معدل النجاح (Win Rate WR):** `{wr_str}`\n"
-            f"📉 **أقصى تراجع (Max Drawdown MDD):** `{mdd_str}`\n\n"
+            f"📉 **أقصى تراجع (Max Drawdown MDD):** `{mdd_str}`\n"
+            f"💵 **مبلغ التداول المعتمد:** `{self._get_current_trade_amount_display()[0]}`\n\n"
             "🚦 **قوائم الانتظار (Queue Backlog):**\n"
             f"   • Ingest: `{ingest_q_size}/{ingest_q_max}`\n"
             f"   • Signal: `{signal_q_size}/{signal_q_max}`\n\n"
@@ -1845,6 +1986,435 @@ class TelegramIngester:
         ])
         await self._safe_reply(event, "\n".join(reply_lines))
 
+    async def _cmd_strategies(self, event: Any, args: str = "") -> None:
+        """Handle /strategy command: view, switch, and configure trading strategies."""
+        target = self.execution_target
+        status: dict[str, Any] = {}
+        if target and hasattr(target, "get_strategy_status"):
+            status = target.get_strategy_status()
+        elif target and hasattr(target, "config"):
+            cfg = target.config
+            status = {
+                "active_strategy": getattr(cfg, "active_strategy", "peak_trailing_50"),
+                "trailing_stop_from_peak_pct": getattr(cfg, "trailing_stop_from_peak_pct", 0.50),
+                "custom_take_profit_pct": getattr(cfg, "custom_take_profit_pct", 0.50),
+                "custom_stop_loss_pct": getattr(cfg, "custom_stop_loss_pct", 0.50),
+                "auto_trade_enabled": getattr(cfg, "auto_trade_enabled", True),
+                "screener_exclusive_focus": getattr(cfg, "screener_exclusive_focus", False),
+                "min_market_cap_usd": float(getattr(cfg, "min_market_cap_usd", 10000.0)),
+            }
+        else:
+            status = {
+                "active_strategy": "peak_trailing_50",
+                "trailing_stop_from_peak_pct": 0.50,
+                "custom_take_profit_pct": 0.50,
+                "custom_stop_loss_pct": 0.50,
+                "auto_trade_enabled": True,
+                "screener_exclusive_focus": False,
+                "min_market_cap_usd": 10000.0,
+            }
+
+        args_clean = args.strip()
+        if args_clean and target and hasattr(target, "set_trading_strategy"):
+            parts = args_clean.split()
+            subcmd = parts[0].lower()
+            if subcmd == "set" and len(parts) > 1:
+                preset = parts[1].lower()
+                status = target.set_trading_strategy(strategy_name=preset)
+            elif subcmd in ("tp", "takeprofit") and len(parts) > 1:
+                try:
+                    val = float(parts[1].replace("%", "")) / 100.0
+                    status = target.set_trading_strategy(custom_take_profit_pct=val)
+                except ValueError:
+                    pass
+            elif subcmd in ("trail", "trailing") and len(parts) > 1:
+                try:
+                    val = float(parts[1].replace("%", "")) / 100.0
+                    status = target.set_trading_strategy(trailing_stop_from_peak_pct=val)
+                except ValueError:
+                    pass
+            elif subcmd in ("sl", "stoploss") and len(parts) > 1:
+                try:
+                    val = float(parts[1].replace("%", "")) / 100.0
+                    status = target.set_trading_strategy(custom_stop_loss_pct=val)
+                except ValueError:
+                    pass
+            elif subcmd in ("mcap", "mincap") and len(parts) > 1:
+                try:
+                    val = float(parts[1].replace("$", "").replace(",", ""))
+                    status = target.set_trading_strategy(min_market_cap_usd=val)
+                except ValueError:
+                    pass
+            elif subcmd in ("autotrade", "auto") and len(parts) > 1:
+                enable_flag = parts[1].lower() in ("on", "true", "1", "enable", "yes")
+                status = target.set_trading_strategy(auto_trade_enabled=enable_flag)
+            elif subcmd in ("screener", "focus") and len(parts) > 1:
+                focus_flag = parts[1].lower() in ("on", "true", "1", "enable", "yes")
+                status = target.set_trading_strategy(screener_exclusive_focus=focus_flag)
+
+            elif subcmd in ("amount", "amt", "tradeamount") and len(parts) > 1:
+                amt_input = args_clean[len(parts[0]):].strip()
+                amt_parsed, curr_parsed, err = parse_trade_amount_input(amt_input)
+                if not err and amt_parsed is not None:
+                    status = target.set_trading_strategy(manual_trade_amount=amt_parsed, manual_trade_currency=curr_parsed)
+                    self._manual_trade_amount = amt_parsed
+                    self._manual_trade_currency = curr_parsed
+
+        strat_name = status.get("active_strategy", "peak_trailing_50")
+        trail_pct = float(status.get("trailing_stop_from_peak_pct", 0.50) or 0.50) * 100.0
+        tp_val = status.get("custom_take_profit_pct")
+        tp_str = f"+{float(tp_val)*100.0:.0f}%" if tp_val is not None else "Dynamic Ladder (Default)"
+        sl_val = status.get("custom_stop_loss_pct")
+        sl_str = f"-{float(sl_val)*100.0:.0f}% from ATH Peak" if strat_name.startswith("peak") else "Dynamic / -8% VWAP"
+        auto_trade = status.get("auto_trade_enabled", True)
+        screener_focus = status.get("screener_exclusive_focus", False)
+        min_mcap = status.get("min_market_cap_usd", 10000.0)
+        amt_disp, _ = self._get_current_trade_amount_display()
+
+        lines = [
+            "🎯 **Trading Strategy & Execution Controls**",
+            "━━━━━━━━━━━━━━━━━━━━━━━━━",
+            f"• **Active Strategy:** `{strat_name}`",
+            f"• **Trade Amount:** `{amt_disp}`",
+            f"• **Trailing Stop-Loss:** `{trail_pct:.0f}%` (from Highest ATH Peak)",
+            f"• **Take-Profit Target:** `{tp_str}`",
+            f"• **Stop-Loss Rationale:** `{sl_str}`",
+            f"• **Automated Execution:** `{'🟢 ENABLED' if auto_trade else '🔴 DISABLED (Audit/Paper Only)'}`",
+            f"• **Graduated & Movers Focus:** `{'🟢 EXCLUSIVE (Graduated & Movers Only)' if screener_focus else '⚪ ALL COINS'}`",
+            f"• **Minimum Market Cap:** `${min_mcap:,.0f} USD`",
+            "",
+            "💡 *Tap a preset button below or use commands:*",
+            "• `/setamount <amount>` — Set fixed trade amount (e.g. 0.1 SOL, $50 USD)",
+            "• `/balance` — Check available wallet balance & risk safety",
+            "• `/strategy set peak50` — Trail 50% from ATH, +50% TP",
+            "• `/strategy set peak60` — Trail 60% from ATH, +60% TP",
+            "• `/strategy set default` — Restore default ladders & stops",
+            "• `/strategy tp 50` — Set take-profit percentage",
+            "• `/strategy trail 50` — Set trailing stop from peak",
+            "• `/strategy mcap 10000` — Set minimum market cap ($10,000+)",
+            "• `/strategy autotrade <on|off>` — Toggle auto-trade",
+            "• `/strategy screener <on|off>` — Toggle exclusive screener focus",
+        ]
+        msg = "\n".join(lines)
+        await self._safe_reply(event, msg, buttons=self._get_strategy_inline_buttons())
+
+    async def _handle_strategy_callback(self, event: Any, data: str) -> None:
+        """Handle strategy inline button taps."""
+        target = self.execution_target
+        if not target or not hasattr(target, "set_trading_strategy"):
+            await self._safe_reply(event, "⚠️ Trading Engine strategy controller not available.")
+            return
+
+        action = data[6:].strip()  # Remove "strat:"
+        status = target.get_strategy_status() if hasattr(target, "get_strategy_status") else {}
+
+        if action == "peak50":
+            target.set_trading_strategy(strategy_name="peak_trailing_50", custom_take_profit_pct=0.50, trailing_stop_from_peak_pct=0.50)
+            await self._safe_reply(event, "✅ Strategy switched to: **Peak Trailing 50%** (+50% Take-Profit, 50% Trailing Stop from ATH).")
+        elif action == "peak60":
+            target.set_trading_strategy(strategy_name="peak_trailing_60", custom_take_profit_pct=0.60, trailing_stop_from_peak_pct=0.60)
+            await self._safe_reply(event, "✅ Strategy switched to: **Peak Trailing 60%** (+60% Take-Profit, 60% Trailing Stop from ATH).")
+        elif action == "default":
+            target.set_trading_strategy(strategy_name="default")
+            await self._safe_reply(event, "✅ Strategy switched to: **Default Programmed Strategy** (Preserving classic TP ladders).")
+        elif action == "toggle_auto":
+            new_val = not status.get("auto_trade_enabled", True)
+            target.set_trading_strategy(auto_trade_enabled=new_val)
+            state_str = "🟢 ENABLED" if new_val else "🔴 DISABLED"
+            await self._safe_reply(event, f"✅ Automated trade execution is now **{state_str}**.")
+        elif action == "toggle_screener":
+            new_val = not status.get("screener_exclusive_focus", False)
+            target.set_trading_strategy(screener_exclusive_focus=new_val)
+            state_str = "🟢 EXCLUSIVE (Graduated & Movers Only)" if new_val else "⚪ ALL COINS"
+            await self._safe_reply(event, f"✅ Screener focus is now **{state_str}**.")
+
+        await self._cmd_strategies(event, "")
+
+    async def _handle_amount_callback(self, event: Any, data: str, sender_id: Any = None) -> None:
+        """Handle inline button taps for trade amount selection."""
+        action = data[4:].strip()  # Remove 'amt:'
+        if action == "cancel":
+            await self._cmd_cancel(event, sender_id)
+            return
+
+        if action == "prompt":
+            await self._cmd_set_amount(event, "", sender_id)
+            return
+
+        if action.startswith("set_"):
+            raw_param = action[4:]  # e.g. '0.1_SOL' or '50_USD'
+            parts = raw_param.split("_")
+            if len(parts) >= 2:
+                val_str, curr = parts[0], parts[1]
+                try:
+                    amt = Decimal(val_str)
+                    if sender_id is not None:
+                        self._pending_user_states.pop(sender_id, None)
+                    self._apply_trade_amount(amt, curr)
+                    approx_info = self._calculate_equivalent_value_str(amt, curr)
+                    reply_msg = (
+                        "✅ **تم تحديث وتثبيت مبلغ التداول بنجاح!**\n"
+                        "━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                        f"• **المبلغ المعتمد الجديد:** `{amt} {curr}` {approx_info}\n"
+                        f"• **حالة التطبيق:** 🟢 نشط على جميع الصفقات الجديدة دون استثناء\n"
+                        f"• **الحفظ الدائم:** 💾 محفوظ في قاعدة البيانات الدائمة\n\n"
+                        "ℹ️ سيستخدم البوت هذا المبلغ في جميع العمليات القادمة حتى تقوم بتغييره."
+                    )
+                    await self._safe_reply(event, reply_msg, buttons=self.get_default_keyboard_markup())
+                except Exception as exc:
+                    logger.warning("Error applying trade amount preset: %s", exc)
+                    await self._safe_reply(event, f"❌ حدث خطأ أثناء تطبيق المبلغ: {exc}")
+
+    async def _cmd_set_amount(self, event: Any, args: str = "", sender_id: Any = None) -> None:
+        """Handle /setamount command in DMs."""
+        clean_args = args.strip()
+        if not clean_args:
+            # No argument provided -> Prompt user and show preset inline buttons
+            if sender_id is not None:
+                self._pending_user_states[sender_id] = "waiting_for_trade_amount"
+
+            curr_amt, _ = self._get_current_trade_amount_display()
+            msg = (
+                "💰 **تحديد مبلغ التداول (Set Trade Amount)**\n"
+                "━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                f"• **المبلغ المعتمد حالياً:** `{curr_amt}`\n\n"
+                "اختر أحد المبالغ الجاهزة من الأزرار أدناه، أو **أرسل المبلغ الذي تريده مباشرة في المحادثة**.\n"
+                "*(أمثلة صالحة: `0.1` أو `0.25 SOL` أو `$50` أو `100 USD`)*\n\n"
+                "📌 **القواعد والتأكيدات:**\n"
+                "1. سيتم تطبيق هذا المبلغ على جميع الصفقات الجديدة تلقائياً دون استثناء.\n"
+                "2. الصفقات المفتوحة مسبقاً لن تتأثر ولن يتم تعديل حجمها.\n"
+                "3. يتم حفظ المبلغ بشكل دائم ولن يُفقد بعد إعادة تشغيل البوت.\n"
+                "4. يمكنك إلغاء العملية في أي وقت عبر إرسال `/cancel`."
+            )
+            await self._safe_reply(event, msg, buttons=self._get_amount_inline_buttons())
+            return
+
+        amt, curr, err = parse_trade_amount_input(clean_args)
+        if err or amt is None:
+            await self._safe_reply(
+                event,
+                f"{err}\n\n💡 أرسل `/setamount` للاختيار من القائمة، أو `/cancel` للإلغاء.",
+                buttons=self._get_amount_inline_buttons(),
+            )
+            return
+
+        if sender_id is not None:
+            self._pending_user_states.pop(sender_id, None)
+
+        self._apply_trade_amount(amt, curr)
+        approx_info = self._calculate_equivalent_value_str(amt, curr)
+
+        reply_msg = (
+            "✅ **تم تحديث مبلغ التداول وتثبيته بنجاح!**\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"• **المبلغ المعتمد الجديد:** `{amt} {curr}` {approx_info}\n"
+            f"• **حالة التطبيق:** 🟢 نشط على جميع الصفقات الجديدة دون استثناء\n"
+            f"• **الحفظ الدائم:** 💾 محفوظ في قاعدة البيانات الدائمة\n\n"
+            "ℹ️ **ملاحظة:** الصفقات المفتوحة حالياً ستبقى بحجمها الأصلي دون أي تعديل.\n"
+            "قبل فتح أي صفقة جديدة، سيتحقق البوت دائماً من توفر رصيد كافٍ لتغطية المبلغ والغاز."
+        )
+        await self._safe_reply(event, reply_msg, buttons=self.get_default_keyboard_markup())
+
+    async def _cmd_get_amount(self, event: Any) -> None:
+        """Handle /getamount command in DMs."""
+        amt_disp, curr_disp = self._get_current_trade_amount_display()
+        is_manual = self._is_manual_trade_amount_active()
+
+        target = self.execution_target
+        balance_summary: dict[str, Any] = {}
+        if target and hasattr(target, "get_balance_summary"):
+            try:
+                balance_summary = target.get_balance_summary()
+            except Exception:
+                pass
+
+        avail_sol = balance_summary.get("available_cash_sol", "N/A")
+        avail_usd = balance_summary.get("available_cash_usd", "N/A")
+
+        lines = [
+            "💰 **مبلغ التداول المعتمد حالياً (Current Trade Amount)**",
+            "━━━━━━━━━━━━━━━━━━━━━━━━━",
+            f"• **القيمة المعتمدة:** `{amt_disp}`",
+            f"• **النمط:** `{'🟢 محدد يدويًا (Manual Override)' if is_manual else '⚪ افتراضي (Dynamic Kelly Sizing)'}`",
+            f"• **نطاق التطبيق:** جميع الصفقات الجديدة (Graduated, Movers, Scalps, New Mints)",
+            f"• **الحفظ الدائم:** 💾 دائم ومحفوظ في قاعدة البيانات",
+            "",
+            f"💳 **الرصيد المتاح حالياً:** `{avail_sol} SOL` (≈ `${avail_usd} USD`)",
+            "",
+            "💡 لتغيير المبلغ في أي وقت، استخدم `/setamount <المبلغ>` أو اضغط الزر أدناه.",
+        ]
+        msg = "\n".join(lines)
+        await self._safe_reply(event, msg, buttons=self._get_amount_inline_buttons())
+
+    async def _cmd_balance(self, event: Any) -> None:
+        """Handle /balance command in DMs."""
+        target = self.execution_target
+        summary: dict[str, Any] = {}
+        if target and hasattr(target, "get_balance_summary"):
+            try:
+                summary = target.get_balance_summary()
+            except Exception as e:
+                logger.debug("Failed getting balance summary: %s", e)
+
+        amt_disp, curr_disp = self._get_current_trade_amount_display()
+
+        cash_sol = summary.get("available_cash_sol", "0.0")
+        cash_usd = summary.get("available_cash_usd", "0.0")
+        total_sol = summary.get("total_equity_sol", "0.0")
+        total_usd = summary.get("total_equity_usd", "0.0")
+        pos_count = summary.get("open_positions_count", 0)
+        sol_price = summary.get("sol_price_usd", "150.0")
+
+        # Check sufficiency against current manual amount
+        sufficiency_status = "⚪ غير محدد (Dynamic Sizing)"
+        if self._manual_trade_amount is not None:
+            try:
+                trade_amt_sol = self._manual_trade_amount
+                if self._manual_trade_currency == "USD":
+                    trade_amt_sol = self._manual_trade_amount / Decimal(str(sol_price))
+
+                avail = Decimal(str(cash_sol))
+                gas_est = Decimal("0.005")
+                if avail >= (trade_amt_sol + gas_est):
+                    sufficiency_status = "🟢 كافٍ لتنفيذ الصفقات الجديدة"
+                else:
+                    deficit = (trade_amt_sol + gas_est) - avail
+                    sufficiency_status = f"🔴 غير كافٍ! (عجز قدره {deficit:.4f} SOL)"
+            except Exception:
+                sufficiency_status = "⚪ تعذر التقييم"
+
+        msg = (
+            "💳 **تقرير الرصيد والمحفظة (Wallet Balance & Risk Audit)**\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"• **الرصيد المتاح للتداول:** `{cash_sol} SOL` (≈ `${cash_usd} USD`)\n"
+            f"• **إجمالي حقوق المحفظة (Equity):** `{total_sol} SOL` (≈ `${total_usd} USD`)\n"
+            f"• **عدد الصفقات المفتوحة حالياً:** `{pos_count}` صفقات\n"
+            f"• **سعر SOL الحالي:** `${sol_price} USD`\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"• **مبلغ التداول المعتمد:** `{amt_disp}`\n"
+            f"• **حالة كفاية الرصيد:** {sufficiency_status}\n\n"
+            "🛡️ *حماية المحفظة:* لا ينفذ البوت أي صفقة إذا كان الرصيد غير كافٍ لتغطية المبلغ المحدد مع رسوم الغاز، وسيقوم بإرسال تنبيه فوري بدلاً من فتح الصفقة."
+        )
+        await self._safe_reply(event, msg, buttons=self._get_amount_inline_buttons())
+
+    async def _cmd_cancel(self, event: Any, sender_id: Any = None) -> None:
+        """Handle /cancel command in DMs."""
+        had_state = False
+        if sender_id is not None and sender_id in self._pending_user_states:
+            self._pending_user_states.pop(sender_id, None)
+            had_state = True
+
+        msg = "✅ **تم إلغاء عملية تعديل المبلغ.**" if had_state else "ℹ️ لا توجد عمليات معلقة لإلغائها."
+        await self._safe_reply(event, msg, buttons=self.get_default_keyboard_markup())
+
+    async def _handle_pending_trade_amount_input(self, event: Any, text: str, sender_id: Any) -> None:
+        """Handle user text input when in waiting_for_trade_amount state."""
+        amt, curr, err = parse_trade_amount_input(text)
+        if err or amt is None:
+            await self._safe_reply(
+                event,
+                f"{err}\n\n💡 أعد المحاولة بإدخال مبلغ صالح (مثال: `0.1` أو `25 USD`)، أو أرسل `/cancel` للإلغاء.",
+                buttons=self._get_amount_inline_buttons(),
+            )
+            return
+
+        self._pending_user_states.pop(sender_id, None)
+        self._apply_trade_amount(amt, curr)
+        approx_info = self._calculate_equivalent_value_str(amt, curr)
+
+        reply_msg = (
+            "✅ **تم اعتماد وتثبيت مبلغ التداول بنجاح!**\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"• **المبلغ المعتمد الجديد:** `{amt} {curr}` {approx_info}\n"
+            f"• **نطاق التطبيق:** 🟢 جميع الصفقات الجديدة دون استثناء\n"
+            f"• **الحفظ الدائم:** 💾 تم حفظ الإعداد في قاعدة البيانات الدائمة\n\n"
+            "ℹ️ سيستخدم البوت هذا المبلغ في كل صفقاته القادمة حتى تقوم بتغييره مجدداً."
+        )
+        await self._safe_reply(event, reply_msg, buttons=self.get_default_keyboard_markup())
+
+    def _apply_trade_amount(self, amount: Decimal, currency: str) -> dict[str, Any]:
+        """Apply trade amount to execution target and local ingester state."""
+        self._manual_trade_amount = amount
+        self._manual_trade_currency = currency
+        target = self.execution_target
+        res: dict[str, Any] = {}
+        if target and hasattr(target, "set_manual_trade_amount"):
+            res = target.set_manual_trade_amount(amount, currency)
+        elif target and hasattr(target, "set_trading_strategy"):
+            res = target.set_trading_strategy(manual_trade_amount=amount, manual_trade_currency=currency)
+        else:
+            res = {
+                "manual_trade_amount": str(amount),
+                "manual_trade_currency": currency,
+                "status": "success",
+            }
+
+        # Backup save to SQLite if target not wired yet
+        if not target and self._db_path and aiosqlite is not None:
+            try:
+                loop = asyncio.get_running_loop()
+                async def _save_db():
+                    try:
+                        async with aiosqlite.connect(self._db_path) as db:
+                            await db.execute(
+                                "CREATE TABLE IF NOT EXISTS bot_settings (key TEXT PRIMARY KEY, value TEXT, updated_at REAL)"
+                            )
+                            now = time.time()
+                            await db.execute(
+                                "INSERT OR REPLACE INTO bot_settings (key, value, updated_at) VALUES (?, ?, ?)",
+                                ("manual_trade_amount", str(amount), now),
+                            )
+                            await db.execute(
+                                "INSERT OR REPLACE INTO bot_settings (key, value, updated_at) VALUES (?, ?, ?)",
+                                ("manual_trade_currency", currency, now),
+                            )
+                            await db.commit()
+                    except Exception as err:
+                        logger.debug("Failed saving setting to db in ingester: %s", err)
+                loop.create_task(_save_db())
+            except RuntimeError:
+                pass
+
+        return res
+
+    def _get_current_trade_amount_display(self) -> tuple[str, str]:
+        """Get formatted display of current trade amount and unit."""
+        target = self.execution_target
+        if target and hasattr(target, "get_manual_trade_amount"):
+            data = target.get_manual_trade_amount()
+            amt = data.get("manual_trade_amount")
+            curr = data.get("manual_trade_currency", "SOL")
+            if amt is not None:
+                return f"{amt} {curr}", curr
+        if self._manual_trade_amount is not None:
+            return f"{self._manual_trade_amount} {self._manual_trade_currency}", self._manual_trade_currency
+        return "افتراضي (Dynamic Sizing / Kelly)", "SOL"
+
+    def _is_manual_trade_amount_active(self) -> bool:
+        """Check whether manual trade amount override is currently active."""
+        target = self.execution_target
+        if target and hasattr(target, "get_manual_trade_amount"):
+            return target.get_manual_trade_amount().get("manual_trade_amount") is not None
+        return self._manual_trade_amount is not None
+
+    def _calculate_equivalent_value_str(self, amt: Decimal, curr: str) -> str:
+        """Calculate approximate counterpart currency string for user reference."""
+        sol_price = 150.0
+        target = self.execution_target
+        if target and hasattr(target, "_current_sol_price_usd"):
+            try:
+                sol_price = float(target._current_sol_price_usd)
+            except Exception:
+                pass
+
+        if curr == "SOL":
+            val_usd = float(amt) * sol_price
+            return f"(≈ ${val_usd:,.2f} USD)"
+        elif curr == "USD":
+            val_sol = float(amt) / sol_price if sol_price > 0 else 0.0
+            return f"(≈ {val_sol:.4f} SOL)"
+        return ""
+
     async def _cmd_trades(self, event: Any) -> None:
         """Handle /trades command in DMs: displays Entry, Current Price, Unrealized PnL %, Duration (s), and Trailing Stop status for OPEN trades."""
         metrics: dict[str, Any] = {}
@@ -2184,6 +2754,7 @@ class TelegramIngester:
 
                     commands = [
                         BotCommand(command="status", description="📊 Live Engine Telemetry & PnL"),
+                        BotCommand(command="strategy", description="🎯 Manage Strategies, TP/SL & Auto-Trade"),
                         BotCommand(command="ai", description="🧠 AlphaSupervisor-AI Control & Risk"),
                         BotCommand(command="trades", description="📋 Active Positions & Closed Ledger"),
                         BotCommand(command="assets", description="🔍 Recently Detected Assets & IDs"),

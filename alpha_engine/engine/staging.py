@@ -950,6 +950,14 @@ class RevivalBreakoutBuffer:
         self.min_accumulation_score = min_accumulation_score
         self.ttl_seconds = ttl_seconds
 
+        if config is not None:
+            self.min_token_age_s = getattr(config, "revival_min_token_age_s", self.min_token_age_s)
+            self.max_dev_balance_pct = getattr(config, "revival_max_dev_balance_pct", self.max_dev_balance_pct)
+            self.max_top10_concentration_pct = getattr(config, "revival_max_top10_concentration_pct", self.max_top10_concentration_pct)
+            self.volume_surge_multiplier_k = getattr(config, "revival_volume_surge_multiplier_k", self.volume_surge_multiplier_k)
+            self.min_net_buy_delta = getattr(config, "revival_min_net_buy_delta", self.min_net_buy_delta)
+            self.min_accumulation_score = getattr(config, "revival_min_accumulation_score", self.min_accumulation_score)
+
         self._staged: dict[str, StagedToken] = {}
         self._on_signal_callbacks: list[Callable[[SignalEvent], Any]] = [on_signal_callback] if on_signal_callback else []
         self._on_decision_callbacks: list[Callable[[DecisionRecord], Any]] = [on_decision_callback] if on_decision_callback else []

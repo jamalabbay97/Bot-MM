@@ -101,6 +101,7 @@ class ExitProfile(str, Enum):
 
     FAST_SNIPE = "FAST_SNIPE"            # Existing 120s velocity decay, -25% SL, +25%/+50% TP
     REVIVAL_SWING = "REVIVAL_SWING"      # Multi-hour/day hold, 35% trailing drawdown, 100%/200% TP ladder
+    PEAK_TRAILING = "PEAK_TRAILING"      # Trailing stop from ATH peak, +50%/+60% TP target
 
 
 class SignalSource(str, Enum):
@@ -159,6 +160,9 @@ class TradeExitReason(str, Enum):
     SL_INITIAL = "sl_initial"                      # Hard stop-loss (-8% / -15%)
     SL_HARD = "sl_hard"                            # Alias for hard stop-loss
     SL_TRAILING = "sl_trailing"                    # Trailing stop
+    TRAILING_PEAK_STOP = "sl_peak_trail"          # Trailing stop from highest recorded price (ATH peak)
+    TP_60 = "tp_60"                                # Take-Profit: +60% target
+    TP_CUSTOM = "tp_custom"                        # Custom configurable Take-Profit
     TRAILING_PEAK_DRAWDOWN_35PCT = "trailing_peak_drawdown_35pct"  # Multi-day swing: 35% drawdown from ATH peak
     TIMEOUT_VELOCITY_DECAY = "timeout_velocity_decay"  # Duration > 120s and PnL < +3%
     TIMEOUT = "timeout"                            # Alias for timeout decay

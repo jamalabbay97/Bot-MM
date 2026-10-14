@@ -201,6 +201,14 @@ class SQLiteLedger:
     )
     """
 
+    _CREATE_SETTINGS = """
+    CREATE TABLE IF NOT EXISTS bot_settings (
+        key         TEXT PRIMARY KEY,
+        value       TEXT NOT NULL,
+        updated_at  INTEGER NOT NULL
+    )
+    """
+
     def __init__(
         self,
         db_path: str | Path = "paper_trading.db",
@@ -261,6 +269,7 @@ class SQLiteLedger:
         await conn.execute(self._CREATE_DECISION_AUDIT_LOG)
         await conn.execute(self._CREATE_PATTERN_STORE)
         await conn.execute(self._CREATE_TRACE_LOG)
+        await conn.execute(self._CREATE_SETTINGS)
         await conn.execute("CREATE INDEX IF NOT EXISTS idx_trades_token ON trades(token_address);")
         await conn.execute("CREATE INDEX IF NOT EXISTS idx_trades_chain ON trades(chain);")
         try:
@@ -951,6 +960,38 @@ class SQLiteLedger:
             cols = [d[0] for d in cursor.description] if cursor.description else []
             rows = await cursor.fetchall()
             return [dict(r) if hasattr(r, "keys") else dict(zip(cols, r)) for r in rows]
+
+    @sqlite_retry(max_retries=5, base_delay=0.1)
+    async def set_setting(self, key: str, value: str) -> None:
+        """Persists a key-value setting into bot_settings table."""
+        conn = self._conn
+        if conn is None:
+            logger.debug("SQLiteLedger connection is closed; skipping set_setting.")
+            return
+        now_ts = int(time.time())
+        await conn.execute(
+            """
+            INSERT INTO bot_settings (key, value, updated_at)
+            VALUES (?, ?, ?)
+            ON CONFLICT(key) DO UPDATE SET
+                value = excluded.value,
+                updated_at = excluded.updated_at
+            """,
+            (key, str(value), now_ts),
+        )
+        await conn.commit()
+
+    @sqlite_retry(max_retries=5, base_delay=0.1)
+    async def get_setting(self, key: str, default: Optional[str] = None) -> Optional[str]:
+        """Retrieves a setting value by key from bot_settings table."""
+        conn = self._conn
+        if conn is None:
+            return default
+        async with conn.execute("SELECT value FROM bot_settings WHERE key = ?", (key,)) as cursor:
+            row = await cursor.fetchone()
+            if row:
+                return str(row[0])
+            return default
 
 
 __all__ = [

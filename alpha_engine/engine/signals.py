@@ -730,7 +730,7 @@ class SignalGenerator:
             alpha_score=alpha,
             source=source,
             execution_venue=venue,
-            strategy_pattern="screener_priority" if staged.is_screener_priority else None,
+            strategy_pattern="screener_priority" if staged.is_screener_priority else ("graduated_launch" if getattr(staged, "graduated", True) else "smart_launch"),
             market_cap_usd=mcap,
         )
         return signal
@@ -743,7 +743,6 @@ class SignalGenerator:
         report: SecurityReport,
         section: ScreenerSection,
         alpha_score: float = 0.90,
-        volume_2m_usd: Optional[Decimal] = None,
         market_cap_usd: Optional[Decimal] = None,
     ) -> SignalEvent:
         """Generate a high-priority BUY SignalEvent for a verified Graduated or Movers screener candidate."""

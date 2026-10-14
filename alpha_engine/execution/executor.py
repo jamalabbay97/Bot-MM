@@ -22,6 +22,8 @@ from alpha_engine.math.cpmm import (
 )
 from alpha_engine.math.mev import simulate_latency
 from alpha_engine.math.sizing import (
+    GAS_MULTIPLE_GATE,
+    KellySizing,
     apply_paper_trading_drag,
     compute_position_size,
     gas_cost_usd,
@@ -83,10 +85,12 @@ class PaperExecutor:
         max_position_fraction: Decimal | None = None,
         apply_drag: bool = False,
         is_new_launch: bool = False,
+        fixed_trade_amount_native: Decimal | None = None,
     ) -> PaperFill | None:
         """
         Produce a PaperFill for the given signal, or return None if skipped.
         Optionally applies realistic paper market drag (0.3% fee + 0.005 gas + 5% slippage).
+        If fixed_trade_amount_native is provided (>0), uses that exact amount instead of dynamic Kelly sizing.
         """
         side = signal.suggested_side
         pool = getattr(signal, "pool_state", None)
@@ -103,33 +107,52 @@ class PaperExecutor:
         )
         adjusted_pool = latency_result.adjusted_pool_state
 
-        kelly_f = half_kelly_fraction(
-            win_rate=self._win_rate,
-            avg_win_native=self._avg_win,
-            avg_loss_native=self._avg_loss,
-        )
-
-        if kelly_f <= 0.0 and side == OrderSide.BUY:
-            logger.debug(
-                "Kelly edge <= 0 for signal %s — skipping BUY.", signal.signal_id[:8]
+        if fixed_trade_amount_native is not None and fixed_trade_amount_native > Decimal(0):
+            native_in = fixed_trade_amount_native
+            usd_at_risk = native_in * self._native_price_usd
+            trade_gas_usd = gas_cost_usd(signal.chain)
+            gas_threshold = trade_gas_usd * GAS_MULTIPLE_GATE
+            if usd_at_risk < gas_threshold:
+                logger.info(
+                    "Gas-drag gate REJECTED fixed trade amount [%s %s]: usd_at_risk=%s < gas_threshold=%s. Position too small to overcome fees.",
+                    side.value.upper(), signal.chain.value, usd_at_risk, gas_threshold,
+                )
+                return None
+            sizing = KellySizing(
+                kelly_fraction=1.0,
+                capped_fraction=float(usd_at_risk / portfolio_equity_usd) if portfolio_equity_usd > Decimal(0) else 1.0,
+                native_trade_size=native_in,
+                usd_at_risk=usd_at_risk,
+                gas_rejected=False,
             )
-            return None
-
-        sizing = compute_position_size(
-            kelly_fraction=kelly_f,
-            portfolio_equity_usd=portfolio_equity_usd,
-            native_price_usd=self._native_price_usd,
-            chain=signal.chain,
-            side=side,
-            max_position_fraction=max_position_fraction,
-        )
-
-        if sizing.gas_rejected:
-            logger.debug(
-                "Gas-drag gate rejected signal %s on %s — size too small.",
-                signal.signal_id[:8], signal.chain.value,
+        else:
+            kelly_f = half_kelly_fraction(
+                win_rate=self._win_rate,
+                avg_win_native=self._avg_win,
+                avg_loss_native=self._avg_loss,
             )
-            return None
+
+            if kelly_f <= 0.0 and side == OrderSide.BUY:
+                logger.debug(
+                    "Kelly edge <= 0 for signal %s — skipping BUY.", signal.signal_id[:8]
+                )
+                return None
+
+            sizing = compute_position_size(
+                kelly_fraction=kelly_f,
+                portfolio_equity_usd=portfolio_equity_usd,
+                native_price_usd=self._native_price_usd,
+                chain=signal.chain,
+                side=side,
+                max_position_fraction=max_position_fraction,
+            )
+
+            if sizing.gas_rejected:
+                logger.debug(
+                    "Gas-drag gate rejected signal %s on %s — size too small.",
+                    signal.signal_id[:8], signal.chain.value,
+                )
+                return None
 
         if side == OrderSide.BUY:
             native_in = sizing.native_trade_size
@@ -329,12 +352,13 @@ class PaperExecutor:
         max_position_fraction: Decimal | None = None,
         apply_drag: bool = False,
         priority_percentile: str = "p95",
+        fixed_trade_amount_native: Decimal | None = None,
     ) -> PaperFill | None:
         """
         Scalping Execution Pipeline:
         - Sub-second execution via private relays (Jito Bundles on Solana, Flashbots/Titan on EVM).
         - Prevents MEV exploitation and front-running.
-        - Fractional Kelly position sizing.
+        - Fractional Kelly position sizing or user fixed trade amount.
         - Validates private relay routing before fill creation.
         """
         fill = await self.execute_signal(
@@ -342,6 +366,7 @@ class PaperExecutor:
             portfolio_equity_usd=portfolio_equity_usd,
             max_position_fraction=max_position_fraction,
             apply_drag=apply_drag,
+            fixed_trade_amount_native=fixed_trade_amount_native,
         )
         if fill is None:
             return None
@@ -369,18 +394,20 @@ class PaperExecutor:
         block_interval: int = 2,
         max_position_fraction: Decimal | None = None,
         apply_drag: bool = False,
+        fixed_trade_amount_native: Decimal | None = None,
     ) -> list[PaperFill]:
         """
         Swing Execution Pipeline:
         - Gas-optimized transaction batching.
         - Dollar-cost averaging (DCA) over multiple blocks to minimize slippage and price impact.
-        - Fractional Kelly position sizing split evenly across num_batches.
+        - Fractional Kelly position sizing or fixed trade amount split evenly across num_batches.
         """
         total_fill = await self.execute_signal(
             signal=signal,
             portfolio_equity_usd=portfolio_equity_usd,
             max_position_fraction=max_position_fraction,
             apply_drag=apply_drag,
+            fixed_trade_amount_native=fixed_trade_amount_native,
         )
         if total_fill is None:
             return []

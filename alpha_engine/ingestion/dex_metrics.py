@@ -12,7 +12,7 @@ import time
 from collections import defaultdict, deque
 from dataclasses import dataclass
 from decimal import Decimal
-from typing import NamedTuple, Optional
+from typing import NamedTuple, Optional, Any
 
 from alpha_engine.models.enums import ChainIdentifier
 from alpha_engine.models.events import PoolStateUpdateEvent, SwapEvent
@@ -445,3 +445,50 @@ class DEXMetricsAggregator:
             native_price_usd = self._latest_native_prices.get(chain, Decimal("150.0"))
 
         return vol_native * native_price_usd
+
+    def get_participant_distribution(
+        self,
+        pool_address: str,
+        window_sec: float = 300.0,
+        current_time_s: Optional[float] = None,
+    ) -> dict[str, Any]:
+        """
+        Analyze trading participants over rolling window to verify genuine trading activity:
+        - unique_wallets_count: total distinct senders/traders
+        - unique_buyers_count: distinct buyers
+        - unique_sellers_count: distinct sellers
+        - top_wallet_volume_share: percentage of total volume driven by the single largest wallet
+        - total_volume_native: total native volume traded in window
+        """
+        now_s = current_time_s if current_time_s is not None else time.time()
+        q = self._pool_swaps.get(pool_address, deque())
+        wallet_volumes: dict[str, Decimal] = defaultdict(Decimal)
+        buyers: set[str] = set()
+        sellers: set[str] = set()
+        total_vol = Decimal("0")
+
+        for entry in reversed(q):
+            age = now_s - entry.timestamp_s
+            if age > window_sec:
+                break
+            sender = entry.sender or "unknown"
+            vol = entry.volume_native
+            wallet_volumes[sender] += vol
+            total_vol += vol
+            if entry.is_buy:
+                buyers.add(sender)
+            else:
+                sellers.add(sender)
+
+        unique_wallets = len(wallet_volumes)
+        max_wallet_vol = max(wallet_volumes.values()) if wallet_volumes else Decimal("0")
+        top_share = float(max_wallet_vol / total_vol) if total_vol > Decimal("0") else 0.0
+
+        return {
+            "unique_wallets_count": unique_wallets,
+            "unique_buyers_count": len(buyers),
+            "unique_sellers_count": len(sellers),
+            "top_wallet_volume_share": top_share,
+            "total_volume_native": total_vol,
+        }
+

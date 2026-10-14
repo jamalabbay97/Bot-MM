@@ -82,8 +82,8 @@ class ScreenerEvaluationResult:
 class GraduatedProfileConfig:
     """Configurable evaluation profile for Graduated tokens."""
 
-    min_market_cap_usd: Decimal = Decimal("8000.0")
-    min_volume_usd: Decimal = Decimal("8000.0")
+    min_market_cap_usd: Decimal = Decimal("10000.0")
+    min_volume_usd: Decimal = Decimal("5000.0")
     volume_window_sec: float = 120.0
     min_liquidity_usd: Decimal = Decimal("10000.0")
     max_price_impact_pct: float = 0.05
@@ -95,14 +95,17 @@ class GraduatedProfileConfig:
     range_window_sec: float = 300.0
     allow_continuation: bool = False
     allow_continuation_without_retest: bool = False
+    verify_genuine_activity: Optional[bool] = None
+    min_independent_wallets: int = 10
+    max_single_wallet_volume_share: float = 0.50
 
 
 @dataclass
 class MoversProfileConfig:
     """Configurable evaluation profile for Movers tokens."""
 
-    min_market_cap_usd: Decimal = Decimal("8000.0")
-    min_volume_usd: Decimal = Decimal("8000.0")
+    min_market_cap_usd: Decimal = Decimal("10000.0")
+    min_volume_usd: Decimal = Decimal("5000.0")
     volume_window_sec: float = 120.0
     min_liquidity_usd: Decimal = Decimal("10000.0")
     min_buy_pressure_ratio: float = 0.55
@@ -114,6 +117,9 @@ class MoversProfileConfig:
     range_window_sec: float = 300.0
     allow_continuation: bool = False
     allow_continuation_without_retest: bool = False
+    verify_genuine_activity: Optional[bool] = None
+    min_independent_wallets: int = 5
+    max_single_wallet_volume_share: float = 0.50
 
 
 class ScreenerPriorityEvaluator:
@@ -123,7 +129,9 @@ class ScreenerPriorityEvaluator:
     and required conditions are fully established.
 
     Mandatory invariants enforced:
-      - MIN_VOLUME_USD = $8,000 over the rolling measurement window (default 120s / 2m).
+      - MIN_MARKET_CAP_USD = $10,000 required before analysis or opening positions.
+      - MIN_VOLUME_USD = $5,000 over the rolling measurement window (default 120s / 2m).
+      - Genuine trading activity verified across multiple independent wallets (wash trading protection).
       - Strict rejection of tokens with < $8,000 volume or unverifiable / missing volume.
       - Never substitutes market capitalization, liquidity, SOL-denominated amounts, or lifetime volume.
       - Deduplication across sections using canonical mint address; merged signals for dual-listed tokens.
@@ -152,8 +160,8 @@ class ScreenerPriorityEvaluator:
             norm_grad_ext = float(raw_grad_ext) / 100.0 if float(raw_grad_ext) > 5.0 else float(raw_grad_ext)
 
             self.graduated_profile = GraduatedProfileConfig(
-                min_market_cap_usd=getattr(config, "min_market_cap_usd", Decimal("8000.0")),
-                min_volume_usd=getattr(config, "screener_min_volume_usd", Decimal("8000.0")),
+                min_market_cap_usd=getattr(config, "min_market_cap_usd", Decimal("10000.0")),
+                min_volume_usd=getattr(config, "screener_min_volume_usd", Decimal("5000.0")),
                 volume_window_sec=getattr(config, "screener_volume_window_sec", 120.0),
                 min_liquidity_usd=getattr(config, "graduated_min_liquidity_usd", Decimal("10000.0")),
                 max_price_impact_pct=getattr(config, "graduated_max_price_impact_pct", 0.05),
@@ -163,6 +171,9 @@ class ScreenerPriorityEvaluator:
                 breakout_volume_multiplier=getattr(config, "breakout_volume_multiplier", 1.5),
                 range_window_sec=getattr(config, "range_formation_window_sec", 300.0),
                 allow_continuation=getattr(config, "allow_continuation_without_retest", False),
+                verify_genuine_activity=getattr(config, "verify_genuine_activity", True),
+                min_independent_wallets=getattr(config, "min_independent_wallets", 5),
+                max_single_wallet_volume_share=getattr(config, "max_single_wallet_volume_share", 0.50),
             )
 
         if movers_config is not None:
@@ -172,8 +183,8 @@ class ScreenerPriorityEvaluator:
             norm_mov_ext = float(raw_mov_ext) / 100.0 if float(raw_mov_ext) > 5.0 else float(raw_mov_ext)
 
             self.movers_profile = MoversProfileConfig(
-                min_market_cap_usd=getattr(config, "min_market_cap_usd", Decimal("8000.0")),
-                min_volume_usd=getattr(config, "screener_min_volume_usd", Decimal("8000.0")),
+                min_market_cap_usd=getattr(config, "min_market_cap_usd", Decimal("10000.0")),
+                min_volume_usd=getattr(config, "screener_min_volume_usd", Decimal("5000.0")),
                 volume_window_sec=getattr(config, "screener_volume_window_sec", 120.0),
                 min_liquidity_usd=getattr(config, "movers_min_liquidity_usd", Decimal("10000.0")),
                 min_buy_pressure_ratio=getattr(config, "movers_min_buy_pressure_ratio", 0.55),
@@ -184,6 +195,9 @@ class ScreenerPriorityEvaluator:
                 breakout_volume_multiplier=getattr(config, "breakout_volume_multiplier", 1.5),
                 range_window_sec=getattr(config, "range_formation_window_sec", 300.0),
                 allow_continuation=getattr(config, "allow_continuation_without_retest", False),
+                verify_genuine_activity=getattr(config, "verify_genuine_activity", True),
+                min_independent_wallets=getattr(config, "min_independent_wallets", 5),
+                max_single_wallet_volume_share=getattr(config, "max_single_wallet_volume_share", 0.50),
             )
 
         # Bounded concurrency semaphore
@@ -264,8 +278,9 @@ class ScreenerPriorityEvaluator:
             sol_price = Decimal(str(getattr(self.config, "sol_price_usd", 150.0)))
             native_res = liq_dec / Decimal("2.0") / sol_price if sol_price > 0 else Decimal("100.0")
             token_res = (liq_dec / Decimal("2.0")) / (cur_price or Decimal("0.001")) if (cur_price or Decimal("0.001")) > 0 else Decimal("1000000.0")
+            fallback_pool_addr = discovery.pool_address or (token_addr if len(token_addr) >= 32 else (token_addr + "0" * 32)[:32])
             pool_state = PoolState(
-                pool_address=discovery.pool_address or f"Pool_{token_addr[:16]}",
+                pool_address=fallback_pool_addr,
                 chain=discovery.chain,
                 token_reserve=token_res,
                 native_reserve=native_res,
@@ -476,7 +491,8 @@ class ScreenerPriorityEvaluator:
                 native_price_usd=native_price,
             )
 
-        min_mcap_required = getattr(self.graduated_profile, "min_market_cap_usd", Decimal("8000.0"))
+        active_prof = self.movers_profile if section == ScreenerSection.MOVERS else self.graduated_profile
+        min_mcap_required = getattr(active_prof, "min_market_cap_usd", Decimal("10000.0"))
 
         if qualifying_mcap_usd is None or qualifying_mcap_usd <= Decimal("0"):
             reason = "Market cap is missing, unverifiable, or stale: entry strictly disallowed"
@@ -518,7 +534,7 @@ class ScreenerPriorityEvaluator:
                 market_cap_usd=qualifying_mcap_usd,
             )
 
-        # 4. Mandatory $8,000 USD Volume Requirement Check
+        # 4. Mandatory $10,000 USD Volume Requirement Check
         # Inspect trustworthy 2-minute rolling USD volume
         qualifying_vol_usd: Optional[Decimal] = None
 
@@ -565,6 +581,45 @@ class ScreenerPriorityEvaluator:
                 reason=reason,
                 volume_2m_usd=qualifying_vol_usd,
             )
+
+        # 4b. Verify Genuine Trading Activity & Wash Trading Guard (Requirement 5)
+        prof = self.movers_profile if section == ScreenerSection.MOVERS else self.graduated_profile
+        should_verify = getattr(prof, "verify_genuine_activity", None)
+        if should_verify is None:
+            should_verify = getattr(self.config, "verify_genuine_activity", False)
+        min_wallets = getattr(prof, "min_independent_wallets", 5)
+        max_share = getattr(prof, "max_single_wallet_volume_share", 0.50)
+
+        if should_verify and self.metrics_aggregator is not None and pool_state and pool_state.pool_address:
+            part_dist = self.metrics_aggregator.get_participant_distribution(
+                pool_address=pool_state.pool_address,
+                window_sec=getattr(prof, "volume_window_sec", 120.0) * 2.5,
+                current_time_s=now_s,
+            )
+            # Only enforce if transactions were recorded in the aggregator
+            if part_dist.get("unique_wallets_count", 0) > 0:
+                if part_dist["unique_wallets_count"] < min_wallets:
+                    reason = f"Non-genuine trading activity: only {part_dist['unique_wallets_count']} independent wallets (< minimum {min_wallets})"
+                    self.record_decision(token_address, chain, section, ScreenerDecision.REJECTED, reason)
+                    return ScreenerEvaluationResult(
+                        admitted=False,
+                        token_address=token_address,
+                        chain=chain,
+                        section=section,
+                        decision=ScreenerDecision.REJECTED,
+                        reason=reason,
+                    )
+                if part_dist["top_wallet_volume_share"] > max_share:
+                    reason = f"Wash trading / manipulation guard: top wallet accounts for {part_dist['top_wallet_volume_share']*100:.1f}% of volume (> {max_share*100:.0f}%)"
+                    self.record_decision(token_address, chain, section, ScreenerDecision.REJECTED, reason)
+                    return ScreenerEvaluationResult(
+                        admitted=False,
+                        token_address=token_address,
+                        chain=chain,
+                        section=section,
+                        decision=ScreenerDecision.REJECTED,
+                        reason=reason,
+                    )
 
         # 5. Executable Liquidity & Price Impact Checks
         liq_usd = pool_state.native_reserve * native_price

@@ -8,6 +8,7 @@ Python 3.11+ | asyncio | 24/7 Self-Healing Supervisor | Zero-Leak Production Gra
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import signal
@@ -15,6 +16,7 @@ import socket
 import sys
 import time
 from decimal import Decimal
+from pathlib import Path
 from typing import Any, Optional
 
 import aiohttp
@@ -176,6 +178,20 @@ class PaperTradingEngine:
         )
         self._last_pnl_cycle_ts: float = time.time()
 
+        # Strategy dynamic controls & Telegram interface state
+        self.active_strategy: str = getattr(config, "active_strategy", "peak_trailing_50")
+        self.trailing_stop_from_peak_pct: float = getattr(config, "trailing_stop_from_peak_pct", 0.50)
+        self.custom_take_profit_pct: Optional[float] = getattr(config, "custom_take_profit_pct", 0.50)
+        self.custom_stop_loss_pct: Optional[float] = getattr(config, "custom_stop_loss_pct", 0.50)
+        self.auto_trade_enabled: bool = getattr(config, "auto_trade_enabled", True)
+        self.screener_exclusive_focus: bool = getattr(config, "screener_exclusive_focus", False)
+        self.screener_poll_interval_s: float = getattr(config, "screener_poll_interval_s", 25.0)
+        self.manual_trade_amount: Optional[Decimal] = (
+            Decimal(str(config.manual_trade_amount)) if getattr(config, "manual_trade_amount", None) is not None else None
+        )
+        self.manual_trade_currency: str = getattr(config, "manual_trade_currency", "SOL")
+        self._load_persisted_trade_amount()
+
         self._explainer: Optional[ConversationalSupervisor] = None
         self._executor: PaperExecutor | None = None
         self._ledger: SQLiteLedger | None = None
@@ -233,6 +249,9 @@ class PaperTradingEngine:
         10 initial trades -> 4-6h mandatory cooldown -> Paced Mode (1 trade, then 3h cooldown, etc.).
         Resets after 24h positive PnL cycle or manual CLI reset.
         """
+        if not getattr(self._cfg, "pacing_governor_enabled", False):
+            return False
+
         t = now if now is not None else time.time()
         # 24-hour positive PnL cycle check
         if t - self._last_pnl_cycle_ts >= 86400.0:
@@ -256,6 +275,9 @@ class PaperTradingEngine:
         """
         Record a newly executed BUY trade with the governor and trigger pacing cooldowns when limits hit.
         """
+        if not getattr(self._cfg, "pacing_governor_enabled", False):
+            return
+
         t = now if now is not None else time.time()
         self._consecutive_trade_count += 1
         max_initial = getattr(self._cfg, "pacing_max_initial_trades", 10)
@@ -285,7 +307,264 @@ class PaperTradingEngine:
         self._consecutive_trade_count = 0
         self._cooldown_until = 0.0
         self._in_paced_mode = False
-        logger.info("Governor: Trading frequency and pacing governor reset.")
+
+    def get_strategy_status(self) -> dict[str, Any]:
+        """Returns the current trading strategy status and parameters."""
+        return {
+            "active_strategy": getattr(self, "active_strategy", getattr(self._cfg, "active_strategy", "peak_trailing_50")),
+            "trailing_stop_from_peak_pct": getattr(self, "trailing_stop_from_peak_pct", getattr(self._cfg, "trailing_stop_from_peak_pct", 0.50)),
+            "custom_take_profit_pct": getattr(self, "custom_take_profit_pct", getattr(self._cfg, "custom_take_profit_pct", 0.50)),
+            "custom_stop_loss_pct": getattr(self, "custom_stop_loss_pct", getattr(self._cfg, "custom_stop_loss_pct", 0.50)),
+            "auto_trade_enabled": getattr(self, "auto_trade_enabled", getattr(self._cfg, "auto_trade_enabled", True)),
+            "screener_exclusive_focus": getattr(self, "screener_exclusive_focus", getattr(self._cfg, "screener_exclusive_focus", False)),
+            "screener_poll_interval_s": getattr(self, "screener_poll_interval_s", getattr(self._cfg, "screener_poll_interval_s", 25.0)),
+            "min_market_cap_usd": float(getattr(self, "min_market_cap_usd", getattr(self._cfg, "min_market_cap_usd", 10000.0))),
+            "manual_trade_amount": float(self.manual_trade_amount) if self.manual_trade_amount is not None else None,
+            "manual_trade_currency": self.manual_trade_currency,
+        }
+
+    def _get_settings_file_path(self) -> Path:
+        """Returns the path to the persistent runtime settings JSON file."""
+        db_p = Path(getattr(self._cfg, "db_path", "paper_trading.db"))
+        return db_p.parent / "bot_runtime_settings.json"
+
+    def _save_persisted_trade_amount(self) -> None:
+        """Persists the manual trade amount to local JSON storage and SQLite ledger."""
+        try:
+            p = self._get_settings_file_path()
+            data: dict[str, Any] = {}
+            if p.exists():
+                try:
+                    data = json.loads(p.read_text(encoding="utf-8"))
+                except Exception:
+                    data = {}
+            data["manual_trade_amount"] = str(self.manual_trade_amount) if self.manual_trade_amount is not None else None
+            data["manual_trade_currency"] = self.manual_trade_currency
+            data["updated_at"] = int(time.time())
+            p.write_text(json.dumps(data, indent=2), encoding="utf-8")
+        except Exception as exc:
+            logger.warning("Failed to save persisted trade amount to JSON: %s", exc)
+
+        if self._ledger is not None:
+            try:
+                payload = json.dumps({
+                    "amount": str(self.manual_trade_amount) if self.manual_trade_amount is not None else None,
+                    "currency": self.manual_trade_currency,
+                    "updated_at": int(time.time()),
+                })
+                asyncio.create_task(self._ledger.set_setting("manual_trade_amount", payload))
+            except Exception as exc:
+                logger.debug("Async ledger setting save error: %s", exc)
+
+    def _load_persisted_trade_amount(self) -> None:
+        """Loads persisted manual trade amount from runtime JSON file."""
+        try:
+            p = self._get_settings_file_path()
+            if p.exists():
+                data = json.loads(p.read_text(encoding="utf-8"))
+                amt = data.get("manual_trade_amount")
+                curr = data.get("manual_trade_currency", "SOL")
+                if amt is not None:
+                    self.manual_trade_amount = Decimal(str(amt))
+                    self.manual_trade_currency = str(curr).upper().strip()
+                    logger.info("Loaded persisted manual trade amount: %s %s", self.manual_trade_amount, self.manual_trade_currency)
+        except Exception as exc:
+            logger.warning("Failed to load persisted trade amount: %s", exc)
+
+    async def _sync_ledger_settings(self) -> None:
+        """Syncs runtime settings from SQLite ledger on initialization."""
+        if self._ledger is not None:
+            try:
+                val = await self._ledger.get_setting("manual_trade_amount")
+                if val:
+                    data = json.loads(val)
+                    amt = data.get("amount")
+                    curr = data.get("currency", "SOL")
+                    if amt is not None:
+                        self.manual_trade_amount = Decimal(str(amt))
+                        self.manual_trade_currency = str(curr).upper().strip()
+                        self._save_persisted_trade_amount()
+                        logger.info("Synced manual trade amount from SQLite ledger: %s %s", self.manual_trade_amount, self.manual_trade_currency)
+            except Exception as exc:
+                logger.debug("Failed to sync ledger settings: %s", exc)
+
+    def set_manual_trade_amount(
+        self,
+        amount: Optional[Decimal | float | str],
+        currency: str = "SOL",
+    ) -> dict[str, Any]:
+        """
+        Sets and permanently persists the manual trade amount to be used across all trade executions.
+        Validates amount > 0 and allowed currency/bounds.
+        """
+        curr = currency.upper().strip() if currency else "SOL"
+        if curr not in ("SOL", "USD", "ETH"):
+            raise ValueError(f"Unsupported trade currency: {currency}. Must be SOL, USD, or ETH.")
+
+        if amount is None:
+            self.manual_trade_amount = None
+            self.manual_trade_currency = curr
+            self._save_persisted_trade_amount()
+            logger.info("Manual trade amount cleared. Restoring dynamic risk sizing.")
+            return self.get_manual_trade_amount()
+
+        dec_amt = Decimal(str(amount))
+        if dec_amt <= Decimal(0):
+            raise ValueError(f"Trade amount must be strictly positive (>0), got {amount}")
+
+        # Bounds validation
+        if curr == "SOL":
+            if dec_amt < Decimal("0.001"):
+                raise ValueError("Minimum trade amount is 0.001 SOL to cover network transaction fees.")
+            if dec_amt > Decimal("500.0"):
+                raise ValueError("Maximum trade amount limit is 500.0 SOL.")
+        elif curr == "USD":
+            if dec_amt < Decimal("0.50"):
+                raise ValueError("Minimum trade amount is $0.50 USD.")
+            if dec_amt > Decimal("100000.0"):
+                raise ValueError("Maximum trade amount limit is $100,000.0 USD.")
+        elif curr == "ETH":
+            if dec_amt < Decimal("0.0001"):
+                raise ValueError("Minimum trade amount is 0.0001 ETH.")
+            if dec_amt > Decimal("50.0"):
+                raise ValueError("Maximum trade amount limit is 50.0 ETH.")
+
+        self.manual_trade_amount = dec_amt
+        self.manual_trade_currency = curr
+        self._save_persisted_trade_amount()
+        logger.info("Manual trade amount configured & persisted: %s %s", self.manual_trade_amount, self.manual_trade_currency)
+        return self.get_manual_trade_amount()
+
+    def get_manual_trade_amount(self) -> dict[str, Any]:
+        """Returns the currently configured manual trade amount and status."""
+        amt = float(self.manual_trade_amount) if self.manual_trade_amount is not None else None
+        curr = self.manual_trade_currency
+        sol_p = float(self._sol_price)
+        eth_p = float(self._eth_price)
+        usd_val = None
+        sol_val = None
+        if amt is not None:
+            if curr == "USD":
+                usd_val = amt
+                sol_val = amt / sol_p if sol_p > 0 else 0.0
+            elif curr == "SOL":
+                sol_val = amt
+                usd_val = amt * sol_p
+            elif curr == "ETH":
+                usd_val = amt * eth_p
+                sol_val = usd_val / sol_p if sol_p > 0 else 0.0
+
+        return {
+            "is_manual": amt is not None,
+            "amount": amt,
+            "currency": curr,
+            "usd_equivalent": usd_val,
+            "sol_equivalent": sol_val,
+            "sol_price_usd": sol_p,
+            "eth_price_usd": eth_p,
+        }
+
+    def get_balance_summary(self) -> dict[str, Any]:
+        """Returns available trading balances, portfolio exposure, and purchasing capacity."""
+        cash_sol = float(self._cash_sol)
+        cash_eth = float(self._cash_eth)
+        sol_p = float(self._sol_price)
+        eth_p = float(self._eth_price)
+        total_cash_usd = cash_sol * sol_p + cash_eth * eth_p
+        total_equity_usd = float(self._current_equity_usd())
+
+        open_positions = self._position_book.open_position_count()
+        open_exposure_native = Decimal(0)
+        for lots in self._position_book._lots.values():
+            for lot in lots:
+                if lot.tokens_held > 0 and lot.status in (LotStatus.OPEN, LotStatus.PENDING_BUY, LotStatus.PENDING_SELL):
+                    open_exposure_native += lot.cost_basis_native
+        open_exposure_usd = float(open_exposure_native * self._sol_price)
+
+        manual_info = self.get_manual_trade_amount()
+        trade_amt_sol = manual_info.get("sol_equivalent") or (0.1 if manual_info.get("amount") is None else manual_info.get("amount"))
+        fee_sol = 0.005
+        cost_per_trade_sol = trade_amt_sol + fee_sol
+        trades_possible = int(cash_sol // cost_per_trade_sol) if cost_per_trade_sol > 0 else 0
+
+        return {
+            "cash_sol": cash_sol,
+            "cash_eth": cash_eth,
+            "cash_sol_usd": cash_sol * sol_p,
+            "cash_eth_usd": cash_eth * eth_p,
+            "total_cash_usd": total_cash_usd,
+            "total_equity_usd": total_equity_usd,
+            "open_positions_count": open_positions,
+            "open_exposure_usd": open_exposure_usd,
+            "trade_amount": manual_info.get("amount"),
+            "trade_currency": manual_info.get("currency"),
+            "trade_amount_usd": manual_info.get("usd_equivalent"),
+            "trades_possible": trades_possible,
+            "sol_price_usd": sol_p,
+            "eth_price_usd": eth_p,
+        }
+
+    def set_trading_strategy(
+        self,
+        strategy_name: Optional[str] = None,
+        trailing_stop_from_peak_pct: Optional[float] = None,
+        custom_take_profit_pct: Optional[float] = None,
+        custom_stop_loss_pct: Optional[float] = None,
+        auto_trade_enabled: Optional[bool] = None,
+        screener_exclusive_focus: Optional[bool] = None,
+        min_market_cap_usd: Optional[float] = None,
+        manual_trade_amount: Optional[Decimal | float | str] = None,
+        manual_trade_currency: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """Dynamically configures the bot's trading strategy, trade size, and operational parameters."""
+        if strategy_name is not None:
+            strat_lower = strategy_name.lower().strip()
+            if strat_lower in ("peak_trailing_50", "peak50", "trail50"):
+                self.active_strategy = "peak_trailing_50"
+                self.trailing_stop_from_peak_pct = 0.50
+                self.custom_take_profit_pct = 0.50
+                self.custom_stop_loss_pct = 0.50
+            elif strat_lower in ("peak_trailing_60", "peak60", "trail60"):
+                self.active_strategy = "peak_trailing_60"
+                self.trailing_stop_from_peak_pct = 0.60
+                self.custom_take_profit_pct = 0.60
+                self.custom_stop_loss_pct = 0.60
+            elif strat_lower in ("default", "legacy", "classic"):
+                self.active_strategy = "default"
+                self.trailing_stop_from_peak_pct = 0.50
+                self.custom_take_profit_pct = None
+                self.custom_stop_loss_pct = None
+            else:
+                self.active_strategy = strategy_name
+
+        if trailing_stop_from_peak_pct is not None:
+            self.trailing_stop_from_peak_pct = float(trailing_stop_from_peak_pct)
+        if custom_take_profit_pct is not None:
+            self.custom_take_profit_pct = float(custom_take_profit_pct)
+        if custom_stop_loss_pct is not None:
+            self.custom_stop_loss_pct = float(custom_stop_loss_pct)
+        if auto_trade_enabled is not None:
+            self.auto_trade_enabled = bool(auto_trade_enabled)
+        if screener_exclusive_focus is not None:
+            self.screener_exclusive_focus = bool(screener_exclusive_focus)
+        if min_market_cap_usd is not None:
+            self.min_market_cap_usd = Decimal(str(min_market_cap_usd))
+            self._cfg.min_market_cap_usd = Decimal(str(min_market_cap_usd))
+        if manual_trade_amount is not None:
+            self.set_manual_trade_amount(manual_trade_amount, manual_trade_currency or self.manual_trade_currency)
+
+        logger.info(
+            "Strategy updated dynamically: active_strategy=%s, trailing_stop=%.1f%%, tp=%.1f%%, auto_trade=%s, screener_focus=%s, min_mcap=$%s, trade_amount=%s %s",
+            self.active_strategy,
+            (self.trailing_stop_from_peak_pct or 0.0) * 100.0,
+            (self.custom_take_profit_pct or 0.0) * 100.0,
+            self.auto_trade_enabled,
+            self.screener_exclusive_focus,
+            getattr(self, "min_market_cap_usd", getattr(self._cfg, "min_market_cap_usd", 10000.0)),
+            self.manual_trade_amount,
+            self.manual_trade_currency,
+        )
+        return self.get_strategy_status()
 
     @property
     def explainer(self) -> Optional[ConversationalSupervisor]:
@@ -1672,8 +1951,57 @@ class PaperTradingEngine:
             is_new_launch = self._is_new_launch_signal(signal_item)
 
             if signal_item.suggested_side == OrderSide.BUY:
-                # 0a. Mandatory Minimum Market Cap Requirement ($8,000 USD)
-                min_mcap_usd = Decimal(str(getattr(self._cfg, "min_market_cap_usd", 8000.0)))
+                # 00. Automated Trading Switch
+                if not getattr(self, "auto_trade_enabled", True):
+                    logger.info("Auto-trade is DISABLED via strategy settings; skipping BUY signal for %s", signal_item.token_address[:10])
+                    continue
+
+                # Ensure pool state is initialized for accurate pricing and market cap checks
+                if signal_item.pool_state is None or signal_item.pool_state.spot_price_native_per_token <= Decimal(0):
+                    signal_item.pool_state = self.get_or_create_initial_pool_state(
+                        chain=signal_item.chain,
+                        token_address=signal_item.token_address,
+                        pool_address=getattr(signal_item, "pool_address", "") or "",
+                    )
+
+                # 00b. Exclusive Focus on Graduated & Movers
+                if getattr(self, "screener_exclusive_focus", False):
+                    # Check if token matches Screener Graduated or Movers criteria:
+                    # 1. Direct screener discovery
+                    is_screener_src = signal_item.source in (
+                        SignalSource.SCREENER_GRADUATED,
+                        SignalSource.SCREENER_MOVERS,
+                    ) or getattr(signal_item, "pattern", None) in ("screener_graduated", "screener_movers") or getattr(signal_item, "strategy_pattern", None) in ("screener_graduated", "screener_movers")
+                    
+                    # 2. Graduated tokens on Solana: Pump.fun tokens migrated to Raydium AMM or graduated launches
+                    tok_addr_l = signal_item.token_address.lower()
+                    is_graduated = (
+                        is_screener_src
+                        or getattr(signal_item, "is_graduated", False)
+                        or getattr(signal_item, "strategy_pattern", None) in ("graduated_launch", "smart_launch")
+                        or (getattr(signal_item, "execution_venue", None) == ExecutionVenue.RAYDIUM_AMM and tok_addr_l.endswith("pump"))
+                    )
+                    
+                    # 3. Market Movers: High-conviction alpha signals, volume surges, or momentum breakouts
+                    is_mover = (
+                        is_screener_src
+                        or signal_item.source in (SignalSource.REVIVAL_BREAKOUT, SignalSource.WAVE2_BREAKOUT, SignalSource.MEME_RADAR_BURST)
+                        or getattr(signal_item, "exit_profile", None) == ExitProfile.REVIVAL_SWING
+                        or (signal_item.strength in (SignalStrength.MODERATE, SignalStrength.STRONG) and signal_item.alpha_score >= 0.40)
+                    )
+                    
+                    if not (is_graduated or is_mover):
+                        logger.info(
+                            "Exclusive Screener Focus active: skipping non-graduated/non-mover token %s (source=%s, venue=%s, alpha=%.3f)",
+                            signal_item.token_address[:10],
+                            signal_item.source,
+                            getattr(signal_item, "execution_venue", "unknown"),
+                            signal_item.alpha_score,
+                        )
+                        continue
+
+                # 0a. Mandatory Minimum Market Cap Requirement ($10,000 USD)
+                min_mcap_usd = Decimal(str(getattr(self, "min_market_cap_usd", getattr(self._cfg, "min_market_cap_usd", 10000.0))))
                 sig_mcap = getattr(signal_item, "market_cap_usd", None)
                 if (sig_mcap is None or sig_mcap <= Decimal("0")) and signal_item.pool_state is not None:
                     native_p = (
@@ -1713,9 +2041,9 @@ class PaperTradingEngine:
                     continue
 
                 # 0. Reject weak signals or scores below quality threshold
-                min_score = getattr(self._cfg, "min_entry_score", 65.0) / 100.0
-                if signal_item.strength == SignalStrength.WEAK or signal_item.alpha_score < min_score:
-                    logger.debug(
+                min_score = getattr(self._cfg, "min_entry_score", 50.0) / 100.0
+                if signal_item.strength == SignalStrength.WEAK and signal_item.alpha_score < min_score:
+                    logger.info(
                         "Dropping BUY signal for %s: alpha_score=%.3f (strength=%s) below threshold %.2f",
                         signal_item.token_address[:10], signal_item.alpha_score, signal_item.strength.value, min_score
                     )
@@ -1757,7 +2085,14 @@ class PaperTradingEngine:
                 equity_usd = self._current_equity_usd()
                 equity_native = equity_usd / native_p if native_p > Decimal(0) else Decimal(0)
                 
-                if self._cfg.strategy_v2_enabled:
+                is_manual_size = (self.manual_trade_amount is not None and self.manual_trade_amount > Decimal(0))
+                if is_manual_size:
+                    if self.manual_trade_currency == "USD":
+                        target_native = self.manual_trade_amount / native_p if native_p > Decimal(0) else Decimal(0)
+                    else:
+                        target_native = self.manual_trade_amount
+                    preliminary_cost = target_native
+                elif self._cfg.strategy_v2_enabled:
                     metrics_dict = {
                         "consecutive_losses": self._metrics.consecutive_launch_losses if is_new_launch else self._metrics.consecutive_losses,
                         "daily_drawdown_pct": getattr(self._metrics, "daily_drawdown_pct", 0.0) 
@@ -1779,6 +2114,39 @@ class PaperTradingEngine:
                 else:
                     preliminary_cost = equity_native * Decimal("0.015")
 
+                # Verify balance and network fee availability before attempting trade execution (Requirement 8)
+                unit = "ETH" if signal_item.chain == ChainIdentifier.BASE_MAINNET else "SOL"
+                available_cash = self._cash_eth if signal_item.chain == ChainIdentifier.BASE_MAINNET else self._cash_sol
+                simulated_fee = Decimal("0.002") if signal_item.chain == ChainIdentifier.BASE_MAINNET else Decimal("0.005")
+                total_needed = preliminary_cost + simulated_fee
+
+                if available_cash < total_needed:
+                    t_short = f"{signal_item.token_address[:4]}..{signal_item.token_address[-4:]}"
+                    insufficient_alert = (
+                        f"⚠️ **رصيد غير كافٍ لتنفيذ الصفقة (INSUFFICIENT BALANCE)**\n\n"
+                        f"• **العملة (Token):** `{t_short}` (`{signal_item.token_address}`)\n"
+                        f"• **الشبكة (Chain):** {signal_item.chain.value}\n"
+                        f"• **مبلغ التداول المطلوب:** `{preliminary_cost:.4f} {unit}`\n"
+                        f"• **رسوم الشبكة المقدرة:** `{simulated_fee} {unit}`\n"
+                        f"• **الإجمالي المطلوب:** `{total_needed:.4f} {unit}`\n"
+                        f"• **الرصيد المتاح حالياً:** `{available_cash:.4f} {unit}`\n\n"
+                        f"❌ **تم إلغاء تنفيذ الصفقة لعدم توفر رصيد كافٍ.**\n"
+                        f"💡 لن يتم رفع أو تعديل مبلغ التداول تلقائياً لتعويض نقص الرصيد.\n"
+                        f"يمكنك شحن الرصيد أو استخدام أمر `/setamount` لتعديل المبلغ."
+                    )
+                    logger.warning(
+                        "Insufficient balance to open position for %s: available=%.4f %s < required=%.4f %s (trade=%.4f + fee=%s). Dropping BUY.",
+                        signal_item.token_address[:10],
+                        available_cash,
+                        unit,
+                        total_needed,
+                        unit,
+                        preliminary_cost,
+                        simulated_fee,
+                    )
+                    asyncio.create_task(self._broadcast_trade_alert(insufficient_alert))
+                    continue
+
                 can_open, reject_reason = self._position_book.can_open_position(
                     token_address=signal_item.token_address,
                     chain=signal_item.chain,
@@ -1786,6 +2154,7 @@ class PaperTradingEngine:
                     total_equity_native=equity_native,
                     pool_address=getattr(signal_item, "pool_address", "") or "",
                     narrative_cluster=getattr(signal_item, "narrative_cluster", None),
+                    is_manual_size=is_manual_size,
                 )
                 if not can_open:
                     logger.info(
@@ -1852,6 +2221,7 @@ class PaperTradingEngine:
                 signal_item,
                 portfolio_equity_usd=equity,
                 is_new_launch=is_new_launch,
+                fixed_trade_amount_native=preliminary_cost if (signal_item.suggested_side == OrderSide.BUY and is_manual_size) else None,
             )
             if fill is None or fill.effective_price <= Decimal(0):
                 if fill is not None and fill.effective_price <= Decimal(0):
@@ -1897,6 +2267,10 @@ class PaperTradingEngine:
                     net_buy_delta=float(getattr(signal_item, "net_buy_delta", 0.0) or 0.0),
                     platform=platform_name,
                     partial_exit_enabled=getattr(self.config, "partial_exit_enabled", False),
+                    strategy_name=getattr(self, "active_strategy", getattr(self.config, "active_strategy", "peak_trailing_50")),
+                    trailing_stop_from_peak_pct=getattr(self, "trailing_stop_from_peak_pct", getattr(self.config, "trailing_stop_from_peak_pct", 0.50)),
+                    custom_take_profit_pct=getattr(self, "custom_take_profit_pct", getattr(self.config, "custom_take_profit_pct", 0.50)),
+                    custom_stop_loss_pct=getattr(self, "custom_stop_loss_pct", getattr(self.config, "custom_stop_loss_pct", 0.50)),
                 )
 
                 if self._ledger:
@@ -2281,6 +2655,171 @@ class PaperTradingEngine:
             except Exception as exc:  # noqa: BLE001
                 logger.error("Error in missed opportunity watchdog: %s", exc)
 
+    async def _screener_priority_poller(self) -> None:
+        """
+        Continuously polls Graduated and Movers platform opportunities every 20-30 seconds,
+        verifying the $10,000 USD minimum market cap before full analysis and execution.
+        """
+        logger.info("Continuous Screener Priority Poller active (polling every 20-30s).")
+        while not self._shutdown_event.is_set():
+            poll_interval = float(getattr(self, "screener_poll_interval_s", getattr(self._cfg, "screener_poll_interval_s", 25.0)))
+            try:
+                await asyncio.wait_for(self._shutdown_event.wait(), timeout=poll_interval)
+                break
+            except asyncio.TimeoutError:
+                pass
+            except asyncio.CancelledError:
+                break
+
+            if self._shutdown_event.is_set():
+                break
+
+            try:
+                await self._poll_graduated_and_movers()
+            except Exception as exc:
+                logger.debug("Error in screener priority poller: %s", exc)
+
+    async def _poll_graduated_and_movers(self) -> None:
+        """
+        Queries live DexScreener token profiles/boosts and internal pool metrics for Solana tokens
+        meeting the strict >= $10,000 market cap and genuine participant criteria.
+        """
+        session = self._session
+        if session is None or session.closed:
+            return
+
+        min_mcap = Decimal(str(getattr(self, "min_market_cap_usd", getattr(self._cfg, "min_market_cap_usd", 10000.0))))
+        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+
+        try:
+            async with session.get(
+                "https://api.dexscreener.com/token-boosts/top/v1",
+                headers=headers,
+                timeout=aiohttp.ClientTimeout(total=8.0),
+            ) as resp:
+                if resp.status != 200:
+                    return
+                boosts = await resp.json()
+        except Exception as exc:
+            logger.debug("DexScreener top boosts poll skipped: %s", exc)
+            return
+
+        if not isinstance(boosts, list):
+            return
+
+        sol_addrs = [
+            b.get("tokenAddress")
+            for b in boosts
+            if isinstance(b, dict) and b.get("chainId") == "solana" and b.get("tokenAddress")
+        ]
+        if not sol_addrs:
+            return
+
+        unique_addrs = list(dict.fromkeys(sol_addrs))[:30]
+        batch_param = ",".join(unique_addrs)
+
+        try:
+            url = f"https://api.dexscreener.com/latest/dex/tokens/{batch_param}"
+            async with session.get(
+                url,
+                headers=headers,
+                timeout=aiohttp.ClientTimeout(total=8.0),
+            ) as resp:
+                if resp.status != 200:
+                    return
+                data = await resp.json()
+        except Exception as exc:
+            logger.debug("DexScreener batch tokens poll skipped: %s", exc)
+            return
+
+        pairs = data.get("pairs", [])
+        if not isinstance(pairs, list):
+            return
+
+        seen_mints: set[str] = set()
+        for p in pairs:
+            if not isinstance(p, dict) or p.get("chainId") != "solana":
+                continue
+
+            base_tok = p.get("baseToken", {})
+            mint = base_tok.get("address")
+            if not mint or mint in seen_mints:
+                continue
+
+            # Skip tokens already in an active open position
+            if self.is_position_open(mint, ChainIdentifier.SOLANA_MAINNET):
+                continue
+
+            mcap_val = p.get("marketCap")
+            if mcap_val is None:
+                continue
+            try:
+                mcap = Decimal(str(mcap_val))
+            except Exception:
+                continue
+
+            # Requirement 3: Enforce strict $10,000 USD minimum market cap before full analysis
+            if mcap < min_mcap:
+                continue
+
+            seen_mints.add(mint)
+            pool_addr = p.get("pairAddress", "")
+            dex_id = (p.get("dexId") or "").lower()
+            liq_usd = float(p.get("liquidity", {}).get("usd") or 0.0)
+            vol_5m = float(p.get("volume", {}).get("m5") or 0.0)
+            vol_2m = vol_5m * (2.0 / 5.0)
+            price_usd = float(p.get("priceUsd") or 0.0)
+            price_change_5m = float(p.get("priceChange", {}).get("m5") or 0.0)
+
+            is_graduated = dex_id in ("raydium", "meteora", "orca", "pumpswap") or mint.endswith("pump")
+            is_mover = price_change_5m >= 3.0 or vol_5m >= 5000.0
+
+            if is_graduated and is_mover:
+                sec = ScreenerSection.BOTH
+            elif is_graduated:
+                sec = ScreenerSection.GRADUATED
+            elif is_mover:
+                sec = ScreenerSection.MOVERS
+            else:
+                sec = ScreenerSection.GRADUATED
+
+            pool_st = self._pool_registry.get(mint) or (self._pool_registry.get(pool_addr) if pool_addr else None)
+            if pool_st is None and liq_usd > 0:
+                sol_p = Decimal(str(getattr(self._cfg, "sol_price_usd", self._sol_price or 150.0)))
+                liq_dec = Decimal(str(liq_usd))
+                native_res = liq_dec / Decimal("2.0") / sol_p if sol_p > 0 else Decimal("100.0")
+                token_res = (liq_dec / Decimal("2.0")) / Decimal(str(price_usd or 0.001)) if (price_usd or 0.001) > 0 else Decimal("1000000.0")
+                pool_st = PoolState(
+                    pool_address=pool_addr or mint,
+                    chain=ChainIdentifier.SOLANA_MAINNET,
+                    token_reserve=token_res,
+                    native_reserve=native_res,
+                    fee_numerator=25,
+                    fee_denominator=10000,
+                    last_updated_block=1000,
+                    token_decimals=6,
+                    native_decimals=9,
+                )
+                self._pool_registry.set(mint, pool_st)
+                if pool_addr:
+                    self._pool_registry.set(pool_addr, pool_st)
+
+            event = ScreenerDiscoveryEvent(
+                mint=mint,
+                token_address=mint,
+                pool_address=pool_addr,
+                section=sec,
+                market_cap_usd=float(mcap),
+                volume_2m_usd=vol_2m,
+                liquidity_usd=liq_usd,
+                current_price=price_usd,
+                price_change_pct_2m=price_change_5m * 0.4,
+                raw_metadata=p,
+                pool_state=pool_st,
+            )
+
+            await self.evaluate_screener_token(event)
+
     def _get_engine_status(self) -> dict[str, Any]:
         """Collects real-time engine telemetry for the interactive Telegram bot."""
         uptime_s = time.time() - self._start_time if self._start_time else 0.0
@@ -2656,6 +3195,7 @@ class PaperTradingEngine:
             self._ledger = ledger
             self.tracer.ledger = self._ledger
             self.tracer.start_worker()
+            await self._sync_ledger_settings()
 
             self._gatekeeper = SecurityGatekeeper(
                 session=session,
@@ -2806,8 +3346,11 @@ class PaperTradingEngine:
                 missed_opp_task = asyncio.create_task(
                     self._missed_opportunity_watchdog(), name="missed_opportunity_watchdog"
                 )
+                screener_poller_task = asyncio.create_task(
+                    self._screener_priority_poller(), name="screener_poller"
+                )
 
-                worker_tasks = [bridge_task, ingest_task, signal_task, poller_task, snapshot_task, heartbeat_task, buffer_task, missed_opp_task]
+                worker_tasks = [bridge_task, ingest_task, signal_task, poller_task, snapshot_task, heartbeat_task, buffer_task, missed_opp_task, screener_poller_task]
                 logger.info("All engine pipelines active. Awaiting market and social signals...")
 
                 # Monitor tasks: wait for either graceful shutdown or unexpected worker crash
@@ -2853,8 +3396,9 @@ class PaperTradingEngine:
                     heartbeat_task.cancel()
                     buffer_task.cancel()
                     missed_opp_task.cancel()
+                    screener_poller_task.cancel()
                     shutdown_waiter.cancel()
-                    await asyncio.gather(poller_task, snapshot_task, heartbeat_task, buffer_task, missed_opp_task, return_exceptions=True)
+                    await asyncio.gather(poller_task, snapshot_task, heartbeat_task, buffer_task, missed_opp_task, screener_poller_task, return_exceptions=True)
 
                     # 4. Flush traces and checkpoint SQLite database
                     try:
@@ -2993,6 +3537,10 @@ class PaperTradingEngine:
                 svm_pool_registry=svm_pool_registry,
                 seed_pool_states=seed_pool_states,
             )
+
+
+# Alias Runner for PaperTradingEngine
+Runner = PaperTradingEngine
 
 
 def _build_example_config() -> tuple[

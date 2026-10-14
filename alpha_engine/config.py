@@ -22,7 +22,7 @@ MAX_PORTFOLIO_EXPOSURE_PCT: float = 0.05
 MAX_PER_TOKEN_RISK_PCT: float = 0.015
 MAX_TOP10_CONCENTRATION: float = 0.20
 MAX_TOP10_CONCENTRATION_PUMP_FUN: float = 0.65
-MIN_MARKET_CAP_USD: Decimal = Decimal("8000.0")
+MIN_MARKET_CAP_USD: Decimal = Decimal("10000.0")
 
 
 class EngineConfig(BaseSettings):
@@ -289,9 +289,9 @@ class EngineConfig(BaseSettings):
         description="Rolling daily drawdown triggering circuit breaker (default: 15%)",
     )
     circuit_breaker_freeze_duration_s: float = Field(
-        default=3600.0,
+        default=300.0,
         ge=0.0,
-        description="Duration in seconds to freeze new buys when circuit breaker trips (60 mins)",
+        description="Duration in seconds to freeze new buys when circuit breaker trips (default: 300s / 5 mins)",
     )
     max_portfolio_risk_pct: float = Field(
         default=0.01,
@@ -394,6 +394,10 @@ class EngineConfig(BaseSettings):
     # -------------------------------------------------------------------------
     # 5c. Trade Frequency & Pacing Governor Settings
     # -------------------------------------------------------------------------
+    pacing_governor_enabled: bool = Field(
+        default=True,
+        description="Enable or disable mandatory multi-hour cooldown governor after initial trades",
+    )
     pacing_max_initial_trades: int = Field(
         default=10,
         ge=1,
@@ -411,7 +415,104 @@ class EngineConfig(BaseSettings):
     )
 
     # -------------------------------------------------------------------------
-    # 5d. Strategy V2 & Scoring Weights
+    # 5d. Strategy Selection & Dynamic Risk Parameters (Telegram Configurable)
+    # -------------------------------------------------------------------------
+    active_strategy: str = Field(
+        default="peak_trailing_50",
+        description="Active trading strategy profile: default, peak_trailing_50, peak_trailing_60, custom",
+    )
+    trailing_stop_from_peak_pct: float = Field(
+        default=0.50,
+        ge=0.05,
+        le=0.90,
+        description="Trailing stop loss drop percentage from highest recorded price (ATH peak, e.g. 50% or 60%)",
+    )
+    custom_take_profit_pct: float = Field(
+        default=0.50,
+        ge=0.05,
+        le=10.0,
+        description="Take-profit target percentage (e.g. 0.50 for +50%, 0.60 for +60%)",
+    )
+    custom_stop_loss_pct: float = Field(
+        default=0.50,
+        ge=0.05,
+        le=0.95,
+        description="Hard stop-loss percentage for custom strategy",
+    )
+    auto_trade_enabled: bool = Field(
+        default=True,
+        description="Whether the bot should automatically execute trades whenever qualifying opportunities are detected",
+    )
+    screener_exclusive_focus: bool = Field(
+        default=False,
+        description="Exclusively focus on identifying and trading tokens from Graduated and Movers sections (toggleable via /strategy screener on|off)",
+    )
+    screener_poll_interval_s: float = Field(
+        default=25.0,
+        ge=5.0,
+        le=60.0,
+        description="Interval in seconds for continuous monitoring of Graduated and Movers sections (20-30s)",
+    )
+    manual_trade_amount: Optional[Decimal] = Field(
+        default=None,
+        description="Manual trade amount per trade set via Telegram or config (e.g. 0.1 SOL, 25 USD). When set, all new trades use this exact amount.",
+    )
+    manual_trade_currency: str = Field(
+        default="SOL",
+        description="Currency for manual_trade_amount: 'SOL', 'USD', or 'ETH'",
+    )
+    min_independent_wallets: int = Field(
+        default=5,
+        ge=1,
+        description="Minimum number of unique wallets required to verify genuine trading activity",
+    )
+    max_single_wallet_volume_share: float = Field(
+        default=0.50,
+        ge=0.10,
+        le=1.0,
+        description="Maximum volume share for any single wallet to prevent wash trading (default: 50%)",
+    )
+    verify_genuine_activity: bool = Field(
+        default=False,
+        description="Whether to verify genuine trading activity and reject wash trading / single-wallet dominance",
+    )
+
+    # Revival / Older Tokens Tuning Parameters
+    revival_min_token_age_s: float = Field(
+        default=7200.0,
+        ge=0.0,
+        description="Minimum token age for revival staging buffer in seconds",
+    )
+    revival_max_dev_balance_pct: float = Field(
+        default=0.001,
+        ge=0.0,
+        description="Maximum developer wallet balance percentage for older tokens (0.1% default)",
+    )
+    revival_max_top10_concentration_pct: float = Field(
+        default=25.0,
+        ge=0.0,
+        description="Maximum top-10 concentration percentage for older tokens (25% default)",
+    )
+    revival_volume_surge_multiplier_k: float = Field(
+        default=3.0,
+        ge=1.0,
+        description="Volume surge multiplier over 1h SMA to qualify revival breakout (3.0x default)",
+    )
+    revival_min_net_buy_delta: float = Field(
+        default=0.65,
+        ge=-1.0,
+        le=1.0,
+        description="Minimum net buy delta for revival breakout (+65% default)",
+    )
+    revival_min_accumulation_score: float = Field(
+        default=0.60,
+        ge=0.0,
+        le=1.0,
+        description="Minimum composite score to trigger revival breakout signal",
+    )
+
+    # -------------------------------------------------------------------------
+    # 5e. Strategy V2 & Scoring Weights
     # -------------------------------------------------------------------------
     strategy_v2_enabled: bool = Field(
         default=True,
@@ -426,7 +527,7 @@ class EngineConfig(BaseSettings):
     score_weight_structure: float = Field(default=10.0)
     score_weight_narrative: float = Field(default=5.0)
     min_entry_score: float = Field(
-        default=65.0,
+        default=50.0,
         description="Minimum 0-100 score required to trigger a buy signal",
     )
     min_signal_strength: SignalStrength = Field(
@@ -443,13 +544,13 @@ class EngineConfig(BaseSettings):
     )
 
     # -------------------------------------------------------------------------
-    # 5e. Screener Priority Strategy: Graduated & Movers
+    # 5f. Screener Priority Strategy: Graduated & Movers
     # -------------------------------------------------------------------------
     min_market_cap_usd: Decimal = Field(
-        default=Decimal("8000.0"),
+        default=Decimal("10000.0"),
         ge=Decimal(0),
         validation_alias=AliasChoices("min_market_cap_usd", "MIN_MARKET_CAP_USD", "min_mcap_usd"),
-        description="Minimum USD market capitalization required to enter any new token position ($8,000)",
+        description="Minimum USD market capitalization required to enter any new token position ($10,000)",
     )
     breakout_margin_pct: float = Field(
         default=0.01,
@@ -677,6 +778,17 @@ class EngineConfig(BaseSettings):
             return None
         return int(v)
 
+    @field_validator("manual_trade_amount", mode="before")
+    @classmethod
+    def parse_manual_trade_amount(cls, v: Any) -> Optional[Decimal]:
+        """Coerce raw manual trade amount to Decimal or None."""
+        if v is None or v == "":
+            return None
+        try:
+            return Decimal(str(v))
+        except Exception:
+            return None
+
     @model_validator(mode="before")
     @classmethod
     def apply_legacy_env_fallbacks(cls, data: Any) -> Any:
@@ -777,6 +889,11 @@ class EngineConfig(BaseSettings):
             self.initial_sol * self.sol_price_usd
             + self.initial_eth * self.eth_price_usd
         )
+
+    @property
+    def MIN_MARKET_CAP_USD(self) -> Decimal:
+        """Mandatory minimum USD market cap threshold ($10,000)."""
+        return self.min_market_cap_usd
 
     @property
     def MIN_VOLUME_USD(self) -> Decimal:

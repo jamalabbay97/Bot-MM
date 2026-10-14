@@ -377,10 +377,43 @@ class SecurityGatekeeper:
             maxsize=negative_cache_maxsize,
             ttl_seconds=negative_cache_ttl_s,
         )
+        self._positive_cache: dict[tuple[str, str], tuple[float, SecurityReport]] = {}
+        self._positive_cache_ttl: float = 300.0
 
     @property
     def negative_cache(self) -> NegativeRejectionCache:
         return self._negative_cache
+
+    def get_cached_clean(
+        self, token_address: str, chain: ChainIdentifier | str | None, pool_address: str = ""
+    ) -> SecurityReport | None:
+        """Fast-path lookup for tokens that have already passed all security tiers."""
+        c_str = chain.value if isinstance(chain, ChainIdentifier) else (str(chain) if chain else "")
+        key = (token_address.lower().strip(), c_str, (pool_address or "").lower().strip())
+        entry = self._positive_cache.get(key)
+        if entry is not None:
+            ts, rep = entry
+            if time.time() - ts <= self._positive_cache_ttl:
+                return rep
+            self._positive_cache.pop(key, None)
+        return None
+
+    def record_clean(
+        self,
+        token_address: str,
+        chain: ChainIdentifier | str | None,
+        report: SecurityReport,
+        pool_address: str = "",
+    ) -> None:
+        """Record verified clean token in positive cache to avoid redundant API hits."""
+        c_str = chain.value if isinstance(chain, ChainIdentifier) else (str(chain) if chain else "")
+        key = (token_address.lower().strip(), c_str, (pool_address or "").lower().strip())
+        self._positive_cache[key] = (time.time(), report)
+        if len(self._positive_cache) > 5000:
+            now = time.time()
+            expired = [k for k, (ts, _) in self._positive_cache.items() if now - ts > self._positive_cache_ttl]
+            for k in expired:
+                self._positive_cache.pop(k, None)
 
     def is_rejected(self, token_address: str, chain: ChainIdentifier | str | None = None) -> bool:
         """Fast-path check whether a token is already recorded in the negative rejection cache."""
@@ -575,6 +608,22 @@ class SecurityGatekeeper:
                 span.output_data = {"tier": cached_rejection.tier.value if hasattr(cached_rejection.tier, "value") else str(cached_rejection.tier)}
                 return cached_rejection
 
+            # Fast-path positive cache lookup: return cached clean report for tokens that already passed
+            cached_clean = self.get_cached_clean(token_address, chain, pool_address=pool_address)
+            if cached_clean is not None:
+                logger.debug(
+                    "Fast-path positive cache hit: token %s already passed security; returning cached clean report.",
+                    token_address[:10],
+                )
+                span.status = TraceStatus.PASSED
+                span.output_data = {
+                    "tier": cached_clean.tier.value if hasattr(cached_clean.tier, "value") else str(cached_clean.tier),
+                    "sell_tax": cached_clean.sell_tax_bps,
+                    "lp_burned": cached_clean.lp_burned_ratio,
+                    "top10": cached_clean.top10_concentration,
+                }
+                return cached_clean
+
             tier1_report = await self._run_tier1(
                 token_address, chain, pool_address, token_age_s=token_age_s
             )
@@ -635,6 +684,7 @@ class SecurityGatekeeper:
                     return honeypot_report
 
             logger.info("Token %s PASSED all security tiers.", token_address)
+            self.record_clean(token_address, chain, tier1_report, pool_address=pool_address)
             span.status = TraceStatus.PASSED
             span.output_data = {
                 "tier": tier1_report.tier.value if hasattr(tier1_report.tier, "value") else str(tier1_report.tier),
@@ -663,6 +713,9 @@ class SecurityGatekeeper:
                 self._session, token_address, chain, self._limiter
             )
             if raw is None:
+                cached_clean = self.get_cached_clean(token_address, chain)
+                if cached_clean is not None:
+                    return cached_clean
                 logger.warning(
                     "GoPlus unavailable for %s — issuing WARN-level report.", token_address
                 )
@@ -681,6 +734,9 @@ class SecurityGatekeeper:
                 pool_address=pool_address,
             )
             if raw is None:
+                cached_clean = self.get_cached_clean(token_address, chain)
+                if cached_clean is not None:
+                    return cached_clean
                 logger.warning(
                     "RugCheck unavailable for %s — issuing WARN-level report.", token_address
                 )

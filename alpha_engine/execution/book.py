@@ -90,6 +90,10 @@ class OpenLot:
     last_confirmed_hl: Decimal = Decimal("0")
     confirmed_higher_lows: list[Decimal] = field(default_factory=list)
     confirmed_higher_highs: list[Decimal] = field(default_factory=list)
+    strategy_name: str = "default"
+    trailing_stop_from_peak_pct: Optional[float] = None
+    custom_take_profit_pct: Optional[float] = None
+    custom_stop_loss_pct: Optional[float] = None
 
     def record_tick(
         self,
@@ -257,6 +261,7 @@ class PositionBook:
         narrative_cluster: Optional[str] = None,
         candidate_ticks: Optional[list[Decimal | float]] = None,
         candidate_returns: Optional[list[float]] = None,
+        is_manual_size: bool = False,
     ) -> tuple[bool, str]:
         """
         Enforce Strict Portfolio State Machine & Dynamic Risk Gating:
@@ -264,8 +269,8 @@ class PositionBook:
         2. Narrative Diversification: reject if an active position shares the same narrative cluster.
         3. Cross-Asset Correlation: reject if Pearson correlation r > 0.80 with any active open lot (>=20 ticks).
         4. MAX_ACTIVE_POSITIONS = 3 hard cap.
-        5. MAX_PER_TOKEN_RISK_PCT = 1.5% max capital per signal.
-        6. MAX_PORTFOLIO_EXPOSURE_PCT = 5% max capital across all open lots.
+        5. MAX_PER_TOKEN_RISK_PCT = 1.5% max capital per signal (bypassed if is_manual_size=True).
+        6. MAX_PORTFOLIO_EXPOSURE_PCT = 5% max capital across all open lots (bypassed if is_manual_size=True).
         """
         if self.is_position_open(token_address, chain):
             return False, f"Duplicate position already open for token {token_address[:10]}"
@@ -337,7 +342,7 @@ class PositionBook:
                 f"Active position count ({self.open_position_count()}) reached MAX_ACTIVE_POSITIONS hard cap ({MAX_ACTIVE_POSITIONS})",
             )
 
-        if total_equity_native > 0:
+        if total_equity_native > 0 and not is_manual_size:
             if allocated_cost_native > total_equity_native * MAX_PER_TOKEN_RISK_PCT:
                 return (
                     False,
@@ -383,6 +388,10 @@ class PositionBook:
         net_buy_delta: float = 0.0,
         platform: Optional[str] = None,
         partial_exit_enabled: bool = False,
+        strategy_name: str = "default",
+        trailing_stop_from_peak_pct: Optional[float] = None,
+        custom_take_profit_pct: Optional[float] = None,
+        custom_stop_loss_pct: Optional[float] = None,
     ) -> OpenLot:
         if fill.effective_price <= Decimal(0):
             raise ValueError(
@@ -431,6 +440,10 @@ class PositionBook:
             platform=resolved_platform,
             is_new_launch=getattr(fill, "is_new_launch", False),
             partial_exit_enabled=partial_exit_enabled,
+            strategy_name=strategy_name,
+            trailing_stop_from_peak_pct=trailing_stop_from_peak_pct,
+            custom_take_profit_pct=custom_take_profit_pct,
+            custom_stop_loss_pct=custom_stop_loss_pct,
             price_history=[(entry_ts, fill.effective_price, fill.simulated_native_spent)],
             tick_prices_5m=[(entry_ts, fill.effective_price)],
             tick_returns_5m=[],
@@ -721,6 +734,80 @@ class PositionBook:
             lot.last_pool_reserve_native = current_pool_reserve_native
 
         gain_ratio = current_price / lot.entry_price
+
+        # --- TRAILING STOP-LOSS BASED ON HIGHEST RECORDED PRICE (ATH PEAK) ---
+        # Requirement 2: Trailing stop-loss based on highest price reached after entering trade.
+        # Drops of 50% or 60% from peak trigger exit; does not close trade simply at -25% from entry.
+        is_peak_trailing_strategy = (
+            lot.strategy_name in ("peak_trailing_50", "peak_trailing_60", "custom")
+            or lot.trailing_stop_from_peak_pct is not None
+        )
+
+        if is_peak_trailing_strategy and lot.peak_price > Decimal(0):
+            trail_from_peak = lot.trailing_stop_from_peak_pct
+            if trail_from_peak is None:
+                trail_from_peak = 0.60 if lot.strategy_name == "peak_trailing_60" else 0.50
+
+            drawdown = (lot.peak_price - current_price) / lot.peak_price
+            if drawdown >= Decimal(str(trail_from_peak)):
+                logger.info(
+                    "PEAK TRAILING STOP (%.0f%% from ATH peak) TRIGGERED for lot %s (%s): peak=%s, curr=%s, drawdown=%.2f%%. Liquidating 100%% of remaining lot.",
+                    float(trail_from_peak * 100),
+                    lot.lot_id[:8],
+                    lot.token_address[:10],
+                    lot.peak_price,
+                    current_price,
+                    float(drawdown * 100),
+                )
+                return ExitDecision(
+                    lot_id=lot.lot_id,
+                    token_address=lot.token_address,
+                    chain=lot.chain,
+                    should_exit=True,
+                    exit_reason=TradeExitReason.TRAILING_PEAK_STOP,
+                    exit_stage=ExitStage.TRAILING_SL,
+                    tokens_to_sell=lot.tokens_held,
+                    current_price=current_price,
+                    pnl_estimate_native=lot.tokens_held * (current_price - lot.entry_price),
+                    prioritized=True,
+                    action="CLOSE_ALL",
+                )
+
+            # Target Take-Profit for Peak Trailing Strategy
+            target_tp = lot.custom_take_profit_pct
+            if target_tp is None:
+                target_tp = 0.60 if lot.strategy_name == "peak_trailing_60" else 0.50
+
+            if target_tp > 0:
+                tp_ratio = Decimal("1.0") + Decimal(str(target_tp))
+                if gain_ratio >= tp_ratio:
+                    logger.info(
+                        "TARGET TAKE-PROFIT (+%.0f%%) TRIGGERED for lot %s (%s): price=%s, entry=%s, gain_ratio=%s >= %s. Liquidating position.",
+                        float(target_tp * 100),
+                        lot.lot_id[:8],
+                        lot.token_address[:10],
+                        current_price,
+                        lot.entry_price,
+                        gain_ratio,
+                        tp_ratio,
+                    )
+                    return ExitDecision(
+                        lot_id=lot.lot_id,
+                        token_address=lot.token_address,
+                        chain=lot.chain,
+                        should_exit=True,
+                        exit_reason=TradeExitReason.TP_60 if abs(target_tp - 0.60) < 0.01 else TradeExitReason.TP_50,
+                        exit_stage=ExitStage.TP2,
+                        tokens_to_sell=lot.tokens_held,
+                        current_price=current_price,
+                        pnl_estimate_native=lot.tokens_held * (current_price - lot.entry_price),
+                        prioritized=True,
+                        action="CLOSE_ALL",
+                    )
+
+            # In peak trailing mode, prevent premature -14%/-25% entry-based stop outs and velocity decay:
+            # Let the trade develop unless emergency liquidity drain (rugpull) occurs.
+            return None
 
         # --- REVIVAL & CTO BREAKOUT SWING EXIT PROFILE ---
         if lot.exit_profile == ExitProfile.REVIVAL_SWING:
@@ -1425,7 +1512,7 @@ class RunningMetrics:
     launch_circuit_breaker_tripped_at: float = 0.0
     circuit_breaker_reason: str = ""
 
-    def is_circuit_breaker_active(self, freeze_duration_s: float = 3600.0) -> bool:
+    def is_circuit_breaker_active(self, freeze_duration_s: float = 300.0) -> bool:
         """Check if global circuit breaker is actively freezing BUY executions."""
         if not self.circuit_breaker_active:
             return False
@@ -1433,22 +1520,23 @@ class RunningMetrics:
         if time.time() - self.circuit_breaker_tripped_at > freeze_duration_s:
             self.circuit_breaker_active = False
             self.circuit_breaker_reason = ""
-            logger.info("Circuit breaker freeze period elapsed (60 min). Resuming normal execution.")
+            logger.info("Circuit breaker freeze period elapsed (%.0f min). Resuming normal execution.", freeze_duration_s / 60.0)
             return False
         return True
 
-    def trip_circuit_breaker(self, reason: str) -> None:
+    def trip_circuit_breaker(self, reason: str, freeze_duration_s: float = 300.0) -> None:
         """Trip global circuit breaker flag and log critical alert."""
         import time
         self.circuit_breaker_active = True
         self.circuit_breaker_tripped_at = time.time()
         self.circuit_breaker_reason = reason
         logger.critical(
-            "CIRCUIT_BREAKER_ACTIVE TRIPPED: %s. Freezing all BUY executions for 60 minutes.",
+            "CIRCUIT_BREAKER_ACTIVE TRIPPED: %s. Freezing BUY executions for %.0f minutes.",
             reason,
+            freeze_duration_s / 60.0,
         )
 
-    def is_launch_circuit_breaker_active(self, freeze_duration_s: float = 3600.0) -> bool:
+    def is_launch_circuit_breaker_active(self, freeze_duration_s: float = 300.0) -> bool:
         """يفحص إذا كان تجميد العملات الجديدة فقط نشطاً."""
         if not self.launch_circuit_breaker_active:
             return False
@@ -1456,7 +1544,7 @@ class RunningMetrics:
         if time.time() - self.launch_circuit_breaker_tripped_at > freeze_duration_s:
             self.launch_circuit_breaker_active = False
             self.consecutive_launch_losses = 0
-            logger.info("New-launch circuit breaker freeze elapsed. Resuming launch trades.")
+            logger.info("New-launch circuit breaker freeze elapsed (%.0f min). Resuming launch trades.", freeze_duration_s / 60.0)
             return False
         return True
 
