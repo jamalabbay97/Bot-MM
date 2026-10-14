@@ -286,18 +286,21 @@ async def verify_solana_mint_preflight(
             timeout=aiohttp.ClientTimeout(total=2.5),
         ) as resp:
             if resp.status != 200:
+                logger.debug("RPC endpoint returned non-200 status %d for mint %s", resp.status, mint_address[:10])
                 return None
             body = await resp.json()
             val = (body.get("result") or {}).get("value")
             if not val:
-                return None
+                logger.debug("Solana getAccountInfo confirmed account does not exist on-chain for mint %s", mint_address[:10])
+                return {"invalid_mint": True, "exists": False, "mint": mint_address}
 
             owner = val.get("owner", "")
             if owner not in (
                 "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
                 "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb",
             ):
-                return None
+                logger.debug("Solana account %s owner %s is not SPL Token / Token-2022", mint_address[:10], owner)
+                return {"invalid_mint": True, "owner": owner, "mint": mint_address}
 
             mint_auth = None
             freeze_auth = None

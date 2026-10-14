@@ -121,9 +121,11 @@ async def _fetch_rugcheck_report(
                 session, mint_address, fallback_rpc, pool_address=pool_address
             )
             if on_chain_info is not None:
+                if on_chain_info.get("invalid_mint"):
+                    return on_chain_info
                 on_chain_info["state"] = "UNINDEXED_NEW_BONDING_CURVE"
                 return on_chain_info
-        return {"invalid_mint": True, "state": "UNINDEXED_NEW_BONDING_CURVE"}
+        # If fallback RPC failed / was unreachable, fall through to attempt RugCheck API query
 
     # Directive 3: Check in-memory LRU Cache (TTL = 60s)
     if UNINDEXED_MINT_CACHE.is_cached(mint_address):
@@ -136,9 +138,11 @@ async def _fetch_rugcheck_report(
                 session, mint_address, fallback_rpc, pool_address=pool_address
             )
             if on_chain_info is not None:
+                if on_chain_info.get("invalid_mint"):
+                    return on_chain_info
                 on_chain_info["state"] = "UNINDEXED_NEW_BONDING_CURVE"
                 return on_chain_info
-        return {"invalid_mint": True, "state": "UNINDEXED_NEW_BONDING_CURVE"}
+        return None
 
     url = _RUGCHECK_URL.format(mint=mint_address)
     max_attempts = len(_RUGCHECK_RETRY_DELAYS_S) + 1
@@ -167,9 +171,11 @@ async def _fetch_rugcheck_report(
                             session, mint_address, fallback_rpc, pool_address=pool_address
                         )
                         if on_chain_info is not None:
+                            if on_chain_info.get("invalid_mint"):
+                                return on_chain_info
                             on_chain_info["state"] = "UNINDEXED_NEW_BONDING_CURVE"
                             return on_chain_info
-                    return {"invalid_mint": True, "state": "UNINDEXED_NEW_BONDING_CURVE"}
+                    return None
 
                 if resp.status != 200:
                     logger.warning(
@@ -184,7 +190,7 @@ async def _fetch_rugcheck_report(
                         continue
                     return None
 
-        except (aiohttp.ClientError, TimeoutError) as exc:
+        except (aiohttp.ClientError, TimeoutError, OSError) as exc:
             logger.warning(
                 "RugCheck request failed for %s (attempt %d/%d): %s",
                 mint_address[:10],
@@ -203,6 +209,8 @@ async def _fetch_rugcheck_report(
             session, mint_address, fallback_rpc, pool_address=pool_address
         )
         if on_chain_info is not None:
+            if on_chain_info.get("invalid_mint"):
+                return on_chain_info
             logger.debug(
                 "Local RPC preflight validation verified unindexed mint %s on-chain.",
                 mint_address[:10],
@@ -210,8 +218,8 @@ async def _fetch_rugcheck_report(
             on_chain_info["state"] = "UNINDEXED_NEW_BONDING_CURVE"
             return on_chain_info
 
-    logger.debug("RugCheck indicated invalid/non-existent token mint %s", mint_address[:10])
-    return {"invalid_mint": True, "state": "UNINDEXED_NEW_BONDING_CURVE"}
+    logger.debug("RugCheck unavailable or unindexed for token mint %s", mint_address[:10])
+    return None
 
 
 def _parse_rugcheck_report(
@@ -224,13 +232,15 @@ def _parse_rugcheck_report(
     max_conc = _MAX_PUMP_FUN_TOP10_CONCENTRATION if is_pump else _MAX_TOP10_CONCENTRATION
 
     if raw.get("invalid_mint"):
+        buy_tax = 0 if is_pump else 10_000
+        sell_tax = 0 if is_pump else 10_000
         return SecurityReport(
             token_address=mint_address,
             chain=ChainIdentifier.SOLANA_MAINNET,
             tier=SecurityTier.TIER1_REJECTED,
             is_honeypot=False,
-            buy_tax_bps=10_000,
-            sell_tax_bps=10_000,
+            buy_tax_bps=buy_tax,
+            sell_tax_bps=sell_tax,
             lp_burned_ratio=0.0,
             top10_concentration=1.0,
             mint_authority_disabled=False,
@@ -314,16 +324,19 @@ def _parse_rugcheck_report(
 
     top_holders: list[dict[str, Any]] = raw.get("topHolders") or []
     non_insider = [h for h in top_holders if isinstance(h, dict) and not h.get("insider", False)]
-    if is_pump:
-        filtered_holders = []
-        for idx, h in enumerate(non_insider):
-            h_addr = h.get("address", "") or h.get("owner", "")
-            h_pct = float(h.get("pct", 0) or 0)
-            if h_addr in excluded_holders or (idx == 0 and h_pct >= 50.0):
-                logger.debug("Excluding Pump.fun bonding curve %s from topHolders", h_addr[:10])
-                continue
-            filtered_holders.append(h)
-        non_insider = filtered_holders
+    
+    # Exclude DEX/AMM liquidity vaults and bonding curves from top-10 concentration
+    filtered_holders = []
+    for idx, h in enumerate(non_insider):
+        h_addr = h.get("address", "") or h.get("owner", "")
+        h_pct = float(h.get("pct", 0) or 0)
+        is_lp_vault = h.get("is_lp", False) or h.get("is_raydium", False)
+        # Exclude known pool address, bonding curves, Raydium authorities, or dominant initial liquidity vaults (>= 30%)
+        if h_addr in excluded_holders or is_lp_vault or (idx == 0 and h_pct >= 30.0):
+            logger.debug("Excluding liquidity vault %s (%.1f%%) from topHolders", h_addr[:10] if h_addr else "vault", h_pct)
+            continue
+        filtered_holders.append(h)
+    non_insider = filtered_holders
 
     top10_pcts = [float(h.get("pct", 0) or 0) for h in non_insider[:10]]
     top10_concentration = min(1.0, sum(top10_pcts) / 100.0)

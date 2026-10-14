@@ -11,6 +11,7 @@ import asyncio
 import logging
 import os
 import signal
+import socket
 import sys
 import time
 from decimal import Decimal
@@ -52,6 +53,7 @@ from alpha_engine.models.enums import (
     ExitProfile,
     LotStatus,
     OrderSide,
+    ScreenerSection,
     SignalSource,
     SignalStrength,
     TradeExitReason,
@@ -62,6 +64,7 @@ from alpha_engine.models.events import (
     PumpMintEvent,
     PumpSwapEvent,
     RawSignalEvent,
+    ScreenerDiscoveryEvent,
     ShutdownSentinel,
     SignalEvent,
     SwapEvent,
@@ -71,6 +74,13 @@ from alpha_engine.models.state import PoolState, PortfolioSnapshot, SecurityRepo
 from alpha_engine.rate_limiter.registry import RateLimiterRegistry
 from alpha_engine.security.constants import is_blacklisted_token
 from alpha_engine.security.gatekeeper import SecurityGatekeeper
+from alpha_engine.engine.strategy.screener_priority import (
+    GraduatedProfileConfig,
+    MoversProfileConfig,
+    ScreenerDecision,
+    ScreenerEvaluationResult,
+    ScreenerPriorityEvaluator,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -111,9 +121,9 @@ class PaperTradingEngine:
         self._ingestion_q: asyncio.Queue[
             SwapEvent | PoolStateUpdateEvent | RawSignalEvent | NewsSignalEvent | ShutdownSentinel
         ] = asyncio.Queue(maxsize=max_q)
-        self._signal_q: asyncio.Queue[SignalEvent | NewsEvent | ShutdownSentinel] = (
-            asyncio.Queue(maxsize=max_q)
-        )
+        self._signal_q: asyncio.Queue[
+            SignalEvent | NewsEvent | ScreenerDiscoveryEvent | ShutdownSentinel
+        ] = asyncio.Queue(maxsize=max_q)
 
         self._recent_gatekeeper_evaluations: deque[dict[str, Any]] = deque(maxlen=20)
         self._recent_news_events: deque[dict[str, Any]] = deque(maxlen=20)
@@ -146,6 +156,24 @@ class PaperTradingEngine:
         from alpha_engine.engine.strategy.exit_engine import ExitEngine
         self.risk_engine = RiskEngine(config)
         self.exit_engine = ExitEngine(config)
+        grad_cfg = GraduatedProfileConfig(
+            min_liquidity_usd=Decimal(str(config.graduated_min_liquidity_usd)),
+            max_price_impact_pct=config.graduated_max_price_impact_pct,
+            min_volume_usd=Decimal(str(config.screener_min_volume_usd)),
+        )
+        movers_cfg = MoversProfileConfig(
+            min_buy_pressure_ratio=0.55,
+            max_extension_pct=config.movers_max_extension_pct,
+            min_volume_usd=Decimal(str(config.screener_min_volume_usd)),
+        )
+        self.screener_evaluator = ScreenerPriorityEvaluator(
+            config=config,
+            gatekeeper=None,
+            metrics_aggregator=self._metrics_aggregator,
+            ledger=None,
+            graduated_config=grad_cfg,
+            movers_config=movers_cfg,
+        )
         self._last_pnl_cycle_ts: float = time.time()
 
         self._explainer: Optional[ConversationalSupervisor] = None
@@ -271,6 +299,10 @@ class PaperTradingEngine:
     def launch_buffer(self) -> PendingLaunchBuffer:
         return self._pending_launch_buffer
 
+    @property
+    def position_book(self) -> PositionBook:
+        return self._position_book
+
     @staticmethod
     def _is_new_launch_signal(signal_item: SignalEvent) -> bool:
         """يحدد إذا كانت العملة إطلاقاً حديثاً أو عملة قديمة/مستقرة."""
@@ -279,10 +311,21 @@ class PaperTradingEngine:
             return False
         if getattr(signal_item, "source", None) in (SignalSource.REVIVAL_BREAKOUT, SignalSource.WAVE2_BREAKOUT, "revival_breakout", "wave2_breakout"):
             return False
+        if getattr(signal_item, "source", None) in (SignalSource.SCREENER_GRADUATED, SignalSource.SCREENER_MOVERS, "screener_graduated", "screener_movers"):
+            return False
+        if getattr(signal_item, "pattern", None) in ("screener_graduated", "screener_movers"):
+            return False
         if getattr(signal_item, "token_age_hours", 0.0) and signal_item.token_age_hours > 0.5:
             return False
         if getattr(signal_item, "token_age_s", 0.0) and signal_item.token_age_s > 1800.0:
             return False
+        
+        # Token is from an established DEX swap and not on Pump.fun
+        tok_addr = getattr(signal_item, "token_address", "").lower()
+        sig_source = getattr(signal_item, "source", None)
+        if sig_source == SignalSource.DEX_SWAP and not tok_addr.endswith("pump"):
+            return False
+
         return True
 
     @staticmethod
@@ -344,7 +387,7 @@ class PaperTradingEngine:
         xp = getattr(exit_fill, "effective_price", Decimal(0))
         pct = float((xp - ep) / ep * 100) if ep > 0 else 0.0
         is_win = exit_pnl_usd > 0
-        dur_s = (time.time_ns() - lot.open_timestamp_ns) / 1e9 if getattr(lot, "open_timestamp_ns", 0) > 0 else 0.0
+        dur_s = max(0.0, (time.time_ns() - lot.open_timestamp_ns) / 1e9) if getattr(lot, "open_timestamp_ns", 0) > 0 else 0.0
 
         platform_name = getattr(lot, "platform", None) or getattr(exit_fill, "platform", None) or resolve_trade_platform(
             token_address=lot.token_address,
@@ -761,6 +804,7 @@ class PaperTradingEngine:
                         gk,
                         buyer=getattr(swap, "buyer", "") or getattr(swap, "sender", ""),
                         slot=getattr(swap, "slot", 0) or getattr(swap, "block_number", 0),
+                        is_pump=is_pump,
                     ),
                     name=f"auto_discover_{target_token[:8]}",
                 )
@@ -965,6 +1009,7 @@ class PaperTradingEngine:
         gk: Any,
         buyer: str = "",
         slot: int = 0,
+        is_pump: Optional[bool] = None,
     ) -> None:
         async with self._screening_semaphore:
             try:
@@ -973,30 +1018,50 @@ class PaperTradingEngine:
                 )
                 disc_reason = self._extract_gatekeeper_rejection_reason(disc_report)
                 self._record_gatekeeper_eval(token_address, chain, disc_reason, passed=disc_report.passes_hard_gates)
-                if disc_report.passes_hard_gates and not self._pending_launch_buffer.is_staged(token_address):
+                if disc_report.passes_hard_gates:
                     initial_pool = self.get_or_create_initial_pool_state(chain, token_address, pool_address)
                     init_price = initial_pool.spot_price_native_per_token if initial_pool else Decimal("0.000000028")
-                    staged = self._pending_launch_buffer.stage_token(
-                        token_address=token_address,
-                        chain=chain,
-                        pool_address=pool_address,
-                        initial_price=init_price,
-                        report=disc_report,
-                        t_0=time.time(),
-                    )
-                    if staged is not None and sol_amount > Decimal(0):
-                        staged.total_volume_native += sol_amount
-                        staged.buy_count += 1
-                        staged.buy_volumes.append(sol_amount)
-                        if buyer:
-                            staged.unique_buyers.add(buyer)
-                        if slot > 0:
-                            staged.slot_buy_counts[slot] += 1
-                            staged.buy_blocks.add(slot)
-                    logger.info(
-                        "Auto-discovery staged %s in PendingLaunchBuffer (volume: %s native)",
-                        token_address[:10], sol_amount
-                    )
+                    if is_pump is None:
+                        is_pump = "pump" in token_address.lower() or "pump" in pool_address.lower()
+                    
+                    if is_pump and not self._pending_launch_buffer.is_staged(token_address):
+                        staged = self._pending_launch_buffer.stage_token(
+                            token_address=token_address,
+                            chain=chain,
+                            pool_address=pool_address,
+                            initial_price=init_price,
+                            report=disc_report,
+                            t_0=time.time(),
+                        )
+                        if staged is not None and sol_amount > Decimal(0):
+                            staged.total_volume_native += sol_amount
+                            staged.buy_count += 1
+                            staged.buy_volumes.append(sol_amount)
+                            if buyer:
+                                staged.unique_buyers.add(buyer)
+                            if slot > 0:
+                                staged.slot_buy_counts[slot] += 1
+                                staged.buy_blocks.add(slot)
+                        logger.info("Auto-discovery staged Pump.fun launch %s in PendingLaunchBuffer", token_address[:10])
+                    elif not is_pump:
+                        # Established DEX token: register in Wave2 or Revival buffer
+                        if not self._wave2_buffer.is_staged(token_address) and not self._revival_buffer.is_staged(token_address):
+                            self._wave2_buffer.stage_token(
+                                token_address=token_address,
+                                chain=chain,
+                                pool_address=pool_address,
+                                initial_price=init_price,
+                                report=disc_report,
+                            )
+                            self._revival_buffer.stage_token(
+                                token_address=token_address,
+                                chain=chain,
+                                pool_address=pool_address,
+                                initial_price=init_price,
+                                report=disc_report,
+                                token_creation_timestamp=time.time() - (24 * 3600),
+                            )
+                            logger.info("Auto-discovery registered established DEX token %s in Wave-2 and Revival Watchlists", token_address[:10])
             except Exception as exc:  # noqa: BLE001
                 logger.debug("Auto-discovery failed for %s: %s", token_address[:10], exc)
 
@@ -1419,6 +1484,46 @@ class PaperTradingEngine:
         req_rank = rank.get(threshold, 0)
         return item_rank >= req_rank
 
+    async def evaluate_screener_token(
+        self, discovery: ScreenerDiscoveryEvent | dict[str, Any]
+    ) -> ScreenerEvaluationResult:
+        """
+        Evaluates a token from the Graduated or Movers screener sections immediately
+        without imposing the standard 2-minute or 5-minute observation delay, provided
+        all mandatory volume ($8,000 rolling 2m), liquidity, and safety conditions are met.
+        """
+        if isinstance(discovery, dict):
+            discovery = ScreenerDiscoveryEvent.model_validate(discovery)
+
+        if self.screener_evaluator.gatekeeper is None and self._gatekeeper is not None:
+            self.screener_evaluator.gatekeeper = self._gatekeeper
+        if self.screener_evaluator.ledger is None and self._ledger is not None:
+            self.screener_evaluator.ledger = self._ledger
+
+        result = await self.screener_evaluator.evaluate(discovery)
+
+        # If accepted and a BUY signal is produced, enqueue it for immediate execution
+        if result.decision == ScreenerDecision.ACCEPTED and result.signal is not None:
+            if self._ledger is not None:
+                await self._ledger.record_signal(result.signal)
+            section_tag = (
+                "GRADUATED" if discovery.section == ScreenerSection.GRADUATED
+                else "MOVERS" if discovery.section == ScreenerSection.MOVERS
+                else "GRADUATED+MOVERS" if discovery.section == ScreenerSection.BOTH
+                else str(discovery.section)
+            )
+            logger.info(
+                "Screener Priority Trade Admitted [%s]: Mint=%s, Section=%s, Volume2m=$%.2f, Score=%.2f",
+                result.signal.signal_id[:8],
+                discovery.mint[:10],
+                section_tag,
+                result.volume_2m_usd,
+                result.signal.alpha_score,
+            )
+            await self._signal_q.put(result.signal)
+
+        return result
+
     async def _process_signal_queue(self) -> None:
         executor = self._executor
         ledger = self._ledger
@@ -1430,6 +1535,10 @@ class PaperTradingEngine:
             if isinstance(item, ShutdownSentinel):
                 logger.info("Signal processor received shutdown sentinel. Terminating queue.")
                 return
+
+            if isinstance(item, ScreenerDiscoveryEvent):
+                await self.evaluate_screener_token(item)
+                continue
 
             if isinstance(item, NewsEvent):
                 # 1. Record recent news headline
@@ -1563,6 +1672,46 @@ class PaperTradingEngine:
             is_new_launch = self._is_new_launch_signal(signal_item)
 
             if signal_item.suggested_side == OrderSide.BUY:
+                # 0a. Mandatory Minimum Market Cap Requirement ($8,000 USD)
+                min_mcap_usd = Decimal(str(getattr(self._cfg, "min_market_cap_usd", 8000.0)))
+                sig_mcap = getattr(signal_item, "market_cap_usd", None)
+                if (sig_mcap is None or sig_mcap <= Decimal("0")) and signal_item.pool_state is not None:
+                    native_p = (
+                        self._eth_price
+                        if signal_item.chain == ChainIdentifier.BASE_MAINNET
+                        else self._sol_price
+                    )
+                    sig_mcap = signal_item.pool_state.calculate_market_cap_usd(native_price_usd=native_p)
+
+                # Strict Market Cap check for new tokens / launches:
+                if is_new_launch or signal_item.source in (
+                    SignalSource.PUMP_FUN_MINT,
+                    SignalSource.SCREENER_GRADUATED,
+                    SignalSource.SCREENER_MOVERS,
+                ):
+                    if sig_mcap is None or sig_mcap <= Decimal("0"):
+                        logger.warning(
+                            "Dropping BUY signal for %s: Market Cap is missing, unverifiable, or stale",
+                            signal_item.token_address[:10],
+                        )
+                        continue
+                    if sig_mcap < min_mcap_usd:
+                        logger.info(
+                            "Dropping BUY signal for %s: Market Cap $%.2f < minimum required threshold $%.2f",
+                            signal_item.token_address[:10],
+                            sig_mcap,
+                            min_mcap_usd,
+                        )
+                        continue
+                elif sig_mcap is not None and sig_mcap > Decimal("0") and sig_mcap < min_mcap_usd:
+                    logger.info(
+                        "Dropping BUY signal for %s: Market Cap $%.2f < minimum required threshold $%.2f",
+                        signal_item.token_address[:10],
+                        sig_mcap,
+                        min_mcap_usd,
+                    )
+                    continue
+
                 # 0. Reject weak signals or scores below quality threshold
                 min_score = getattr(self._cfg, "min_entry_score", 65.0) / 100.0
                 if signal_item.strength == SignalStrength.WEAK or signal_item.alpha_score < min_score:
@@ -1747,6 +1896,7 @@ class PaperTradingEngine:
                     volume_surge_multiplier=float(getattr(signal_item, "volume_surge_multiplier", 0.0) or 0.0),
                     net_buy_delta=float(getattr(signal_item, "net_buy_delta", 0.0) or 0.0),
                     platform=platform_name,
+                    partial_exit_enabled=getattr(self.config, "partial_exit_enabled", False),
                 )
 
                 if self._ledger:
@@ -2489,9 +2639,16 @@ class PaperTradingEngine:
                 self._pool_registry.set(addr, state)
             logger.info("Pool registry seeded with %d pools.", len(seed_pool_states))
 
+        connector = aiohttp.TCPConnector(
+            family=socket.AF_INET,
+            ttl_dns_cache=300,
+            limit=100,
+            enable_cleanup_closed=True,
+        )
         async with (
             aiohttp.ClientSession(
-                headers={"User-Agent": "Bot-MM-Engine/1.0"}
+                headers={"User-Agent": "Bot-MM-Engine/1.0"},
+                connector=connector,
             ) as session,
             SQLiteLedger(cfg.db_path) as ledger,
         ):
@@ -2511,6 +2668,8 @@ class PaperTradingEngine:
                 negative_cache_ttl_s=getattr(cfg, "gatekeeper_negative_cache_ttl_s", 300.0),
                 negative_cache_maxsize=getattr(cfg, "gatekeeper_negative_cache_maxsize", 5000),
             )
+            self.screener_evaluator.gatekeeper = self._gatekeeper
+            self.screener_evaluator.ledger = self._ledger
 
             self._executor = PaperExecutor(
                 position_book=self._position_book,

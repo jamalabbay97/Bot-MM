@@ -22,6 +22,7 @@ MAX_PORTFOLIO_EXPOSURE_PCT: float = 0.05
 MAX_PER_TOKEN_RISK_PCT: float = 0.015
 MAX_TOP10_CONCENTRATION: float = 0.20
 MAX_TOP10_CONCENTRATION_PUMP_FUN: float = 0.65
+MIN_MARKET_CAP_USD: Decimal = Decimal("8000.0")
 
 
 class EngineConfig(BaseSettings):
@@ -442,6 +443,122 @@ class EngineConfig(BaseSettings):
     )
 
     # -------------------------------------------------------------------------
+    # 5e. Screener Priority Strategy: Graduated & Movers
+    # -------------------------------------------------------------------------
+    min_market_cap_usd: Decimal = Field(
+        default=Decimal("8000.0"),
+        ge=Decimal(0),
+        validation_alias=AliasChoices("min_market_cap_usd", "MIN_MARKET_CAP_USD", "min_mcap_usd"),
+        description="Minimum USD market capitalization required to enter any new token position ($8,000)",
+    )
+    breakout_margin_pct: float = Field(
+        default=0.01,
+        ge=0.0,
+        description="Minimum price close margin above range high for confirmed breakout (default: 1%)",
+    )
+    breakout_volume_multiplier: float = Field(
+        default=1.5,
+        ge=1.0,
+        description="Minimum volume multiplier vs median of last 5 bars for breakout confirmation",
+    )
+    retest_tolerance_pct: float = Field(
+        default=0.01,
+        ge=0.0,
+        description="Retest band tolerance around breakout level (±1%)",
+    )
+    range_formation_window_sec: float = Field(
+        default=300.0,
+        ge=60.0,
+        description="Range formation observation window in seconds (default: 300s / 5m)",
+    )
+    allow_continuation_without_retest: bool = Field(
+        default=False,
+        description="Allow entry on strong breakout continuation without retest if independent criteria pass",
+    )
+    partial_exit_enabled: bool = Field(
+        default=True,
+        description="Enable partial scale-out profit taking at +2R",
+    )
+    partial_exit_r_multiple: float = Field(
+        default=2.0,
+        ge=1.0,
+        description="Target initial risk multiple (R) to trigger partial exit (+2R)",
+    )
+    partial_exit_fraction: float = Field(
+        default=0.25,
+        ge=0.0,
+        le=1.0,
+        description="Fraction of position to sell at partial exit (default: 25%)",
+    )
+    trailing_hl_buffer_pct: float = Field(
+        default=0.01,
+        ge=0.0,
+        description="Buffer below latest confirmed Higher Low for trailing protective exit (1%)",
+    )
+    daily_loss_limit_pct: float = Field(
+        default=0.02,
+        ge=0.001,
+        le=0.20,
+        description="Daily loss limit percentage of starting balance (2%)",
+    )
+    screener_min_volume_usd: Decimal = Field(
+        default=Decimal("8000.0"),
+        gt=Decimal(0),
+        validation_alias=AliasChoices("screener_min_volume_usd", "min_volume_usd", "MIN_VOLUME_USD"),
+        description="Minimum USD trading volume within window to qualify Graduated/Movers entry ($8,000)",
+    )
+    screener_volume_window_sec: float = Field(
+        default=120.0,
+        gt=0.0,
+        description="Rolling volume measurement window in seconds for screener tokens (default: 120s / 2m)",
+    )
+    screener_graduated_priority_enabled: bool = Field(
+        default=True,
+        description="Enable priority evaluation for Graduated tokens without mandatory observation delay",
+    )
+    screener_movers_priority_enabled: bool = Field(
+        default=True,
+        description="Enable priority evaluation for Movers tokens without mandatory observation delay",
+    )
+    screener_concurrency_limit: int = Field(
+        default=10,
+        ge=1,
+        description="Max concurrent evaluations for screener tokens to prevent resource overload",
+    )
+    graduated_min_liquidity_usd: Decimal = Field(
+        default=Decimal("10000.0"),
+        ge=Decimal(0),
+        description="Minimum executable pool liquidity in USD required for Graduated tokens",
+    )
+    graduated_max_price_impact_pct: float = Field(
+        default=0.05,
+        ge=0.001,
+        le=0.50,
+        description="Maximum acceptable price impact for standard trades on Graduated tokens (5%)",
+    )
+    movers_max_extension_pct: float = Field(
+        default=1.50,
+        ge=0.10,
+        description="Maximum allowed price extension above consolidation/breakout before rejecting as excessively extended (150%)",
+    )
+    movers_min_buy_pressure_ratio: float = Field(
+        default=0.55,
+        ge=0.0,
+        le=1.0,
+        description="Minimum buy vs sell volume ratio required for Movers tokens (55%)",
+    )
+    movers_min_liquidity_usd: Decimal = Field(
+        default=Decimal("10000.0"),
+        ge=Decimal(0),
+        description="Minimum executable liquidity in USD required for Movers tokens",
+    )
+    screener_market_data_max_staleness_s: float = Field(
+        default=30.0,
+        gt=0.0,
+        description="Maximum allowed staleness for market data in seconds before rejecting entry",
+    )
+
+    # -------------------------------------------------------------------------
     # 6. Starting Balances & Price Baseline
     # -------------------------------------------------------------------------
     initial_sol: Decimal = Field(
@@ -660,6 +777,16 @@ class EngineConfig(BaseSettings):
             self.initial_sol * self.sol_price_usd
             + self.initial_eth * self.eth_price_usd
         )
+
+    @property
+    def MIN_VOLUME_USD(self) -> Decimal:
+        """Mandatory $8,000 minimum USD trading volume threshold."""
+        return self.screener_min_volume_usd
+
+    @property
+    def min_volume_usd(self) -> Decimal:
+        """Alias for screener_min_volume_usd."""
+        return self.screener_min_volume_usd
 
 
 def _require_env(key: str, default: str | None = None) -> str:

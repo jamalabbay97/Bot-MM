@@ -147,20 +147,20 @@ def test_pump_fun_relaxed_concentration_and_bonding_curve_exclusion():
     assert report.passes_hard_gates is True
     assert report.tier == SecurityTier.CLEAN
 
-    # Non-pump token with 40% concentration MUST fail hard gates
+    # Non-pump token with >40% concentration MUST fail hard gates
     non_pump_mint = "StandardMint1111111111111111111111111111111"
     raw_non_pump = {
         "mintAuthority": None,
         "freezeAuthority": None,
         "markets": [{"lp": {"lpLockedPct": 100.0}}],
         "topHolders": [
-            {"address": "Holder1", "pct": 20.0, "insider": False},
+            {"address": "Holder1", "pct": 25.0, "insider": False},
             {"address": "Holder2", "pct": 20.0, "insider": False},
         ],
         "risks": [],
     }
     non_pump_rep = _parse_rugcheck_report(non_pump_mint, raw_non_pump)
-    assert non_pump_rep.top10_concentration == pytest.approx(0.40, rel=1e-2)
+    assert non_pump_rep.top10_concentration == pytest.approx(0.45, rel=1e-2)
     assert non_pump_rep.is_pump_fun is False
     assert non_pump_rep.passes_hard_gates is False
     assert non_pump_rep.tier == SecurityTier.TIER1_REJECTED

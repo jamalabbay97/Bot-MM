@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import logging
 import math
+import time
 import uuid 
 from collections import defaultdict
 from dataclasses import dataclass, field
@@ -83,6 +84,12 @@ class OpenLot:
     net_buy_delta: float = 0.0
     platform: str = "DexScan"
     is_new_launch: bool = False
+    initial_risk_r: Decimal = Decimal("0.08")
+    scaled_out_2r: bool = False
+    partial_exit_enabled: bool = False
+    last_confirmed_hl: Decimal = Decimal("0")
+    confirmed_higher_lows: list[Decimal] = field(default_factory=list)
+    confirmed_higher_highs: list[Decimal] = field(default_factory=list)
 
     def record_tick(
         self,
@@ -115,6 +122,22 @@ class OpenLot:
         cutoff_5m = ts - 300.0
         self.tick_prices_5m = [p for p in self.tick_prices_5m if p[0] >= cutoff_5m]
         self.tick_returns_5m = [r for r in self.tick_returns_5m if r[0] >= cutoff_5m]
+
+        # Track confirmed Higher Lows (HL) from completed tick structure:
+        if len(self.tick_prices_5m) >= 3:
+            p_prev2 = self.tick_prices_5m[-3][1]
+            p_prev1 = self.tick_prices_5m[-2][1]
+            p_curr = price
+            # Local trough confirmed: dipped to p_prev1 then bounced to p_curr > p_prev1
+            if p_prev1 < p_prev2 and p_curr > p_prev1 and p_prev1 > self.entry_price:
+                if p_prev1 > self.last_confirmed_hl:
+                    self.last_confirmed_hl = p_prev1
+                    self.confirmed_higher_lows.append(p_prev1)
+                    # Protect under confirmed HL with 1% buffer
+                    protective_stop = (p_prev1 * Decimal("0.99")).quantize(Decimal("1e-18"))
+                    if protective_stop > self.trailing_stop_price:
+                        self.trailing_stop_price = protective_stop
+                        self.trailing_stop_active = True
 
     def get_tick_returns_5m(self) -> list[float]:
         """Return rolling 5-minute tick returns as a list of float values."""
@@ -359,6 +382,7 @@ class PositionBook:
         volume_surge_multiplier: float = 0.0,
         net_buy_delta: float = 0.0,
         platform: Optional[str] = None,
+        partial_exit_enabled: bool = False,
     ) -> OpenLot:
         if fill.effective_price <= Decimal(0):
             raise ValueError(
@@ -371,6 +395,7 @@ class PositionBook:
             pool_address=pool_address or fill.pool_address,
             bonding_curve_mode=bonding_curve_mode,
         )
+        now_wall_ns = time.time_ns()
         lot = OpenLot(
             token_address=fill.token_address,
             chain=fill.chain,
@@ -379,7 +404,7 @@ class PositionBook:
             cost_basis_native=fill.simulated_native_spent,
             entry_price=fill.effective_price,
             signal_id=signal_id,
-            open_timestamp_ns=fill.fill_timestamp_ns,
+            open_timestamp_ns=now_wall_ns,
             peak_price=fill.effective_price,
             exit_stage=ExitStage.NONE,
             trailing_stop_active=False,
@@ -405,6 +430,7 @@ class PositionBook:
             net_buy_delta=net_buy_delta,
             platform=resolved_platform,
             is_new_launch=getattr(fill, "is_new_launch", False),
+            partial_exit_enabled=partial_exit_enabled,
             price_history=[(entry_ts, fill.effective_price, fill.simulated_native_spent)],
             tick_prices_5m=[(entry_ts, fill.effective_price)],
             tick_returns_5m=[],
@@ -543,6 +569,7 @@ class PositionBook:
         is_sell: bool = False,
         emergency_stop_pct: Decimal = Decimal("-0.25"),
         security_report: Any | None = None,
+        partial_exit_fraction: Decimal | None = None,
     ) -> ExitDecision | None:
         """
         Evaluate adaptive dynamic exit rules for an open lot:
@@ -640,13 +667,12 @@ class PositionBook:
                 if reserve_loss >= Decimal("1.50") or (reserve_loss / lot.peak_pool_reserve_native) >= Decimal("0.05"):
                     reserve_dump_confirmed = True
 
-            # Emergency Liquidity Drain Trigger (> 35% reserve collapse with absolute threshold)
+            # Emergency Liquidity Drain Trigger (> 50% reserve collapse with significant absolute threshold)
             if lot.last_pool_reserve_native > 0 and current_pool_reserve_native < lot.last_pool_reserve_native:
                 reserve_drop_abs = lot.last_pool_reserve_native - current_pool_reserve_native
                 drain_pct = reserve_drop_abs / lot.last_pool_reserve_native
-                # For bonding curves, require significant absolute drop (>= 2.5 SOL) to prevent micro-tick false drains
-                min_drop_required = Decimal("2.5") if is_bc else Decimal("0.05")
-                if drain_pct >= Decimal("0.35") and reserve_drop_abs >= min_drop_required:
+                min_drop_required = Decimal("10.0") if is_bc else Decimal("0.5")
+                if drain_pct >= Decimal("0.50") and reserve_drop_abs >= min_drop_required:
                     logger.warning(
                         "LIQUIDITY DRAIN DETECTED for lot %s (%s): reserve dropped %.2f%% (%s -> %s).",
                         lot.lot_id[:8],
@@ -1074,6 +1100,27 @@ class PositionBook:
                         prioritized=is_prioritized,
                     )
 
+            # Dynamic +2R Take Profit / Partial Scale-Out (e.g. at +2R, scale out 25% of initial position):
+            if lot.partial_exit_enabled or (partial_exit_fraction is not None):
+                r_target = Decimal("1.0") + (lot.initial_risk_r * Decimal("2.0"))
+                if gain_ratio >= r_target and not lot.scaled_out_2r and not lot.scaled_out_50_pct and lot.exit_stage == ExitStage.NONE:
+                    frac = partial_exit_fraction if partial_exit_fraction is not None else Decimal("0.25")
+                    target_sell = (lot.initial_tokens * frac).quantize(Decimal("1e-18"))
+                    qty = min(lot.tokens_held, target_sell if target_sell > 0 else (lot.tokens_held / Decimal("4")))
+                    if qty > 0:
+                        lot.scaled_out_2r = True
+                        return ExitDecision(
+                            lot_id=lot.lot_id,
+                            token_address=lot.token_address,
+                            chain=lot.chain,
+                            should_exit=True,
+                            exit_reason=TradeExitReason.TP_25,
+                            exit_stage=ExitStage.TP1,
+                            tokens_to_sell=qty,
+                            current_price=current_price,
+                            pnl_estimate_native=qty * (current_price - lot.entry_price),
+                        )
+
             # Take-Profit (TP): +25% (Scale out 50% of position size), +50% (Sell remaining 50%)
             # +50% Take Profit
             if gain_ratio >= Decimal("1.50") and lot.exit_stage in (ExitStage.NONE, ExitStage.TP1):
@@ -1232,6 +1279,27 @@ class PositionBook:
                     current_price=current_price,
                     pnl_estimate_native=qty * (current_price - lot.entry_price),
                 )
+
+        # Dynamic +2R Take Profit / Partial Scale-Out (e.g. at +2R, scale out 25% of initial position):
+        if lot.partial_exit_enabled or (partial_exit_fraction is not None):
+            r_target = Decimal("1.0") + (lot.initial_risk_r * Decimal("2.0"))
+            if gain_ratio >= r_target and not lot.scaled_out_2r and not lot.scaled_out_50_pct and lot.exit_stage == ExitStage.NONE:
+                frac = partial_exit_fraction if partial_exit_fraction is not None else Decimal("0.25")
+                target_sell = (lot.initial_tokens * frac).quantize(Decimal("1e-18"))
+                qty = min(lot.tokens_held, target_sell if target_sell > 0 else (lot.tokens_held / Decimal("4")))
+                if qty > 0:
+                    lot.scaled_out_2r = True
+                    return ExitDecision(
+                        lot_id=lot.lot_id,
+                        token_address=lot.token_address,
+                        chain=lot.chain,
+                        should_exit=True,
+                        exit_reason=TradeExitReason.TP_25,
+                        exit_stage=ExitStage.TP1,
+                        tokens_to_sell=qty,
+                        current_price=current_price,
+                        pnl_estimate_native=qty * (current_price - lot.entry_price),
+                    )
 
         # 2x (+100%): Sell 50% of initial tokens (recouping initial investment)
         if gain_ratio >= Decimal("2.0") and lot.exit_stage == ExitStage.NONE:

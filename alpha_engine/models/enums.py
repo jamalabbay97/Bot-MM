@@ -74,12 +74,22 @@ class NewsSignalStatus(str, Enum):
     BOT_FARM_FLAGGED = "bot_farm_flagged"     # Flagged by engagement velocity / anti-sybil
 
 
+class ScreenerSection(str, Enum):
+    """Platform screener section categories."""
+
+    GRADUATED = "graduated"
+    MOVERS = "movers"
+    BOTH = "both"
+
+
 class StrategyType(str, Enum):
     """Categorical classification of trading strategy."""
 
     FAST_SNIPE = "fast_snipe"
     WAVE2_BREAKOUT = "wave2_breakout"
     REVIVAL_SWING = "revival_swing"
+    GRADUATED_PRIORITY = "graduated_priority"
+    MOVERS_PRIORITY = "movers_priority"
 
 
 class ExitProfile(str, Enum):
@@ -107,6 +117,8 @@ class SignalSource(str, Enum):
     REVIVAL_BREAKOUT = "revival_breakout"
     RAYDIUM_NEW_POOL = "raydium_new_pool"
     MEME_RADAR_BURST = "meme_radar_burst"
+    SCREENER_GRADUATED = "screener_graduated"
+    SCREENER_MOVERS = "screener_movers"
 
 
 class LotStatus(str, Enum):

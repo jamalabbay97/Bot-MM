@@ -25,8 +25,8 @@ MAX_AUTONOMOUS_CAP: Decimal = Decimal("0.05")     # Autonomous hard-stop cap 5%
 
 # Realistic paper-trading drag constants:
 DEX_SWAP_FEE_PCT: Decimal = Decimal("0.003")      # 0.3% DEX swap fee
-SIMULATED_GAS_NATIVE: Decimal = Decimal("0.005")  # 0.005 SOL or ETH
-ASSUMED_SLIPPAGE_PCT: Decimal = Decimal("0.05")   # 5% assumed execution slippage
+SIMULATED_GAS_NATIVE: Decimal = Decimal("0.0005") # 0.0005 SOL or ETH (~$0.07 realistic priority gas)
+ASSUMED_SLIPPAGE_PCT: Decimal = Decimal("0.01")   # 1% assumed execution slippage (instead of 5%)
 
 # Gas drag gate: reject trade if gas > 5 % of position value (usd_at_risk < gas_cost * 20).
 GAS_MULTIPLE_GATE: int = 20

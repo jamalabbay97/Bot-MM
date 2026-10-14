@@ -20,9 +20,9 @@ _GOPLUS_CHAIN_IDS: dict[ChainIdentifier, str] = {
 # Hard-reject thresholds
 _MAX_SELL_TAX_BPS = 500          # 5%
 _MAX_BUY_TAX_BPS = 500           # 5%
-_MIN_LP_BURNED_RATIO = 0.90      # 90%
-_MAX_TOP10_CONCENTRATION = 0.35  # 35% for early DEX pools (launch-phase)
-_MAX_EARLY_DEX_TOP10_CONCENTRATION = 0.35  # 35%
+_MIN_LP_BURNED_RATIO = 0.80      # 80% (accommodates standard AMM lockers)
+_MAX_TOP10_CONCENTRATION = 0.40  # 40% for established DEX pools excluding liquidity vaults
+_MAX_EARLY_DEX_TOP10_CONCENTRATION = 0.45  # 45%
 _MAX_PUMP_FUN_TOP10_CONCENTRATION = 0.65  # 65% for Pump.fun tokens
 _API_TIMEOUT_S = 3.5
 _MIN_SELL_RETURN_RATIO = Decimal("0.90")   # Tier 2 threshold

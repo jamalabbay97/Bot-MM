@@ -53,9 +53,16 @@ class PoolRollingMetrics:
     latest_price: Decimal = Decimal("0")
     # Rolling Volume (native units)
     volume_1m: Decimal = Decimal("0")
+    volume_2m: Decimal = Decimal("0")
     volume_5m: Decimal = Decimal("0")
     volume_1h: Decimal = Decimal("0")
-    # Buy vs Sell breakdowns (5m window)
+    volume_2m_usd: Decimal = Decimal("0")
+    market_cap_usd: Decimal = Decimal("0")
+    # Buy vs Sell breakdowns (2m & 5m window)
+    buy_volume_2m: Decimal = Decimal("0")
+    sell_volume_2m: Decimal = Decimal("0")
+    buy_count_2m: int = 0
+    sell_count_2m: int = 0
     buy_volume_5m: Decimal = Decimal("0")
     sell_volume_5m: Decimal = Decimal("0")
     buy_count_5m: int = 0
@@ -96,6 +103,8 @@ class DEXMetricsAggregator:
         self._concentrated_ticks: dict[str, tuple[int, int, Decimal]] = {}
         # token_address -> pool_address mapping
         self._token_to_pool: dict[str, str] = {}
+        # chain -> latest known native price USD (e.g. SOL/USD)
+        self._latest_native_prices: dict[ChainIdentifier, Decimal] = {}
 
     def record_pool_state(self, pool_state: PoolState) -> None:
         """Store or update the authoritative pool state and compute reserve shifts."""
@@ -135,6 +144,7 @@ class DEXMetricsAggregator:
         swap: SwapEvent,
         pool_state: Optional[PoolState] = None,
         is_quote_token_in: Optional[bool] = None,
+        native_price_usd: Optional[Decimal] = None,
     ) -> None:
         """
         Record a DEX swap event and update pool reserves and rolling history.
@@ -143,11 +153,17 @@ class DEXMetricsAggregator:
         if pool_state is not None:
             self.record_pool_state(pool_state)
 
+        # Store latest native price USD when provided
+        if native_price_usd is not None and native_price_usd > Decimal("0"):
+            self._latest_native_prices[swap.chain] = native_price_usd
+
         # Determine buy vs sell
         # By convention in alpha_engine, buying the token means token_out is the token
-        # If pool_state is known:
         token_addr = ""
-        if pool_state is not None and pool_state.token_address:
+        if is_quote_token_in is not None:
+            is_buy = bool(is_quote_token_in)
+            token_addr = swap.token_out if is_buy else swap.token_in
+        elif pool_state is not None and pool_state.token_address:
             token_addr = pool_state.token_address
             is_buy = swap.token_out == token_addr
         elif pool_addr in self._token_to_pool:
@@ -191,7 +207,10 @@ class DEXMetricsAggregator:
             q.popleft()
 
     def get_metrics(
-        self, pool_address: str, current_time_s: Optional[float] = None
+        self,
+        pool_address: str,
+        current_time_s: Optional[float] = None,
+        native_price_usd: Optional[Decimal] = None,
     ) -> PoolRollingMetrics:
         """
         Aggregate and return real-time sliding-window metrics for the given pool.
@@ -200,8 +219,14 @@ class DEXMetricsAggregator:
         q = self._pool_swaps.get(pool_address, deque())
 
         vol_1m = Decimal("0")
+        vol_2m = Decimal("0")
         vol_5m = Decimal("0")
         vol_1h = Decimal("0")
+
+        buy_vol_2m = Decimal("0")
+        sell_vol_2m = Decimal("0")
+        buy_cnt_2m = 0
+        sell_cnt_2m = 0
 
         buy_vol_5m = Decimal("0")
         sell_vol_5m = Decimal("0")
@@ -221,6 +246,14 @@ class DEXMetricsAggregator:
 
             if age <= 60.0:
                 vol_1m += entry.volume_native
+            if age <= 120.0:
+                vol_2m += entry.volume_native
+                if entry.is_buy:
+                    buy_vol_2m += entry.volume_native
+                    buy_cnt_2m += 1
+                else:
+                    sell_vol_2m += entry.volume_native
+                    sell_cnt_2m += 1
             if age <= 300.0:
                 vol_5m += entry.volume_native
                 if entry.is_buy:
@@ -272,14 +305,33 @@ class DEXMetricsAggregator:
             tick_shift = c_tick - i_tick
             conc_liq = liq
 
+        price_usd = (
+            native_price_usd
+            if native_price_usd is not None and native_price_usd > Decimal("0")
+            else self._latest_native_prices.get(chain, Decimal("150.0"))
+        )
+        vol_2m_usd = vol_2m * price_usd
+        mcap_usd = (
+            pool_state.calculate_market_cap_usd(price_usd)
+            if pool_state is not None
+            else Decimal("0")
+        )
+
         return PoolRollingMetrics(
             pool_address=pool_address,
             chain=chain,
             token_address=token_addr,
             latest_price=latest_price,
             volume_1m=vol_1m,
+            volume_2m=vol_2m,
             volume_5m=vol_5m,
             volume_1h=vol_1h,
+            volume_2m_usd=vol_2m_usd,
+            market_cap_usd=mcap_usd,
+            buy_volume_2m=buy_vol_2m,
+            sell_volume_2m=sell_vol_2m,
+            buy_count_2m=buy_cnt_2m,
+            sell_count_2m=sell_cnt_2m,
             buy_volume_5m=buy_vol_5m,
             sell_volume_5m=sell_vol_5m,
             buy_count_5m=buy_cnt_5m,
@@ -295,6 +347,26 @@ class DEXMetricsAggregator:
             concentrated_liquidity_depth=conc_liq,
             last_updated_s=now_s,
         )
+
+    def get_market_cap_usd(
+        self,
+        pool_address: str,
+        native_price_usd: Optional[Decimal] = None,
+        circulating_supply: Optional[Decimal] = None,
+    ) -> Optional[Decimal]:
+        """
+        Calculate the current market capitalization in USD for a pool.
+        Returns None if pool state is unknown or missing reserves.
+        """
+        pool_state = self._pool_states.get(pool_address)
+        if pool_state is None:
+            return None
+        price_usd = (
+            native_price_usd
+            if native_price_usd is not None and native_price_usd > Decimal("0")
+            else self._latest_native_prices.get(pool_state.chain, Decimal("150.0"))
+        )
+        return pool_state.calculate_market_cap_usd(price_usd, circulating_supply=circulating_supply)
 
     def get_order_flow_imbalance(
         self, pool_address: str, num_blocks: int = 15
@@ -346,3 +418,30 @@ class DEXMetricsAggregator:
             return VolumeSpikeResult(has_spike=has_spike, ratio=ratio)
         ratio = float(metrics.volume_5m / avg_5m_of_1h)
         return VolumeSpikeResult(has_spike=(ratio >= multiplier), ratio=round(ratio, 2))
+
+    def get_rolling_volume_usd(
+        self,
+        pool_address: str,
+        window_sec: float = 120.0,
+        native_price_usd: Optional[Decimal] = None,
+        current_time_s: Optional[float] = None,
+    ) -> Decimal:
+        """
+        Calculate trustworthy rolling USD volume within the configured measurement window.
+        Inspects available trade history without requiring observation timers.
+        """
+        now_s = current_time_s if current_time_s is not None else time.time()
+        q = self._pool_swaps.get(pool_address, deque())
+        vol_native = Decimal("0")
+        for entry in reversed(q):
+            age = now_s - entry.timestamp_s
+            if age > window_sec:
+                break
+            vol_native += entry.volume_native
+
+        if native_price_usd is None or native_price_usd <= Decimal("0"):
+            pool_state = self._pool_states.get(pool_address)
+            chain = pool_state.chain if pool_state else ChainIdentifier.SOLANA_MAINNET
+            native_price_usd = self._latest_native_prices.get(chain, Decimal("150.0"))
+
+        return vol_native * native_price_usd

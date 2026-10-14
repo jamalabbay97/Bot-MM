@@ -52,12 +52,13 @@ class CouncilArbiterCRO:
                 is_new_launch = True
             elif token_age_h is not None and token_age_h <= 0.5:
                 is_new_launch = True
-            elif sig_source_val in ("pump_fun_mint", "dex_swap", "dex_discovery", "launch_stage") or "pump" in str(token_ca).lower():
+            elif "pump" in str(token_ca).lower() or sig_source_val in ("pump_fun_mint", "launch_stage"):
                 is_new_launch = True
             elif staged_data is not None and hasattr(staged_data, "t_0"):
                 is_new_launch = True
-            elif token_age_s is None and token_age_h is None:
-                # Default for fast token signals without historical age is new launch
+            elif sig_source_val == "dex_swap" and not str(token_ca).lower().endswith("pump"):
+                is_new_launch = False
+            elif token_age_s is None and token_age_h is None and "pump" in str(token_ca).lower():
                 is_new_launch = True
 
         # Parallel evaluation by Reach, Forensic, and Quant agents

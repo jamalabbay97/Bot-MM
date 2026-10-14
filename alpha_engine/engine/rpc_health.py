@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import socket
 import time
 from dataclasses import dataclass, field
 from typing import Any, Optional
@@ -79,7 +80,8 @@ class RPCHealthMonitor:
         """Measure round-trip response latency and query latest block/slot."""
         close_session = False
         if session is None:
-            session = aiohttp.ClientSession()
+            connector = aiohttp.TCPConnector(family=socket.AF_INET, ttl_dns_cache=300)
+            session = aiohttp.ClientSession(connector=connector)
             close_session = True
 
         if endpoint.chain == ChainIdentifier.BASE_MAINNET:

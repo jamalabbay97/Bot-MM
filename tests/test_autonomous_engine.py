@@ -580,7 +580,7 @@ def test_dynamic_exits_trailing_stop_and_hard_stop():
 
 
 def test_dynamic_exits_emergency_liquidity_drain():
-    """Verify Emergency Liquidity Drain dump if pool reserves decrease by > 30%."""
+    """Verify Emergency Liquidity Drain dump if pool reserves decrease by > 50%."""
     book = PositionBook()
     fill = PaperFill(
         token_address="0xdraintoken",
@@ -593,11 +593,11 @@ def test_dynamic_exits_emergency_liquidity_drain():
     # Open lot with 100 SOL initial reserve
     lot = book.open_lot(fill, signal_id="sig_drain", initial_pool_reserve_native=Decimal("100.0"))
 
-    # Pool drops from 100 SOL to 65 SOL (35% drop in single block)
+    # Pool drops from 100 SOL to 45 SOL (55% drop in single block)
     dec_drain = book.evaluate_lot_exit(
         lot=lot,
         current_price=Decimal("0.0002"),
-        current_pool_reserve_native=Decimal("65.0"),
+        current_pool_reserve_native=Decimal("45.0"),
     )
     assert dec_drain is not None
     assert dec_drain.should_exit is True

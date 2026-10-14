@@ -23,6 +23,7 @@ from alpha_engine.models.enums import (
     ChainIdentifier,
     ExecutionVenue,
     OrderSide,
+    ScreenerSection,
     SecurityTier,
     SignalSource,
     SignalStrength,
@@ -56,6 +57,9 @@ class StagedLaunch:
     buy_volumes: list[Decimal] = field(default_factory=list)
     is_dev_bundled: bool = False
     last_telemetry_s: float = 0.0
+    screener_section: Optional[ScreenerSection] = None
+    rolling_volume_2m_usd: Decimal = Decimal(0)
+    is_screener_priority: bool = False
 
 
 class PendingLaunchBuffer:
@@ -135,6 +139,9 @@ class PendingLaunchBuffer:
         report: SecurityReport,
         raw_signal: RawSignalEvent,
         t_0: float | None = None,
+        screener_section: Optional[ScreenerSection] = None,
+        rolling_volume_2m_usd: Decimal = Decimal(0),
+        is_screener_priority: bool = False,
     ) -> StagedLaunch:
         now_s = t_0 if t_0 is not None else time.time()
         init_p = initial_price if initial_price > 0 else Decimal("0.000000028")
@@ -149,6 +156,9 @@ class PendingLaunchBuffer:
             report=report,
             raw_signal=raw_signal,
             last_telemetry_s=now_s,
+            screener_section=screener_section,
+            rolling_volume_2m_usd=rolling_volume_2m_usd,
+            is_screener_priority=is_screener_priority or (screener_section is not None),
         )
         self._staged[token_address] = staged
         logger.info(
@@ -168,6 +178,9 @@ class PendingLaunchBuffer:
         report: SecurityReport | None = None,
         raw_signal: RawSignalEvent | None = None,
         t_0: float | None = None,
+        screener_section: Optional[ScreenerSection] = None,
+        rolling_volume_2m_usd: Decimal = Decimal(0),
+        is_screener_priority: bool = False,
     ) -> StagedLaunch:
         """Stage a newly evaluated token launch into the observation buffer."""
         rep = report or SecurityReport(
@@ -193,6 +206,9 @@ class PendingLaunchBuffer:
             report=rep,
             raw_signal=sig,
             t_0=t_0,
+            screener_section=screener_section,
+            rolling_volume_2m_usd=rolling_volume_2m_usd,
+            is_screener_priority=is_screener_priority,
         )
 
     def is_staged(self, token_address: str) -> bool:
@@ -416,6 +432,19 @@ class PendingLaunchBuffer:
                 and slot_cluster_pct < self.slot_bundle_threshold
             )
 
+            # Screener priority graduation (Graduated or Movers):
+            # Eliminates arbitrary observation delay when minimum volume ($8,000 USD or target native) and safety pass!
+            is_screener_priority_grad = (
+                (staged.is_screener_priority or staged.screener_section is not None)
+                and (
+                    staged.rolling_volume_2m_usd >= Decimal("8000.0")
+                    or staged.total_volume_native >= self.min_volume_native
+                )
+                and is_not_dumped
+                and len(staged.unique_buyers) >= self.min_unique_signers
+                and (staged.buy_count <= 1 or slot_cluster_pct < self.slot_bundle_threshold)
+            )
+
             is_standard_grad = (
                 age >= self.min_age_s
                 and staged.buy_count >= self.min_buys
@@ -426,10 +455,15 @@ class PendingLaunchBuffer:
                 and len(staged.buy_blocks) >= self.min_blocks_span
             )
 
-            if is_fast_track or is_standard_grad:
+            if is_screener_priority_grad or is_fast_track or is_standard_grad:
                 staged.graduated = True
                 self._notify_removal(staged.token_address)
-                grad_type = "FAST-TRACK" if (is_fast_track and age < self.min_age_s) else "STANDARD"
+                if is_screener_priority_grad and age < self.min_age_s:
+                    grad_type = "SCREENER-PRIORITY"
+                elif is_fast_track and age < self.min_age_s:
+                    grad_type = "FAST-TRACK"
+                else:
+                    grad_type = "STANDARD"
                 logger.info(
                     "PendingLaunchBuffer: GRADUATING launch %s (%s)! Age=%.1fs, buys=%d, unique_buyers=%d, blocks=%d, vol=%s native",
                     staged.token_address[:10],
@@ -666,6 +700,24 @@ class SignalGenerator:
         strength_str = classify_alpha_score(alpha)
         strength = SignalStrength(strength_str)
         
+        venue = (
+            ExecutionVenue.RAYDIUM_AMM
+            if (staged.is_screener_priority or staged.screener_section) and staged.chain == ChainIdentifier.SOLANA_MAINNET
+            else ExecutionVenue.PUMP_FUN
+        )
+        source = (
+            SignalSource.SCREENER_GRADUATED
+            if staged.screener_section == ScreenerSection.GRADUATED
+            else (
+                SignalSource.SCREENER_MOVERS
+                if staged.screener_section == ScreenerSection.MOVERS
+                else SignalSource.PUMP_FUN_MINT
+            )
+        )
+
+        native_price = getattr(self.config, "sol_price_usd", Decimal("150.0"))
+        mcap = pool.calculate_market_cap_usd(native_price_usd=native_price)
+
         signal = SignalEvent(
             timestamp_ns=time.time_ns(),
             chain=staged.chain,
@@ -676,13 +728,58 @@ class SignalGenerator:
             security_report=staged.report,
             strength=strength,
             alpha_score=alpha,
-            source=SignalSource.PUMP_FUN_MINT,
-            execution_venue=ExecutionVenue.PUMP_FUN,
+            source=source,
+            execution_venue=venue,
+            strategy_pattern="screener_priority" if staged.is_screener_priority else None,
+            market_cap_usd=mcap,
         )
-        # We can attach metadata to signal later if SignalEvent supports it, 
-        # or we just let it be. But wait, SignalEvent doesn't have metadata natively?
-        # Actually, let's just return the signal.
         return signal
+
+    def generate_screener_signal(
+        self,
+        token_address: str,
+        chain: ChainIdentifier,
+        pool: PoolState,
+        report: SecurityReport,
+        section: ScreenerSection,
+        alpha_score: float = 0.90,
+        volume_2m_usd: Optional[Decimal] = None,
+        market_cap_usd: Optional[Decimal] = None,
+    ) -> SignalEvent:
+        """Generate a high-priority BUY SignalEvent for a verified Graduated or Movers screener candidate."""
+        strength_str = classify_alpha_score(alpha_score)
+        strength = SignalStrength(strength_str)
+        source = (
+            SignalSource.SCREENER_GRADUATED
+            if section == ScreenerSection.GRADUATED
+            else (
+                SignalSource.SCREENER_MOVERS
+                if section == ScreenerSection.MOVERS
+                else SignalSource.SCREENER_GRADUATED
+            )
+        )
+        venue = (
+            ExecutionVenue.RAYDIUM_AMM
+            if chain == ChainIdentifier.SOLANA_MAINNET
+            else ExecutionVenue.UNISWAP_V2
+        )
+        native_price = getattr(self.config, "sol_price_usd", Decimal("150.0"))
+        mcap = market_cap_usd if market_cap_usd is not None and market_cap_usd > 0 else pool.calculate_market_cap_usd(native_price_usd=native_price)
+        return SignalEvent(
+            timestamp_ns=time.time_ns(),
+            chain=chain,
+            pool_address=pool.pool_address,
+            token_address=token_address,
+            suggested_side=OrderSide.BUY,
+            pool_state=pool,
+            security_report=report,
+            strength=strength,
+            alpha_score=alpha_score,
+            source=source,
+            strategy_pattern=f"screener_{section.value}_priority",
+            execution_venue=venue,
+            market_cap_usd=mcap,
+        )
 
     def generate_sell_signal(
         self,

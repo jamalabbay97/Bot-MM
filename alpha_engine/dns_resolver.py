@@ -156,7 +156,18 @@ def patch_dns_resolvers(servers: Sequence[str] | None = None) -> None:
                     _RESOLVED_CACHE[host] = [target_ip]
                     return _ORIG_GETADDRINFO(target_ip, port, *args, **kwargs)
 
-        return _ORIG_GETADDRINFO(host, port, *args, **kwargs)
+        try:
+            return _ORIG_GETADDRINFO(host, port, *args, **kwargs)
+        except socket.gaierror as e:
+            # Resilient fallback: If system DNS fails (e.g. temporary failure in name resolution),
+            # query upstream public DNS (Cloudflare 1.1.1.1 / Google 8.8.8.8) to resolve A records.
+            if isinstance(host, str) and not host.replace(".", "").isdigit():
+                upstream_ips = query_upstream_dns(host, servers=effective_servers)
+                if upstream_ips:
+                    _RESOLVED_CACHE[host] = upstream_ips
+                    logger.debug("Recovered host %s via upstream DNS query: %s", host, upstream_ips[0])
+                    return _ORIG_GETADDRINFO(upstream_ips[0], port, *args, **kwargs)
+            raise
 
     socket.getaddrinfo = _safe_getaddrinfo
     _PATCHED = True

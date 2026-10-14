@@ -543,6 +543,7 @@ def test_position_book_ai_dynamic_exits():
         ai_trailing_stop_activation_pct=40.0,
         ai_time_exit_minutes=15.0,
     )
+    lot.open_timestamp_ns = fill_ts
 
     assert isinstance(lot, OpenLot)
     assert lot.ai_hard_stop_loss_pct == -15.0

@@ -27,8 +27,10 @@ from alpha_engine.models.enums import (
     ExitProfile,
     NewsSignalStatus,
     OrderSide,
+    ScreenerSection,
     SignalSource,
     SignalStrength,
+    StrategyType,
 )
 from alpha_engine.models.state import PoolState, SecurityReport
 
@@ -105,7 +107,9 @@ class SignalEvent(BaseModel):
     narrative_cluster: Optional[str] = Field(default=None, description="Theme cluster: ai, dog, cat, political, utility, etc.")
     exit_profile: ExitProfile = Field(default=ExitProfile.FAST_SNIPE, description="Associated exit profile (FAST_SNIPE vs REVIVAL_SWING)")
     base_market_cap: Optional[Decimal] = Field(default=None, description="Market cap at the consolidation base")
+    market_cap_usd: Optional[Decimal] = Field(default=None, description="Market cap in USD at signal generation")
     strategy_pattern: Optional[str] = Field(default=None, description="Strategy pattern: fast_snipe, wave2_breakout, revival_breakout")
+    strategy_type: Optional[StrategyType] = Field(default=None, description="Explicit strategy classification")
     token_age_hours: Optional[float] = Field(default=None, description="Token age in hours at signal trigger")
     consolidation_length_hours: Optional[float] = Field(default=None, description="Consolidation duration in hours")
     volume_surge_multiplier: Optional[float] = Field(default=None, description="Volume surge over SMA")
@@ -164,6 +168,64 @@ class RawSignalEvent(BaseModel):
     sybil_channel_count: Annotated[int, Field(ge=1)] = 1
     is_edit: bool = False
     narrative_cluster: Optional[str] = Field(default=None, description="Theme cluster: ai, dog, cat, political, utility, etc.")
+
+
+class ScreenerDiscoveryEvent(BaseModel):
+    """
+    Event emitted when a token is identified from a platform screener section
+    (Graduated, Movers, or both).
+    """
+
+    model_config = _STRICT_MODEL_CFG
+
+    signal_id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    timestamp_ns: Annotated[int, Field(gt=0)] = Field(default_factory=lambda: time.time_ns())
+    chain: ChainIdentifier = ChainIdentifier.SOLANA_MAINNET
+    token_address: Annotated[str, Field(min_length=32, max_length=66)] = ""
+    mint: str = ""
+    pool_address: Optional[str] = None
+    section: ScreenerSection = ScreenerSection.GRADUATED
+    market_cap_usd: Optional[float] = None
+    volume_2m_usd: Optional[float] = None
+    liquidity_usd: Optional[float] = None
+    current_price: Optional[float] = None
+    breakout_price: Optional[float] = None
+    price_change_pct: Optional[float] = None
+    price_change_pct_2m: Optional[float] = None
+    volume_trend_fading: bool = False
+    volume_surge_multiplier: Optional[float] = None
+    failed_breakout: Optional[bool] = None
+    retest_confirmed: Optional[bool] = None
+    needs_retest: Optional[bool] = None
+    market_data_fresh: bool = True
+    market_source: str = "screener"
+    raw_metadata: dict[str, Any] = Field(default_factory=dict)
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        if args and isinstance(args[0], dict):
+            d = dict(args[0])
+            d.update(kwargs)
+        else:
+            d = dict(kwargs)
+
+        if "mint" in d and not d.get("token_address"):
+            d["token_address"] = d["mint"]
+        elif "token_address" in d and not d.get("mint"):
+            d["mint"] = d["token_address"]
+
+        if "timestamp" in d and "timestamp_ns" not in d:
+            d["timestamp_ns"] = int(float(d.pop("timestamp")) * 1e9)
+
+        # Convert Decimals to float if passed
+        for k in ("market_cap_usd", "volume_2m_usd", "liquidity_usd", "current_price", "breakout_price"):
+            if k in d and d[k] is not None:
+                d[k] = float(d[k])
+
+        super().__init__(**d)
+
+    @property
+    def timestamp(self) -> float:
+        return self.timestamp_ns / 1e9
 
 
 class PumpMintEvent(BaseModel):

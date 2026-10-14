@@ -14,6 +14,7 @@ from alpha_engine.models.enums import (
     NewsSignalStatus,
     OrderSide,
     PlatformSource,
+    ScreenerSection,
     SecurityTier,
     SignalSource,
     SignalStrength,
@@ -29,6 +30,7 @@ from alpha_engine.models.events import (
     PumpMintEvent,
     PumpSwapEvent,
     RawSignalEvent,
+    ScreenerDiscoveryEvent,
     ShutdownSentinel,
     SignalEvent,
     SwapEvent,
@@ -104,6 +106,7 @@ __all__ = [
     "TradingPlatform",
     "PlatformSource",
     "resolve_trade_platform",
+    "ScreenerSection",
     # Ingestion & Pipeline Events
     "SwapEvent",
     "SignalEvent",
@@ -112,6 +115,7 @@ __all__ = [
     "ShutdownSentinel",
     "PumpMintEvent",
     "PumpSwapEvent",
+    "ScreenerDiscoveryEvent",
     # News & Social Models
     "TelegramMessage",
     "NewsSignalEvent",

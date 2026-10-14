@@ -208,17 +208,31 @@ class NegativeRejectionCache:
         report_raw = str(getattr(rep, "external_api_raw", "") or "").lower()
         is_honeypot = bool(getattr(rep, "is_honeypot", False))
         sell_tax = getattr(rep, "sell_tax_bps", 0) or 0
+        is_pump = bool(getattr(rep, "is_pump_fun", False))
+
+        is_transient_or_unindexed = (
+            "unindexed" in report_raw
+            or "unavailable" in report_raw
+            or "network_error" in report_raw
+            or "rpc_error" in report_raw
+            or "rpc_fallback" in report_raw
+            or "invalid_mint" in report_raw
+            or "preflight" in report_raw
+        )
 
         fatal = (
             is_fatal
             if is_fatal is not None
             else (
-                is_honeypot
-                or "confirmed_honeypot" in reason_lower
-                or "honeypot" in reason_lower
-                or "honeypot" in report_raw
-                or "drainer" in reason_lower
-                or sell_tax >= 9000
+                not is_transient_or_unindexed
+                and (
+                    is_honeypot
+                    or "confirmed_honeypot" in reason_lower
+                    or "honeypot" in reason_lower
+                    or "honeypot" in report_raw
+                    or "drainer" in reason_lower
+                    or (sell_tax >= 9000 and not is_pump)
+                )
             )
         )
 
@@ -565,7 +579,7 @@ class SecurityGatekeeper:
                 token_address, chain, pool_address, token_age_s=token_age_s
             )
 
-            if tier1_report.tier == SecurityTier.TIER1_REJECTED or not tier1_report.passes_hard_gates:
+            if tier1_report.tier == SecurityTier.TIER1_REJECTED:
                 self._negative_cache.record_rejection(token_address, chain, tier1_report)
                 logger.info(
                     "Token %s REJECTED at Tier 1 (sell_tax=%d bps, lp_burned=%.2f, "
@@ -585,6 +599,16 @@ class SecurityGatekeeper:
                     "top10": tier1_report.top10_concentration,
                     "flags": getattr(tier1_report, "warning_flags", []) or [],
                 }
+                return tier1_report
+
+            if not tier1_report.passes_hard_gates:
+                logger.warning(
+                    "Token %s unverified at Tier 1 (tier=%s): not caching in negative rejection cache.",
+                    token_address,
+                    tier1_report.tier,
+                )
+                span.status = TraceStatus.REJECTED
+                span.reason = f"Tier 1 screening unverified ({tier1_report.tier})"
                 return tier1_report
 
             if self._enable_tier2 and chain == ChainIdentifier.BASE_MAINNET and pool_address:
@@ -642,7 +666,9 @@ class SecurityGatekeeper:
                 logger.warning(
                     "GoPlus unavailable for %s — issuing WARN-level report.", token_address
                 )
-                return _build_fallback_report(token_address, chain, SecurityTier.TIER1_WARN)
+                return _build_fallback_report(
+                    token_address, chain, SecurityTier.TIER1_WARN, reason="GoPlus unavailable"
+                )
             return _parse_goplus_report(token_address, chain, raw)
 
         elif chain == ChainIdentifier.SOLANA_MAINNET:
@@ -659,7 +685,7 @@ class SecurityGatekeeper:
                     "RugCheck unavailable for %s — issuing WARN-level report.", token_address
                 )
                 return _build_fallback_report(
-                    token_address, chain, SecurityTier.TIER1_WARN
+                    token_address, chain, SecurityTier.TIER1_WARN, reason="RugCheck unavailable"
                 )
             return _parse_rugcheck_report(token_address, raw, pool_address=pool_address)
 

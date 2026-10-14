@@ -89,6 +89,21 @@ class PoolState(BaseModel):
         """Constant product k = x * y."""
         return self.token_reserve * self.native_reserve
 
+    def calculate_market_cap_usd(
+        self,
+        native_price_usd: Decimal,
+        circulating_supply: Optional[Decimal] = None,
+    ) -> Decimal:
+        """
+        Calculate current market capitalization in USD based on spot price and circulating supply.
+        For standard Solana memecoins (Pump.fun, Raydium), supply defaults to 1,000,000,000 (1B).
+        """
+        if self.token_reserve <= Decimal(0) or self.native_reserve <= Decimal(0) or native_price_usd <= Decimal(0):
+            return Decimal("0")
+        supply = circulating_supply if circulating_supply is not None and circulating_supply > Decimal(0) else Decimal("1000000000")
+        spot_price_usd = self.spot_price_native_per_token * native_price_usd
+        return (spot_price_usd * supply).quantize(Decimal("1e-4"))
+
 
 class SecurityReport(BaseModel):
     """

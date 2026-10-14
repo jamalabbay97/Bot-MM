@@ -12,6 +12,7 @@ from collections import deque
 from decimal import Decimal
 import json
 import logging
+import socket
 import time
 from typing import Any, Optional
 
@@ -514,7 +515,11 @@ class AlphaSupervisorAI:
 
     async def _get_session(self) -> aiohttp.ClientSession:
         if self._session is None or self._session.closed:
-            self._session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=self._timeout_s))
+            connector = aiohttp.TCPConnector(family=socket.AF_INET, ttl_dns_cache=300)
+            self._session = aiohttp.ClientSession(
+                connector=connector,
+                timeout=aiohttp.ClientTimeout(total=self._timeout_s),
+            )
             self._owns_session = True
         return self._session
 
