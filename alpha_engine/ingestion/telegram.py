@@ -50,6 +50,12 @@ try:
     from telethon.errors import FloodWaitError, RPCError
     from telethon.sessions import SQLiteSession, StringSession
     TELETHON_AVAILABLE = True
+    try:
+        from telethon.tl.types import KeyboardInlineButton
+        if not hasattr(KeyboardInlineButton, "data"):
+            setattr(KeyboardInlineButton, "data", property(lambda self: getattr(getattr(self, "type", None), "data", b"")))
+    except Exception:
+        pass
 except ImportError:  # pragma: no cover
     TELETHON_AVAILABLE = False
 
@@ -264,6 +270,9 @@ def parse_trade_amount_input(text: str) -> tuple[Optional[Decimal], str, Optiona
     elif "sol" in lower or "solana" in lower or "سولانا" in lower:
         curr = "SOL"
 
+    if "-" in clean:
+        return None, curr, "❌ لا يمكن أن يكون مبلغ التداول صفراً أو سالباً. يجب إدخال قيمة موجبة."
+
     # Extract numeric part
     num_str = re.sub(r"[^\d.]", "", clean)
     if not num_str:
@@ -383,6 +392,7 @@ class TelegramIngester:
         self._pending_user_states: dict[int | str, str] = {}
         self._manual_trade_amount: Optional[Decimal] = None
         self._manual_trade_currency: str = "SOL"
+        self._wallet_tracker: Optional[Any] = None
 
         # Determine if running in dormant/mock mode
         self._is_dormant = False
@@ -404,6 +414,18 @@ class TelegramIngester:
     def set_ai_supervisor(self, supervisor: Any) -> None:
         """Assign or update AI supervisor instance."""
         self._ai_supervisor = supervisor
+
+    @property
+    def wallet_tracker(self) -> Any:
+        """Access or lazily initialize the WalletTracker instance."""
+        if self._wallet_tracker is None:
+            from alpha_engine.tracker.wallet_tracker import get_wallet_tracker
+            self._wallet_tracker = get_wallet_tracker(db_path=self._db_path)
+        return self._wallet_tracker
+
+    @wallet_tracker.setter
+    def wallet_tracker(self, tracker: Any) -> None:
+        self._wallet_tracker = tracker
 
     @property
     def execution_target(self) -> Any | None:
@@ -664,6 +686,82 @@ class TelegramIngester:
         except Exception:
             return None
 
+    def _get_token_page_inline_buttons(
+        self,
+        ca: str,
+        is_private: bool,
+        notif_enabled: bool,
+        is_position_open: bool = False,
+    ) -> Any:
+        """Inline interactive buttons for live token terminal page."""
+        if not TELETHON_AVAILABLE:
+            return None
+        try:
+            from telethon import Button
+            priv_label = "🌐 عام (Make Public)" if is_private else "🔒 خاص (Make Private)"
+            notif_label = "🔔 التنبيهات: مفعّلة ✅" if notif_enabled else "🔕 التنبيهات: معطّلة ❌"
+            trade_btn = (
+                Button.inline("🔴 بيع فوري / خروج (Sell / Exit)", data=f"tok:sell:{ca}".encode("utf-8"))
+                if is_position_open
+                else Button.inline("🟢 شراء فوري / دخول (Buy / Enter)", data=f"tok:buy:{ca}".encode("utf-8"))
+            )
+            return [
+                [
+                    Button.inline(priv_label, data=f"tok:priv:{ca}".encode("utf-8")),
+                    Button.inline(notif_label, data=f"tok:notif:{ca}".encode("utf-8")),
+                ],
+                [
+                    trade_btn,
+                    Button.inline("🔄 تحديث (Refresh)", data=f"tok:refresh:{ca}".encode("utf-8")),
+                ],
+                [
+                    Button.inline("❌ إغلاق الصفحة (Close)", data=f"tok:close:{ca}".encode("utf-8")),
+                    Button.inline("👛 عرض كمحفظة", data=f"tok:aswal:{ca}".encode("utf-8")),
+                ],
+            ]
+        except Exception:
+            return None
+
+    def _get_wallet_page_inline_buttons(self, wallet_addr: str, copy_enabled: bool, alerts_enabled: bool) -> Any:
+        """Inline interactive buttons for wallet tracker terminal."""
+        if not TELETHON_AVAILABLE:
+            return None
+        try:
+            from telethon import Button
+            copy_label = "🛑 إيقاف النسخ (Stop Copy)" if copy_enabled else "👥 نسخ الصفقات (Copy Trade)"
+            copy_action = "stopcopy" if copy_enabled else "copy"
+            alerts_label = "🔔 التنبيهات: نشطة ✅" if alerts_enabled else "🔕 التنبيهات: معطلة ❌"
+            return [
+                [
+                    Button.inline(copy_label, data=f"wal:{copy_action}:{wallet_addr}".encode("utf-8")),
+                    Button.inline(alerts_label, data=f"wal:notif:{wallet_addr}".encode("utf-8")),
+                ],
+                [
+                    Button.inline("🔄 تحديث النشاط", data=f"wal:refresh:{wallet_addr}".encode("utf-8")),
+                    Button.inline("🗑️ إزالة المحفظة (Untrack)", data=f"wal:remove:{wallet_addr}".encode("utf-8")),
+                ],
+                [
+                    Button.inline("🪙 عرض كعملة", data=f"wal:astok:{wallet_addr}".encode("utf-8")),
+                    Button.inline("❌ إغلاق (Close)", data=f"wal:close:{wallet_addr}".encode("utf-8")),
+                ],
+            ]
+        except Exception:
+            return None
+
+    def _get_copytrade_inline_buttons(self, global_enabled: bool) -> Any:
+        """Inline interactive buttons for copy-trading management dashboard."""
+        if not TELETHON_AVAILABLE:
+            return None
+        try:
+            from telethon import Button
+            toggle_label = "🛑 تعطيل نسخ الصفقات بالكامل" if global_enabled else "✅ تفعيل نسخ الصفقات عالمياً"
+            return [
+                [Button.inline(toggle_label, data=b"cpt:toggle_global")],
+                [Button.inline("📋 قائمة المحافظ المنسوخة", data=b"cpt:list"), Button.inline("❌ إغلاق", data=b"cpt:close")],
+            ]
+        except Exception:
+            return None
+
     def _get_assets_inline_buttons(self) -> Any:
         """Quick 1-tap investigation inline buttons under /assets output."""
         if not TELETHON_AVAILABLE or not self._chat_explainer:
@@ -813,6 +911,18 @@ class TelegramIngester:
                 except Exception as final_exc:
                     logger.warning("[TelegramIngester] Failed to send reply: %s", final_exc)
 
+    async def _safe_edit_or_reply(self, event: Any, text: str, buttons: Any = None) -> None:
+        """Edit an existing message from a callback query or fallback to safe reply."""
+        if hasattr(event, "edit"):
+            try:
+                res = event.edit(text, buttons=buttons, parse_mode="markdown")
+                if asyncio.iscoroutine(res):
+                    await res
+                return
+            except Exception as exc:
+                logger.debug("Failed to edit message in callback: %s", exc)
+        await self._safe_reply(event, text, buttons=buttons)
+
     async def broadcast_trade_alert(self, message: str) -> None:
         """
         Broadcast real-time trade alert to all configured admin user IDs
@@ -905,12 +1015,28 @@ class TelegramIngester:
                     await self._cmd_set_amount(event, "", sender_id)
                 elif cmd in ("balance", "wallet"):
                     await self._cmd_balance(event)
+                elif cmd in ("copytrade", "copytrading"):
+                    await self._cmd_copytrade(event, "", sender_id)
+                elif cmd in ("alerts", "notifications"):
+                    await self._cmd_token_alerts(event, "", sender_id)
                 elif cmd == "help":
                     await self._cmd_start_help(event)
             elif data.startswith("strat:"):
                 await self._handle_strategy_callback(event, data)
             elif data.startswith("amt:"):
                 await self._handle_amount_callback(event, data, sender_id)
+            elif data.startswith("tok:"):
+                await self._handle_token_callback(event, data, sender_id)
+            elif data.startswith("wal:"):
+                await self._handle_wallet_callback(event, data, sender_id)
+            elif data.startswith("cpt:"):
+                await self._handle_copytrade_callback(event, data, sender_id)
+            elif data.startswith("trade:"):
+                parts = data.split(":")
+                action = parts[1] if len(parts) > 1 else ""
+                ca = parts[2] if len(parts) > 2 else ""
+                if action == "close" and ca:
+                    await self._cmd_manual_sell(event, ca, sender_id=sender_id)
             elif data.startswith("inv:"):
                 target_id = data[4:].strip()
                 if self._chat_explainer and hasattr(self._chat_explainer, "tool_investigate_asset"):
@@ -1180,8 +1306,42 @@ class TelegramIngester:
             await self._cmd_set_amount(event, args, sender_id)
         elif first_token in ("/getamount", "/currentamount", "getamount", "currentamount", "المبلغ الحالي", "المبلغ_الحالي"):
             await self._cmd_get_amount(event)
+        elif first_token in ("/token", "/coin", "/ca", "token", "coin", "عملة", "العملة"):
+            args = clean_text[len(parts[0]):].strip() if len(parts) > 1 else ""
+            await self._cmd_token_page(event, args, sender_id)
+        elif first_token in ("/track", "track", "تتبع"):
+            args = clean_text[len(parts[0]):].strip() if len(parts) > 1 else ""
+            await self._cmd_wallet_page(event, args, sender_id)
+        elif first_token in ("/untrack", "/removewallet", "untrack", "removewallet", "حذف_المحفظة", "ازالة_المحفظة"):
+            args = clean_text[len(parts[0]):].strip() if len(parts) > 1 else ""
+            await self._cmd_untrack_wallet(event, args, sender_id)
+        elif first_token in ("/copytrade", "/copytrades", "copytrade", "copytrades", "نسخ", "نسخ_الصفقات"):
+            args = clean_text[len(parts[0]):].strip() if len(parts) > 1 else ""
+            await self._cmd_copytrade(event, args, sender_id)
+        elif first_token in ("/stopcopy", "stopcopy", "ايقاف_النسخ", "وقف_النسخ"):
+            args = clean_text[len(parts[0]):].strip() if len(parts) > 1 else ""
+            await self._cmd_stopcopy(event, args, sender_id)
+        elif first_token in ("/alerts", "/notifications", "alerts", "notifications", "تنبيهات", "التنبيهات", "اشعارات"):
+            args = clean_text[len(parts[0]):].strip() if len(parts) > 1 else ""
+            await self._cmd_token_alerts(event, args, sender_id)
+        elif first_token in ("/mute", "mute", "كتم"):
+            args = clean_text[len(parts[0]):].strip() if len(parts) > 1 else ""
+            await self._cmd_mute_token(event, args, sender_id)
+        elif first_token in ("/unmute", "unmute", "الغاء_الكتم"):
+            args = clean_text[len(parts[0]):].strip() if len(parts) > 1 else ""
+            await self._cmd_unmute_token(event, args, sender_id)
         elif first_token in ("/balance", "/wallet", "balance", "wallet", "الرصيد", "المحفظة", "رصيد", "محفظة"):
-            await self._cmd_balance(event)
+            args = clean_text[len(parts[0]):].strip() if len(parts) > 1 else ""
+            if args and (first_token in ("/wallet", "wallet", "محفظة", "المحفظة")):
+                await self._cmd_wallet_page(event, args, sender_id)
+            else:
+                await self._cmd_balance(event)
+        elif first_token in ("/buy", "buy", "شراء", "دخول"):
+            args = clean_text[len(parts[0]):].strip() if len(parts) > 1 else ""
+            await self._cmd_manual_buy(event, args, sender_id=sender_id)
+        elif first_token in ("/sell", "/close", "/exit", "sell", "close", "exit", "بيع", "اغلاق", "إغلاق", "خروج"):
+            args = clean_text[len(parts[0]):].strip() if len(parts) > 1 else ""
+            await self._cmd_manual_sell(event, args, sender_id=sender_id)
         elif first_token in ("/start", "/help", "help", "start", "مساعدة", "تعليمات"):
             await self._cmd_start_help(event)
         elif first_token in ("/status", "status", "حالة", "الحالة"):
@@ -1372,11 +1532,23 @@ class TelegramIngester:
             "• `/getamount` — عرض مبلغ التداول المعتمد حالياً وحالته.\n"
             "• `/balance` — فحص الرصيد المتاح، كفاية السيولة، ومخاطر الغاز.\n"
             "• `/cancel` — إلغاء إدخال المبلغ الحالي والعودة للوضع الطبيعي.\n\n"
+            "🪙 **صفحة العملة والتنبيهات (Token Terminal & Alerts):**\n"
+            "• إرسال عنوان العقد مباشرة — التقاط وعرض صفحة العملة اللحظية فوراً مع تفعيل جميع الإشعارات.\n"
+            "• `/token <CA>` — عرض صفحة العملة والأسعار والسيولة والمراجعة الأمنية.\n"
+            "• خيارات الصفحة: جعلها خاصة 🔒، إغلاقها ❌، تفعيل/تعطيل التنبيهات 🔔، عرض كمحفظة 👛.\n"
+            "• `/alerts` — إدارة وتصفح إشعارات العملات المفعلة.\n"
+            "• `/mute <CA>` و `/unmute <CA>` — كتم أو إعادة تفعيل تنبيهات عملة معينة.\n\n"
+            "👥 **تتبع المحافظ ونسخ الصفقات (Wallet Tracking & Copy Trading):**\n"
+            "• إرسال عنوان محفظة أو `/wallet <ADDR>` أو `/track <ADDR>` — تتبع المحفظة ونقاط الدخول والخروج ونمط الخروج.\n"
+            "• `/copytrade` — لوحة التحكم بنسخ الصفقات والمحافظ المنسوخة والمفتاح العام.\n"
+            "• `/stopcopy <ADDR>` — إيقاف نسخ صفقات محفظة معينة.\n"
+            "• `/untrack <ADDR>` — إزالة المحفظة بالكامل من المراقبة والتتبع.\n"
+            "• `/copytrade toggle` — تفعيل أو تعطيل ميزة النسخ عالمياً.\n\n"
             "⚙️ **التحكم والحوكمة (Engine Controls):**\n"
             "• `/override <param> <val>` — تعديل المعاملات (risk, blacklist, ttl, surge_k).\n"
             "• `/reset_governor` — إعادة ضبط حاكم وتيرة التداول (Trading Governor).\n"
             "• `/help` — عرض هذا الدليل الشامل.\n\n"
-            "💡 *ملاحظة:* استخدم أزرار لوحة التحكم أدناه، أو أرسل عنوان عقد مباشرة للبدء."
+            "💡 *ملاحظة:* استخدم أزرار لوحة التحكم أدناه، أو أرسل عنوان عقد أو محفظة مباشرة للبدء."
         )
         await self._safe_reply(event, msg, buttons=self.get_default_keyboard_markup())
 
@@ -1500,6 +1672,16 @@ class TelegramIngester:
             return
 
         for chain, ca in cas:
+            addr_type = await self.wallet_tracker.detect_address_type(ca)
+            if addr_type == "WALLET":
+                logger.info("[TelegramIngester] Admin DM scan detected wallet address: %s", ca)
+                header = (
+                    f"👛 **تم التعرف على العنوان: محفظة متداول (Wallet Address) على شبكة {chain.value}**\n"
+                    f"• العنوان: `{ca}`"
+                )
+                await self._cmd_wallet_page(event, ca, sender_id, header=header)
+                continue
+
             raw_signal = RawSignalEvent(
                 timestamp_ns=time.time_ns(),
                 chain=chain,
@@ -1512,6 +1694,7 @@ class TelegramIngester:
                 status=NewsSignalStatus.VALID,
                 sybil_channel_count=1,
                 is_edit=False,
+                is_direct_dm=True,
             )
             logger.info(
                 "[TelegramIngester] Admin DM scan dispatched: %s on %s by user %s",
@@ -1519,17 +1702,32 @@ class TelegramIngester:
                 chain.value,
                 sender_id,
             )
-            await self._enqueue_event(raw_signal)
-            await self._safe_reply(
-                event,
-                f"🔎 Ingested CA: `{ca}` | Dispatching to SecurityGatekeeper & AMM Math Engine... (تم استلام العقد وتمريره للفحص والتنفيذ)",
+            header = (
+                f"🪙 **تم التعرف على العنوان: عقد عملة رقمية (Token Contract Address) على شبكة {chain.value}**\n"
+                f"• العنوان: `{ca}`\n"
+                f"⚡ **جاري تنفيذ استراتيجية التداول الفوري واستثناء شرط القيمة السوقية (Direct DM Priority)...**"
             )
+            await self._enqueue_event(raw_signal)
+            await self._cmd_token_page(event, ca, sender_id, header=header)
 
     async def _cmd_direct_ca_or_help(self, event: Any, text: str, sender_id: Optional[int]) -> None:
         """Handle raw messages containing contract addresses, questions, or general queries in DM."""
         cas = self.extract_contract_addresses(text)
         if cas:
             for chain, ca in cas:
+                # Disambiguate address type: Token CA vs Wallet address
+                addr_type = await self.wallet_tracker.detect_address_type(ca)
+                if addr_type == "WALLET":
+                    logger.info("[TelegramIngester] Detected wallet address in DM: %s. Routing to wallet tracker.", ca)
+                    header = (
+                        f"👛 **تم التعرف على العنوان: محفظة متداول (Wallet Address) على شبكة {chain.value}**\n"
+                        f"• العنوان: `{ca}`"
+                    )
+                    await self._cmd_wallet_page(event, ca, sender_id, header=header)
+                    continue
+
+                # Token CA detected:
+                # 1. Enqueue raw signal for trading pipeline & security gatekeeper (with Direct DM priority)
                 raw_signal = RawSignalEvent(
                     timestamp_ns=time.time_ns(),
                     chain=chain,
@@ -1542,6 +1740,7 @@ class TelegramIngester:
                     status=NewsSignalStatus.VALID,
                     sybil_channel_count=1,
                     is_edit=False,
+                    is_direct_dm=True,
                 )
                 logger.info(
                     "[TelegramIngester] Direct DM CA dispatched: %s on %s by user %s",
@@ -1549,11 +1748,15 @@ class TelegramIngester:
                     chain.value,
                     sender_id,
                 )
-                await self._enqueue_event(raw_signal)
-                await self._safe_reply(
-                    event,
-                    f"🔎 Ingested CA: `{ca}` | Dispatching to SecurityGatekeeper & AMM Math Engine... (تم استلام العقد وتمريره للفحص والتنفيذ)",
+                header = (
+                    f"🪙 **تم التعرف على العنوان: عقد عملة رقمية (Token Contract Address) على شبكة {chain.value}**\n"
+                    f"• العنوان: `{ca}`\n"
+                    f"⚡ **جاري تنفيذ استراتيجية التداول الفوري واستثناء شرط القيمة السوقية (Direct DM Priority)...**"
                 )
+                await self._enqueue_event(raw_signal)
+
+                # 2. Immediately capture and display live token page with controls and enabled alerts
+                await self._cmd_token_page(event, ca, sender_id, header=header)
         else:
             # 1. Unknown slash commands
             if text.startswith("/"):
@@ -2415,6 +2618,443 @@ class TelegramIngester:
             return f"(≈ {val_sol:.4f} SOL)"
         return ""
 
+    # -------------------------------------------------------------------------
+    # Token Terminal Page, Wallet Tracking, & Copy-Trading Handlers
+    # -------------------------------------------------------------------------
+
+    async def _handle_token_callback(self, event: Any, data: str, sender_id: Any = None) -> None:
+        """Handle inline button callbacks for token page interactions (tok:priv, tok:notif, tok:refresh, tok:close, tok:aswal)."""
+        parts = data.split(":")
+        action = parts[1] if len(parts) > 1 else ""
+        ca = parts[2] if len(parts) > 2 else ""
+
+        if action == "close":
+            try:
+                if hasattr(event, "delete"):
+                    res = event.delete()
+                    if asyncio.iscoroutine(res):
+                        await res
+                    return
+            except Exception:
+                pass
+            await self._safe_edit_or_reply(event, "🗑️ **تم إغلاق صفحة العملة (Token Page Closed)**", buttons=None)
+            return
+
+        if not ca:
+            return
+
+        if action == "buy":
+            await self._cmd_manual_buy(event, ca, sender_id=sender_id)
+            return
+        elif action == "sell":
+            await self._cmd_manual_sell(event, ca, sender_id=sender_id)
+            return
+
+        is_open = False
+        target = getattr(self, "_execution_target", None)
+        if target and hasattr(target, "is_position_open"):
+            try:
+                is_open = target.is_position_open(ca)
+            except Exception:
+                is_open = False
+
+        if action == "priv":
+            new_priv = await self.wallet_tracker.toggle_token_privacy(ca, user_id=sender_id)
+            page_data = await self.wallet_tracker.fetch_token_page(ca, user_id=sender_id)
+            _, notif_on, _ = await self.wallet_tracker.get_token_subscription(ca, user_id=sender_id)
+            msg = self.wallet_tracker.format_token_page_message(page_data, is_private=new_priv, notif_enabled=notif_on)
+            buttons = self._get_token_page_inline_buttons(ca, is_private=new_priv, notif_enabled=notif_on, is_position_open=is_open)
+            await self._safe_edit_or_reply(event, msg, buttons=buttons)
+
+        elif action == "notif":
+            new_notif = await self.wallet_tracker.toggle_token_notifications(ca, user_id=sender_id)
+            page_data = await self.wallet_tracker.fetch_token_page(ca, user_id=sender_id)
+            _, _, is_priv = await self.wallet_tracker.get_token_subscription(ca, user_id=sender_id)
+            msg = self.wallet_tracker.format_token_page_message(page_data, is_private=is_priv, notif_enabled=new_notif)
+            buttons = self._get_token_page_inline_buttons(ca, is_private=is_priv, notif_enabled=new_notif, is_position_open=is_open)
+            await self._safe_edit_or_reply(event, msg, buttons=buttons)
+
+        elif action == "refresh":
+            page_data = await self.wallet_tracker.fetch_token_page(ca, user_id=sender_id)
+            _, notif_on, is_priv = await self.wallet_tracker.get_token_subscription(ca, user_id=sender_id)
+            msg = self.wallet_tracker.format_token_page_message(page_data, is_private=is_priv, notif_enabled=notif_on)
+            buttons = self._get_token_page_inline_buttons(ca, is_private=is_priv, notif_enabled=notif_on, is_position_open=is_open)
+            await self._safe_edit_or_reply(event, msg, buttons=buttons)
+
+        elif action == "aswal":
+            await self._cmd_wallet_page(event, ca, sender_id=sender_id)
+
+    async def _handle_wallet_callback(self, event: Any, data: str, sender_id: Any = None) -> None:
+        """Handle inline button callbacks for wallet tracking & copy trading."""
+        parts = data.split(":")
+        action = parts[1] if len(parts) > 1 else ""
+        wallet_addr = parts[2] if len(parts) > 2 else ""
+
+        if action == "close":
+            try:
+                if hasattr(event, "delete"):
+                    res = event.delete()
+                    if asyncio.iscoroutine(res):
+                        await res
+                    return
+            except Exception:
+                pass
+            await self._safe_edit_or_reply(event, "🗑️ **تم إغلاق صفحة المحفظة (Wallet Page Closed)**", buttons=None)
+            return
+
+        if not wallet_addr:
+            return
+
+        if action == "copy":
+            await self.wallet_tracker.set_wallet_copy_trading(wallet_addr, enabled=True, user_id=sender_id)
+            activity = await self.wallet_tracker.track_wallet(wallet_addr, user_id=sender_id)
+            msg = self.wallet_tracker.format_wallet_activity_message(activity)
+            buttons = self._get_wallet_page_inline_buttons(wallet_addr, copy_enabled=True, alerts_enabled=activity.alerts_enabled)
+            await self._safe_edit_or_reply(event, msg, buttons=buttons)
+
+        elif action == "stopcopy":
+            await self.wallet_tracker.stop_wallet_copy_trading(wallet_addr, user_id=sender_id)
+            activity = await self.wallet_tracker.track_wallet(wallet_addr, user_id=sender_id)
+            msg = self.wallet_tracker.format_wallet_activity_message(activity)
+            buttons = self._get_wallet_page_inline_buttons(wallet_addr, copy_enabled=False, alerts_enabled=activity.alerts_enabled)
+            await self._safe_edit_or_reply(event, msg, buttons=buttons)
+
+        elif action == "remove":
+            await self.wallet_tracker.untrack_wallet(wallet_addr, user_id=sender_id)
+            msg = (
+                f"🗑️ **تمت إزالة المحفظة بنجاح من المراقبة والنسخ!**\n"
+                f"• العنوان: `{wallet_addr}`\n"
+                f"• تم إلغاء جميع التنبيهات وإيقاف نسخ الصفقات التابع لها."
+            )
+            await self._safe_edit_or_reply(event, msg, buttons=None)
+
+        elif action == "notif":
+            activity = await self.wallet_tracker.track_wallet(wallet_addr, user_id=sender_id)
+            new_alerts = not activity.alerts_enabled
+            conn_mgr = self.wallet_tracker._get_connection()
+            async with conn_mgr as conn:
+                await conn.execute(
+                    "UPDATE tracked_wallets SET alerts_enabled = ? WHERE address = ?",
+                    (1 if new_alerts else 0, wallet_addr),
+                )
+                await conn.commit()
+            activity.alerts_enabled = new_alerts
+            msg = self.wallet_tracker.format_wallet_activity_message(activity)
+            buttons = self._get_wallet_page_inline_buttons(wallet_addr, copy_enabled=activity.copy_trading_enabled, alerts_enabled=new_alerts)
+            await self._safe_edit_or_reply(event, msg, buttons=buttons)
+
+        elif action == "refresh":
+            activity = await self.wallet_tracker.track_wallet(wallet_addr, user_id=sender_id)
+            msg = self.wallet_tracker.format_wallet_activity_message(activity)
+            buttons = self._get_wallet_page_inline_buttons(wallet_addr, copy_enabled=activity.copy_trading_enabled, alerts_enabled=activity.alerts_enabled)
+            await self._safe_edit_or_reply(event, msg, buttons=buttons)
+
+        elif action == "astok":
+            await self._cmd_token_page(event, wallet_addr, sender_id=sender_id)
+
+    async def _handle_copytrade_callback(self, event: Any, data: str, sender_id: Any = None) -> None:
+        """Handle inline button callbacks for copy trading management."""
+        action = data[4:].strip()  # Remove 'cpt:'
+        if action == "close":
+            try:
+                if hasattr(event, "delete"):
+                    res = event.delete()
+                    if asyncio.iscoroutine(res):
+                        await res
+                    return
+            except Exception:
+                pass
+            await self._safe_edit_or_reply(event, "🗑️ **تم إغلاق لوحة نسخ الصفقات**", buttons=None)
+            return
+
+        if action == "toggle_global":
+            new_state = await self.wallet_tracker.toggle_global_copy_trading()
+            wallets = await self.wallet_tracker.list_tracked_wallets(user_id=sender_id)
+            msg = self._build_copytrade_dashboard_message(wallets, global_enabled=new_state)
+            buttons = self._get_copytrade_inline_buttons(global_enabled=new_state)
+            await self._safe_edit_or_reply(event, msg, buttons=buttons)
+
+        elif action == "list":
+            wallets = await self.wallet_tracker.list_tracked_wallets(user_id=sender_id)
+            is_global = await self.wallet_tracker.is_global_copy_trading_enabled()
+            msg = self._build_copytrade_dashboard_message(wallets, global_enabled=is_global)
+            buttons = self._get_copytrade_inline_buttons(global_enabled=is_global)
+            await self._safe_edit_or_reply(event, msg, buttons=buttons)
+
+    async def _cmd_token_page(self, event: Any, ca: str, sender_id: Any = None, header: str = "") -> None:
+        """Fetch and immediately display the token's live page with controls and enable notifications."""
+        clean_ca = ca.strip()
+        if not clean_ca:
+            await self._safe_reply(event, "🪙 **الرجاء إدخال عنوان عقد العملة (Token CA):**\nمثال: `/token 7F4DGZr5cygRf7tDtXyqA6QeFn4KpzWXsRQWzEojpump`")
+            return
+
+        try:
+            page_data = await self.wallet_tracker.fetch_token_page(clean_ca, user_id=sender_id)
+            _, notif_on, is_priv = await self.wallet_tracker.get_token_subscription(clean_ca, user_id=sender_id)
+            msg = self.wallet_tracker.format_token_page_message(page_data, is_private=is_priv, notif_enabled=notif_on)
+            if header:
+                msg = f"{header}\n\n{msg}"
+
+            is_open = False
+            target = getattr(self, "_execution_target", None)
+            if target and hasattr(target, "is_position_open"):
+                try:
+                    is_open = target.is_position_open(clean_ca)
+                except Exception:
+                    is_open = False
+
+            buttons = self._get_token_page_inline_buttons(clean_ca, is_private=is_priv, notif_enabled=notif_on, is_position_open=is_open)
+            await self._safe_reply(event, msg, buttons=buttons)
+        except Exception as exc:
+            logger.warning("Error fetching token page for %s: %s", clean_ca, exc)
+            await self._safe_reply(event, f"❌ حدث خطأ أثناء جلب بيانات العملة `{clean_ca}`: {exc}")
+
+    async def _cmd_manual_buy(self, event: Any, ca: str, sender_id: Any = None) -> None:
+        """Execute an immediate manual buy order for a token contract."""
+        parts = ca.strip().split()
+        clean_ca = parts[0] if parts else ""
+        if not clean_ca:
+            await self._safe_reply(event, "❌ يرجى تحديد عنوان عقد العملة للشراء (مثال: `/buy <CA>` أو `/buy <CA> 0.2`).")
+            return
+
+        custom_amount: Optional[Decimal] = None
+        if len(parts) > 1:
+            try:
+                custom_amount = Decimal(parts[1].replace("$", "").replace(",", ""))
+                if custom_amount <= Decimal(0):
+                    custom_amount = None
+            except Exception:
+                custom_amount = None
+
+        target = getattr(self, "_execution_target", None)
+        if target is None:
+            await self._safe_reply(event, "⚠️ محرك التداول غير متصل حالياً لتنفيذ أمر الشراء المباشر.")
+            return
+
+        if hasattr(target, "manual_enter_position"):
+            amt_info = f" بمبلغ `{custom_amount}`" if custom_amount is not None else ""
+            await self._safe_reply(event, f"⚡ **جاري فحص وتنفيذ أمر الشراء الفوري للعملة `{clean_ca[:6]}..{clean_ca[-4:]}`{amt_info}...**")
+            ok, reason, _ = await target.manual_enter_position(
+                clean_ca,
+                amount_native=custom_amount,
+                originating_channel=f"DM:{sender_id or 'admin'}",
+            )
+            if ok:
+                amt_str = f"\n• المبلغ المخصص: `{custom_amount}`" if custom_amount is not None else ""
+                await self._safe_reply(
+                    event,
+                    f"🟢 **تم إرسال أمر الشراء بنجاح!**\n• العملة: `{clean_ca}`{amt_str}\n• الحالة: تم التمرير إلى محرك التنفيذ الفوري واستثناء شرط القيمة السوقية.\nاستخدم أمر `/trades` لمتابعة المركز المفتوح.",
+                )
+            else:
+                await self._safe_reply(event, f"❌ **تعذر تنفيذ الشراء:**\n{reason}")
+        else:
+            await self._safe_reply(event, "⚠️ أمر الشراء اليدوي غير مدعوم في المحرك الحالي.")
+
+    async def _cmd_manual_sell(self, event: Any, ca: str, sender_id: Any = None) -> None:
+        """Execute an immediate manual exit / sell order for an open token position."""
+        clean_ca = ca.strip()
+        if not clean_ca:
+            await self._safe_reply(event, "❌ يرجى تحديد عنوان عقد العملة لإغلاق الصفقة (مثال: `/sell <CA>` أو `/close <CA>`).")
+            return
+
+        target = getattr(self, "_execution_target", None)
+        if target is None:
+            await self._safe_reply(event, "⚠️ محرك التداول غير متصل حالياً لتنفيذ أمر الإغلاق المباشر.")
+            return
+
+        if hasattr(target, "manual_exit_position"):
+            ok, reason, pnl = await target.manual_exit_position(clean_ca, reason_str="Manual Telegram Sell/Exit")
+            if ok:
+                pnl_str = f"+${float(pnl):.2f}" if pnl is not None and pnl >= 0 else f"-${abs(float(pnl or 0)):.2f}"
+                await self._safe_reply(
+                    event,
+                    f"🔴 **تم بيع وإغلاق الصفقة بنجاح!**\n• العملة: `{clean_ca}`\n• النتيجة: `{reason}`\n• الربح/الخسارة: `{pnl_str}`\nاستخدم `/trades` لعرض الصفقات المتبقية.",
+                )
+            else:
+                await self._safe_reply(event, f"❌ **تعذر إغلاق الصفقة:**\n{reason}")
+        else:
+            await self._safe_reply(event, "⚠️ أمر الإغلاق اليدوي غير مدعوم في المحرك الحالي.")
+
+    async def _cmd_wallet_page(self, event: Any, wallet_addr: str, sender_id: Any = None, header: str = "") -> None:
+        """Track and display comprehensive wallet activity, entry/exit points, and exit strategy."""
+        clean_addr = wallet_addr.strip()
+        if not clean_addr:
+            await self._safe_reply(event, "👛 **الرجاء إدخال عنوان المحفظة للمراقبة والتتبع:**\nمثال: `/wallet 9WzDXwBbmkg8ZTbNMqUxvQRAyrZzDsGYdLVL9zYtAWWM`")
+            return
+
+        try:
+            activity = await self.wallet_tracker.track_wallet(clean_addr, user_id=sender_id)
+            msg = self.wallet_tracker.format_wallet_activity_message(activity)
+            if header:
+                msg = f"{header}\n\n{msg}"
+            buttons = self._get_wallet_page_inline_buttons(clean_addr, copy_enabled=activity.copy_trading_enabled, alerts_enabled=activity.alerts_enabled)
+            await self._safe_reply(event, msg, buttons=buttons)
+        except Exception as exc:
+            logger.warning("Error tracking wallet %s: %s", clean_addr, exc)
+            await self._safe_reply(event, f"❌ حدث خطأ أثناء تتبع المحفظة `{clean_addr}`: {exc}")
+
+    async def _cmd_untrack_wallet(self, event: Any, wallet_addr: str = "", sender_id: Any = None) -> None:
+        """Remove a tracked wallet and stop copying its trades."""
+        clean_addr = wallet_addr.strip()
+        if not clean_addr:
+            wallets = await self.wallet_tracker.list_tracked_wallets(user_id=sender_id)
+            if not wallets:
+                await self._safe_reply(event, "📭 لا توجد محافظ قيد المراقبة حالياً لإزالتها.")
+                return
+            wallet_lines = "\n".join([f"• `{w['address']}` ({w.get('label', 'Wallet')})" for w in wallets[:10]])
+            await self._safe_reply(
+                event,
+                f"🗑️ **إزالة محفظة من المراقبة والنسخ (Untrack Wallet)**\n\n"
+                f"المحافظ المراقبة حالياً:\n{wallet_lines}\n\n"
+                f"لإزالة أي محفظة أرسل: `/untrack <ADDRESS>`",
+            )
+            return
+
+        ok = await self.wallet_tracker.untrack_wallet(clean_addr, user_id=sender_id)
+        if ok:
+            await self._safe_reply(
+                event,
+                f"✅ **تمت إزالة المحفظة بنجاح!**\n"
+                f"• العنوان: `{clean_addr}`\n"
+                f"• تم إيقاف نسخ الصفقات وتعطيل تنبيهات الدخول والخروج الخاصة بها.",
+            )
+        else:
+            await self._safe_reply(event, f"⚠️ المحفظة `{clean_addr}` لم تكن موجودة في قائمة المراقبة.")
+
+    async def _cmd_copytrade(self, event: Any, args: str = "", sender_id: Any = None) -> None:
+        """Manage and monitor copy-trading functionality and tracked wallets."""
+        clean_args = args.strip().lower()
+        if clean_args in ("toggle", "switch", "تفعيل", "تعطيل", "ايقاف"):
+            new_state = await self.wallet_tracker.toggle_global_copy_trading()
+            state_str = "🟢 مفعّل (Enabled)" if new_state else "🔴 معطّل (Disabled)"
+            await self._safe_reply(event, f"⚙️ **تم تحديث حالة نسخ الصفقات عالمياً:** {state_str}")
+            return
+
+        wallets = await self.wallet_tracker.list_tracked_wallets(user_id=sender_id)
+        is_global = await self.wallet_tracker.is_global_copy_trading_enabled()
+        msg = self._build_copytrade_dashboard_message(wallets, global_enabled=is_global)
+        buttons = self._get_copytrade_inline_buttons(global_enabled=is_global)
+        await self._safe_reply(event, msg, buttons=buttons)
+
+    def _build_copytrade_dashboard_message(self, wallets: list[dict[str, Any]], global_enabled: bool) -> str:
+        """Build a formatted copy-trading dashboard overview."""
+        global_str = "🟢 نشط بالكامل (Active)" if global_enabled else "🔴 معطّل وموقوف (Disabled)"
+        total_wallets = len(wallets)
+        active_copying = sum(1 for w in wallets if w.get("copy_trading_enabled"))
+
+        lines = [
+            "👥 **لوحة التحكم بنسخ الصفقات (Copy-Trading Dashboard)**",
+            "━━━━━━━━━━━━━━━━━━━━━━━━━",
+            f"• **مفتاح النسخ العام:** {global_str}",
+            f"• **إجمالي المحافظ المراقبة:** `{total_wallets}` محفظة",
+            f"• **المحافظ المفعل عليها النسخ:** `{active_copying}` محفظة",
+            "━━━━━━━━━━━━━━━━━━━━━━━━━",
+        ]
+
+        if not wallets:
+            lines.append("📭 لا توجد محافظ مضافة حالياً.")
+            lines.append("💡 أرسل عنوان أي محفظة أو استخدم `/track <ADDRESS>` لإضافتها وبدء التتبع.")
+        else:
+            lines.append("📋 **قائمة المحافظ المسجلة:**")
+            for idx, w in enumerate(wallets[:8], 1):
+                addr_short = f"{w['address'][:4]}..{w['address'][-4:]}"
+                copy_ico = "🟢 نسخ نشط" if w.get("copy_trading_enabled") else "⚪ مراقبة فقط"
+                strat = w.get("detected_strategy", "Unknown")
+                wr = f"{w.get('win_rate_pct', 0.0):.1f}%"
+                lines.append(f"{idx}. `{addr_short}` | {copy_ico} | فوز: `{wr}` | نمط: {strat}")
+
+            lines.append("\n📌 **الأوامر المتاحة:**")
+            lines.append("• `/stopcopy <ADDRESS>` — إيقاف نسخ محفظة معينة")
+            lines.append("• `/untrack <ADDRESS>` — إزالة المحفظة بالكامل")
+            lines.append("• `/copytrade toggle` — تفعيل/تعطيل النسخ عالمياً")
+
+        return "\n".join(lines)
+
+    async def _cmd_stopcopy(self, event: Any, wallet_addr: str = "", sender_id: Any = None) -> None:
+        """Stop trade copying for a specific wallet or list copy targets."""
+        clean_addr = wallet_addr.strip()
+        if not clean_addr:
+            wallets = await self.wallet_tracker.list_tracked_wallets(user_id=sender_id)
+            copying = [w for w in wallets if w.get("copy_trading_enabled")]
+            if not copying:
+                await self._safe_reply(event, "ℹ️ لا توجد محافظ مفعل عليها نسخ الصفقات حالياً.")
+                return
+            copy_lines = "\n".join([f"• `{w['address']}` ({w.get('label', 'Wallet')})" for w in copying])
+            await self._safe_reply(
+                event,
+                f"🛑 **إيقاف نسخ الصفقات (Stop Copy Trading)**\n\n"
+                f"المحافظ التي يتم نسخها حالياً:\n{copy_lines}\n\n"
+                f"لإيقاف النسخ عن أي محفظة: `/stopcopy <ADDRESS>`\n"
+                f"أو اضغط زر '🛑 إيقاف النسخ' من صفحة المحفظة.",
+            )
+            return
+
+        ok = await self.wallet_tracker.stop_wallet_copy_trading(clean_addr, user_id=sender_id)
+        if ok:
+            await self._safe_reply(
+                event,
+                f"🛑 **تم إيقاف نسخ الصفقات بنجاح للمحفظة:**\n`{clean_addr}`\n"
+                f"• لن يقوم البوت بتكرار أو نسخ أي صفقات جديدة من هذه المحفظة.",
+            )
+        else:
+            await self._safe_reply(event, f"⚠️ المحفظة `{clean_addr}` غير مسجلة أو لم تكن مفعّلة للنسخ.")
+
+    async def _cmd_token_alerts(self, event: Any, args: str = "", sender_id: Any = None) -> None:
+        """List and manage active token notification subscriptions."""
+        conn_mgr = self.wallet_tracker._get_connection()
+        async with conn_mgr as conn:
+            cursor = await conn.execute(
+                "SELECT token_address, chain, notifications_enabled, is_private, symbol, created_at "
+                "FROM token_subscriptions ORDER BY created_at DESC LIMIT 20"
+            )
+            rows = await cursor.fetchall()
+
+        if not rows:
+            await self._safe_reply(
+                event,
+                "🔕 **إدارة إشعارات العملات (Token Alerts Manager)**\n\n"
+                "لا توجد اشتراكات تنبيهات نشطة حالياً.\n"
+                "💡 بمجرد إدخال أي عنوان عقد عملة، سيتم تفعيل جميع الإشعارات الخاصة بها تلقائياً.",
+            )
+            return
+
+        lines = [
+            "🔔 **إدارة إشعارات وتنبيهات العملات (Token Alerts)**",
+            "━━━━━━━━━━━━━━━━━━━━━━━━━",
+            "جميع العملات المدخلة يتم تفعيل إشعاراتها تلقائياً. يمكنك كتم أو تفعيل أي عملة:\n",
+        ]
+        for row in rows:
+            tok = row[0]
+            tok_short = f"{tok[:4]}..{tok[-4:]}"
+            sym = row[4] or "Token"
+            notif = "🔔 مفعّلة" if row[2] else "🔕 معطّلة"
+            priv = "🔒 خاص" if row[3] else "🌐 عام"
+            lines.append(f"• `{tok_short}` ({sym}) — {notif} | {priv}")
+
+        lines.append("\n📌 **الأوامر السريعة:**")
+        lines.append("• `/mute <CA>` — كتم تنبيهات عملة معينة")
+        lines.append("• `/unmute <CA>` — إعادة تفعيل تنبيهات العملة")
+        lines.append("• أو استخدم زر التنبيهات المباشر في صفحة العملة.")
+        await self._safe_reply(event, "\n".join(lines))
+
+    async def _cmd_mute_token(self, event: Any, ca: str = "", sender_id: Any = None) -> None:
+        """Mute / disable notifications for a specific token."""
+        clean_ca = ca.strip()
+        if not clean_ca:
+            await self._safe_reply(event, "🔕 يرجى تزويد عنوان العقد: `/mute <CA>`")
+            return
+        await self.wallet_tracker.toggle_token_notifications(clean_ca, enabled=False, user_id=sender_id)
+        await self._safe_reply(event, f"🔕 **تم كتم إشعارات العملة بنجاح:** `{clean_ca}`")
+
+    async def _cmd_unmute_token(self, event: Any, ca: str = "", sender_id: Any = None) -> None:
+        """Unmute / enable notifications for a specific token."""
+        clean_ca = ca.strip()
+        if not clean_ca:
+            await self._safe_reply(event, "🔔 يرجى تزويد عنوان العقد: `/unmute <CA>`")
+            return
+        await self.wallet_tracker.toggle_token_notifications(clean_ca, enabled=True, user_id=sender_id)
+        await self._safe_reply(event, f"🔔 **تم تفعيل جميع إشعارات العملة بنجاح:** `{clean_ca}`")
+
     async def _cmd_trades(self, event: Any) -> None:
         """Handle /trades command in DMs: displays Entry, Current Price, Unrealized PnL %, Duration (s), and Trailing Stop status for OPEN trades."""
         metrics: dict[str, Any] = {}
@@ -2621,9 +3261,19 @@ class TelegramIngester:
                     f"{short_token:<10} | {platform_str:<8} | {type_str:<5} | {side_str:<4} | {fill_p:<11} | {pnl_str:<8}"
                 )
             lines.append("```")
-            response_sections.append("\n".join(lines))
+        buttons = []
+        if open_trades and TELETHON_AVAILABLE:
+            try:
+                from telethon import Button
+                for t in open_trades[:6]:
+                    tok_str = str(t.get("token_address", ""))
+                    short_tok = f"{tok_str[:4]}..{tok_str[-4:]}" if len(tok_str) > 10 else tok_str
+                    buttons.append([Button.inline(f"🔴 إغلاق صفقة {short_tok} (Sell)", data=f"trade:close:{tok_str}".encode("utf-8"))])
+                buttons.append([Button.inline("🔄 تحديث الصفقات", data=b"cmd:trades"), Button.inline("❌ إغلاق", data=b"tok:close:trades")])
+            except Exception:
+                buttons = []
 
-        await self._safe_reply(event, "\n\n".join(response_sections))
+        await self._safe_reply(event, "\n\n".join(response_sections), buttons=buttons if buttons else None)
 
     # -------------------------------------------------------------------------
     # 3. Lifecycle & Connection Management

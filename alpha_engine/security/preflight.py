@@ -8,6 +8,7 @@ Python 3.11+ | web3.py
 from __future__ import annotations
 
 import logging
+import os
 import time
 from decimal import Decimal
 
@@ -253,7 +254,7 @@ async def _tier2_evm_preflight(
 async def verify_solana_mint_preflight(
     session: aiohttp.ClientSession,
     mint_address: str,
-    rpc_url: str,
+    rpc_url: str | list[str],
     pool_address: str = "",
 ) -> dict[str, Any] | None:
     """
@@ -264,11 +265,26 @@ async def verify_solana_mint_preflight(
       - Freeze authority (disabled / null)
       - Top-10 holder concentration via getTokenLargestAccounts & getTokenSupply,
         excluding the Pump.fun bonding curve address.
+    Supports auto-failover across multiple RPC endpoints if rate-limited (HTTP 429).
     """
-    if not rpc_url:
+    if isinstance(rpc_url, (list, tuple)):
+        candidates = [u for u in rpc_url if u]
+    elif rpc_url:
+        candidates = [rpc_url]
+    else:
+        candidates = []
+
+    env_failovers = os.getenv("SOLANA_RPC_FAILOVER_URLS", "")
+    if env_failovers:
+        for u in env_failovers.split(","):
+            u = u.strip()
+            if u and u not in candidates:
+                candidates.append(u)
+
+    if not candidates:
         return None
 
-    # 1. Fetch getAccountInfo (jsonParsed)
+    # 1. Fetch getAccountInfo (jsonParsed) with failover across candidates
     payload_info = {
         "jsonrpc": "2.0",
         "id": 1,
@@ -279,40 +295,51 @@ async def verify_solana_mint_preflight(
         ],
     }
 
+    active_rpc: str | None = None
+    val = None
+    for candidate in candidates:
+        try:
+            async with session.post(
+                candidate,
+                json=payload_info,
+                timeout=aiohttp.ClientTimeout(total=2.5),
+            ) as resp:
+                if resp.status == 200:
+                    body = await resp.json()
+                    val = (body.get("result") or {}).get("value")
+                    active_rpc = candidate
+                    break
+                logger.debug("RPC endpoint %s returned non-200 status %d for mint %s", candidate[:30], resp.status, mint_address[:10])
+        except Exception as exc:
+            logger.debug("RPC endpoint %s failed for mint %s: %s", candidate[:30], mint_address[:10], exc)
+
+    if active_rpc is None:
+        return None
+
     try:
-        async with session.post(
-            rpc_url,
-            json=payload_info,
-            timeout=aiohttp.ClientTimeout(total=2.5),
-        ) as resp:
-            if resp.status != 200:
-                logger.debug("RPC endpoint returned non-200 status %d for mint %s", resp.status, mint_address[:10])
-                return None
-            body = await resp.json()
-            val = (body.get("result") or {}).get("value")
-            if not val:
-                logger.debug("Solana getAccountInfo confirmed account does not exist on-chain for mint %s", mint_address[:10])
-                return {"invalid_mint": True, "exists": False, "mint": mint_address}
+        if not val:
+            logger.debug("Solana getAccountInfo confirmed account does not exist on-chain for mint %s", mint_address[:10])
+            return {"invalid_mint": True, "exists": False, "mint": mint_address}
 
-            owner = val.get("owner", "")
-            if owner not in (
-                "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
-                "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb",
-            ):
-                logger.debug("Solana account %s owner %s is not SPL Token / Token-2022", mint_address[:10], owner)
-                return {"invalid_mint": True, "owner": owner, "mint": mint_address}
+        owner = val.get("owner", "")
+        if owner not in (
+            "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
+            "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb",
+        ):
+            logger.debug("Solana account %s owner %s is not SPL Token / Token-2022", mint_address[:10], owner)
+            return {"invalid_mint": True, "owner": owner, "mint": mint_address}
 
-            mint_auth = None
-            freeze_auth = None
-            decimals = 6
-            data_field = val.get("data")
-            if isinstance(data_field, dict):
-                parsed = data_field.get("parsed") or {}
-                if parsed.get("type") == "mint":
-                    info = parsed.get("info") or {}
-                    mint_auth = info.get("mintAuthority")
-                    freeze_auth = info.get("freezeAuthority")
-                    decimals = info.get("decimals", 6)
+        mint_auth = None
+        freeze_auth = None
+        decimals = 6
+        data_field = val.get("data")
+        if isinstance(data_field, dict):
+            parsed = data_field.get("parsed") or {}
+            if parsed.get("type") == "mint":
+                info = parsed.get("info") or {}
+                mint_auth = info.get("mintAuthority")
+                freeze_auth = info.get("freezeAuthority")
+                decimals = info.get("decimals", 6)
 
         # 2. Fetch top largest token accounts & supply to calculate concentration & detect sniper bundles
         top10_concentration = 0.0
@@ -332,7 +359,7 @@ async def verify_solana_mint_preflight(
                 "params": [mint_address, {"commitment": "confirmed"}],
             }
             async with session.post(
-                rpc_url,
+                active_rpc,
                 json=payload_supply,
                 timeout=aiohttp.ClientTimeout(total=2.0),
             ) as resp_supply:
@@ -344,7 +371,7 @@ async def verify_solana_mint_preflight(
 
             if total_supply > 0:
                 async with session.post(
-                    rpc_url,
+                    active_rpc,
                     json=payload_largest,
                     timeout=aiohttp.ClientTimeout(total=2.0),
                 ) as resp_largest:

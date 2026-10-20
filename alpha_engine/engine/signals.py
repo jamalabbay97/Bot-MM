@@ -679,6 +679,9 @@ class SignalGenerator:
             strength=strength,
             alpha_score=alpha,
             source=source,
+            originating_channel=getattr(raw_signal, "originating_channel", None),
+            is_direct_dm=bool(getattr(raw_signal, "is_direct_dm", False)),
+            custom_amount_native=getattr(raw_signal, "custom_amount_native", None),
         )
 
     def generate_launch_signal(

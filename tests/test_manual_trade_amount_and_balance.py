@@ -17,9 +17,9 @@ from alpha_engine.execution.book import PositionBook
 from alpha_engine.execution.executor import PaperExecutor
 from alpha_engine.execution.ledger import SQLiteLedger
 from alpha_engine.ingestion.telegram import TelegramIngester, parse_trade_amount_input
-from alpha_engine.models.enums import ChainIdentifier, OrderSide, SignalStrength, SignalSource
+from alpha_engine.models.enums import ChainIdentifier, OrderSide, SignalStrength, SignalSource, SecurityTier
 from alpha_engine.models.events import SignalEvent
-from alpha_engine.models.state import PaperFill, PoolState
+from alpha_engine.models.state import PaperFill, PoolState, SecurityReport
 
 
 class DummyEvent:
@@ -239,6 +239,7 @@ async def test_manual_trade_amount_sizing_in_pipeline(tmp_path):
     cfg = EngineConfig(
         db_path=str(db_file),
         auto_trade_enabled=True,
+        ai_supervisor_enabled=False,
         manual_trade_amount=Decimal("0.25"),
         manual_trade_currency="SOL",
     )
@@ -255,30 +256,33 @@ async def test_manual_trade_amount_sizing_in_pipeline(tmp_path):
     # Mock execute_signal to observe fixed_trade_amount_native
     mock_fill = PaperFill(
         order_id="ord_1",
-        signal_id="sig_test_1",
         token_address="TokenABC123456789012345678901234567890123",
         chain=ChainIdentifier.SOLANA_MAINNET,
         side=OrderSide.BUY,
-        fill_price_native=Decimal("0.0001"),
-        fill_price_usd=Decimal("0.015"),
-        token_amount_out=Decimal("2500"),
-        native_amount_in=Decimal("0.25"),
-        fee_native=Decimal("0.0005"),
-        slippage_pct=Decimal("0.01"),
-        latency_ms=50.0,
-        tx_hash="tx_dummy",
-        timestamp_ns=int(time.time() * 1e9),
+        simulated_native_spent=Decimal("0.25"),
+        tokens_acquired=Decimal("2500"),
+        effective_price=Decimal("0.0001"),
     )
     runner._executor.execute_signal = AsyncMock(return_value=mock_fill)
 
     pool_state = PoolState(
         chain=ChainIdentifier.SOLANA_MAINNET,
         pool_address="PoolABC111111111111111111111111111111111111",
-        base_mint="TokenABC123456789012345678901234567890123",
-        quote_mint="So11111111111111111111111111111111111111112",
-        spot_price_native_per_token=Decimal("0.0001"),
-        base_reserve=Decimal("1000000000"),
-        quote_reserve=Decimal("100"),
+        token_reserve=Decimal("1000000000"),
+        native_reserve=Decimal("100"),
+        fee_numerator=3,
+        fee_denominator=1000,
+        last_updated_block=100000,
+        token_address="TokenABC123456789012345678901234567890123",
+    )
+    sec_rep = SecurityReport(
+        token_address="TokenABC123456789012345678901234567890123",
+        chain=ChainIdentifier.SOLANA_MAINNET,
+        tier=SecurityTier.CLEAN,
+        is_honeypot=False,
+        buy_tax_bps=0,
+        sell_tax_bps=0,
+        passes_hard_gates=True,
     )
     sig = SignalEvent(
         signal_id="sig_test_1",
@@ -288,9 +292,10 @@ async def test_manual_trade_amount_sizing_in_pipeline(tmp_path):
         token_address="TokenABC123456789012345678901234567890123",
         suggested_side=OrderSide.BUY,
         pool_state=pool_state,
+        security_report=sec_rep,
         strength=SignalStrength.STRONG,
         alpha_score=0.90,
-        source=SignalSource.RAYDIUM_MINT,
+        source=SignalSource.RAYDIUM_NEW_POOL,
         market_cap_usd=Decimal("25000.0"),
     )
 
@@ -341,11 +346,21 @@ async def test_insufficient_balance_prevents_execution_and_alerts(tmp_path):
     pool_state = PoolState(
         chain=ChainIdentifier.SOLANA_MAINNET,
         pool_address="PoolDEF111111111111111111111111111111111111",
-        base_mint="TokenDEF123456789012345678901234567890123",
-        quote_mint="So11111111111111111111111111111111111111112",
-        spot_price_native_per_token=Decimal("0.0001"),
-        base_reserve=Decimal("1000000000"),
-        quote_reserve=Decimal("100"),
+        token_reserve=Decimal("1000000000"),
+        native_reserve=Decimal("100"),
+        fee_numerator=3,
+        fee_denominator=1000,
+        last_updated_block=100000,
+        token_address="TokenDEF123456789012345678901234567890123",
+    )
+    sec_rep = SecurityReport(
+        token_address="TokenDEF123456789012345678901234567890123",
+        chain=ChainIdentifier.SOLANA_MAINNET,
+        tier=SecurityTier.CLEAN,
+        is_honeypot=False,
+        buy_tax_bps=0,
+        sell_tax_bps=0,
+        passes_hard_gates=True,
     )
     sig = SignalEvent(
         signal_id="sig_insufficient",
@@ -355,9 +370,10 @@ async def test_insufficient_balance_prevents_execution_and_alerts(tmp_path):
         token_address="TokenDEF123456789012345678901234567890123",
         suggested_side=OrderSide.BUY,
         pool_state=pool_state,
+        security_report=sec_rep,
         strength=SignalStrength.STRONG,
         alpha_score=0.90,
-        source=SignalSource.RAYDIUM_MINT,
+        source=SignalSource.RAYDIUM_NEW_POOL,
         market_cap_usd=Decimal("30000.0"),
     )
 

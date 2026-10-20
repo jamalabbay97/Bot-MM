@@ -56,6 +56,7 @@ from alpha_engine.models.enums import (
     LotStatus,
     OrderSide,
     ScreenerSection,
+    SecurityTier,
     SignalSource,
     SignalStrength,
     TradeExitReason,
@@ -347,12 +348,9 @@ class PaperTradingEngine:
 
         if self._ledger is not None:
             try:
-                payload = json.dumps({
-                    "amount": str(self.manual_trade_amount) if self.manual_trade_amount is not None else None,
-                    "currency": self.manual_trade_currency,
-                    "updated_at": int(time.time()),
-                })
-                asyncio.create_task(self._ledger.set_setting("manual_trade_amount", payload))
+                amt_str = str(self.manual_trade_amount) if self.manual_trade_amount is not None else ""
+                asyncio.create_task(self._ledger.set_setting("manual_trade_amount", amt_str))
+                asyncio.create_task(self._ledger.set_setting("manual_trade_currency", self.manual_trade_currency))
             except Exception as exc:
                 logger.debug("Async ledger setting save error: %s", exc)
 
@@ -377,10 +375,14 @@ class PaperTradingEngine:
             try:
                 val = await self._ledger.get_setting("manual_trade_amount")
                 if val:
-                    data = json.loads(val)
-                    amt = data.get("amount")
-                    curr = data.get("currency", "SOL")
-                    if amt is not None:
+                    try:
+                        data = json.loads(val)
+                        amt = data.get("amount")
+                        curr = data.get("currency", "SOL")
+                    except Exception:
+                        amt = val
+                        curr = await self._ledger.get_setting("manual_trade_currency") or "SOL"
+                    if amt:
                         self.manual_trade_amount = Decimal(str(amt))
                         self.manual_trade_currency = str(curr).upper().strip()
                         self._save_persisted_trade_amount()
@@ -458,6 +460,8 @@ class PaperTradingEngine:
             "is_manual": amt is not None,
             "amount": amt,
             "currency": curr,
+            "manual_trade_amount": str(self.manual_trade_amount) if self.manual_trade_amount is not None else None,
+            "manual_trade_currency": curr,
             "usd_equivalent": usd_val,
             "sol_equivalent": sol_val,
             "sol_price_usd": sol_p,
@@ -825,6 +829,221 @@ class PaperTradingEngine:
         chain: ChainIdentifier | None = None,
     ) -> bool:
         return self._position_book.is_position_open(token_address, chain=chain)
+
+    async def manual_enter_position(
+        self,
+        token_address: str,
+        chain: Optional[ChainIdentifier] = None,
+        amount_native: Optional[Decimal] = None,
+        originating_channel: Optional[str] = None,
+    ) -> tuple[bool, str, Optional[Any]]:
+        """
+        Manually triggers entry into a token position (via Telegram /buy or token page button).
+        Bypasses market cap and screener filters while verifying security gates, balance, and exposure.
+        """
+        clean_addr = token_address.strip()
+        chain_id = chain or (
+            ChainIdentifier.BASE_MAINNET if clean_addr.startswith("0x") else ChainIdentifier.SOLANA_MAINNET
+        )
+
+        if self.is_position_open(clean_addr, chain=chain_id):
+            return False, "يوجد مركز مفتوح بالفعل لهذه العملة (Position already open)", None
+
+        # Pre-check cash balance if amount_native is provided or if default manual_trade_amount is set
+        native_p = self._eth_price if chain_id == ChainIdentifier.BASE_MAINNET else self._sol_price
+        unit = "ETH" if chain_id == ChainIdentifier.BASE_MAINNET else "SOL"
+        available_cash = self._cash_eth if chain_id == ChainIdentifier.BASE_MAINNET else self._cash_sol
+        fee_est = Decimal("0.002") if chain_id == ChainIdentifier.BASE_MAINNET else Decimal("0.005")
+
+        req_amount = amount_native
+        if req_amount is None and self.manual_trade_amount is not None and self.manual_trade_amount > Decimal(0):
+            if self.manual_trade_currency == "USD":
+                req_amount = self.manual_trade_amount / native_p if native_p > Decimal(0) else Decimal(0)
+            else:
+                req_amount = self.manual_trade_amount
+
+        if req_amount is not None and req_amount > Decimal(0):
+            if available_cash < (req_amount + fee_est):
+                return False, f"رصيد غير كافٍ ({available_cash:.4f} {unit} المتاح < {req_amount + fee_est:.4f} {unit} المطلوب)", None
+
+        # 1. Evaluate security gates via gatekeeper
+        report = None
+        if hasattr(self, "_gatekeeper") and self._gatekeeper is not None:
+            try:
+                report = await self._gatekeeper.evaluate_token(
+                    token_address=clean_addr,
+                    chain=chain_id,
+                )
+            except Exception as exc:
+                logger.warning("Manual buy gatekeeper error for %s: %s", clean_addr[:10], exc)
+
+        if report is not None and not getattr(report, "passes_hard_gates", True):
+            reason = self._extract_gatekeeper_rejection_reason(report)
+            return False, f"فشل الفحص الأمني للعملة (Security Veto): {reason}", None
+
+        if report is None:
+            report = SecurityReport(
+                token_address=clean_addr,
+                chain=chain_id,
+                tier=SecurityTier.CLEAN,
+                is_honeypot=False,
+                is_rug=False,
+                score=100.0,
+                flags=[],
+                buy_tax_bps=0,
+                sell_tax_bps=0,
+                checked_at_ts=int(time.time()),
+                passes_hard_gates=True,
+            )
+
+        # 2. Get or create pool state
+        pool = self._pool_registry.get(clean_addr)
+        if pool is None:
+            pool = self.get_or_create_initial_pool_state(chain_id, clean_addr, "")
+
+        # 3. Create high-conviction BUY SignalEvent with is_direct_dm=True and custom_amount_native
+        mcap = pool.calculate_market_cap_usd(native_price_usd=native_p) if pool else Decimal("10000.0")
+
+        signal = SignalEvent(
+            timestamp_ns=time.time_ns(),
+            chain=chain_id,
+            pool_address=pool.pool_address if pool else "",
+            token_address=clean_addr,
+            suggested_side=OrderSide.BUY,
+            pool_state=pool,
+            security_report=report,
+            strength=SignalStrength.STRONG,
+            alpha_score=0.95,
+            source=SignalSource.TELEGRAM_SCRAPER,
+            originating_channel=originating_channel or "DM:ManualBuy",
+            is_direct_dm=True,
+            market_cap_usd=mcap,
+            custom_amount_native=amount_native,
+        )
+
+        # 4. Enqueue into signal queue
+        await self._signal_q.put(signal)
+        return True, "تم إرسال أمر الشراء بنجاح إلى محرك التنفيذ (Trade signal queued)", signal
+
+    async def manual_exit_position(
+        self,
+        token_address: str,
+        chain: Optional[ChainIdentifier] = None,
+        reason_str: str = "manual_telegram_exit",
+    ) -> tuple[bool, str, Optional[Decimal]]:
+        """
+        Manually forces an immediate exit/sell of an open position for token_address (via Telegram /sell or button).
+        Closes all open lots for this token, executes the exit fill, applies PnL, and credits balance.
+        """
+        clean_addr = token_address.strip()
+        chain_id = chain or (
+            ChainIdentifier.BASE_MAINNET if clean_addr.startswith("0x") else ChainIdentifier.SOLANA_MAINNET
+        )
+
+        open_lots = self._position_book.get_open_lots(chain=chain_id, token_address=clean_addr)
+        if not open_lots:
+            return False, "لا توجد صفقة مفتوحة نشطة لهذه العملة حالياً (No open position found)", None
+
+        pool = self._pool_registry.get(clean_addr)
+        if pool is None and open_lots and open_lots[0].pool_address:
+            pool = self._pool_registry.get(open_lots[0].pool_address)
+        if pool is None:
+            pool = self.get_or_create_initial_pool_state(chain_id, clean_addr, "")
+
+        current_price = pool.spot_price_native_per_token if pool and pool.spot_price_native_per_token > 0 else open_lots[0].entry_price
+        native_price = self._eth_price if chain_id == ChainIdentifier.BASE_MAINNET else self._sol_price
+
+        total_pnl_usd = Decimal("0")
+        total_native_recovered = Decimal("0")
+        total_tokens_sold = Decimal("0")
+
+        from alpha_engine.models.enums import TradeExitReason, ExitStage
+        from alpha_engine.models.state import ExitDecision
+
+        for lot in list(open_lots):
+            lot.status = LotStatus.PENDING_SELL
+            lot.pending_exit_timestamp = time.time()
+            if self._ledger:
+                await self._ledger.record_lot_transition(
+                    lot_id=lot.lot_id,
+                    token_address=lot.token_address,
+                    chain=lot.chain.value,
+                    status=LotStatus.PENDING_SELL.value,
+                    exit_reason=reason_str,
+                )
+
+            decision = ExitDecision(
+                lot_id=lot.lot_id,
+                token_address=lot.token_address,
+                chain=lot.chain,
+                should_exit=True,
+                exit_reason=TradeExitReason.MANUAL_CLOSE,
+                exit_stage=ExitStage.SL,
+                tokens_to_sell=lot.tokens_held,
+                current_price=current_price,
+                pnl_estimate_native=lot.tokens_held * (current_price - lot.entry_price),
+                prioritized=True,
+            )
+
+            exit_fill = await self._executor.execute_exit(
+                chain=decision.chain,
+                token_address=decision.token_address,
+                pool=pool,
+                tokens_to_sell=decision.tokens_to_sell,
+                reason=decision.exit_reason,
+                apply_drag=True,
+                portfolio_equity_usd=max(Decimal("1.0"), self._current_equity_usd()),
+                platform=getattr(lot, "platform", None),
+            )
+
+            if exit_fill is not None and exit_fill.effective_price > Decimal(0):
+                pnl_native, _ = self._position_book.apply_exit_decision(
+                    decision, sell_price=exit_fill.effective_price
+                )
+                exit_pnl_usd = pnl_native * native_price
+                total_pnl_usd += exit_pnl_usd
+                total_native_recovered += exit_fill.simulated_native_spent
+                total_tokens_sold += exit_fill.tokens_acquired
+
+                if decision.chain == ChainIdentifier.BASE_MAINNET:
+                    self._cash_eth += exit_fill.simulated_native_spent
+                else:
+                    self._cash_sol += exit_fill.simulated_native_spent
+
+                gas_usd = exit_fill.simulated_gas_cost_usd or Decimal("0.05")
+                new_equity = self._current_equity_usd()
+                self._metrics.record_closed_trade(
+                    realized_pnl_usd=exit_pnl_usd,
+                    gas_cost_usd=gas_usd,
+                    current_equity_usd=new_equity,
+                    is_new_launch=getattr(lot, "is_new_launch", False),
+                )
+                if self._ledger:
+                    rec = TradeRecord.from_fill(
+                        fill=exit_fill,
+                        signal_id=getattr(lot, "signal_id", "") or "manual_exit",
+                        realized_pnl_usd=exit_pnl_usd,
+                        platform="TelegramManual",
+                    )
+                    await self._ledger.record_trade(rec)
+
+        # Broadcast exit alert
+        unit = "ETH" if chain_id == ChainIdentifier.BASE_MAINNET else "SOL"
+        sign = "+" if total_pnl_usd >= 0 else ""
+        icon = "🟢" if total_pnl_usd >= 0 else "🔴"
+        t_short = f"{clean_addr[:4]}..{clean_addr[-4:]}"
+        alert_msg = (
+            f"{icon} **MANUAL EXIT EXECUTED (إغلاق صفقة يدوي)**\n\n"
+            f"• **العملة (Token):** `{t_short}` (`{clean_addr}`)\n"
+            f"• **الشبكة (Chain):** {chain_id.value}\n"
+            f"• **الكمية المباعة:** `{total_tokens_sold:,.2f}`\n"
+            f"• **المبلغ المسترد:** `{total_native_recovered:.4f} {unit}`\n"
+            f"• **الربح/الخسارة المحققة:** `{sign}${float(total_pnl_usd):.2f}`\n"
+            f"• **السبب:** `Manual Telegram Exit Command`"
+        )
+        asyncio.create_task(self._broadcast_trade_alert(alert_msg))
+
+        return True, f"تم إغلاق الصفقة بنجاح | PnL: {sign}${float(total_pnl_usd):.2f}", total_pnl_usd
 
     def _extract_gatekeeper_rejection_reason(self, report: SecurityReport) -> str:
         if getattr(report, "passes_hard_gates", False):
@@ -1553,6 +1772,10 @@ class PaperTradingEngine:
 
             if getattr(raw_sig, "narrative_cluster", None):
                 updates["narrative_cluster"] = raw_sig.narrative_cluster
+            if getattr(raw_sig, "is_direct_dm", False):
+                updates["is_direct_dm"] = True
+            if getattr(raw_sig, "originating_channel", None):
+                updates["originating_channel"] = raw_sig.originating_channel
 
             if updates:
                 signal_event = signal_event.model_copy(update=updates)
@@ -1951,8 +2174,13 @@ class PaperTradingEngine:
             is_new_launch = self._is_new_launch_signal(signal_item)
 
             if signal_item.suggested_side == OrderSide.BUY:
+                is_direct_dm = bool(getattr(signal_item, "is_direct_dm", False)) or (
+                    bool(getattr(signal_item, "originating_channel", ""))
+                    and str(getattr(signal_item, "originating_channel", "")).startswith("DM:")
+                )
+
                 # 00. Automated Trading Switch
-                if not getattr(self, "auto_trade_enabled", True):
+                if not getattr(self, "auto_trade_enabled", True) and not is_direct_dm:
                     logger.info("Auto-trade is DISABLED via strategy settings; skipping BUY signal for %s", signal_item.token_address[:10])
                     continue
 
@@ -1990,7 +2218,7 @@ class PaperTradingEngine:
                         or (signal_item.strength in (SignalStrength.MODERATE, SignalStrength.STRONG) and signal_item.alpha_score >= 0.40)
                     )
                     
-                    if not (is_graduated or is_mover):
+                    if not (is_graduated or is_mover or is_direct_dm):
                         logger.info(
                             "Exclusive Screener Focus active: skipping non-graduated/non-mover token %s (source=%s, venue=%s, alpha=%.3f)",
                             signal_item.token_address[:10],
@@ -2011,19 +2239,35 @@ class PaperTradingEngine:
                     )
                     sig_mcap = signal_item.pool_state.calculate_market_cap_usd(native_price_usd=native_p)
 
-                # Strict Market Cap check for new tokens / launches:
-                if is_new_launch or signal_item.source in (
-                    SignalSource.PUMP_FUN_MINT,
-                    SignalSource.SCREENER_GRADUATED,
-                    SignalSource.SCREENER_MOVERS,
-                ):
-                    if sig_mcap is None or sig_mcap <= Decimal("0"):
-                        logger.warning(
-                            "Dropping BUY signal for %s: Market Cap is missing, unverifiable, or stale",
-                            signal_item.token_address[:10],
-                        )
-                        continue
-                    if sig_mcap < min_mcap_usd:
+                if is_direct_dm:
+                    logger.info(
+                        "Direct Telegram DM signal for %s: Bypassing minimum market cap threshold ($%.2f). Market Cap=$%s",
+                        signal_item.token_address[:10],
+                        min_mcap_usd,
+                        f"{sig_mcap:.2f}" if sig_mcap else "n/a",
+                    )
+                else:
+                    # Strict Market Cap check for new tokens / launches:
+                    if is_new_launch or signal_item.source in (
+                        SignalSource.PUMP_FUN_MINT,
+                        SignalSource.SCREENER_GRADUATED,
+                        SignalSource.SCREENER_MOVERS,
+                    ):
+                        if sig_mcap is None or sig_mcap <= Decimal("0"):
+                            logger.warning(
+                                "Dropping BUY signal for %s: Market Cap is missing, unverifiable, or stale",
+                                signal_item.token_address[:10],
+                            )
+                            continue
+                        if sig_mcap < min_mcap_usd:
+                            logger.info(
+                                "Dropping BUY signal for %s: Market Cap $%.2f < minimum required threshold $%.2f",
+                                signal_item.token_address[:10],
+                                sig_mcap,
+                                min_mcap_usd,
+                            )
+                            continue
+                    elif sig_mcap is not None and sig_mcap > Decimal("0") and sig_mcap < min_mcap_usd:
                         logger.info(
                             "Dropping BUY signal for %s: Market Cap $%.2f < minimum required threshold $%.2f",
                             signal_item.token_address[:10],
@@ -2031,18 +2275,10 @@ class PaperTradingEngine:
                             min_mcap_usd,
                         )
                         continue
-                elif sig_mcap is not None and sig_mcap > Decimal("0") and sig_mcap < min_mcap_usd:
-                    logger.info(
-                        "Dropping BUY signal for %s: Market Cap $%.2f < minimum required threshold $%.2f",
-                        signal_item.token_address[:10],
-                        sig_mcap,
-                        min_mcap_usd,
-                    )
-                    continue
 
                 # 0. Reject weak signals or scores below quality threshold
                 min_score = getattr(self._cfg, "min_entry_score", 50.0) / 100.0
-                if signal_item.strength == SignalStrength.WEAK and signal_item.alpha_score < min_score:
+                if not is_direct_dm and signal_item.strength == SignalStrength.WEAK and signal_item.alpha_score < min_score:
                     logger.info(
                         "Dropping BUY signal for %s: alpha_score=%.3f (strength=%s) below threshold %.2f",
                         signal_item.token_address[:10], signal_item.alpha_score, signal_item.strength.value, min_score
@@ -2085,8 +2321,14 @@ class PaperTradingEngine:
                 equity_usd = self._current_equity_usd()
                 equity_native = equity_usd / native_p if native_p > Decimal(0) else Decimal(0)
                 
-                is_manual_size = (self.manual_trade_amount is not None and self.manual_trade_amount > Decimal(0))
-                if is_manual_size:
+                custom_amt = getattr(signal_item, "custom_amount_native", None)
+                is_manual_size = (
+                    (custom_amt is not None and custom_amt > Decimal(0))
+                    or (self.manual_trade_amount is not None and self.manual_trade_amount > Decimal(0))
+                )
+                if custom_amt is not None and custom_amt > Decimal(0):
+                    preliminary_cost = custom_amt
+                elif is_manual_size:
                     if self.manual_trade_currency == "USD":
                         target_native = self.manual_trade_amount / native_p if native_p > Decimal(0) else Decimal(0)
                     else:
@@ -2162,6 +2404,14 @@ class PaperTradingEngine:
                         signal_item.token_address[:10],
                         reject_reason,
                     )
+                    if is_direct_dm:
+                        dm_reject_alert = (
+                            f"⚠️ **تعذر فتح صفقة جديدة للعملة عبر الرسائل المباشرة**\n\n"
+                            f"• **العملة:** `{signal_item.token_address}`\n"
+                            f"• **السبب:** {reject_reason}\n\n"
+                            f"💡 يمكنك استخدام أمر `/trades` أو زر الإغلاق لإنهاء مركز مفتوح لإتاحة مساحة لصفقة جديدة."
+                        )
+                        asyncio.create_task(self._broadcast_trade_alert(dm_reject_alert))
                     continue
 
             if not self.validate_signal_strength(signal_item):

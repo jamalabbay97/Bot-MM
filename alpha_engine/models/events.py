@@ -115,6 +115,9 @@ class SignalEvent(BaseModel):
     volume_surge_multiplier: Optional[float] = Field(default=None, description="Volume surge over SMA")
     net_buy_delta: Optional[float] = Field(default=None, description="Net buy volume ratio")
     execution_venue: Optional[ExecutionVenue] = Field(default=None, description="Execution venue (e.g. RAYDIUM_AMM, UNISWAP_V3)")
+    originating_channel: Optional[str] = Field(default=None, description="Originating channel or DM handle")
+    is_direct_dm: bool = Field(default=False, description="Flag indicating signal was directly sent via Telegram DM")
+    custom_amount_native: Optional[Decimal] = Field(default=None, description="Custom trade amount in native asset for manual trades")
 
     @property
     def signal_source(self) -> SignalSource:
@@ -167,6 +170,8 @@ class RawSignalEvent(BaseModel):
     status: NewsSignalStatus = NewsSignalStatus.VALID
     sybil_channel_count: Annotated[int, Field(ge=1)] = 1
     is_edit: bool = False
+    is_direct_dm: bool = False
+    custom_amount_native: Optional[Decimal] = None
     narrative_cluster: Optional[str] = Field(default=None, description="Theme cluster: ai, dog, cat, political, utility, etc.")
 
 
