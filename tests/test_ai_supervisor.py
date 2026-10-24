@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 from decimal import Decimal
+import json
 import time
 from typing import Any
 
@@ -599,3 +600,160 @@ def test_position_book_ai_breakeven_trigger():
     )
     assert lot.trailing_stop_active is True
     assert lot.trailing_stop_price >= lot.entry_price  # Stop shifted to breakeven buffer
+
+
+def test_ai_supervisor_multi_provider_normalization():
+    """Verify provider key resolution, default model selection, and model alias normalization."""
+    # 1. Groq
+    cfg_groq = EngineConfig(ai_provider="groq", groq_api_key="gsk-test-mock-key")
+    sup_groq = AlphaSupervisorAI(cfg_groq)
+    assert sup_groq._provider == "groq"
+    assert sup_groq._api_key == "gsk-test-mock-key"
+    assert sup_groq._model == "llama-3.3-70b-versatile"
+
+    # 2. DeepSeek
+    cfg_ds = EngineConfig(ai_provider="deepseek", deepseek_api_key="ds-test-mock-key")
+    sup_ds = AlphaSupervisorAI(cfg_ds)
+    assert sup_ds._provider == "deepseek"
+    assert sup_ds._api_key == "ds-test-mock-key"
+    assert sup_ds._model == "deepseek-chat"
+
+    # 3. Ollama (offline local)
+    cfg_ollama = EngineConfig(ai_provider="ollama", ai_base_url="http://localhost:11434/v1")
+    sup_ollama = AlphaSupervisorAI(cfg_ollama)
+    assert sup_ollama._provider == "ollama"
+    assert sup_ollama._api_key == "ollama"
+    assert sup_ollama._model == "llama3.2"
+
+    # 4. Gemini model alias normalization
+    cfg_gem = EngineConfig(ai_provider="gemini", ai_model="gemini-flash", gemini_api_key="gemini-key")
+    sup_gem = AlphaSupervisorAI(cfg_gem)
+    assert sup_gem._model == "gemini-3.8-flash"
+
+    # 5. OpenAI default model (gpt-4o verified, not hypothetical gpt-5.6)
+    cfg_openai = EngineConfig(ai_provider="openai", openai_api_key="sk-openai-key")
+    sup_openai = AlphaSupervisorAI(cfg_openai)
+    assert sup_openai._provider == "openai"
+    assert sup_openai._model == "gpt-4o"
+
+    # 6. OpenAI model alias normalization (gpt-5.6 legacy alias maps to gpt-4o, o3 maps to o3-mini)
+    cfg_openai_alias = EngineConfig(ai_provider="openai", ai_model="gpt-5.6", openai_api_key="sk-openai-key")
+    assert AlphaSupervisorAI(cfg_openai_alias)._model == "gpt-4o"
+    cfg_openai_o3 = EngineConfig(ai_provider="openai", ai_model="o3", openai_api_key="sk-openai-key")
+    assert AlphaSupervisorAI(cfg_openai_o3)._model == "o3-mini"
+
+    # 7. Anthropic Claude 3.7 Sonnet alias normalization
+    cfg_ant_37 = EngineConfig(ai_provider="anthropic", ai_model="claude-3.7-sonnet", anthropic_api_key="sk-ant-key")
+    assert AlphaSupervisorAI(cfg_ant_37)._model == "claude-3-7-sonnet-latest"
+
+
+def test_ai_supervisor_properties_and_reasoning_summary():
+    """Verify risk_rationale, risk_score properties, and markdown stripping in AISupervisorResponse."""
+    raw_with_fences = """```json
+    {
+      "decision": "EXECUTE_BUY",
+      "confidence_score": 0.85,
+      "reasoning_summary": "Strong organic momentum with 65% win rate smart money.",
+      "action_parameters": {
+        "target_token_address": "TokenTest111111111111111111111111111111",
+        "recommended_position_pct": 1.2,
+        "max_slippage_bps": 120,
+        "priority_fee_multiplier": 1.2,
+        "take_profit_ladder": [{"trigger_multiplier": 2.0, "sell_pct": 50}],
+        "hard_stop_loss_pct": -15.0,
+        "trailing_stop_activation_pct": 40.0,
+        "time_exit_minutes": 15
+      },
+      "wallet_audit": {
+        "is_wallet_reputable": true,
+        "risk_classification": "ORGANIC_SMART_MONEY",
+        "rationale": "High win rate wallet."
+      },
+      "security_assessment": {
+        "is_secure": true,
+        "honeypot_risk": "NONE",
+        "liquidity_health": "OPTIMAL",
+        "flags": []
+      },
+      "feedback_tuning": {
+        "adjust_global_risk": "NEUTRAL",
+        "blacklisted_entities": [],
+        "insights_learned": "High conviction."
+      }
+    }
+    ```"""
+    resp = AISupervisorResponse.from_strict_json(raw_with_fences)
+    assert resp.decision == AISupervisorDecisionEnum.EXECUTE_BUY
+    assert resp.reasoning_summary == "Strong organic momentum with 65% win rate smart money."
+    assert resp.risk_rationale == "Strong organic momentum with 65% win rate smart money."
+    assert resp.risk_score == 15.0  # (1.0 - 0.85) * 100
+
+
+def test_ai_supervisor_groq_and_fallback_provider():
+    """Verify Groq API call formatting and fallback provider handling."""
+    from unittest.mock import AsyncMock, MagicMock, patch
+
+    async def _run():
+        cfg = EngineConfig(
+            ai_provider="groq",
+            groq_api_key="gsk-test-mock-key",
+            ai_fallback_provider="openai",
+            openai_api_key="sk-test-openai-fallback",
+        )
+        supervisor = AlphaSupervisorAI(cfg)
+
+        mock_resp = MagicMock()
+        mock_resp.status = 200
+        mock_resp.json = AsyncMock(return_value={
+            "choices": [{
+                "message": {
+                    "content": json.dumps({
+                        "decision": "EXECUTE_BUY",
+                        "confidence_score": 0.90,
+                        "reasoning_summary": "Groq fast inference approved.",
+                        "action_parameters": {
+                            "target_token_address": "TokenTest111111111111111111111111111111",
+                            "recommended_position_pct": 1.0,
+                            "max_slippage_bps": 100,
+                            "priority_fee_multiplier": 1.2,
+                            "take_profit_ladder": [{"trigger_multiplier": 2.0, "sell_pct": 50}],
+                            "hard_stop_loss_pct": -15.0,
+                            "trailing_stop_activation_pct": 40.0,
+                            "time_exit_minutes": 15
+                        },
+                        "wallet_audit": {
+                            "is_wallet_reputable": True,
+                            "risk_classification": "ORGANIC_SMART_MONEY",
+                            "rationale": "Groq validated smart money."
+                        },
+                        "security_assessment": {
+                            "is_secure": True,
+                            "honeypot_risk": "NONE",
+                            "liquidity_health": "OPTIMAL",
+                            "flags": []
+                        },
+                        "feedback_tuning": {
+                            "adjust_global_risk": "NEUTRAL",
+                            "blacklisted_entities": [],
+                            "insights_learned": "Groq alpha verified."
+                        }
+                    })
+                }
+            }]
+        })
+        mock_post = AsyncMock()
+        mock_post.__aenter__.return_value = mock_resp
+        mock_session = MagicMock()
+        mock_session.post.return_value = mock_post
+
+        with patch.object(supervisor, "_get_session", new=AsyncMock(return_value=mock_session)):
+            res = await supervisor._call_llm({"target_token_address": "TokenTest111111111111111111111111111111"})
+            assert res.decision == AISupervisorDecisionEnum.EXECUTE_BUY
+            assert "Groq" in res.risk_rationale
+
+            # Verify Groq URL was called
+            call_url = mock_session.post.call_args[0][0]
+            assert "api.groq.com/openai/v1/chat/completions" in call_url
+
+    asyncio.run(_run())
+

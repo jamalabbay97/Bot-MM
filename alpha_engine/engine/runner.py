@@ -15,6 +15,7 @@ import signal
 import socket
 import sys
 import time
+import uuid
 from decimal import Decimal
 from pathlib import Path
 from typing import Any, Optional
@@ -39,11 +40,14 @@ from alpha_engine.engine.registry import PoolRegistry
 from alpha_engine.engine.rpc_health import RPCHealthMonitor
 from alpha_engine.engine.signals import PendingLaunchBuffer, SignalGenerator
 from alpha_engine.engine.staging import RevivalBreakoutBuffer, Wave2StagingBuffer
-from alpha_engine.execution.book import PositionBook, RunningMetrics
+from alpha_engine.ruflo.protocol import ConsensusProtocol, SwarmTopology
+from alpha_engine.ruflo.swarm import RufloSwarmCoordinator
+from alpha_engine.execution.book import OpenLot, PositionBook, RunningMetrics
 from alpha_engine.execution.executor import PaperExecutor
 from alpha_engine.execution.ledger import SQLiteLedger
 from alpha_engine.tracer import tracer
 from alpha_engine.ingestion.coordinator import IngestionCoordinator
+from alpha_engine.ingestion.market_oracle import MarketOracle
 from alpha_engine.logging_config import setup_production_logging
 from alpha_engine.math.cpmm import get_initial_bonding_curve_pool
 from alpha_engine.models.ai import ActionParameters, AISupervisorDecisionEnum
@@ -53,12 +57,14 @@ from alpha_engine.models.enums import (
     ChainIdentifier,
     ExecutionVenue,
     ExitProfile,
+    ExitStage,
     LotStatus,
     OrderSide,
     ScreenerSection,
     SecurityTier,
     SignalSource,
     SignalStrength,
+    TokenRequestState,
     TradeExitReason,
     resolve_trade_platform,
 )
@@ -73,9 +79,17 @@ from alpha_engine.models.events import (
     SwapEvent,
 )
 from alpha_engine.models.news import NewsEvent, NewsSignalEvent
-from alpha_engine.models.state import PoolState, PortfolioSnapshot, SecurityReport, TradeRecord
+from alpha_engine.models.state import (
+    ExitDecision,
+    PoolState,
+    PortfolioSnapshot,
+    SecurityReport,
+    TokenRequestRecord,
+    TradeRecord,
+)
 from alpha_engine.rate_limiter.registry import RateLimiterRegistry
-from alpha_engine.security.constants import is_blacklisted_token
+from alpha_engine.security.constants import is_blacklisted_token, derive_pump_fun_bonding_curve
+from alpha_engine.ingestion.svm import is_valid_solana_pubkey
 from alpha_engine.security.gatekeeper import SecurityGatekeeper
 from alpha_engine.engine.strategy.screener_priority import (
     GraduatedProfileConfig,
@@ -93,7 +107,6 @@ class PaperTradingEngine:
     Top-level engine that wires all subsystems together and runs the
     async event loop under an autonomous self-healing supervisor.
     """
-
     def __init__(self, config: EngineConfig) -> None:
         self._cfg = config
         self.config = config
@@ -127,6 +140,16 @@ class PaperTradingEngine:
         self._signal_q: asyncio.Queue[
             SignalEvent | NewsEvent | ScreenerDiscoveryEvent | ShutdownSentinel
         ] = asyncio.Queue(maxsize=max_q)
+
+        # Dedicated User Request Queue & Opportunity Processing Pipeline
+        user_q_max = getattr(config, "max_user_request_queue_size", 200)
+        self._user_request_queue: asyncio.Queue[TokenRequestRecord] = asyncio.Queue(maxsize=user_q_max)
+        concurrent_analyses = getattr(config, "max_concurrent_analyses", 5)
+        self._analysis_semaphore = asyncio.Semaphore(concurrent_analyses)
+        self._waiting_for_capacity: list[TokenRequestRecord] = []
+        self._token_request_tasks: set[asyncio.Task[Any]] = set()
+        self._waiting_capacity_lock = asyncio.Lock()
+        self._position_book.register_capacity_freed_callback(self._on_position_capacity_freed)
 
         self._recent_gatekeeper_evaluations: deque[dict[str, Any]] = deque(maxlen=20)
         self._recent_news_events: deque[dict[str, Any]] = deque(maxlen=20)
@@ -199,6 +222,7 @@ class PaperTradingEngine:
         self.tracer = tracer
         self._gatekeeper: SecurityGatekeeper | None = None
         self._session: aiohttp.ClientSession | None = None
+        self._market_oracle: Optional[MarketOracle] = None
         self._telegram: Any = None
         self._coordinator: Any | None = None
         self._recent_closed_trades: deque[dict[str, Any]] = deque(maxlen=50)
@@ -219,6 +243,42 @@ class PaperTradingEngine:
                 ChainIdentifier.SOLANA_MAINNET: [u for u in solana_urls if u],
             }
         )
+
+        # Ruflo Multi-Agent Swarm Orchestrator
+        self._swarm_coordinator: Optional[RufloSwarmCoordinator] = None
+        if getattr(config, "ruflo_enabled", True):
+            top_str = getattr(config, "ruflo_topology", "hierarchical")
+            cons_str = getattr(config, "ruflo_consensus", "bft")
+            topo = SwarmTopology.HIERARCHICAL
+            if top_str.lower() == "mesh":
+                topo = SwarmTopology.MESH
+            elif top_str.lower() == "adaptive":
+                topo = SwarmTopology.ADAPTIVE
+
+            cons = ConsensusProtocol.BFT
+            if cons_str.lower() == "raft":
+                cons = ConsensusProtocol.RAFT
+            elif cons_str.lower() == "gossip":
+                cons = ConsensusProtocol.GOSSIP
+
+            self._swarm_coordinator = RufloSwarmCoordinator(
+                config=config,
+                coordinator=None,
+                gatekeeper=None,
+                executor=None,
+                position_book=self._position_book,
+                ledger=None,
+                ai_supervisor=self._ai_supervisor,
+                feedback_engine=self._feedback,
+                rpc_monitor=self._rpc_monitor,
+                topology=topo,
+                consensus=cons,
+            )
+            self._ai_supervisor.set_episodic_memory(self._swarm_coordinator.memory)
+
+    @property
+    def swarm_coordinator(self) -> Optional[RufloSwarmCoordinator]:
+        return self._swarm_coordinator
 
     @property
     def config(self) -> EngineConfig:
@@ -243,6 +303,13 @@ class PaperTradingEngine:
     @property
     def revival_buffer(self) -> RevivalBreakoutBuffer:
         return self._revival_buffer
+
+    @property
+    def market_oracle(self) -> MarketOracle:
+        """Access or lazily initialize the public market oracle."""
+        if self._market_oracle is None:
+            self._market_oracle = MarketOracle(session=self._session)
+        return self._market_oracle
 
     def is_trading_paused_by_governor(self, now: Optional[float] = None) -> bool:
         """
@@ -533,9 +600,9 @@ class PaperTradingEngine:
                 self.trailing_stop_from_peak_pct = 0.60
                 self.custom_take_profit_pct = 0.60
                 self.custom_stop_loss_pct = 0.60
-            elif strat_lower in ("default", "legacy", "classic"):
+            elif strat_lower in ("default", "legacy", "classic", "ai", "ai_adaptive"):
                 self.active_strategy = "default"
-                self.trailing_stop_from_peak_pct = 0.50
+                self.trailing_stop_from_peak_pct = None
                 self.custom_take_profit_pct = None
                 self.custom_stop_loss_pct = None
             else:
@@ -585,6 +652,139 @@ class PaperTradingEngine:
     @property
     def position_book(self) -> PositionBook:
         return self._position_book
+
+    def reset_circuit_breaker(self) -> None:
+        """Manually or programmatically reset circuit breakers and zero out loss streaks."""
+        if hasattr(self, "_metrics") and self._metrics is not None:
+            self._metrics.reset_circuit_breaker()
+
+    async def force_close_all_open_lots(self) -> int:
+        """
+        Force-closes all active open lots immediately, applying exit fills,
+        updating the ledger, and freeing capacity.
+        """
+        open_lots = self._position_book.get_open_lots()
+        if not open_lots:
+            logger.info("No open lots to force-close.")
+            return 0
+
+        closed_count = 0
+        now_s = time.time()
+        now_ns = time.time_ns()
+        for lot in open_lots:
+            pool = self._pool_registry.get(lot.token_address) or (self._pool_registry.get(lot.pool_address) if lot.pool_address else None)
+            if pool is None or getattr(pool, "last_updated_block", 0) <= 0:
+                pool = PoolState(
+                    pool_address=lot.pool_address or lot.token_address,
+                    chain=lot.chain,
+                    token_reserve=Decimal("1000000000"),
+                    native_reserve=Decimal("0.0001"),
+                    fee_numerator=25,
+                    fee_denominator=10000,
+                    last_updated_block=1000,
+                    timestamp_s=now_s,
+                    token_decimals=6 if lot.chain == ChainIdentifier.SOLANA_MAINNET else 18,
+                    native_decimals=9 if lot.chain == ChainIdentifier.SOLANA_MAINNET else 18,
+                )
+                self._pool_registry.set(lot.token_address, pool)
+
+            curr_price = pool.spot_price_native_per_token if pool else lot.entry_price
+            decision = ExitDecision(
+                lot_id=lot.lot_id,
+                token_address=lot.token_address,
+                chain=lot.chain,
+                should_exit=True,
+                exit_reason=TradeExitReason.MANUAL_CLOSE,
+                exit_stage=ExitStage.SL,
+                tokens_to_sell=lot.tokens_held,
+                current_price=curr_price,
+                pnl_estimate_native=lot.tokens_held * (curr_price - lot.entry_price),
+                prioritized=True,
+                action="CLOSE_ALL",
+            )
+            if self._executor is not None:
+                exit_fill = await self._executor.execute_exit(
+                    chain=decision.chain,
+                    token_address=decision.token_address,
+                    pool=pool,
+                    tokens_to_sell=decision.tokens_to_sell,
+                    reason=decision.exit_reason,
+                    apply_drag=True,
+                    portfolio_equity_usd=max(Decimal("1.0"), self._current_equity_usd()),
+                    platform=getattr(lot, "platform", None),
+                    min_fill_timestamp_ns=lot.open_timestamp_ns,
+                )
+                if exit_fill is not None:
+                    pnl_native, _ = self._position_book.apply_exit_decision(
+                        decision, sell_price=exit_fill.effective_price, net_native_received=exit_fill.simulated_native_spent
+                    )
+                    native_price = self._eth_price if decision.chain == ChainIdentifier.BASE_MAINNET else self._sol_price
+                    exit_pnl_usd = (pnl_native * native_price).quantize(Decimal("0.01"))
+                    if decision.chain == ChainIdentifier.BASE_MAINNET:
+                        self._cash_eth += exit_fill.simulated_native_spent
+                    else:
+                        self._cash_sol += exit_fill.simulated_native_spent
+                    new_equity = self._current_equity_usd()
+                    self._metrics.record_closed_trade(
+                        realized_pnl_usd=exit_pnl_usd,
+                        gas_cost_usd=Decimal(0),
+                        current_equity_usd=new_equity,
+                        is_new_launch=getattr(lot, "is_new_launch", False),
+                    )
+                    self._position_book.set_token_cooldown(lot.token_address, duration_s=300.0)
+                    if self._ledger:
+                        await self._ledger.record_lot_transition(
+                            lot_id=lot.lot_id,
+                            token_address=lot.token_address,
+                            chain=lot.chain.value,
+                            status=LotStatus.CLOSED.value,
+                            exit_reason=TradeExitReason.MANUAL_CLOSE.value,
+                            pnl_usd=exit_pnl_usd,
+                        )
+                        await self._ledger.record_lot_transition(
+                            lot_id=lot.lot_id,
+                            token_address=lot.token_address,
+                            chain=lot.chain.value,
+                            status=LotStatus.SETTLED.value,
+                            exit_reason=TradeExitReason.MANUAL_CLOSE.value,
+                            pnl_usd=exit_pnl_usd,
+                        )
+                        rec = TradeRecord.from_fill(
+                            exit_fill,
+                            signal_id=lot.signal_id or "force_close_all",
+                            realized_pnl_usd=exit_pnl_usd,
+                            exit_reason=TradeExitReason.MANUAL_CLOSE,
+                        )
+                        await self._ledger.record_trade(rec)
+                    closed_count += 1
+            else:
+                self._position_book.remove_lot(lot.chain.value, lot.token_address, lot.lot_id)
+                if self._ledger:
+                    await self._ledger.mark_token_closed(lot.token_address, reason="MANUAL_CLOSE", pnl_usd=0.0)
+                closed_count += 1
+
+        self._position_book.notify_capacity_freed()
+        logger.info("Force-closed %d open lots successfully.", closed_count)
+        return closed_count
+
+    async def reset_paper_trading_ledger(self) -> None:
+        """
+        Wipes paper trading ledger history: clears trades, lot lifecycle, and resets
+        portfolio equity to configured starting cash ($8,300 USD / initial native).
+        """
+        open_lots = self._position_book.get_open_lots()
+        for lot in open_lots:
+            self._position_book.remove_lot(lot.chain.value, lot.token_address, lot.lot_id)
+
+        if self._ledger is not None:
+            await self._ledger.clear_all_trades_and_lots()
+
+        self._metrics.reset()
+        self._metrics.reset_circuit_breaker()
+        self._cash_eth = Decimal("1.0")
+        self._cash_sol = Decimal("50.0")
+        self._position_book.notify_capacity_freed()
+        logger.info("Paper trading ledger and position book reset to pristine initial state.")
 
     @staticmethod
     def _is_new_launch_signal(signal_item: SignalEvent) -> bool:
@@ -677,24 +877,48 @@ class PaperTradingEngine:
             chain=lot.chain,
         )
 
+        is_partial = getattr(lot, "status", None) != LotStatus.CLOSED
+        side_str = "SELL (PARTIAL)" if is_partial else "SELL"
+        exit_label = f"{decision_reason} (partial)" if is_partial and "partial" not in decision_reason.lower() else decision_reason
+
         self._recent_closed_trades.append({
             "token_address": lot.token_address,
             "chain": lot.chain,
             "platform": platform_name,
             "is_new_launch": getattr(lot, "is_new_launch", False),
-            "side": "SELL",
+            "side": side_str,
             "entry_price": ep,
             "exit_price": xp,
             "realized_pnl_usd": exit_pnl_usd,
             "realized_pnl_pct": pct,
-            "exit_reason": decision_reason,
+            "exit_reason": exit_label,
             "duration_s": dur_s,
             "is_win": is_win,
             "timestamp": time.time(),
         })
 
-        status_icon = "🟢" if is_win else "🔴"
-        title = f"TAKE-PROFIT (+{pct:.2f}%)" if is_win else f"STOP-LOSS ({pct:.2f}%)"
+        d_reason_lower = str(decision_reason).lower()
+        if "emergency_drain" in d_reason_lower or "rug_liquidity_drain" in d_reason_lower:
+            status_icon = "⚠️"
+            title = f"EMERGENCY EXIT: LIQUIDITY DRAIN ({pct:+.2f}%)"
+        elif "emergency_honeypot" in d_reason_lower:
+            status_icon = "⚠️"
+            title = f"EMERGENCY EXIT: HONEYPOT ({pct:+.2f}%)"
+        elif "slippage_insolvency" in d_reason_lower:
+            status_icon = "⚠️"
+            title = f"EMERGENCY EXIT: SLIPPAGE INSOLVENCY ({pct:+.2f}%)"
+        elif "timeout" in d_reason_lower:
+            status_icon = "⏱️"
+            title = f"TIME EXPIRATION EXIT ({pct:+.2f}%)"
+        elif is_partial:
+            status_icon = "🟢"
+            title = f"PARTIAL TAKE-PROFIT (+{pct:.2f}%)"
+        elif is_win:
+            status_icon = "🟢"
+            title = f"TAKE-PROFIT (+{pct:.2f}%)"
+        else:
+            status_icon = "🔴"
+            title = f"STOP-LOSS ({pct:.2f}%)"
         unit = "ETH" if lot.chain == ChainIdentifier.BASE_MAINNET else "SOL"
         native_price = self._eth_price if lot.chain == ChainIdentifier.BASE_MAINNET else self._sol_price
         ep_str = self._format_price_clean(ep, native_price, unit)
@@ -705,7 +929,8 @@ class PaperTradingEngine:
         is_swing = getattr(lot, "exit_profile", None) == ExitProfile.REVIVAL_SWING
 
         logger.info(
-            "CLOSED TRADE | Platform=%s | Token=%s (%s) | Entry=%s | Exit=%s | PnL=%+.2f%% (%s$%.2f) | Reason=%s | Duration=%.1fs",
+            "%s | Platform=%s | Token=%s (%s) | Entry=%s | Exit=%s | PnL=%+.2f%% (%s$%.2f) | Reason=%s | Duration=%.1fs",
+            "PARTIAL EXIT" if is_partial else "CLOSED TRADE",
             platform_name,
             lot.token_address[:10],
             chain_val,
@@ -774,6 +999,17 @@ class PaperTradingEngine:
             )
             asyncio.create_task(self._ai_supervisor.reflect_on_trade(reflection))
 
+        if hasattr(self, "_swarm_coordinator") and self._swarm_coordinator:
+            asyncio.create_task(
+                self._swarm_coordinator.supervisor_agent.tool_reflect_trade(
+                    trade_id=str(getattr(exit_fill, "order_id", "")),
+                    token_address=lot.token_address,
+                    realized_pnl_usd=float(exit_pnl_usd),
+                    roi_pct=pct,
+                    chain=lot.chain.value if hasattr(lot.chain, "value") else str(lot.chain),
+                )
+            )
+
 
     def _install_signal_handlers(self) -> None:
         """
@@ -817,8 +1053,19 @@ class PaperTradingEngine:
             self._cash_sol * self._sol_price
             + self._cash_eth * self._eth_price
         )
-        unrealized = self._metrics.cumulative_realized_usd
-        return cash_usd + unrealized
+        # Mark-to-market value of open positions without double-counting realized PnL
+        open_lots = self._position_book.get_all_open_lots()
+        unrealized_positions_usd = Decimal(0)
+        for lot in open_lots:
+            pool = self._pool_registry.get(lot.token_address, expected_token=lot.token_address)
+            if pool is None and lot.pool_address:
+                pool = self._pool_registry.get(lot.pool_address, expected_token=lot.token_address)
+            native_p = self._eth_price if lot.chain == ChainIdentifier.BASE_MAINNET else self._sol_price
+            if pool and getattr(pool, "last_updated_block", 0) > 0 and pool.spot_price_native_per_token > Decimal(0):
+                unrealized_positions_usd += lot.tokens_remaining * pool.spot_price_native_per_token * native_p
+            else:
+                unrealized_positions_usd += lot.tokens_remaining * lot.entry_price * native_p
+        return cash_usd + unrealized_positions_usd
 
     def _total_equity_usd(self) -> Decimal:
         return self._current_equity_usd()
@@ -866,6 +1113,20 @@ class PaperTradingEngine:
             if available_cash < (req_amount + fee_est):
                 return False, f"رصيد غير كافٍ ({available_cash:.4f} {unit} المتاح < {req_amount + fee_est:.4f} {unit} المطلوب)", None
 
+        # Pre-check position capacity atomically
+        can_open, reject_reason = self._position_book.can_open_position(
+            token_address=clean_addr,
+            chain=chain_id,
+            is_manual_size=True,
+        )
+        if not can_open:
+            return False, f"⚠️ تعذر فتح صفقة جديدة: {reject_reason}", None
+
+        # Reserve position slot atomically
+        reserved = self._position_book.reserve_position_slot(token_address=clean_addr)
+        if not reserved:
+            return False, f"⚠️ Active position count ({self._position_book.effective_active_position_count()}) reached MAX_ACTIVE_POSITIONS limit ({self._position_book.max_active_positions}).", None
+
         # 1. Evaluate security gates via gatekeeper
         report = None
         if hasattr(self, "_gatekeeper") and self._gatekeeper is not None:
@@ -878,6 +1139,7 @@ class PaperTradingEngine:
                 logger.warning("Manual buy gatekeeper error for %s: %s", clean_addr[:10], exc)
 
         if report is not None and not getattr(report, "passes_hard_gates", True):
+            self._position_book.release_position_slot(token_address=clean_addr)
             reason = self._extract_gatekeeper_rejection_reason(report)
             return False, f"فشل الفحص الأمني للعملة (Security Veto): {reason}", None
 
@@ -994,13 +1256,14 @@ class PaperTradingEngine:
                 apply_drag=True,
                 portfolio_equity_usd=max(Decimal("1.0"), self._current_equity_usd()),
                 platform=getattr(lot, "platform", None),
+                min_fill_timestamp_ns=lot.open_timestamp_ns,
             )
 
             if exit_fill is not None and exit_fill.effective_price > Decimal(0):
                 pnl_native, _ = self._position_book.apply_exit_decision(
-                    decision, sell_price=exit_fill.effective_price
+                    decision, sell_price=exit_fill.effective_price, net_native_received=exit_fill.simulated_native_spent
                 )
-                exit_pnl_usd = pnl_native * native_price
+                exit_pnl_usd = (pnl_native * native_price).quantize(Decimal("0.01"))
                 total_pnl_usd += exit_pnl_usd
                 total_native_recovered += exit_fill.simulated_native_spent
                 total_tokens_sold += exit_fill.tokens_acquired
@@ -1011,13 +1274,16 @@ class PaperTradingEngine:
                     self._cash_sol += exit_fill.simulated_native_spent
 
                 gas_usd = exit_fill.simulated_gas_cost_usd or Decimal("0.05")
+                self._metrics.total_gas_usd += gas_usd
                 new_equity = self._current_equity_usd()
                 self._metrics.record_closed_trade(
                     realized_pnl_usd=exit_pnl_usd,
-                    gas_cost_usd=gas_usd,
+                    gas_cost_usd=Decimal(0),
                     current_equity_usd=new_equity,
                     is_new_launch=getattr(lot, "is_new_launch", False),
                 )
+                if lot.status == LotStatus.CLOSED:
+                    self._position_book.set_token_cooldown(decision.token_address, duration_s=300.0)
                 if self._ledger:
                     rec = TradeRecord.from_fill(
                         fill=exit_fill,
@@ -1044,6 +1310,541 @@ class PaperTradingEngine:
         asyncio.create_task(self._broadcast_trade_alert(alert_msg))
 
         return True, f"تم إغلاق الصفقة بنجاح | PnL: {sign}${float(total_pnl_usd):.2f}", total_pnl_usd
+
+    def _calculate_opportunity_score(
+        self,
+        pool: Optional[PoolState],
+        security_report: Optional[SecurityReport],
+        chain: ChainIdentifier = ChainIdentifier.SOLANA_MAINNET,
+        metrics_snapshot: Optional[dict[str, Any]] = None,
+    ) -> float:
+        """
+        Calculate a standardized, reproducible opportunity score (0.0 to 100.0) based on:
+        1. Security & Contract Safety (weight: 30%)
+           - Clean report, score, zero honeypot/rug, low taxes.
+        2. Liquidity & Liquidity Stability (weight: 25%)
+           - Pool native reserve depth relative to benchmarks ($1k - $50k+).
+        3. Volume & Activity (weight: 20%)
+           - Trading volume in window, trade count, unique wallets.
+        4. Buy Pressure & Momentum (weight: 15%)
+           - Buy/sell ratio, price change/stability.
+        5. Execution Feasibility & Slippage (weight: 10%)
+           - Expected price impact for standard lot size.
+        """
+        # 1. Security Score (0 - 30)
+        sec_subscore = 0.0
+        if security_report is not None:
+            if getattr(security_report, "passes_hard_gates", False):
+                base_sec = float(getattr(security_report, "score", 80.0))
+                sec_subscore = (base_sec / 100.0) * 30.0
+            else:
+                sec_subscore = 0.0
+        else:
+            sec_subscore = 20.0  # Unchecked default baseline
+
+        # 2. Liquidity Score (0 - 25)
+        liq_subscore = 0.0
+        native_price = self._eth_price if chain == ChainIdentifier.BASE_MAINNET else self._sol_price
+        if pool is not None and pool.native_reserve > Decimal(0):
+            liq_usd = float(pool.native_reserve * native_price)
+            if liq_usd >= 50_000:
+                liq_subscore = 25.0
+            elif liq_usd >= 20_000:
+                liq_subscore = 20.0 + (liq_usd - 20_000) / 30_000 * 5.0
+            elif liq_usd >= 5_000:
+                liq_subscore = 12.0 + (liq_usd - 5_000) / 15_000 * 8.0
+            elif liq_usd >= 1_000:
+                liq_subscore = 5.0 + (liq_usd - 1_000) / 4_000 * 7.0
+            else:
+                liq_subscore = max(1.0, (liq_usd / 1_000) * 5.0)
+        else:
+            liq_subscore = 5.0
+
+        # 3. Volume & Activity Score (0 - 20)
+        vol_subscore = 10.0  # Default reasonable score if no snapshot
+        if metrics_snapshot is not None:
+            vol_usd = float(metrics_snapshot.get("volume_usd", 0.0))
+            if vol_usd >= 50_000:
+                vol_subscore = 20.0
+            elif vol_usd >= 10_000:
+                vol_subscore = 14.0 + (vol_usd - 10_000) / 40_000 * 6.0
+            elif vol_usd >= 2_000:
+                vol_subscore = 6.0 + (vol_usd - 2_000) / 8_000 * 8.0
+            else:
+                vol_subscore = max(2.0, (vol_usd / 2_000) * 6.0)
+
+        # 4. Buy Pressure & Momentum Score (0 - 15)
+        momentum_subscore = 8.0
+        if metrics_snapshot is not None:
+            buy_ratio = float(metrics_snapshot.get("buy_pressure_ratio", 0.50))
+            momentum_subscore = min(15.0, max(0.0, buy_ratio * 15.0))
+
+        # 5. Execution Feasibility (0 - 10)
+        exec_subscore = 8.0
+        if pool is not None and pool.native_reserve > Decimal("0.5"):
+            exec_subscore = 10.0
+        elif pool is not None and pool.native_reserve > Decimal("0.1"):
+            exec_subscore = 6.0
+        else:
+            exec_subscore = 3.0
+
+        total_score = sec_subscore + liq_subscore + vol_subscore + momentum_subscore + exec_subscore
+        return round(min(100.0, max(0.0, total_score)), 2)
+
+    async def submit_token_request(
+        self,
+        token_address: str,
+        chain: Optional[ChainIdentifier] = None,
+        user_id: Optional[int] = None,
+        message_id: Optional[int] = None,
+        originating_channel: Optional[str] = None,
+        custom_amount_native: Optional[Decimal] = None,
+    ) -> TokenRequestRecord:
+        """
+        Independent ingestion and lifecycle tracking for a token submission.
+        Assigns unique request ID, persists record in SQLite, and schedules
+        analysis without blocking caller.
+        """
+        clean_addr = token_address.strip()
+        chain_id = chain or (
+            ChainIdentifier.BASE_MAINNET if clean_addr.startswith("0x") else ChainIdentifier.SOLANA_MAINNET
+        )
+        now_ns = time.time_ns()
+        req_id = f"req_{uuid.uuid4().hex[:12]}"
+
+        # Validation: check format
+        is_valid = False
+        if chain_id == ChainIdentifier.BASE_MAINNET:
+            if clean_addr.startswith("0x") and len(clean_addr) == 42:
+                is_valid = True
+        else:
+            if 32 <= len(clean_addr) <= 44 and not clean_addr.startswith("11111111"):
+                is_valid = True
+
+        if not is_valid:
+            record = TokenRequestRecord(
+                request_id=req_id,
+                token_address=clean_addr,
+                chain=chain_id,
+                user_id=user_id,
+                message_id=message_id,
+                originating_channel=originating_channel or "DM:User",
+                custom_amount_native=custom_amount_native,
+                state=TokenRequestState.REJECTED,
+                rejection_reason="Invalid contract address structure",
+                submitted_at_ns=now_ns,
+                created_at_ns=now_ns,
+                updated_at_ns=now_ns,
+            )
+            if self._ledger:
+                await self._ledger.record_token_request(record)
+            return record
+
+        record = TokenRequestRecord(
+            request_id=req_id,
+            token_address=clean_addr,
+            chain=chain_id,
+            user_id=user_id,
+            message_id=message_id,
+            originating_channel=originating_channel or "DM:User",
+            custom_amount_native=custom_amount_native,
+            state=TokenRequestState.RECEIVED,
+            submitted_at_ns=now_ns,
+            created_at_ns=now_ns,
+            updated_at_ns=now_ns,
+        )
+        if self._ledger:
+            await self._ledger.record_token_request(record)
+
+        # Transition to QUEUED
+        record.state = TokenRequestState.QUEUED
+        record.updated_at_ns = time.time_ns()
+        if self._ledger:
+            await self._ledger.update_token_request_status(record.request_id, TokenRequestState.QUEUED)
+
+        # Backpressure & Queue Handling
+        try:
+            self._user_request_queue.put_nowait(record)
+        except asyncio.QueueFull:
+            record.state = TokenRequestState.REJECTED
+            record.rejection_reason = "User request queue saturated (backpressure limit)"
+            record.updated_at_ns = time.time_ns()
+            if self._ledger:
+                await self._ledger.update_token_request_status(
+                    record.request_id, TokenRequestState.REJECTED, rejection_reason=record.rejection_reason
+                )
+            logger.warning("User request queue full (size=%d); rejected %s", self._user_request_queue.qsize(), clean_addr[:10])
+            return record
+
+        # Dispatch async task for immediate decoupled analysis
+        task = asyncio.create_task(self._process_single_token_request(record))
+        self._token_request_tasks.add(task)
+        task.add_done_callback(self._token_request_tasks.discard)
+        return record
+
+    async def _process_single_token_request(self, record: TokenRequestRecord) -> None:
+        async with self._analysis_semaphore:
+            # 1. State: ANALYZING
+            record.state = TokenRequestState.ANALYZING
+            record.updated_at_ns = time.time_ns()
+            if self._ledger:
+                await self._ledger.update_token_request_status(record.request_id, TokenRequestState.ANALYZING)
+
+            # Check if position already open
+            if self.is_position_open(record.token_address, chain=record.chain):
+                record.state = TokenRequestState.REJECTED
+                record.rejection_reason = "Position already open for this token"
+                record.updated_at_ns = time.time_ns()
+                if self._ledger:
+                    await self._ledger.update_token_request_status(
+                        record.request_id, TokenRequestState.REJECTED, rejection_reason=record.rejection_reason
+                    )
+                return
+
+            # Check blacklist
+            if is_blacklisted_token(record.token_address, record.chain):
+                record.state = TokenRequestState.REJECTED
+                record.rejection_reason = "Token is in system blacklist (native/wrapped/quote asset)"
+                record.updated_at_ns = time.time_ns()
+                if self._ledger:
+                    await self._ledger.update_token_request_status(
+                        record.request_id, TokenRequestState.REJECTED, rejection_reason=record.rejection_reason
+                    )
+                return
+
+            # 2. Security Screening
+            report = None
+            if hasattr(self, "_gatekeeper") and self._gatekeeper is not None:
+                try:
+                    report = await self._gatekeeper.evaluate_token(record.token_address, record.chain)
+                except Exception as exc:
+                    logger.warning("Gatekeeper error during token request analysis for %s: %s", record.token_address[:10], exc)
+
+            if report is not None and not getattr(report, "passes_hard_gates", True):
+                reason = self._extract_gatekeeper_rejection_reason(report)
+                record.state = TokenRequestState.REJECTED
+                record.rejection_reason = f"Security veto: {reason}"
+                record.updated_at_ns = time.time_ns()
+                if self._ledger:
+                    await self._ledger.update_token_request_status(
+                        record.request_id, TokenRequestState.REJECTED, rejection_reason=record.rejection_reason
+                    )
+                return
+
+            if report is None:
+                report = SecurityReport(
+                    token_address=record.token_address,
+                    chain=record.chain,
+                    tier=SecurityTier.CLEAN,
+                    is_honeypot=False,
+                    is_rug=False,
+                    score=100.0,
+                    flags=[],
+                    buy_tax_bps=0,
+                    sell_tax_bps=0,
+                    checked_at_ts=int(time.time()),
+                    passes_hard_gates=True,
+                )
+
+            # 3. Market data & Opportunity Scoring
+            pool = self.get_or_create_initial_pool_state(record.chain, record.token_address)
+            score = self._calculate_opportunity_score(pool, report, record.chain)
+            record.opportunity_score = score
+
+            if score < 15.0:
+                record.state = TokenRequestState.REJECTED
+                record.rejection_reason = f"Opportunity score {score:.1f} below minimum threshold (15.0)"
+                record.updated_at_ns = time.time_ns()
+                if self._ledger:
+                    await self._ledger.update_token_request_status(
+                        record.request_id, TokenRequestState.REJECTED, rejection_reason=record.rejection_reason, score=score
+                    )
+                return
+
+            record.state = TokenRequestState.ELIGIBLE
+            record.updated_at_ns = time.time_ns()
+            if self._ledger:
+                await self._ledger.update_token_request_status(record.request_id, TokenRequestState.ELIGIBLE, score=score)
+
+            # 4. Check Capacity & Atomic Reservation
+            can_open, reject_reason = self._position_book.can_open_position(
+                token_address=record.token_address,
+                chain=record.chain,
+                is_manual_size=True,
+            )
+            if not can_open:
+                # Capacity is occupied -> place in waiting queue
+                record.state = TokenRequestState.WAITING_FOR_CAPACITY
+                record.note = f"Position limit reached ({self._position_book.effective_active_position_count()}/{self._position_book.max_active_positions}). Queued for capacity."
+                record.updated_at_ns = time.time_ns()
+                if self._ledger:
+                    await self._ledger.update_token_request_status(
+                        record.request_id, TokenRequestState.WAITING_FOR_CAPACITY, note=record.note, score=score
+                    )
+                async with self._waiting_capacity_lock:
+                    self._waiting_for_capacity.append(record)
+                    self._waiting_for_capacity.sort(key=lambda r: (r.opportunity_score or 0.0), reverse=True)
+                logger.info(
+                    "Token request %s (%s) queued in waiting_for_capacity (rank=%d, score=%.1f)",
+                    record.request_id,
+                    record.token_address[:10],
+                    len(self._waiting_for_capacity),
+                    score,
+                )
+                return
+
+            reserved = self._position_book.reserve_position_slot(token_address=record.token_address, request_id=record.request_id)
+            if not reserved:
+                # Race condition, slot taken
+                record.state = TokenRequestState.WAITING_FOR_CAPACITY
+                record.note = "Contention for final position slot; queued for next capacity release"
+                record.updated_at_ns = time.time_ns()
+                if self._ledger:
+                    await self._ledger.update_token_request_status(
+                        record.request_id, TokenRequestState.WAITING_FOR_CAPACITY, note=record.note, score=score
+                    )
+                async with self._waiting_capacity_lock:
+                    self._waiting_for_capacity.append(record)
+                    self._waiting_for_capacity.sort(key=lambda r: (r.opportunity_score or 0.0), reverse=True)
+                return
+
+            # Reserved! Execute now:
+            await self._execute_reserved_request(record, pool, report)
+
+    async def _execute_reserved_request(
+        self,
+        record: TokenRequestRecord,
+        pool: PoolState,
+        report: Optional[SecurityReport],
+    ) -> None:
+        record.state = TokenRequestState.EXECUTION_PENDING
+        record.updated_at_ns = time.time_ns()
+        if self._ledger:
+            await self._ledger.update_token_request_status(record.request_id, TokenRequestState.EXECUTION_PENDING)
+
+        native_p = self._eth_price if record.chain == ChainIdentifier.BASE_MAINNET else self._sol_price
+        unit = "ETH" if record.chain == ChainIdentifier.BASE_MAINNET else "SOL"
+        available_cash = self._cash_eth if record.chain == ChainIdentifier.BASE_MAINNET else self._cash_sol
+        fee_est = Decimal("0.002") if record.chain == ChainIdentifier.BASE_MAINNET else Decimal("0.005")
+
+        req_amount = record.custom_amount_native
+        if req_amount is None and self.manual_trade_amount is not None and self.manual_trade_amount > Decimal(0):
+            if self.manual_trade_currency == "USD":
+                req_amount = self.manual_trade_amount / native_p if native_p > Decimal(0) else Decimal(0)
+            else:
+                req_amount = self.manual_trade_amount
+
+        if req_amount is None or req_amount <= Decimal(0):
+            req_amount = Decimal("0.03") if record.chain == ChainIdentifier.SOLANA_MAINNET else Decimal("0.003")
+
+        if available_cash < (req_amount + fee_est):
+            self._position_book.release_position_slot(request_id=record.request_id, token_address=record.token_address)
+            record.state = TokenRequestState.REJECTED
+            record.rejection_reason = f"Insufficient cash balance ({available_cash:.4f} {unit} < {req_amount + fee_est:.4f} {unit})"
+            record.updated_at_ns = time.time_ns()
+            if self._ledger:
+                await self._ledger.update_token_request_status(
+                    record.request_id, TokenRequestState.REJECTED, rejection_reason=record.rejection_reason
+                )
+            return
+
+        mcap = pool.calculate_market_cap_usd(native_price_usd=native_p) if pool else Decimal("10000.0")
+        signal = SignalEvent(
+            timestamp_ns=time.time_ns(),
+            chain=record.chain,
+            pool_address=pool.pool_address if pool else "0x" + "0" * 40,
+            token_address=record.token_address,
+            suggested_side=OrderSide.BUY,
+            pool_state=pool,
+            security_report=report,
+            strength=SignalStrength.STRONG,
+            alpha_score=record.opportunity_score / 100.0 if record.opportunity_score else 0.95,
+            source=SignalSource.TELEGRAM_SCRAPER,
+            originating_channel=record.originating_channel or "DM:User",
+            is_direct_dm=True,
+            market_cap_usd=mcap,
+            custom_amount_native=req_amount,
+        )
+
+        fill = None
+        if self._executor is not None:
+            fill = await self._executor.execute_signal(
+                signal,
+                portfolio_equity_usd=self._current_equity_usd(),
+                is_new_launch=False,
+                fixed_trade_amount_native=req_amount,
+            )
+
+        if fill is None or fill.effective_price <= Decimal(0):
+            self._position_book.release_position_slot(request_id=record.request_id, token_address=record.token_address)
+            record.state = TokenRequestState.FAILED
+            record.rejection_reason = "Paper execution returned no fill or invalid effective price"
+            record.updated_at_ns = time.time_ns()
+            if self._ledger:
+                await self._ledger.update_token_request_status(
+                    record.request_id, TokenRequestState.FAILED, rejection_reason=record.rejection_reason
+                )
+            return
+
+        # Success fill! Open lot and commit slot
+        platform_name = getattr(fill, "platform", None) or resolve_trade_platform(
+            token_address=fill.token_address,
+            chain=fill.chain,
+            source=signal.source,
+            execution_venue=getattr(signal, "execution_venue", None),
+            pool_address=getattr(signal, "pool_address", ""),
+        )
+        lot = self._position_book.open_lot(
+            fill,
+            signal.signal_id,
+            initial_pool_reserve_native=pool.native_reserve if pool else Decimal(0),
+            pool_address=pool.pool_address if pool else "",
+            bonding_curve_mode=(platform_name == "Pump.fun"),
+            platform=platform_name,
+        )
+        self._position_book.commit_slot_to_lot_by_token(record.token_address, record.chain)
+        if pool is not None:
+            self._pool_registry.set(record.token_address, pool)
+            if lot.pool_address:
+                self._pool_registry.set(lot.pool_address, pool)
+
+        native_price = self._eth_price if record.chain == ChainIdentifier.BASE_MAINNET else self._sol_price
+        gas_usd = fill.simulated_gas_cost_usd or Decimal("0.05")
+        gas_native = (gas_usd / native_price).quantize(Decimal("1e-18")) if native_price > Decimal(0) else Decimal("0.0005")
+
+        if record.chain == ChainIdentifier.BASE_MAINNET:
+            self._cash_eth -= (fill.simulated_native_spent + gas_native)
+        else:
+            self._cash_sol -= (fill.simulated_native_spent + gas_native)
+
+        self._metrics.total_gas_usd += gas_usd
+        lot.cost_basis_native = fill.simulated_native_spent + gas_native
+
+        if self._ledger:
+            trade_rec = TradeRecord.from_fill(
+                fill=fill,
+                signal_id=signal.signal_id,
+                platform=platform_name,
+            )
+            await self._ledger.record_trade(trade_rec)
+            await self._ledger.record_lot_transition(
+                lot_id=lot.lot_id,
+                token_address=lot.token_address,
+                chain=lot.chain.value,
+                status=LotStatus.OPEN.value,
+            )
+
+        record.state = TokenRequestState.EXECUTED
+        record.order_id = fill.order_id
+        record.lot_id = lot.lot_id
+        record.simulated_fill_price = fill.effective_price
+        record.tokens_filled = fill.tokens_acquired
+        record.updated_at_ns = time.time_ns()
+        if self._ledger:
+            await self._ledger.update_token_request_status(
+                record.request_id,
+                TokenRequestState.EXECUTED,
+                order_id=fill.order_id,
+                lot_id=lot.lot_id,
+                fill_price=fill.effective_price,
+                tokens_filled=fill.tokens_acquired,
+            )
+
+        # Broadcast buy alert
+        p_str = self._format_price_clean(fill.effective_price, native_p, unit)
+        t_str = f"{fill.token_address[:4]}..{fill.token_address[-4:]}"
+        buy_alert = (
+            f"🟢 **BUY EXECUTED (Paper Trade)**\n\n"
+            f"• **Platform:** `{platform_name}`\n"
+            f"• **Token:** `{t_str}` (`{fill.token_address}`)\n"
+            f"• **Chain:** {record.chain.value}\n"
+            f"• **Opportunity Score:** `{record.opportunity_score:.1f}/100`\n"
+            f"• **Buy Price:** `{p_str}`\n"
+            f"• **Spent:** `{float(fill.simulated_native_spent):.4f} {unit}`\n"
+            f"• **Tokens Acquired:** `{float(fill.tokens_acquired):,.2f}`\n"
+            f"• **Request ID:** `{record.request_id}`\n"
+            f"• **Order ID:** `{fill.order_id[:8]}`"
+        )
+        asyncio.create_task(self._broadcast_trade_alert(buy_alert))
+
+    def _on_position_capacity_freed(self, lot_id: str = "", token_address: str = "") -> None:
+        """Invoked by PositionBook whenever a lot is closed or slot is released."""
+        logger.info("Position capacity freed (lot=%s, token=%s). Evaluating waiting queue...", lot_id, token_address[:10])
+        asyncio.create_task(self._evaluate_next_waiting_candidate())
+
+    async def _evaluate_next_waiting_candidate(self) -> None:
+        async with self._waiting_capacity_lock:
+            if not self._waiting_for_capacity:
+                return
+
+            now_s = time.time()
+            valid_candidates = []
+            for c in self._waiting_for_capacity:
+                submitted_ts = c.created_at_ns or c.submitted_at_ns or time.time_ns()
+                age_s = now_s - (submitted_ts / 1_000_000_000)
+                if age_s > 900:  # 15 minutes TTL
+                    c.state = TokenRequestState.EXPIRED
+                    c.note = "Expired in waiting queue (TTL > 15m)"
+                    c.updated_at_ns = time.time_ns()
+                    if self._ledger:
+                        await self._ledger.update_token_request_status(c.request_id, TokenRequestState.EXPIRED, note=c.note)
+                else:
+                    valid_candidates.append(c)
+
+            self._waiting_for_capacity = valid_candidates
+            if not self._waiting_for_capacity:
+                return
+
+            # Pick highest score
+            candidate = self._waiting_for_capacity.pop(0)
+
+        # Check capacity
+        can_open, reject_reason = self._position_book.can_open_position(
+            token_address=candidate.token_address,
+            chain=candidate.chain,
+            is_manual_size=True,
+        )
+        if not can_open:
+            async with self._waiting_capacity_lock:
+                self._waiting_for_capacity.insert(0, candidate)
+            return
+
+        reserved = self._position_book.reserve_position_slot(token_address=candidate.token_address, request_id=candidate.request_id)
+        if not reserved:
+            async with self._waiting_capacity_lock:
+                self._waiting_for_capacity.insert(0, candidate)
+            return
+
+        pool = self.get_or_create_initial_pool_state(candidate.chain, candidate.token_address)
+        report = None
+        if hasattr(self, "_gatekeeper") and self._gatekeeper is not None:
+            try:
+                report = await self._gatekeeper.evaluate_token(candidate.token_address, candidate.chain)
+            except Exception:
+                pass
+            if report and not report.passes_hard_gates:
+                self._position_book.release_position_slot(candidate.token_address)
+                candidate.state = TokenRequestState.REJECTED
+                candidate.rejection_reason = "Security veto on pre-execution revalidation"
+                candidate.updated_at_ns = time.time_ns()
+                if self._ledger:
+                    await self._ledger.update_token_request_status(
+                        candidate.request_id, TokenRequestState.REJECTED, rejection_reason=candidate.rejection_reason
+                    )
+                return
+
+        await self._execute_reserved_request(candidate, pool, report)
+
+    async def _process_user_request_queue(self) -> None:
+        """Background queue processor for user token requests."""
+        while not self._shutdown_event.is_set():
+            try:
+                record = await asyncio.wait_for(self._user_request_queue.get(), timeout=1.0)
+            except asyncio.TimeoutError:
+                continue
+            except asyncio.CancelledError:
+                break
+            self._user_request_queue.task_done()
 
     def _extract_gatekeeper_rejection_reason(self, report: SecurityReport) -> str:
         if getattr(report, "passes_hard_gates", False):
@@ -1309,9 +2110,10 @@ class PaperTradingEngine:
                 self._screening_tasks.add(task)
                 task.add_done_callback(self._screening_tasks.discard)
 
-            pool = self._pool_registry.get(swap.pool_address)
-            if pool is None:
-                pool = self._pool_registry.get(target_token)
+            # Prioritize target_token lookup to prevent cross-token pool state collisions
+            pool = self._pool_registry.get(target_token, expected_token=target_token)
+            if pool is None and swap.pool_address:
+                pool = self._pool_registry.get(swap.pool_address, expected_token=target_token)
             if pool is None:
                 # إنشاء حوض أولي تلقائياً للعملة القديمة لمتابعة صفقاتها بدلاً من إسقاطها
                 pool = self.get_or_create_initial_pool_state(swap.chain, target_token, swap.pool_address)
@@ -1805,6 +2607,9 @@ class PaperTradingEngine:
             is_sell = (swap.token_in == token)
             vol = swap.amount_out if is_sell else swap.amount_in
             for lot in open_lots:
+                # Guard against cross-token exit evaluation
+                if pool.token_address and pool.token_address.lower() != lot.token_address.lower():
+                    continue
                 decision = self._position_book.evaluate_lot_exit(
                     lot=lot,
                     current_price=pool.spot_price_native_per_token,
@@ -1817,37 +2622,30 @@ class PaperTradingEngine:
                     is_sell=is_sell,
                 )
                 
-                # V2 Exit Logic
+                # V2 Exit Logic:
+                # PositionBook is the primary authority for lot exits (peak trailing, TP ladders, dynamic stops).
+                # The V2 ExitEngine acts as an emergency safeguard for liquidity drain rugpulls.
                 if (decision is None or not decision.should_exit) and self.config.strategy_v2_enabled:
                     entry_ts = getattr(lot, "entry_timestamp_s", None) or lot.last_tick_timestamp_s
                     age_seconds = time.time() - entry_ts if entry_ts else 0.0
                     liquidity_drop = 0.0
                     if lot.peak_pool_reserve_native > 0:
                         liquidity_drop = float((lot.peak_pool_reserve_native - pool.native_reserve) / lot.peak_pool_reserve_native)
-                    should_exit, reason = self.exit_engine.check_exit_conditions(
-                        current_price=pool.spot_price_native_per_token,
-                        entry_price=lot.entry_price,
-                        liquidity_drop_pct=liquidity_drop,
-                        age_seconds=age_seconds
-                    )
-                    if should_exit:
+                    if liquidity_drop >= self.config.emergency_exit_liquidity_drop_pct:
                         from alpha_engine.models.state import ExitDecision
                         from alpha_engine.models.enums import ExitStage, TradeExitReason
-                        
-                        is_rug = reason in (TradeExitReason.RUG_LIQUIDITY_DRAIN, TradeExitReason.LIQUIDITY_RUG)
-                        is_sl = reason in (TradeExitReason.SL_HARD, TradeExitReason.SL_INITIAL)
-                        
                         decision = ExitDecision(
                             lot_id=lot.lot_id,
                             token_address=lot.token_address,
                             chain=lot.chain,
                             should_exit=True,
-                            exit_reason=reason,
-                            exit_stage=ExitStage.RUGPULL if is_rug else (ExitStage.SL if is_sl else ExitStage.TP1),
+                            exit_reason=TradeExitReason.RUG_LIQUIDITY_DRAIN,
+                            exit_stage=ExitStage.RUGPULL,
                             tokens_to_sell=lot.tokens_held,
                             current_price=pool.spot_price_native_per_token,
                             pnl_estimate_native=lot.tokens_held * (pool.spot_price_native_per_token - lot.entry_price),
                             prioritized=True,
+                            action="CLOSE_ALL",
                         )
 
                 if decision is not None and decision.should_exit:
@@ -1860,6 +2658,7 @@ class PaperTradingEngine:
                         apply_drag=True,
                         portfolio_equity_usd=max(Decimal("1.0"), self._current_equity_usd()),
                         platform=getattr(lot, "platform", None),
+                        min_fill_timestamp_ns=lot.open_timestamp_ns,
                     )
                     if exit_fill is not None:
                         native_price = (
@@ -1868,9 +2667,9 @@ class PaperTradingEngine:
                             else self._sol_price
                         )
                         pnl_native, _ = self._position_book.apply_exit_decision(
-                            decision, sell_price=exit_fill.effective_price
+                            decision, sell_price=exit_fill.effective_price, net_native_received=exit_fill.simulated_native_spent
                         )
-                        exit_pnl_usd = pnl_native * native_price
+                        exit_pnl_usd = (pnl_native * native_price).quantize(Decimal("0.01"))
                         if decision.chain == ChainIdentifier.BASE_MAINNET:
                             self._cash_eth += exit_fill.simulated_native_spent
                         else:
@@ -1879,12 +2678,16 @@ class PaperTradingEngine:
                         new_equity = self._current_equity_usd()
                         is_launch = (getattr(lot, "exit_profile", None) != ExitProfile.REVIVAL_SWING and 
                                      getattr(lot, "bonding_curve_mode", False) is True)
+                        if exit_fill.simulated_gas_cost_usd:
+                            self._metrics.total_gas_usd += exit_fill.simulated_gas_cost_usd
                         self._metrics.record_closed_trade(
                             realized_pnl_usd=exit_pnl_usd,
-                            gas_cost_usd=exit_fill.simulated_gas_cost_usd,
+                            gas_cost_usd=Decimal(0),
                             current_equity_usd=new_equity,
                             is_new_launch=is_launch,
                         )
+                        if lot.status == LotStatus.CLOSED:
+                            self._position_book.set_token_cooldown(decision.token_address, duration_s=300.0)
                         platform_name = getattr(lot, "platform", None) or getattr(exit_fill, "platform", None) or resolve_trade_platform(
                             token_address=decision.token_address,
                             chain=decision.chain,
@@ -2389,30 +3192,36 @@ class PaperTradingEngine:
                     asyncio.create_task(self._broadcast_trade_alert(insufficient_alert))
                     continue
 
-                can_open, reject_reason = self._position_book.can_open_position(
-                    token_address=signal_item.token_address,
-                    chain=signal_item.chain,
-                    allocated_cost_native=preliminary_cost,
-                    total_equity_native=equity_native,
-                    pool_address=getattr(signal_item, "pool_address", "") or "",
-                    narrative_cluster=getattr(signal_item, "narrative_cluster", None),
-                    is_manual_size=is_manual_size,
-                )
-                if not can_open:
-                    logger.info(
-                        "Dropping BUY signal for %s: %s",
-                        signal_item.token_address[:10],
-                        reject_reason,
+                has_reserved = self._position_book.has_reserved_slot(signal_item.token_address)
+                if not has_reserved:
+                    can_open, reject_reason = self._position_book.can_open_position(
+                        token_address=signal_item.token_address,
+                        chain=signal_item.chain,
+                        allocated_cost_native=preliminary_cost,
+                        total_equity_native=equity_native,
+                        pool_address=getattr(signal_item, "pool_address", "") or "",
+                        narrative_cluster=getattr(signal_item, "narrative_cluster", None),
+                        is_manual_size=is_manual_size,
                     )
-                    if is_direct_dm:
-                        dm_reject_alert = (
-                            f"⚠️ **تعذر فتح صفقة جديدة للعملة عبر الرسائل المباشرة**\n\n"
-                            f"• **العملة:** `{signal_item.token_address}`\n"
-                            f"• **السبب:** {reject_reason}\n\n"
-                            f"💡 يمكنك استخدام أمر `/trades` أو زر الإغلاق لإنهاء مركز مفتوح لإتاحة مساحة لصفقة جديدة."
+                    if not can_open:
+                        logger.info(
+                            "Dropping BUY signal for %s: %s",
+                            signal_item.token_address[:10],
+                            reject_reason,
                         )
-                        asyncio.create_task(self._broadcast_trade_alert(dm_reject_alert))
-                    continue
+                        if is_direct_dm:
+                            dm_reject_alert = (
+                                f"⚠️ **تعذر فتح صفقة جديدة للعملة عبر الرسائل المباشرة**\n\n"
+                                f"• **العملة:** `{signal_item.token_address}`\n"
+                                f"• **السبب:** {reject_reason}\n\n"
+                                f"💡 يمكنك استخدام أمر `/trades` أو زر الإغلاق لإنهاء مركز مفتوح لإتاحة مساحة لصفقة جديدة."
+                            )
+                            asyncio.create_task(self._broadcast_trade_alert(dm_reject_alert))
+                        continue
+                    reserved = self._position_book.reserve_position_slot(token_address=signal_item.token_address)
+                    if not reserved:
+                        logger.info("Dropping BUY signal for %s: position slot reservation failed", signal_item.token_address[:10])
+                        continue
 
             if not self.validate_signal_strength(signal_item):
                 logger.info(
@@ -2420,6 +3229,8 @@ class PaperTradingEngine:
                     getattr(signal_item, "token_address", "")[:10],
                     getattr(signal_item, "strength", None),
                 )
+                if signal_item.suggested_side == OrderSide.BUY:
+                    self._position_book.release_position_slot(token_address=signal_item.token_address)
                 continue
 
             if signal_item.pool_state is None or signal_item.pool_state.spot_price_native_per_token <= Decimal(0):
@@ -2460,6 +3271,7 @@ class PaperTradingEngine:
                             f"AlphaSupervisor-AI Veto: {', '.join(ai_audit.security_assessment.flags) if ai_audit.security_assessment.flags else ai_audit.wallet_audit.rationale}",
                             passed=False,
                         )
+                        self._position_book.release_position_slot(token_address=signal_item.token_address)
                         continue
 
                     ai_action_params = ai_audit.action_parameters
@@ -2480,6 +3292,8 @@ class PaperTradingEngine:
                         signal_item.token_address[:10],
                         fill.effective_price,
                     )
+                if signal_item.suggested_side == OrderSide.BUY:
+                    self._position_book.release_position_slot(token_address=signal_item.token_address)
                 continue
 
             realized_pnl_usd: Decimal | None = None
@@ -2516,11 +3330,11 @@ class PaperTradingEngine:
                     volume_surge_multiplier=float(getattr(signal_item, "volume_surge_multiplier", 0.0) or 0.0),
                     net_buy_delta=float(getattr(signal_item, "net_buy_delta", 0.0) or 0.0),
                     platform=platform_name,
-                    partial_exit_enabled=getattr(self.config, "partial_exit_enabled", False),
-                    strategy_name=getattr(self, "active_strategy", getattr(self.config, "active_strategy", "peak_trailing_50")),
-                    trailing_stop_from_peak_pct=getattr(self, "trailing_stop_from_peak_pct", getattr(self.config, "trailing_stop_from_peak_pct", 0.50)),
-                    custom_take_profit_pct=getattr(self, "custom_take_profit_pct", getattr(self.config, "custom_take_profit_pct", 0.50)),
-                    custom_stop_loss_pct=getattr(self, "custom_stop_loss_pct", getattr(self.config, "custom_stop_loss_pct", 0.50)),
+                    partial_exit_enabled=getattr(self.config, "partial_exit_enabled", True),
+                    strategy_name=getattr(self, "active_strategy", getattr(self.config, "active_strategy", "default")),
+                    trailing_stop_from_peak_pct=getattr(self, "trailing_stop_from_peak_pct", getattr(self.config, "trailing_stop_from_peak_pct", None)),
+                    custom_take_profit_pct=getattr(self, "custom_take_profit_pct", getattr(self.config, "custom_take_profit_pct", None)),
+                    custom_stop_loss_pct=getattr(self, "custom_stop_loss_pct", getattr(self.config, "custom_stop_loss_pct", None)),
                 )
 
                 if self._ledger:
@@ -2530,10 +3344,22 @@ class PaperTradingEngine:
                         chain=lot.chain.value,
                         status=LotStatus.OPEN.value,
                     )
+                self._position_book.commit_slot_to_lot_by_token(signal_item.token_address, lot.lot_id)
+                if signal_item.pool_state is not None:
+                    self._pool_registry.set(signal_item.token_address, signal_item.pool_state)
+                    if lot.pool_address:
+                        self._pool_registry.set(lot.pool_address, signal_item.pool_state)
+                native_price = self._eth_price if signal_item.chain == ChainIdentifier.BASE_MAINNET else self._sol_price
+                gas_usd = fill.simulated_gas_cost_usd or Decimal("0.05")
+                gas_native = (gas_usd / native_price).quantize(Decimal("1e-18")) if native_price > Decimal(0) else Decimal("0.0005")
+
                 if signal_item.chain == ChainIdentifier.BASE_MAINNET:
-                    self._cash_eth -= fill.simulated_native_spent
+                    self._cash_eth -= (fill.simulated_native_spent + gas_native)
                 else:
-                    self._cash_sol -= fill.simulated_native_spent
+                    self._cash_sol -= (fill.simulated_native_spent + gas_native)
+
+                self._metrics.total_gas_usd += gas_usd
+                lot.cost_basis_native = fill.simulated_native_spent + gas_native
 
                 unit = "ETH" if signal_item.chain == ChainIdentifier.BASE_MAINNET else "SOL"
                 native_price = self._eth_price if signal_item.chain == ChainIdentifier.BASE_MAINNET else self._sol_price
@@ -3094,10 +3920,10 @@ class PaperTradingEngine:
         open_trades_info = []
         now_ns = time.time_ns()
         for lot in self._position_book.get_open_lots():
-            pool = self._pool_registry.get(lot.token_address)
+            pool = self._pool_registry.get(lot.token_address, expected_token=lot.token_address)
             if pool is None and lot.pool_address:
-                pool = self._pool_registry.get(lot.pool_address)
-            curr_p = pool.spot_price_native_per_token if pool else lot.entry_price
+                pool = self._pool_registry.get(lot.pool_address, expected_token=lot.token_address)
+            curr_p = pool.spot_price_native_per_token if (pool and getattr(pool, "last_updated_block", 0) > 0) else lot.entry_price
             native_p = self._eth_price if lot.chain == ChainIdentifier.BASE_MAINNET else self._sol_price
             unrealized_usd = (lot.tokens_held * (curr_p - lot.entry_price)) * native_p
             pos_val_usd = float(lot.tokens_held * curr_p * native_p)
@@ -3106,8 +3932,10 @@ class PaperTradingEngine:
             if lot.trailing_stop_active:
                 if lot.trailing_stop_price >= lot.entry_price * Decimal("1.30"):
                     trailing_status = "LOCKED (+30%)"
-                elif lot.trailing_stop_price >= lot.entry_price * Decimal("1.08"):
-                    trailing_status = "LOCKED (+8%)"
+                elif lot.trailing_stop_price >= lot.entry_price * Decimal("1.10"):
+                    trailing_status = "LOCKED (+10%)"
+                elif lot.trailing_stop_price >= lot.entry_price:
+                    trailing_status = "LOCKED (BE)"
                 else:
                     trailing_status = "ACTIVE"
             else:
@@ -3150,10 +3978,197 @@ class PaperTradingEngine:
         }
 
 
+    async def _poll_open_lots_prices(self, lots: list[OpenLot]) -> None:
+        """
+        Actively poll DexScreener for open positions that lack live WebSocket updates.
+        Updates PoolState with authoritative market spot price and liquidity reserves.
+        If a token is verified dead/removed with 0 liquidity, seeds a collapsed reserve
+        so emergency exit triggers cleanly instead of deadlocking active capacity.
+        """
+        if not lots or self._session is None or self._session.closed:
+            return
+
+        now = time.time()
+        # Throttle external calls to at most once every 2 seconds
+        if hasattr(self, "_last_open_lot_poll_s") and (now - self._last_open_lot_poll_s) < 2.0:
+            return
+        self._last_open_lot_poll_s = now
+
+        sol_lots = [
+            l for l in lots
+            if l.chain == ChainIdentifier.SOLANA_MAINNET
+            and not (l.bonding_curve_mode and self._pool_registry.get(l.token_address, expected_token=l.token_address) is not None)
+        ]
+        evm_lots = [l for l in lots if l.chain == ChainIdentifier.BASE_MAINNET]
+
+        # 1. Solana Lots
+        if sol_lots:
+            mints = list(dict.fromkeys(l.token_address for l in sol_lots if l.token_address))[:30]
+            if mints:
+                try:
+                    batch_param = ",".join(mints)
+                    url = f"https://api.dexscreener.com/latest/dex/tokens/{batch_param}"
+                    async with self._session.get(
+                        url,
+                        headers={"User-Agent": "Bot-MM-Engine/1.0"},
+                        timeout=aiohttp.ClientTimeout(total=5.0),
+                    ) as resp:
+                        if resp.status == 200:
+                            data = await resp.json()
+                            pairs = data.get("pairs", [])
+                            pairs_by_mint: dict[str, list[dict[str, Any]]] = {}
+                            if isinstance(pairs, list):
+                                for p in pairs:
+                                    base_addr = p.get("baseToken", {}).get("address")
+                                    if base_addr:
+                                        pairs_by_mint.setdefault(base_addr, []).append(p)
+
+                            sol_price = Decimal(str(getattr(self.config, "sol_price_usd", self._sol_price or 180.0)))
+                            for lot in sol_lots:
+                                t_addr = lot.token_address
+                                t_pairs = pairs_by_mint.get(t_addr, [])
+                                if t_pairs:
+                                    best_pair = max(
+                                        t_pairs,
+                                        key=lambda x: float((x.get("liquidity") or {}).get("usd") or 0.0),
+                                    )
+                                    price_usd = float(best_pair.get("priceUsd") or 0.0)
+                                    liq_usd = float((best_pair.get("liquidity") or {}).get("usd") or 0.0)
+                                    if price_usd > 0:
+                                        spot_p = Decimal(str(price_usd)) / sol_price if sol_price > Decimal(0) else Decimal("0.000000028")
+                                        liq_dec = Decimal(str(liq_usd))
+                                        existing_pool = self._pool_registry.get(t_addr, expected_token=t_addr)
+                                        if existing_pool is not None and existing_pool.native_reserve > Decimal(0):
+                                            native_res = existing_pool.native_reserve
+                                            token_res = native_res / spot_p
+                                        elif liq_dec > Decimal(0) and sol_price > Decimal(0):
+                                            native_res = liq_dec / Decimal("2.0") / sol_price
+                                            token_res = native_res / spot_p
+                                        else:
+                                            native_res = Decimal("50.0")
+                                            token_res = native_res / spot_p
+                                        pool = PoolState(
+                                            pool_address=lot.pool_address or best_pair.get("pairAddress") or t_addr,
+                                            chain=ChainIdentifier.SOLANA_MAINNET,
+                                            token_address=t_addr,
+                                            token_reserve=token_res,
+                                            native_reserve=native_res,
+                                            fee_numerator=25,
+                                            fee_denominator=10000,
+                                            last_updated_block=1000,
+                                            timestamp_s=now,
+                                            token_decimals=6,
+                                            native_decimals=9,
+                                        )
+                                        self._pool_registry.set(t_addr, pool)
+                                        if lot.pool_address:
+                                            self._pool_registry.set(lot.pool_address, pool)
+                                        logger.info(
+                                            "Active price poller updated open lot %s (%s): price=%s SOL ($%.6f), reserve=%.2f SOL",
+                                            lot.lot_id[:8],
+                                            t_addr[:10],
+                                            spot_p,
+                                            price_usd,
+                                            float(native_res),
+                                        )
+                                else:
+                                    lot_dur_s = (now - (lot.open_timestamp_ns / 1e9 if lot.open_timestamp_ns > 0 else now))
+                                    if lot_dur_s > 60.0:
+                                        logger.warning(
+                                            "Open lot %s (%s) has no active market pairs on DexScreener (age=%.0fs). Marking as collapsed liquidity.",
+                                            lot.lot_id[:8],
+                                            t_addr[:10],
+                                            lot_dur_s,
+                                        )
+                                        pool = PoolState(
+                                            pool_address=lot.pool_address or t_addr,
+                                            chain=ChainIdentifier.SOLANA_MAINNET,
+                                            token_address=t_addr,
+                                            token_reserve=Decimal("1000000000"),
+                                            native_reserve=Decimal("0.0001"),
+                                            fee_numerator=25,
+                                            fee_denominator=10000,
+                                            last_updated_block=1000,
+                                            timestamp_s=now,
+                                            token_decimals=6,
+                                            native_decimals=9,
+                                        )
+                                        self._pool_registry.set(t_addr, pool)
+                                        if lot.pool_address:
+                                            self._pool_registry.set(lot.pool_address, pool)
+                except Exception as exc:
+                    logger.debug("Active price poll for Solana lots encountered error: %s", exc)
+
+        # 2. Base Lots
+        if evm_lots:
+            mints = list(dict.fromkeys(l.token_address for l in evm_lots if l.token_address))[:30]
+            if mints:
+                try:
+                    batch_param = ",".join(mints)
+                    url = f"https://api.dexscreener.com/latest/dex/tokens/{batch_param}"
+                    async with self._session.get(
+                        url,
+                        headers={"User-Agent": "Bot-MM-Engine/1.0"},
+                        timeout=aiohttp.ClientTimeout(total=5.0),
+                    ) as resp:
+                        if resp.status == 200:
+                            data = await resp.json()
+                            pairs = data.get("pairs", [])
+                            pairs_by_mint = {}
+                            if isinstance(pairs, list):
+                                for p in pairs:
+                                    base_addr = str(p.get("baseToken", {}).get("address", "")).lower()
+                                    if base_addr:
+                                        pairs_by_mint.setdefault(base_addr, []).append(p)
+
+                            eth_price = Decimal(str(getattr(self.config, "eth_price_usd", self._eth_price or 2500.0)))
+                            for lot in evm_lots:
+                                t_addr = lot.token_address.lower()
+                                t_pairs = pairs_by_mint.get(t_addr, [])
+                                if t_pairs:
+                                    best_pair = max(
+                                        t_pairs,
+                                        key=lambda x: float((x.get("liquidity") or {}).get("usd") or 0.0),
+                                    )
+                                    price_usd = float(best_pair.get("priceUsd") or 0.0)
+                                    liq_usd = float((best_pair.get("liquidity") or {}).get("usd") or 0.0)
+                                    if price_usd > 0:
+                                        spot_p = Decimal(str(price_usd)) / eth_price if eth_price > Decimal(0) else Decimal("0.0000001")
+                                        liq_dec = Decimal(str(liq_usd))
+                                        existing_pool = self._pool_registry.get(t_addr, expected_token=t_addr)
+                                        if existing_pool is not None and existing_pool.native_reserve > Decimal(0):
+                                            native_res = existing_pool.native_reserve
+                                            token_res = native_res / spot_p
+                                        elif liq_dec > Decimal(0) and eth_price > Decimal(0):
+                                            native_res = liq_dec / Decimal("2.0") / eth_price
+                                            token_res = native_res / spot_p
+                                        else:
+                                            native_res = Decimal("5.0")
+                                            token_res = native_res / spot_p
+                                        pool = PoolState(
+                                            pool_address=lot.pool_address or best_pair.get("pairAddress") or lot.token_address,
+                                            chain=ChainIdentifier.BASE_MAINNET,
+                                            token_address=lot.token_address,
+                                            token_reserve=token_res,
+                                            native_reserve=native_res,
+                                            fee_numerator=30,
+                                            fee_denominator=10000,
+                                            last_updated_block=1000,
+                                            timestamp_s=now,
+                                            token_decimals=18,
+                                            native_decimals=18,
+                                        )
+                                        self._pool_registry.set(lot.token_address, pool)
+                                        if lot.pool_address:
+                                            self._pool_registry.set(lot.pool_address, pool)
+                except Exception as exc:
+                    logger.debug("Active price poll for Base lots encountered error: %s", exc)
+
     async def _position_price_poller(self) -> None:
         """
         Adaptive High-Speed Exit Monitor Loop (Directive 2 & 4).
         Runs every 500ms. Evaluates dynamic bonding-curve exits:
+        - Active price polling fallback via DexScreener for lots lacking live WebSocket ticks.
         - Stale tick guard: ticks > 3.0s old halt exit triggers.
         - Slippage insolvency guard: curves unable to absorb lot without >15% collapse trigger emergency dump.
         - Velocity/time decay: duration > 120s and PnL < +3% triggers liquidation.
@@ -3177,6 +4192,24 @@ class PaperTradingEngine:
                 now_s = time.time()
                 now_ns = time.time_ns()
 
+                # Actively resolve market prices for lots lacking fresh live ticks (>15s old or uninitialized)
+                lots_needing_price = [
+                    l for l in open_lots
+                    if (
+                        not (l.bonding_curve_mode and self._pool_registry.get(l.token_address, expected_token=l.token_address) is not None)
+                        and (
+                            self._pool_registry.get(l.token_address, expected_token=l.token_address) is None
+                            or getattr(self._pool_registry.get(l.token_address, expected_token=l.token_address), "last_updated_block", 0) <= 0
+                            or (
+                                (now_s - (l.open_timestamp_ns / 1e9 if l.open_timestamp_ns > 0 else now_s) > 15.0)
+                                and (now_s - getattr(self._pool_registry.get(l.token_address, expected_token=l.token_address), "timestamp_s", now_s) > 15.0)
+                            )
+                        )
+                    )
+                ]
+                if lots_needing_price:
+                    await self._poll_open_lots_prices(lots_needing_price)
+
                 for lot in open_lots:
                     # Idempotent state recovery: check lots in PENDING_SELL
                     if lot.status == LotStatus.PENDING_SELL:
@@ -3192,29 +4225,70 @@ class PaperTradingEngine:
                         else:
                             continue
 
-                    pool = self._pool_registry.get(lot.token_address)
-                    if pool is None:
-                        pool = self.get_or_create_initial_pool_state(lot.chain, lot.token_address)
+                    pool = self._pool_registry.get(lot.token_address, expected_token=lot.token_address)
+                    if pool is None and lot.pool_address:
+                        pool = self._pool_registry.get(lot.pool_address, expected_token=lot.token_address)
 
-                    current_price = pool.spot_price_native_per_token
-                    self._ai_supervisor.record_price_update(
-                        lot.token_address,
-                        current_price,
-                        now_s,
-                    )
-                    # Pull tick timestamp; if not stamped on pool, default to now
-                    tick_timestamp_s = getattr(pool, "timestamp_s", None) or now_s
-
-                    grace_sec = getattr(self.config, "exit_grace_period_sec", 15.0)
-                    decision = self._position_book.evaluate_lot_exit(
-                        lot=lot,
-                        current_price=current_price,
-                        current_pool_reserve_native=pool.native_reserve,
-                        tick_timestamp_s=tick_timestamp_s,
-                        current_timestamp_ns=now_ns,
-                        bonding_curve_mode=True,
-                        exit_grace_period_sec=grace_sec,
-                    )
+                    if pool is None or getattr(pool, "last_updated_block", 0) <= 0:
+                        dur_s = (now_ns - lot.open_timestamp_ns) / 1e9 if lot.open_timestamp_ns > 0 else 0.0
+                        if dur_s > 120.0:
+                            logger.warning(
+                                "Stagnant unpriced lot %s (%s) held for %.1fs with no liquidity/price. Liquidating via TIMEOUT.",
+                                lot.lot_id[:8],
+                                lot.token_address[:10],
+                                dur_s,
+                            )
+                            pool = PoolState(
+                                pool_address=lot.pool_address or lot.token_address,
+                                chain=lot.chain,
+                                token_reserve=Decimal("1000000000"),
+                                native_reserve=Decimal("0.0001"),
+                                fee_numerator=25,
+                                fee_denominator=10000,
+                                last_updated_block=1000,
+                                timestamp_s=now_s,
+                                token_decimals=6 if lot.chain == ChainIdentifier.SOLANA_MAINNET else 18,
+                                native_decimals=9 if lot.chain == ChainIdentifier.SOLANA_MAINNET else 18,
+                            )
+                            self._pool_registry.set(lot.token_address, pool)
+                            decision = ExitDecision(
+                                lot_id=lot.lot_id,
+                                token_address=lot.token_address,
+                                chain=lot.chain,
+                                should_exit=True,
+                                exit_reason=TradeExitReason.TIMEOUT_VELOCITY_DECAY,
+                                exit_stage=ExitStage.TIMEOUT,
+                                tokens_to_sell=lot.tokens_held,
+                                current_price=lot.entry_price * Decimal("0.01"),
+                                pnl_estimate_native=Decimal("0"),
+                                prioritized=True,
+                                action="CLOSE_ALL",
+                            )
+                        else:
+                            logger.debug(
+                                "Awaiting live on-chain tick for lot %s (%s) before evaluating exits (pool uninitialized).",
+                                lot.lot_id[:8],
+                                lot.token_address[:10],
+                            )
+                            continue
+                    else:
+                        current_price = pool.spot_price_native_per_token
+                        self._ai_supervisor.record_price_update(
+                            lot.token_address,
+                            current_price,
+                            now_s,
+                        )
+                        tick_timestamp_s = getattr(pool, "timestamp_s", None) or now_s
+                        grace_sec = getattr(self.config, "exit_grace_period_sec", 15.0)
+                        decision = self._position_book.evaluate_lot_exit(
+                            lot=lot,
+                            current_price=current_price,
+                            current_pool_reserve_native=pool.native_reserve,
+                            tick_timestamp_s=tick_timestamp_s,
+                            current_timestamp_ns=now_ns,
+                            bonding_curve_mode=lot.bonding_curve_mode,
+                            exit_grace_period_sec=grace_sec,
+                        )
                     if decision is not None and decision.should_exit:
                         # Idempotent state transition: OPEN -> PENDING_SELL
                         lot.status = LotStatus.PENDING_SELL
@@ -3237,6 +4311,7 @@ class PaperTradingEngine:
                             apply_drag=True,
                             portfolio_equity_usd=max(Decimal("1.0"), self._current_equity_usd()),
                             platform=getattr(lot, "platform", None),
+                            min_fill_timestamp_ns=lot.open_timestamp_ns,
                         )
                         if exit_fill is not None and exit_fill.effective_price > Decimal(0):
                             native_price = (
@@ -3245,9 +4320,9 @@ class PaperTradingEngine:
                                 else self._sol_price
                             )
                             pnl_native, _ = self._position_book.apply_exit_decision(
-                                decision, sell_price=exit_fill.effective_price
+                                decision, sell_price=exit_fill.effective_price, net_native_received=exit_fill.simulated_native_spent
                             )
-                            exit_pnl_usd = pnl_native * native_price
+                            exit_pnl_usd = (pnl_native * native_price).quantize(Decimal("0.01"))
                             if decision.chain == ChainIdentifier.BASE_MAINNET:
                                 self._cash_eth += exit_fill.simulated_native_spent
                             else:
@@ -3256,12 +4331,16 @@ class PaperTradingEngine:
                             new_equity = self._current_equity_usd()
                             is_launch = (getattr(lot, "exit_profile", None) != ExitProfile.REVIVAL_SWING and 
                                          getattr(lot, "bonding_curve_mode", False) is True)
+                            if exit_fill.simulated_gas_cost_usd:
+                                self._metrics.total_gas_usd += exit_fill.simulated_gas_cost_usd
                             self._metrics.record_closed_trade(
                                 realized_pnl_usd=exit_pnl_usd,
-                                gas_cost_usd=exit_fill.simulated_gas_cost_usd,
+                                gas_cost_usd=Decimal(0),
                                 current_equity_usd=new_equity,
                                 is_new_launch=is_launch,
                             )
+                            if lot.status == LotStatus.CLOSED:
+                                self._position_book.set_token_cooldown(decision.token_address, duration_s=300.0)
 
                             if self._ledger:
                                 if lot.status == LotStatus.CLOSED:
@@ -3442,10 +4521,54 @@ class PaperTradingEngine:
             SQLiteLedger(cfg.db_path) as ledger,
         ):
             self._session = session
+            self._market_oracle = MarketOracle(session=session)
             self._ledger = ledger
             self.tracer.ledger = self._ledger
             self.tracer.start_worker()
             await self._sync_ledger_settings()
+
+            # Restore open lots from ledger to prevent state loss across restarts
+            open_lots = await self._ledger.restore_open_positions_from_ledger()
+            if open_lots:
+                max_age_s = float(getattr(self.config, "max_open_lot_age_s", 43200.0))
+                restored_count = self._position_book.restore_open_lots(open_lots, max_age_s=max_age_s)
+                logger.info("Restored %d open lots from ledger into PositionBook on startup.", restored_count)
+                if len(open_lots) > restored_count:
+                    discarded = len(open_lots) - restored_count
+                    logger.warning(
+                        "Discarded %d stale zombie open lots (>%.1fh old) on startup.",
+                        discarded,
+                        max_age_s / 3600.0,
+                    )
+                    now_ns = time.time_ns()
+                    for lot_dict in open_lots:
+                        open_ts_ns = int(lot_dict.get("fill_timestamp_ns") or 0)
+                        if open_ts_ns > 0 and (now_ns - open_ts_ns) / 1e9 > max_age_s:
+                            t_addr = str(lot_dict.get("token_address", ""))
+                            await self._ledger.mark_token_closed(t_addr, reason="STALE_ZOMBIE_EXPIRY")
+
+                sol_mint = "So11111111111111111111111111111111111111112"
+                for lot_dict in open_lots:
+                    t_addr = str(lot_dict.get("token_address", "")).strip()
+                    ch = str(lot_dict.get("chain", "")).lower()
+                    plat = str(lot_dict.get("platform", "")).lower()
+                    if t_addr and (ch == "solana_mainnet" or plat == "pump.fun" or t_addr.lower().endswith("pump")):
+                        curve = lot_dict.get("pool_address")
+                        if not curve or not is_valid_solana_pubkey(curve):
+                            curve_pda, _ = derive_pump_fun_bonding_curve(t_addr)
+                            if curve_pda:
+                                curve = curve_pda
+                        if curve and is_valid_solana_pubkey(curve):
+                            svm_pool_registry[curve] = (t_addr, sol_mint, 6, 9)
+
+            # Restore and resume any pending token requests from previous run
+            pending_requests = await self._ledger.get_pending_token_requests()
+            if pending_requests:
+                logger.info("Restored %d pending token requests from ledger.", len(pending_requests))
+                for req in pending_requests:
+                    task = asyncio.create_task(self._process_single_token_request(req))
+                    self._token_request_tasks.add(task)
+                    task.add_done_callback(self._token_request_tasks.discard)
 
             self._gatekeeper = SecurityGatekeeper(
                 session=session,
@@ -3506,6 +4629,8 @@ class PaperTradingEngine:
             async with coordinator:
                 self._coordinator = coordinator
                 self._telegram = coordinator.telegram_ingester
+                if self._telegram and hasattr(self._telegram, "set_market_oracle"):
+                    self._telegram.set_market_oracle(self._market_oracle)
 
                 async def _on_wave2_signal(sig: SignalEvent) -> None:
                     if not self.is_position_open(sig.token_address, sig.chain):
@@ -3599,8 +4724,11 @@ class PaperTradingEngine:
                 screener_poller_task = asyncio.create_task(
                     self._screener_priority_poller(), name="screener_poller"
                 )
+                user_request_task = asyncio.create_task(
+                    self._process_user_request_queue(), name="user_request_processor"
+                )
 
-                worker_tasks = [bridge_task, ingest_task, signal_task, poller_task, snapshot_task, heartbeat_task, buffer_task, missed_opp_task, screener_poller_task]
+                worker_tasks = [bridge_task, ingest_task, signal_task, user_request_task, poller_task, snapshot_task, heartbeat_task, buffer_task, missed_opp_task, screener_poller_task]
                 logger.info("All engine pipelines active. Awaiting market and social signals...")
 
                 # Monitor tasks: wait for either graceful shutdown or unexpected worker crash
@@ -3631,7 +4759,7 @@ class PaperTradingEngine:
                     # 2. Drain queues with a safety timeout
                     try:
                         await asyncio.wait_for(
-                            asyncio.gather(ingest_task, signal_task, return_exceptions=True),
+                            asyncio.gather(ingest_task, signal_task, user_request_task, return_exceptions=True),
                             timeout=15.0,
                         )
                         logger.info("All queues successfully drained and processed.")
@@ -3639,8 +4767,10 @@ class PaperTradingEngine:
                         logger.warning("Queue drain timed out after 15s; proceeding with teardown.")
                         ingest_task.cancel()
                         signal_task.cancel()
+                        user_request_task.cancel()
 
                     # 3. Cancel background monitoring tasks
+                    user_request_task.cancel()
                     poller_task.cancel()
                     snapshot_task.cancel()
                     heartbeat_task.cancel()
@@ -3648,7 +4778,7 @@ class PaperTradingEngine:
                     missed_opp_task.cancel()
                     screener_poller_task.cancel()
                     shutdown_waiter.cancel()
-                    await asyncio.gather(poller_task, snapshot_task, heartbeat_task, buffer_task, missed_opp_task, screener_poller_task, return_exceptions=True)
+                    await asyncio.gather(user_request_task, poller_task, snapshot_task, heartbeat_task, buffer_task, missed_opp_task, screener_poller_task, return_exceptions=True)
 
                     # 4. Flush traces and checkpoint SQLite database
                     try:
@@ -3789,8 +4919,9 @@ class PaperTradingEngine:
             )
 
 
-# Alias Runner for PaperTradingEngine
+# Alias Runner and AlphaEngine for PaperTradingEngine
 Runner = PaperTradingEngine
+AlphaEngine = PaperTradingEngine
 
 
 def _build_example_config() -> tuple[

@@ -8,7 +8,7 @@ Python 3.11+ | asyncio
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Union
+from typing import Union, Any
 
 from alpha_engine.models.enums import ChainIdentifier
 from alpha_engine.rate_limiter.bucket import AsyncTokenBucket
@@ -82,6 +82,29 @@ class RateLimiterRegistry:
         limiter = self.for_chain(chain_or_provider)
         await limiter.acquire(cost=cost)
 
+    @classmethod
+    def from_config(cls, config: Any) -> "RateLimiterRegistry":
+        """
+        Build the registry configured from EngineConfig, respecting dynamic limits.
+        """
+        return cls(
+            alchemy=build_alchemy_limiter(),
+            helius=build_helius_limiter(),
+        )
+
+    def penalize_from_latency(
+        self,
+        chain_or_provider: Union[ChainIdentifier, str],
+        latency_ms: float,
+        threshold_ms: float = 400.0,
+    ) -> None:
+        """
+        Dynamically penalize rate limiter bucket if latency exceeds the health threshold.
+        """
+        if latency_ms > threshold_ms:
+            penalty = min(5.0, (latency_ms - threshold_ms) / 1000.0 * 2.0)
+            self.penalize(chain_or_provider, penalty)
+
     def penalize(
         self,
         chain_or_provider: Union[ChainIdentifier, str],
@@ -92,6 +115,16 @@ class RateLimiterRegistry:
         """
         limiter = self.for_chain(chain_or_provider)
         limiter.penalize(penalty_seconds)
+
+    def has_penalty(self, chain_or_provider: Union[ChainIdentifier, str]) -> bool:
+        """Check if target chain limiter is currently under rate-limit penalty."""
+        return self.for_chain(chain_or_provider).is_penalized
+
+    def reset_penalty(self, chain_or_provider: Union[ChainIdentifier, str]) -> None:
+        """Clear active rate-limit penalty for target chain."""
+        self.for_chain(chain_or_provider).reset_penalty()
+
+    get = for_chain
 
     def __repr__(self) -> str:
         return (

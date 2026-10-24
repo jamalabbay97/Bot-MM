@@ -30,6 +30,7 @@ from alpha_engine.math.cpmm import get_initial_bonding_curve_pool
 from alpha_engine.models.enums import (
     ChainIdentifier,
     ExitStage,
+    LotStatus,
     OrderSide,
     SecurityTier,
     SignalSource,
@@ -37,7 +38,7 @@ from alpha_engine.models.enums import (
     TradeExitReason,
 )
 from alpha_engine.models.events import SignalEvent
-from alpha_engine.models.state import PaperFill, SecurityReport
+from alpha_engine.models.state import PaperFill, PoolState, SecurityReport
 from alpha_engine.security.constants import is_blacklisted_token
 
 
@@ -538,4 +539,133 @@ def test_format_price_clean_dual_usd_and_native():
     dual_str = PaperTradingEngine._format_price_clean(price_sol, native_price_usd=sol_usd, unit="SOL")
     assert "SOL" in dual_str
     assert "$" in dual_str
+
+
+@pytest.mark.asyncio
+async def test_bonding_curve_pool_not_corrupted_by_price_poller():
+    """Verify that open bonding curve lots are not corrupted by price poller with 10 SOL dummy reserves."""
+    engine = PaperTradingEngine(config=EngineConfig())
+    mint = "2GXMToEET3vQKQCWpr2iB82mUd8trdNw9z87TfyFpump"
+
+    # 1. Establish legitimate bonding curve pool with 96.35 SOL reserve
+    real_curve_pool = PoolState(
+        pool_address=mint,
+        chain=ChainIdentifier.SOLANA_MAINNET,
+        token_address=mint,
+        native_reserve=Decimal("96.35365511"),
+        token_reserve=Decimal("348730915.0"),
+        fee_numerator=10,
+        fee_denominator=1000,
+        last_updated_block=460885082,
+        token_decimals=6,
+        native_decimals=9,
+        timestamp_s=time.time(),
+    )
+    engine._pool_registry.set(mint, real_curve_pool)
+
+    # 2. Open lot in bonding curve mode
+    fill = PaperFill(
+        token_address=mint,
+        pool_address=mint,
+        chain=ChainIdentifier.SOLANA_MAINNET,
+        side=OrderSide.BUY,
+        simulated_native_spent=Decimal("0.03"),
+        tokens_acquired=Decimal("102504.85"),
+        effective_price=Decimal("0.0000002926"),
+        price_impact_bps=104,
+        simulated_gas_cost_usd=Decimal("0.02"),
+        fill_latency_ms=45.0,
+        signal_timestamp_ns=time.time_ns(),
+        fill_timestamp_ns=time.time_ns(),
+        kelly_fraction=0.0139,
+        portfolio_equity_usd=Decimal("8300.0"),
+        platform="Pump.fun",
+    )
+    lot = engine._position_book.open_lot(
+        fill=fill,
+        signal_id="sig_pump_test",
+        initial_pool_reserve_native=real_curve_pool.native_reserve,
+        pool_address=mint,
+        bonding_curve_mode=True,
+        platform="Pump.fun",
+    )
+
+    # 3. Simulate poller check: bonding curve lot with active pool must NOT be in lots_needing_price
+    now_s = time.time()
+    lots_needing_price = [
+        l for l in [lot]
+        if (
+            not (l.bonding_curve_mode and engine._pool_registry.get(l.token_address, expected_token=l.token_address) is not None)
+            and (
+                engine._pool_registry.get(l.token_address, expected_token=l.token_address) is None
+                or getattr(engine._pool_registry.get(l.token_address, expected_token=l.token_address), "last_updated_block", 0) <= 0
+                or (
+                    (now_s - (l.open_timestamp_ns / 1e9 if l.open_timestamp_ns > 0 else now_s) > 15.0)
+                    and (now_s - getattr(engine._pool_registry.get(l.token_address, expected_token=l.token_address), "timestamp_s", now_s) > 15.0)
+                )
+            )
+        )
+    ]
+    assert len(lots_needing_price) == 0
+
+    # 4. Even if _poll_open_lots_prices is invoked, it must skip active bonding curve lots
+    await engine._poll_open_lots_prices([lot])
+    pool_after = engine._pool_registry.get(mint)
+    assert pool_after is not None
+    assert pool_after.native_reserve == Decimal("96.35365511")
+    assert pool_after.token_reserve == Decimal("348730915.0")
+
+
+@pytest.mark.asyncio
+async def test_emergency_drain_title_formatting():
+    """Verify that emergency_drain exits format as EMERGENCY EXIT instead of TAKE-PROFIT."""
+    engine = PaperTradingEngine(config=EngineConfig())
+    lot = OpenLot(
+        token_address="2GXMToEET3vQKQCWpr2iB82mUd8trdNw9z87TfyFpump",
+        chain=ChainIdentifier.SOLANA_MAINNET,
+        initial_tokens=Decimal("100000"),
+        tokens_held=Decimal("100000"),
+        entry_price=Decimal("0.00000029"),
+        platform="Pump.fun",
+        status=LotStatus.CLOSED,
+    )
+
+    exit_fill = PaperFill(
+        token_address=lot.token_address,
+        pool_address=lot.token_address,
+        chain=lot.chain,
+        side=OrderSide.SELL,
+        simulated_native_spent=Decimal("0.02"),
+        tokens_acquired=Decimal("100000"),
+        effective_price=Decimal("0.00000020"),
+        price_impact_bps=5000,
+        simulated_gas_cost_usd=Decimal("0.02"),
+        fill_latency_ms=45.0,
+        signal_timestamp_ns=time.time_ns(),
+        fill_timestamp_ns=time.time_ns(),
+        kelly_fraction=0.0,
+        portfolio_equity_usd=Decimal("8300.0"),
+        platform="Pump.fun",
+    )
+
+    broadcast_msgs = []
+    async def mock_broadcast(msg: str):
+        broadcast_msgs.append(msg)
+
+    engine._broadcast_trade_alert = mock_broadcast
+
+    # Record trade close and inspect recent closed trades & alert formatting
+    engine._record_closed_trade_and_notify(
+        lot=lot,
+        exit_fill=exit_fill,
+        decision_reason=TradeExitReason.EMERGENCY_DRAIN.value,
+        exit_pnl_usd=Decimal("-1.50"),
+        pnl_native=Decimal("-0.01"),
+    )
+    await asyncio.sleep(0.01)
+    last_trade = engine._recent_closed_trades[-1]
+    assert last_trade["exit_reason"] == "emergency_drain"
+    assert len(broadcast_msgs) == 1
+    assert "EMERGENCY EXIT: LIQUIDITY DRAIN" in broadcast_msgs[0]
+    assert "TAKE-PROFIT" not in broadcast_msgs[0]
 

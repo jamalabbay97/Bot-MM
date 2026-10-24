@@ -17,7 +17,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 from alpha_engine.models.enums import SignalStrength
 
 # Risk and Portfolio State Machine Constants
-MAX_ACTIVE_POSITIONS: int = 4
+MAX_ACTIVE_POSITIONS: int = 3
 MAX_PORTFOLIO_EXPOSURE_PCT: float = 0.05
 MAX_PER_TOKEN_RISK_PCT: float = 0.015
 MAX_TOP10_CONCENTRATION: float = 0.20
@@ -65,6 +65,16 @@ class EngineConfig(BaseSettings):
     solana_fallback_rpcs: list[str] = Field(
         default_factory=lambda: ["https://api.mainnet-beta.solana.com"],
         description="Fallback HTTP RPC endpoints for Solana (SVM)",
+    )
+    rpc_latency_threshold_ms: float = Field(
+        default=400.0,
+        gt=0.0,
+        description="Maximum round-trip RPC response latency in ms before initiating automatic failover",
+    )
+    rpc_max_block_lag: int = Field(
+        default=2,
+        ge=0,
+        description="Maximum block/slot lag relative to peer nodes before marking RPC endpoint degraded",
     )
 
     # -------------------------------------------------------------------------
@@ -158,7 +168,7 @@ class EngineConfig(BaseSettings):
     )
     ai_provider: str = Field(
         default="gemini",
-        description="AI provider for AlphaSupervisor-AI (gemini, openai, openrouter, anthropic)",
+        description="AI provider for AlphaSupervisor-AI (gemini, openai, openrouter, anthropic, groq, deepseek, ollama)",
     )
     gemini_api_key: Optional[str] = Field(
         default=None,
@@ -176,8 +186,24 @@ class EngineConfig(BaseSettings):
         default=None,
         description="Anthropic API key for Claude 3.5 Supervisor",
     )
+    groq_api_key: Optional[str] = Field(
+        default=None,
+        description="Groq API key for ultra-low latency Llama-3 inference",
+    )
+    deepseek_api_key: Optional[str] = Field(
+        default=None,
+        description="DeepSeek API key for advanced chain-of-thought alpha reasoning",
+    )
+    ai_base_url: Optional[str] = Field(
+        default=None,
+        description="Custom OpenAI-compatible base URL (e.g. for Ollama http://localhost:11434/v1, vLLM, or Together)",
+    )
+    ai_fallback_provider: Optional[str] = Field(
+        default=None,
+        description="Secondary fallback AI provider if primary provider times out or encounters rate limits",
+    )
     ai_model: str = Field(
-        default="gemini-2.5-flash",
+        default="gemini-3.8-flash",
         description="AI model to query for AlphaSupervisor-AI supervision",
     )
     ai_timeout_s: float = Field(
@@ -189,6 +215,37 @@ class EngineConfig(BaseSettings):
     ai_strict_veto: bool = Field(
         default=True,
         description="Enforce strict veto if AI supervisor decision is PASS",
+    )
+
+
+    # -------------------------------------------------------------------------
+    # 5g. Ruflo Multi-Agent Swarm Orchestration Framework
+    # -------------------------------------------------------------------------
+    ruflo_enabled: bool = Field(
+        default=True,
+        description="Enable Ruflo multi-agent swarm orchestration and specialized agents",
+    )
+    ruflo_topology: str = Field(
+        default="hierarchical",
+        description="Ruflo swarm coordination topology (hierarchical, mesh, adaptive)",
+    )
+    ruflo_consensus: str = Field(
+        default="bft",
+        description="Ruflo multi-agent consensus protocol (bft, raft, gossip)",
+    )
+    ruflo_reflection_interval_s: float = Field(
+        default=60.0,
+        gt=0.0,
+        description="Interval in seconds between autonomous episodic memory reflections",
+    )
+    ruflo_max_memory_episodes: int = Field(
+        default=2000,
+        ge=10,
+        description="Maximum episodes preserved in the Ruflo episodic memory vector store",
+    )
+    paper_trading_mode: bool = Field(
+        default=True,
+        description="Enforce simulated paper-trading execution with zero capital risk",
     )
 
     # -------------------------------------------------------------------------
@@ -264,6 +321,18 @@ class EngineConfig(BaseSettings):
         ge=1,
         le=50,
         description="Hard cap on concurrent active positions across all chains (default: 3)",
+    )
+    max_concurrent_analyses: int = Field(
+        default=5,
+        ge=1,
+        le=50,
+        description="Maximum concurrent background token analyses across workers (default: 5)",
+    )
+    max_user_request_queue_size: int = Field(
+        default=200,
+        ge=1,
+        le=5000,
+        description="Maximum capacity for dedicated user token request queue (default: 200)",
     )
     max_portfolio_exposure_pct: float = Field(
         default=0.05,
@@ -419,24 +488,18 @@ class EngineConfig(BaseSettings):
     # -------------------------------------------------------------------------
     active_strategy: str = Field(
         default="peak_trailing_50",
-        description="Active trading strategy profile: default, peak_trailing_50, peak_trailing_60, custom",
+        description="Active trading strategy profile: default (Dynamic Multi-Stage Ladders & Trailing Stops), peak_trailing_50, peak_trailing_60, custom",
     )
-    trailing_stop_from_peak_pct: float = Field(
+    trailing_stop_from_peak_pct: Optional[float] = Field(
         default=0.50,
-        ge=0.05,
-        le=0.90,
         description="Trailing stop loss drop percentage from highest recorded price (ATH peak, e.g. 50% or 60%)",
     )
-    custom_take_profit_pct: float = Field(
+    custom_take_profit_pct: Optional[float] = Field(
         default=0.50,
-        ge=0.05,
-        le=10.0,
         description="Take-profit target percentage (e.g. 0.50 for +50%, 0.60 for +60%)",
     )
-    custom_stop_loss_pct: float = Field(
+    custom_stop_loss_pct: Optional[float] = Field(
         default=0.50,
-        ge=0.05,
-        le=0.95,
         description="Hard stop-loss percentage for custom strategy",
     )
     auto_trade_enabled: bool = Field(
@@ -535,9 +598,9 @@ class EngineConfig(BaseSettings):
         description="Minimum qualitative signal strength required for entry (WEAK, MODERATE, STRONG)",
     )
     
-    tp1_pct: float = Field(default=0.20, description="Take Profit 1 (+20%)")
+    tp1_pct: float = Field(default=0.25, description="Take Profit 1 (+25%)")
     tp2_pct: float = Field(default=0.50, description="Take Profit 2 (+50%)")
-    tp3_pct: float = Field(default=1.00, description="Take Profit 3 (+100%)")
+    tp3_pct: float = Field(default=1.00, description="Take Profit 3 (+100% / 2x)")
     emergency_exit_liquidity_drop_pct: float = Field(
         default=0.40,
         description="Emergency exit if liquidity drops >40% in 5m",

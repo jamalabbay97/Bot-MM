@@ -165,6 +165,10 @@ class AsyncTokenBucket:
             penalty_seconds,
         )
 
+    def reset_penalty(self) -> None:
+        """Clear any active penalty backoff immediately."""
+        self._penalty_until = 0.0
+
     @asynccontextmanager
     async def throttle(self, cost: float = 1.0) -> AsyncIterator[None]:
         """
@@ -199,3 +203,8 @@ class AsyncTokenBucket:
             f"refill_rate={self.refill_rate:.1f}/s, "
             f"tokens={self.available_tokens:.2f})"
         )
+
+
+# Backward-compatible and semantic alias
+TokenBucketRateLimiter = AsyncTokenBucket
+

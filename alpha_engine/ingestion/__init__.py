@@ -20,6 +20,7 @@ from alpha_engine.ingestion.decoders import (
 )
 from alpha_engine.ingestion.dex_metrics import DEXMetricsAggregator
 from alpha_engine.ingestion.evm import EVMIngester
+from alpha_engine.ingestion.market_oracle import MarketOracle
 from alpha_engine.ingestion.svm import SVMIngester
 from alpha_engine.ingestion.telegram import TelegramIngester
 from alpha_engine.ingestion.x_stream import XStreamIngester
@@ -38,6 +39,7 @@ __all__ = [
     "XStreamIngester",
     "IngestionCoordinator",
     "DEXMetricsAggregator",
+    "MarketOracle",
     "_SWAP_TOPIC",
     "_SYNC_TOPIC",
 ]

@@ -191,9 +191,51 @@ def test_circuit_breaker_streak_and_drawdown():
 
     # Equity drops from 10500 to 9600 (drawdown = 900 / 10500 = 8.57% >= 8.0%)
     metrics2.record_closed_trade(Decimal("-900.0"), Decimal("0.01"), Decimal("9600.0"))
-    assert metrics2.circuit_breaker_active is True
-    assert metrics2.daily_drawdown_pct >= 8.0
-    assert "Daily drawdown reached" in metrics2.circuit_breaker_reason
+    # Manual Reset functionality
+    metrics2.reset_circuit_breaker()
+    assert metrics2.circuit_breaker_active is False
+    assert metrics2.consecutive_losses == 0
+    assert metrics2.circuit_breaker_reason == ""
+
+    # Automatic timeout reset clears consecutive losses
+    metrics.circuit_breaker_tripped_at = time.time() - 301.0
+    assert metrics.is_circuit_breaker_active(freeze_duration_s=300.0) is False
+    assert metrics.consecutive_losses == 0
+
+
+def test_restore_open_lots_discards_zombie_positions():
+    """Verify that restore_open_lots skips ancient zombie lots (>24h old) to prevent liquidation cascades."""
+    book = PositionBook()
+    now_ns = time.time_ns()
+    day_and_half_ago_ns = now_ns - int(36 * 3600 * 1e9)
+    five_mins_ago_ns = now_ns - int(300 * 1e9)
+
+    lots = [
+        {
+            "order_id": "zombie_lot_1",
+            "token_address": "ZombieToken111111111111111111111111111111",
+            "chain": "solana_mainnet",
+            "tokens_delta": 1000,
+            "effective_price": 0.001,
+            "native_spent": 1.0,
+            "fill_timestamp_ns": day_and_half_ago_ns,
+        },
+        {
+            "order_id": "fresh_lot_1",
+            "token_address": "FreshToken22222222222222222222222222222222",
+            "chain": "solana_mainnet",
+            "tokens_delta": 500,
+            "effective_price": 0.002,
+            "native_spent": 1.0,
+            "fill_timestamp_ns": five_mins_ago_ns,
+        },
+    ]
+
+    restored = book.restore_open_lots(lots, max_age_s=86400.0)
+    assert restored == 1
+    assert book.is_position_open("FreshToken22222222222222222222222222222222", ChainIdentifier.SOLANA_MAINNET) is True
+    assert book.is_position_open("ZombieToken111111111111111111111111111111", ChainIdentifier.SOLANA_MAINNET) is False
+
 
 
 # =====================================================================

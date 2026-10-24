@@ -452,6 +452,7 @@ def test_interactive_dm_scan_command_and_direct_ca():
     async def run():
         queue: asyncio.Queue = asyncio.Queue()
         ingester = TelegramIngester(event_queue=queue)
+        ingester.wallet_tracker.detect_address_type = AsyncMock(return_value="TOKEN")
 
         # 1. Base EVM address via /scan
         evm_ca = "0x285617313860407d647990b50375990264186566"

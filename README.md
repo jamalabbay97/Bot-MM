@@ -172,7 +172,7 @@ Located in `alpha_engine/council/`, the Council represents a decentralized hedge
 
 Located in `alpha_engine/engine/ai_supervisor.py`, `AlphaSupervisorAI` acts as the institutional risk overseer.
 
-- **Hybrid LLM & Deterministic Fallback**: Leverages Google Gemini (`gemini-2.5-flash` or custom models) or OpenAI with an asynchronous timeout guard ($4.0$s). If RPC, network, or quota issues arise, the engine falls back seamlessly to deterministic institutional rules.
+- **Hybrid LLM & Deterministic Fallback**: Leverages Google Gemini (`gemini-3.8-flash` or custom models) or OpenAI with an asynchronous timeout guard ($4.0$s). If RPC, network, or quota issues arise, the engine falls back seamlessly to deterministic institutional rules.
 - **Dynamic Global Risk Modes**:
   - `NORMAL`: Standard operation, full Kelly allocation.
   - `DEFENSIVE`: Tightened stop-loss (-8%), halved position sizing.
@@ -485,7 +485,7 @@ SOLANA_RPC_WS=wss://mainnet.helius-rpc.com/?api-key=YOUR_HELIUS_KEY
 AI_SUPERVISOR_ENABLED=true
 AI_PROVIDER=gemini                         # 'gemini' or 'openai'
 GEMINI_API_KEY=YOUR_GEMINI_API_KEY         # Optional: Leave empty for local deterministic heuristics
-AI_MODEL=gemini-2.5-flash
+AI_MODEL=gemini-3.8-flash
 AI_TIMEOUT_S=4.0
 AI_STRICT_VETO=true
 

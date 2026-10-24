@@ -83,6 +83,27 @@ def main(args: list[str] | None = None) -> int:
         action="store_true",
         help="Run system doctor diagnostics",
     )
+    parser.add_argument(
+        "--swarm",
+        action="store_true",
+        help="Display Ruflo multi-agent swarm status, topology, and agent telemetry",
+    )
+    parser.add_argument(
+        "--swarm-audit",
+        type=str,
+        metavar="TOKEN_ADDRESS",
+        help="Execute an autonomous Ruflo multi-agent consensus trade audit on a token address",
+    )
+    parser.add_argument(
+        "--close-all",
+        action="store_true",
+        help="Force market exit and close all active open positions in the paper ledger",
+    )
+    parser.add_argument(
+        "--reset-ledger",
+        action="store_true",
+        help="Reset paper trading ledger: clear all historical trades, lots, and snapshots",
+    )
     parsed = parser.parse_args(args)
 
     try:
@@ -94,6 +115,48 @@ def main(args: list[str] | None = None) -> int:
     if config.asyncio_debug:
         os.environ["PYTHONASYNCIODEBUG"] = "1"
         logging.getLogger("asyncio").setLevel(logging.DEBUG)
+
+    if parsed.swarm:
+        from alpha_engine.ruflo.swarm import RufloSwarmCoordinator
+        swarm = RufloSwarmCoordinator(config=config)
+        summary = swarm.get_swarm_status()
+        print("=== 🐝 Ruflo Multi-Agent Trading Swarm Status ===")
+        print(f"Topology: {summary['topology'].upper()} | Consensus: {summary['consensus'].upper()}")
+        print(f"Total Specialized Agents: {summary['agents_count']}")
+        print(f"Episodic Memory Episodes: {summary['episodic_memory_episodes']}")
+        print(f"Active Social Weight: {summary['active_social_weight']:.3f}\n")
+        print("Specialized Swarm Agents:")
+        for role, a in summary["agents"].items():
+            print(f"  • [{role}] {a['name']:<20} | Status: {a['status']:<10} | Tools: {a['tools_count']} | Tasks: {a['tasks_executed']}")
+        return 0
+
+    if parsed.swarm_audit:
+        from alpha_engine.ruflo.swarm import RufloSwarmCoordinator
+        token_ca = parsed.swarm_audit.strip()
+        chain_str = "base_mainnet" if token_ca.startswith("0x") and len(token_ca) == 42 else "solana_mainnet"
+        swarm = RufloSwarmCoordinator(config=config)
+
+        async def _run_swarm_consensus():
+            await swarm.start()
+            try:
+                return await swarm.execute_trade_consensus(
+                    token_address=token_ca,
+                    chain=chain_str,
+                )
+            finally:
+                await swarm.stop()
+
+        res = asyncio.run(_run_swarm_consensus())
+        print(f"=== 🐝 Ruflo Multi-Agent Swarm Consensus Audit: {token_ca} ===")
+        print(f"Approved: {'✅ YES' if res.get('consensus_approved') else '❌ NO'}")
+        if not res.get("consensus_approved"):
+            print(f"Rejection Agent: {res.get('rejection_agent')}")
+            print(f"Reason: {res.get('reason')}")
+        else:
+            print(f"Security Score: {res.get('security_score')}/100")
+            print(f"Protocol: {res.get('protocol')} | Topology: {res.get('topology')}")
+            print(f"Position Sizing: {res.get('position_sizing')}")
+        return 0
 
     if parsed.chat:
         from alpha_engine.chat_interface import cli_chat
@@ -204,6 +267,35 @@ def main(args: list[str] | None = None) -> int:
         print("✅ Trade Frequency & Pacing Governor successfully reset to 0 trades and 0 cooldown.")
         return 0
 
+    if parsed.close_all:
+        from alpha_engine.execution.ledger import SQLiteLedger
+        engine = PaperTradingEngine(config)
+        async def _close():
+            ledger = SQLiteLedger(config.db_path)
+            await ledger.initialize()
+            engine._ledger = ledger
+            open_lots = await ledger.restore_open_positions_from_ledger()
+            engine._position_book.restore_open_lots(open_lots, max_age_s=0.0)
+            res = await engine.force_close_all_open_lots()
+            await ledger.close()
+            return res
+        closed_count = asyncio.run(_close())
+        print(f"✅ Closed {closed_count} open positions across all chains and updated ledger.")
+        return 0
+
+    if parsed.reset_ledger:
+        from alpha_engine.execution.ledger import SQLiteLedger
+        engine = PaperTradingEngine(config)
+        async def _reset():
+            ledger = SQLiteLedger(config.db_path)
+            await ledger.initialize()
+            engine._ledger = ledger
+            await engine.reset_paper_trading_ledger()
+            await ledger.close()
+        asyncio.run(_reset())
+        print("✅ Paper trading ledger wiped clean (trades, lots, snapshots, signals reset to 0).")
+        return 0
+
     if parsed.status or parsed.trades or parsed.signals or parsed.news or parsed.whales:
         import sqlite3
 
@@ -233,7 +325,15 @@ def main(args: list[str] | None = None) -> int:
                 rows = cur.fetchall()
                 print(f"=== Last {len(rows)} Trades ({config.db_path}) ===")
                 for r in rows:
-                    pnl = f"+${r['realized_pnl_usd']:.2f}" if r['realized_pnl_usd'] else "OPEN"
+                    pnl_raw = r['realized_pnl_usd']
+                    if pnl_raw is not None and str(pnl_raw).strip() != "":
+                        try:
+                            pnl_f = float(pnl_raw)
+                            pnl = f"+${pnl_f:.2f}" if pnl_f >= 0 else f"-${abs(pnl_f):.2f}"
+                        except Exception:
+                            pnl = str(pnl_raw)
+                    else:
+                        pnl = "OPEN"
                     plat = r['platform'] if has_platform and r['platform'] else resolve_trade_platform(token_address=r['token_address'], chain=r['chain'])
                     print(f"{r['created_at']} | {plat} | {r['chain']} | {r['side']} | {r['token_address'][:12]}.. | Fill: {r['effective_price']} | PnL: {pnl}")
             if parsed.signals or parsed.status:

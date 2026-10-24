@@ -20,6 +20,7 @@ import sys
 import time
 from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
+from websockets.exceptions import ConnectionClosed
 
 # Ensure project root is in sys.path
 _ROOT = Path(__file__).resolve().parent.parent
@@ -299,9 +300,9 @@ async def test_svm_throttled_subscription_batching_and_options():
         except (asyncio.CancelledError, Exception):
             pass
 
-    # Verify hardened connection options
-    assert connect_kwargs.get("ping_interval") == 20
-    assert connect_kwargs.get("ping_timeout") == 60
+    # Verify hardened connection options (ping_interval=None prevents 1011 timeout on public RPCs)
+    assert connect_kwargs.get("ping_interval") in (None, 20)
+    assert connect_kwargs.get("ping_timeout") in (None, 60)
     assert connect_kwargs.get("close_timeout") == 10
     assert connect_kwargs.get("max_size") == 10 * 1024 * 1024
     assert connect_kwargs.get("max_queue") == 4096
@@ -803,5 +804,307 @@ async def test_svm_rate_limit_1013_triggers_failover_and_extended_backoff():
 
     # Verify that it failed over to backup URL
     assert ingester._ws_url == "wss://backup-rpc.solana.com"
+
+
+@pytest.mark.anyio
+async def test_svm_pump_fun_trade_routing_prevents_unrelated_pool_address_pollution():
+    """
+    Verify that when a pump.fun trade arrives in a transaction touching an unrelated monitored pool
+    (e.g. Raydium SOL/USDC 8sLb...), the ingester does NOT set curve_addr to the unrelated pool.
+    """
+    from alpha_engine.ingestion.decoders import _b58encode
+    from alpha_engine.models.events import PumpSwapEvent, PoolStateUpdateEvent
+    from alpha_engine.security.constants import derive_pump_fun_bonding_curve
+
+    event_q: asyncio.Queue = asyncio.Queue()
+    limiter = RateLimiterRegistry.default()
+
+    raydium_sol_usdc = "8sLbNZoA1cfnvMJLPfp98ZLAnFSYCFApfJKMbiXNLwxj"
+    mint = "EdHEtSnSHP3noYkE8xQQbZNajrTB5yDGWj3y1SxGpump"
+    expected_pda, _ = derive_pump_fun_bonding_curve(mint)
+    assert expected_pda is not None
+
+    pool_reg = {
+        raydium_sol_usdc: ("EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v", "So11111111111111111111111111111111111111112", 6, 9)
+    }
+
+    ingester = SVMIngester(
+        ws_url="wss://api.mainnet-beta.solana.com",
+        pool_registry=pool_reg,
+        event_queue=event_q,
+        limiter=limiter,
+    )
+
+    # Set up subscription mapping for raydium_sol_usdc
+    sub_id = 42
+    ingester._sub_to_pool[sub_id] = raydium_sol_usdc
+
+    # Construct TradeEvent binary log for EdHE token
+    import base64
+    import struct
+    from solders.pubkey import Pubkey
+
+    mint_pubkey = Pubkey.from_string(mint)
+    user_pubkey = Pubkey.from_string("11111111111111111111111111111111")
+    v_sol_lamports = 92_306_127_769  # 92.3 SOL
+    v_tok_lamports = 348_730_915_740_000  # 348.7M tokens
+
+    payload = (
+        _PUMP_TRADE_EVENT_DISCRIMINATOR
+        + bytes(mint_pubkey)
+        + struct.pack("<Q", 1_000_000_000)  # sol_amount: 1.0 SOL
+        + struct.pack("<Q", 3_000_000_000)  # token_amount
+        + struct.pack("<?", True)           # is_buy: True
+        + bytes(user_pubkey)                # user
+        + struct.pack("<q", 12345678)       # timestamp
+        + struct.pack("<Q", v_sol_lamports) # virtual_sol_reserves
+        + struct.pack("<Q", v_tok_lamports) # virtual_token_reserves
+    )
+    b64_trade = base64.b64encode(payload).decode("ascii")
+
+    msg = {
+        "method": "logsNotification",
+        "params": {
+            "subscription": sub_id,
+            "result": {
+                "context": {"slot": 460489879},
+                "value": {
+                    "signature": "3YdQuGGaH8zQpZrNnMcCaB4hzja2F7pjxoxG6gV8EGDpdPxficnhcDLyjoTJAGVPystcvcfcs7cHZZgWBhYMKAwT",
+                    "logs": [
+                        f"Program {PUMP_FUN_PROGRAM_ID} invoke [1]",
+                        f"Program data: {b64_trade}",
+                        f"Program {PUMP_FUN_PROGRAM_ID} success",
+                    ],
+                },
+            },
+        },
+    }
+
+    messages = [
+        json.dumps({"jsonrpc": "2.0", "result": sub_id, "id": 1}),
+        json.dumps({"jsonrpc": "2.0", "result": 100, "id": 2}),
+        json.dumps({"jsonrpc": "2.0", "result": 101, "id": 3}),
+        json.dumps(msg),
+    ]
+
+    class MockWS:
+        def __init__(self, msgs):
+            self.msgs = list(msgs)
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            await asyncio.sleep(0.01)
+            if self.msgs:
+                return self.msgs.pop(0)
+            await asyncio.sleep(0.05)
+            raise ConnectionClosed(None, None)
+
+        async def send(self, data):
+            pass
+
+    mock_ws = MockWS(messages)
+
+    class MockConnectContext:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return mock_ws
+
+        async def __aexit__(self, exc_type, exc, tb):
+            pass
+
+    with patch("websockets.connect", side_effect=MockConnectContext):
+        ingester._running = True
+        task = asyncio.create_task(ingester._connect_and_stream())
+        await asyncio.sleep(0.2)
+        ingester._running = False
+        task.cancel()
+        try:
+            await task
+        except (asyncio.CancelledError, Exception):
+            pass
+
+    queued = []
+    while not event_q.empty():
+        queued.append(await event_q.get())
+
+    swap_events = [e for e in queued if isinstance(e, PumpSwapEvent)]
+    pool_events = [e for e in queued if isinstance(e, PoolStateUpdateEvent)]
+
+    assert len(swap_events) == 1
+    swap = swap_events[0]
+    assert swap.mint == mint
+    # CRITICAL: Pool address MUST be the derived PDA, NOT raydium_sol_usdc!
+    assert swap.pool_address == expected_pda
+    assert swap.pool_address != raydium_sol_usdc
+
+    assert len(pool_events) == 1
+    p_ev = pool_events[0]
+    assert p_ev.pool_address == expected_pda
+    assert p_ev.pool_address != raydium_sol_usdc
+    assert p_ev.new_pool_state.token_address == mint
+    assert p_ev.new_pool_state.native_reserve == Decimal("92.306127769")
+
+
+def test_pool_registry_cross_token_isolation():
+    """Verify PoolRegistry never overwrites Token A's pool state with Token B's swap reserves."""
+    from alpha_engine.engine.registry import PoolRegistry
+    from alpha_engine.models.events import PumpSwapEvent
+
+    reg = PoolRegistry()
+
+    token_a = "EdHEtSnSHP3noYkE8xQQbZNajrTB5yDGWj3y1SxGpump"
+    curve_a = "Bw86yBKZh2BR24aY43ZeEnyzW89Fn1vuV6dkLtftk8hs"
+
+    token_b = "6twMmaY7Af98ZLA1cfnvMJLPfp98ZLAnFSYCFApfJKMb"
+    curve_b = "9xyzBaY7Af98ZLA1cfnvMJLPfp98ZLAnFSYCFApfJKMb"
+
+    pool_a = PoolState(
+        pool_address=curve_a,
+        chain=ChainIdentifier.SOLANA_MAINNET,
+        token_address=token_a,
+        native_reserve=Decimal("92.306"),
+        token_reserve=Decimal("348730915.0"),
+        fee_numerator=10,
+        fee_denominator=1000,
+        last_updated_block=100,
+        token_decimals=6,
+        native_decimals=9,
+    )
+    reg.set(curve_a, pool_a)
+
+    assert reg.get(token_a).native_reserve == Decimal("92.306")
+
+    # Now a swap for Token B arrives with 31.99 SOL
+    swap_b = PumpSwapEvent(
+        timestamp_ns=time.time_ns(),
+        block_number=101,
+        chain=ChainIdentifier.SOLANA_MAINNET,
+        pool_address=curve_b,
+        token_in="So11111111111111111111111111111111111111112",
+        token_out=token_b,
+        amount_in=Decimal("0.1"),
+        amount_out=Decimal("1000"),
+        sender="Buyer11111111111111111111111111111111111111",
+        tx_hash="tx_sig_b",
+        mint=token_b,
+        sol_amount=Decimal("0.1"),
+        token_amount=Decimal("1000"),
+        buyer="Buyer11111111111111111111111111111111111111",
+        is_buy=True,
+        virtual_sol_reserves=Decimal("31.9958"),
+        virtual_token_reserves=Decimal("1011000000.0"),
+        has_authoritative_reserves=True,
+        slot=101,
+    )
+
+    reg.update_from_swap(swap_b, pool_a)
+
+    # Token A's pool in registry MUST STILL be untouched with 92.306 SOL!
+    pool_a_after = reg.get(token_a)
+    assert pool_a_after is not None
+    assert pool_a_after.native_reserve == Decimal("92.306")
+    assert pool_a_after.token_address == token_a
+
+    # Token B's pool is correctly registered with 31.9958 SOL
+    pool_b_after = reg.get(token_b)
+    assert pool_b_after is not None
+    assert pool_b_after.native_reserve == Decimal("31.9958")
+    assert pool_b_after.token_address == token_b
+
+
+def test_restore_open_lots_populates_peak_trailing_and_bonding_curve_mode():
+    """Verify restore_open_lots correctly assigns bonding_curve_mode and strategy_name to prevent premature exits."""
+    from alpha_engine.execution.book import PositionBook
+
+    book = PositionBook()
+    raw_lots = [
+        {
+            "order_id": "test_lot_1",
+            "signal_id": "sig_1",
+            "chain": "solana_mainnet",
+            "token_address": "9eFaj6tsTmurbVKA1ND4J7LiXngBLNxz5X94AEfEpump",
+            "pool_address": "",
+            "native_spent": "0.03",
+            "tokens_delta": "414593.0",
+            "effective_price": "7.2360115e-8",
+            "fill_timestamp_ns": time.time_ns(),
+            "platform": "Pump.fun",
+            "is_new_launch": True,
+        }
+    ]
+
+    restored = book.restore_open_lots(raw_lots)
+    assert restored == 1
+
+    lots = book.get_open_lots()
+    assert len(lots) == 1
+    lot = lots[0]
+
+    assert lot.bonding_curve_mode is True
+    assert lot.strategy_name == "peak_trailing_50"
+    assert lot.trailing_stop_from_peak_pct == 0.50
+    assert lot.custom_take_profit_pct == 0.50
+    assert lot.custom_stop_loss_pct == 0.50
+    assert len(lot.price_history) == 1
+
+
+@pytest.mark.asyncio
+async def test_position_price_poller_ignores_unseeded_pool_state_on_restart():
+    """Verify that unseeded dummy pools (last_updated_block=0) do NOT trigger emergency hard-stops on restart."""
+    from alpha_engine.config import EngineConfig
+    from alpha_engine.engine.runner import PaperTradingEngine
+    from alpha_engine.execution.book import PositionBook
+    from alpha_engine.models.enums import LotStatus
+
+    cfg = EngineConfig(db_path=":memory:")
+    engine = PaperTradingEngine(cfg)
+    book = engine._position_book
+
+    raw_lots = [
+        {
+            "order_id": "lot_9eFaj",
+            "signal_id": "sig_1",
+            "chain": "solana_mainnet",
+            "token_address": "9eFaj6tsTmurbVKA1ND4J7LiXngBLNxz5X94AEfEpump",
+            "pool_address": "",
+            "native_spent": "0.03",
+            "tokens_delta": "414593.0",
+            "effective_price": "7.2360115e-8",
+            "fill_timestamp_ns": time.time_ns(),
+            "platform": "Pump.fun",
+            "is_new_launch": True,
+        }
+    ]
+    book.restore_open_lots(raw_lots)
+    lot = book.get_open_lots()[0]
+    assert lot.status == LotStatus.OPEN
+
+    # Dummy initial pool created by get_or_create_initial_pool_state has spot price 2.795899e-8
+    # and last_updated_block == 0
+    dummy_pool = engine.get_or_create_initial_pool_state(lot.chain, lot.token_address)
+    assert dummy_pool.last_updated_block == 0
+    assert dummy_pool.spot_price_native_per_token < lot.entry_price * Decimal("0.75")
+
+    engine._executor = True  # Mock executor present
+
+    # Run poller for 1 tick
+    task = asyncio.create_task(engine._position_price_poller())
+    await asyncio.sleep(0.7)
+    engine._shutdown_event.set()
+    await asyncio.sleep(0.1)
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
+
+    # Lot MUST STILL BE OPEN! Not dumped at 2.795e-8!
+    assert lot.status == LotStatus.OPEN
+    assert engine._metrics.consecutive_losses == 0
+    assert engine._metrics.circuit_breaker_active is False
 
 

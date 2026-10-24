@@ -28,6 +28,9 @@ class SystemDoctor:
             "Solana SVM RPC": self._ping_url("https://api.mainnet-beta.solana.com", is_rpc=True, payload={"jsonrpc": "2.0", "method": "getHealth", "params": [], "id": 1}),
             "RugCheck API": self._ping_url("https://api.rugcheck.xyz/v1/tokens/So11111111111111111111111111111111111111112/report/summary"),
             "GoPlus API": self._ping_url("https://api.gopluslabs.io/api/v1/supported_chains"),
+            "Fear & Greed (Alternative.me)": self._ping_url("https://api.alternative.me/fng/?limit=1"),
+            "DefiLlama Price Oracle": self._ping_url("https://coins.llama.fi/prices/current/solana:So11111111111111111111111111111111111111112"),
+            "GeckoTerminal Public DEX": self._ping_url("https://api.geckoterminal.com/api/v2/networks/solana/tokens/So11111111111111111111111111111111111111112"),
             "Jina Reader": self._ping_url("https://r.jina.ai/https://example.com"),
             "Reddit Search": self._ping_url("https://www.reddit.com/r/CryptoCurrency/search.json?q=test&limit=1"),
         }

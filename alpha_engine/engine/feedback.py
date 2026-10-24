@@ -126,8 +126,11 @@ class AdaptiveFeedbackEngine:
         min_social_weight: float = 0.20,
         decay_factor: float = 0.80,
         lookback_trades: int = 10,
+        episodic_memory: Optional[Any] = None,
+        **kwargs: Any,
     ) -> None:
         self._profiler = profiler
+        self.episodic_memory = episodic_memory
         self.social_signal_weight = initial_social_weight
         self._min_social_weight = min_social_weight
         self._decay_factor = decay_factor
@@ -137,11 +140,20 @@ class AdaptiveFeedbackEngine:
         self._reflections: list[TradeReflection] = []
         self._source_history: dict[SignalSource, list[TradeReflection]] = defaultdict(list)
         self._wallet_history: dict[str, list[TradeReflection]] = defaultdict(list)
+        self.source_confidence_weights: dict[Any, float] = {src: 1.0 for src in SignalSource}
+        for src in SignalSource:
+            self.source_confidence_weights[src.name] = 1.0
+            self.source_confidence_weights[src.value] = 1.0
+        self.source_confidence_weights["X_STREAM"] = 1.0
 
         # Autonomous learning & parameter adaptation modules
         self.pattern_store = PatternMemoryStore()
         self.parameter_tuner = DynamicParameterTuner()
         self.missed_opportunity_analyzer = MissedOpportunityAnalyzer(self.pattern_store)
+
+    def get_source_confidence_weight(self, source: SignalSource) -> float:
+        """Return the dynamic confidence weight [0.20, 1.20] for a given signal source."""
+        return self.source_confidence_weights.get(source, 1.0)
 
     async def record_closed_trade(self, reflection: TradeReflection) -> None:
         """
@@ -170,6 +182,133 @@ class AdaptiveFeedbackEngine:
         if reflection.wallet_address:
             self._wallet_history[reflection.wallet_address].append(reflection)
             await self._evaluate_wallet_health(reflection.wallet_address)
+
+    async def audit_closed_trade_ruflo(
+        self,
+        reflection: Optional[TradeReflection] = None,
+        memory: Optional[Any] = None,
+        episodic_memory: Optional[Any] = None,
+        **kwargs: Any,
+    ) -> dict[str, Any]:
+        """
+        Automated Ruflo post-trade audit analyzing realized PnL, gas/slippage decay,
+        and source accuracy (Telegram/X vs. On-Chain), updating whitelist_db and
+        signal confidence weights automatically.
+        """
+        if reflection is None:
+            raw_src = kwargs.get("signal_source", "TELEGRAM_SCRAPER")
+            if isinstance(raw_src, str):
+                if raw_src.upper() in ("X_STREAM", "X_SENTIMENT", "TWITTER"):
+                    src_enum = SignalSource.X_SENTIMENT
+                else:
+                    try:
+                        src_enum = SignalSource[raw_src.upper()]
+                    except KeyError:
+                        src_enum = SignalSource.TELEGRAM_SCRAPER
+            else:
+                src_enum = raw_src
+
+            raw_chain = kwargs.get("chain", "solana_mainnet")
+            if isinstance(raw_chain, str):
+                try:
+                    chain_enum = ChainIdentifier[raw_chain.upper()]
+                except KeyError:
+                    chain_enum = ChainIdentifier.SOLANA_MAINNET
+            else:
+                chain_enum = raw_chain
+
+            pnl_val = Decimal(str(kwargs.get("realized_pnl_usd", 0.0)))
+            reflection = TradeReflection(
+                trade_id=kwargs.get("trade_id", f"audit_{time.time_ns()}"),
+                token_address=kwargs.get("token_address", "token_unknown"),
+                chain=chain_enum,
+                signal_source=src_enum,
+                entry_price=Decimal(str(kwargs.get("entry_price", 1.0))),
+                exit_price=Decimal(str(kwargs.get("exit_price", 1.0))),
+                realized_pnl_usd=pnl_val,
+                roi_pct=float(kwargs.get("roi_pct", 0.0)),
+                is_win=pnl_val > Decimal(0),
+                actual_slippage_bps=int(kwargs.get("actual_slippage_bps", 0)),
+                expected_slippage_bps=int(kwargs.get("expected_slippage_bps", 50)),
+                time_to_fill_ms=float(kwargs.get("fill_latency_ms", 30.0)),
+            )
+
+        await self.record_closed_trade(reflection)
+
+        mem = memory or episodic_memory or getattr(self, "episodic_memory", None)
+
+        # 1. Slippage & Gas Decay Analysis
+        slippage_diff = reflection.actual_slippage_bps - reflection.expected_slippage_bps
+        slippage_leakage = max(0.0, float(slippage_diff) * float(reflection.entry_price) * 0.0001)
+        slippage_decay_flag = slippage_diff > 100 or reflection.actual_slippage_bps > 250
+
+        # 2. Source Accuracy & Confidence Adaptation across Telegram, X, and DEX
+        src = reflection.signal_source
+        src_trades = self._source_history[src]
+        lookback = min(len(src_trades), self._lookback_trades)
+        recent_src = src_trades[-lookback:] if lookback > 0 else []
+        wins = sum(1 for t in recent_src if t.is_win)
+        win_rate = (wins / len(recent_src)) if recent_src else (1.0 if reflection.is_win else 0.0)
+
+        old_weight = self.source_confidence_weights.get(src, 1.0)
+        if reflection.is_win:
+            new_weight = min(1.30, round(old_weight * 1.08, 3))
+        else:
+            new_weight = max(0.20, round(old_weight * 0.90, 3))
+
+        self.source_confidence_weights[src] = new_weight
+        self.source_confidence_weights[src.name] = new_weight
+        self.source_confidence_weights[src.value] = new_weight
+        if src == SignalSource.X_SENTIMENT:
+            self.source_confidence_weights["X_STREAM"] = new_weight
+
+        # 3. Dynamic Parameter Tuning
+        total_pnl = sum(t.realized_pnl_usd for t in self._reflections[-20:]) if self._reflections else Decimal(0)
+        all_wins = sum(1 for t in self._reflections[-20:] if t.is_win)
+        recent_win_rate = (all_wins / len(self._reflections[-20:]) * 100.0) if self._reflections else 50.0
+        tuned_params = self.parameter_tuner.update_from_performance(
+            win_rate_24h=recent_win_rate,
+            realized_pnl_usd=total_pnl,
+            total_trades_24h=len(self._reflections[-20:]),
+        )
+
+        # 4. Episodic Memory Record (if RufloEpisodicMemory provided)
+        episode_id = None
+        if mem is not None and hasattr(mem, "record_episode"):
+            from alpha_engine.ruflo.memory import MemoryEpisode
+            root_cause = "PROFIT_TARGET_HIT" if reflection.is_win else (
+                "SLIPPAGE_DECAY" if slippage_decay_flag else "STOP_LOSS_TRIGGERED"
+            )
+            ep = MemoryEpisode(
+                episode_id=reflection.trade_id,
+                token_address=reflection.token_address,
+                chain=reflection.chain.value if hasattr(reflection.chain, "value") else str(reflection.chain),
+                decision_type="ENTER",
+                signal_source=reflection.signal_source.value,
+                confidence_score=float(tuned_params.confidence_multiplier),
+                feature_vector=[float(recent_win_rate) / 100.0, float(reflection.roi_pct) / 100.0, 0.5, 0.5, 0.5, 0.5, 0.5],
+                realized_pnl_usd=float(reflection.realized_pnl_usd),
+                roi_pct=float(reflection.roi_pct),
+                actual_slippage_bps=reflection.actual_slippage_bps,
+                fill_latency_ms=reflection.time_to_fill_ms,
+                root_cause_tag=root_cause,
+                summary_reflection=f"Post-trade audit for {reflection.token_address[:8]}: PnL=${reflection.realized_pnl_usd} ({reflection.roi_pct:.1f}%). Source {reflection.signal_source.value} weight updated to {new_weight}",
+            )
+            await mem.record_episode(ep)
+            episode_id = ep.episode_id
+
+        return {
+            "status": "AUDITED",
+            "trade_id": reflection.trade_id,
+            "signal_source": reflection.signal_source.value,
+            "source_win_rate": round(win_rate, 3),
+            "source_new_weight": new_weight,
+            "slippage_decay_flag": slippage_decay_flag,
+            "slippage_leakage_usd": round(slippage_leakage, 4),
+            "tuned_confidence_multiplier": tuned_params.confidence_multiplier,
+            "tuned_max_slippage_bps": tuned_params.max_slippage_bps,
+            "episodic_memory_id": episode_id,
+        }
 
     def _adapt_social_weight(self) -> None:
         x_trades = self._source_history[SignalSource.X_SENTIMENT]

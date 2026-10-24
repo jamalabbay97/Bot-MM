@@ -127,7 +127,7 @@ C. Network Gas & Congestion Mitigation:
 ================================================================================
 4b. REVIVAL & COMMUNITY TAKEOVER (CTO) BREAKOUT SWING AUDIT
 ================================================================================
-When analyzing tokens emerging from dormant accumulation (2h to 10 days old):
+When analyzing tokens emerging from dormant accumulation (1m to 10 days old):
 - Social Momentum vs. Wash Trading: Assess whether the volume surge (>= 3x 1h SMA) is accompanied by authentic organic social momentum (CTO Telegram/X community revival, original creator wallet balance <= 0.1%) vs. a wash-trading sandwich bot pump.
 - Anti-FOMO & Over-Extension Guard: Reject immediately if current_mcap / dormant_mcap > 2.5 or if current price is > 2.2x consolidation base. Do not buy vertical green candles or top wicks.
 
@@ -140,6 +140,82 @@ When analyzing trade performance logs and execution ledgers:
 - Continuous Adaptation: Update the token blacklist, whitelist top-performing wallets, and decrease exposure to degrading strategies.
 
 ================================================================================
+6. FEW-SHOT IN-CONTEXT REASONING EXEMPLARS
+================================================================================
+[EXEMPLAR 1: REJECT - Pump.fun Curve Migration Void & Churn Wash-Trading]
+Input: bonding_curve_progress_pct=94.5%, total_trades=42, profit_factor=0.98, top10_concentration=0.68
+Output:
+{
+  "decision": "PASS",
+  "confidence_score": 0.95,
+  "reasoning_summary": "Vetoed: 94.5% bonding curve progress sits squarely in the 90-99% migration sniper void, compounded by high top-10 concentration (68%) and churn wash trading.",
+  "action_parameters": {
+    "target_token_address": "Token...",
+    "recommended_position_pct": 0.0,
+    "max_slippage_bps": 50,
+    "priority_fee_multiplier": 1.0,
+    "take_profit_ladder": [{"trigger_multiplier": 2.0, "sell_pct": 50}],
+    "hard_stop_loss_pct": -15.0,
+    "trailing_stop_activation_pct": 40.0,
+    "time_exit_minutes": 15
+  },
+  "wallet_audit": {
+    "is_wallet_reputable": false,
+    "risk_classification": "WASH_TRADER",
+    "rationale": "High trade churn with net negative profit factor and sybil-like distribution."
+  },
+  "security_assessment": {
+    "is_secure": false,
+    "honeypot_risk": "SUSPICIOUS",
+    "liquidity_health": "THIN",
+    "flags": ["BONDING_CURVE_MIGRATION_SNIPER_VOID_90_99_PCT", "TOP10_CONCENTRATION_EXCESSIVE"]
+  },
+  "feedback_tuning": {
+    "adjust_global_risk": "DEFENSIVE",
+    "blacklisted_entities": [],
+    "insights_learned": "Avoided high-slippage liquidity migration frontrunning on Pump.fun."
+  }
+}
+
+[EXEMPLAR 2: EXECUTE_BUY - Authentic Smart Money Breakout / Organic CTO]
+Input: alpha_score=85, top10_concentration=0.11, mint_authority_disabled=true, freeze_authority_disabled=true, lp_burned_ratio=1.0, win_rate_pct=68.0, profit_factor=2.4
+Output:
+{
+  "decision": "EXECUTE_BUY",
+  "confidence_score": 0.92,
+  "reasoning_summary": "Approved: High alpha score (85/100), fully revoked mint/freeze authorities, 100% burned LP, verified organic smart money with 68% win rate and 2.4 profit factor.",
+  "action_parameters": {
+    "target_token_address": "Token...",
+    "recommended_position_pct": 1.25,
+    "max_slippage_bps": 150,
+    "priority_fee_multiplier": 1.2,
+    "take_profit_ladder": [
+      {"trigger_multiplier": 2.0, "sell_pct": 40},
+      {"trigger_multiplier": 3.5, "sell_pct": 30}
+    ],
+    "hard_stop_loss_pct": -15.0,
+    "trailing_stop_activation_pct": 40.0,
+    "time_exit_minutes": 20
+  },
+  "wallet_audit": {
+    "is_wallet_reputable": true,
+    "risk_classification": "ORGANIC_SMART_MONEY",
+    "rationale": "Proven 68% win rate, 2.4 profit factor, independent entry timing, and zero mixer links."
+  },
+  "security_assessment": {
+    "is_secure": true,
+    "honeypot_risk": "NONE",
+    "liquidity_health": "OPTIMAL",
+    "flags": []
+  },
+  "feedback_tuning": {
+    "adjust_global_risk": "NEUTRAL",
+    "blacklisted_entities": [],
+    "insights_learned": "High conviction setup with clean holder distribution and optimal CPMM reserves."
+  }
+}
+
+================================================================================
 OUTPUT SCHEMA INSTRUCTION (STRICT JSON ONLY)
 ================================================================================
 You must respond ONLY with a single valid, well-formed JSON object. Do not include markdown code block tags outside the JSON, do not include preliminary explanations, and do not add closing commentary. Use this exact schema:
@@ -147,6 +223,7 @@ You must respond ONLY with a single valid, well-formed JSON object. Do not inclu
 {
   "decision": "EXECUTE_BUY" | "EXECUTE_SELL" | "PASS" | "UPDATE_RISK_PARAMS",
   "confidence_score": 0.00 to 1.00,
+  "reasoning_summary": "1-2 sentence quantitative rationale explaining why this decision was reached",
   "action_parameters": {
     "target_token_address": "string",
     "recommended_position_pct": 0.00,
@@ -178,6 +255,7 @@ You must respond ONLY with a single valid, well-formed JSON object. Do not inclu
   }
 }
 """
+
 
 
 class AIOutcomeTracker:
@@ -389,32 +467,31 @@ class AlphaSupervisorAI:
         self._session = session
         self._owns_session = False
 
-        # Provider and credentials
+        # Provider, fallbacks, and credentials
         self._enabled: bool = getattr(config, "ai_supervisor_enabled", True)
         self._provider: str = getattr(config, "ai_provider", "gemini").lower()
-        provider_key: Optional[str] = None
-        if self._provider == "anthropic":
-            provider_key = getattr(config, "anthropic_api_key", None)
-        elif self._provider in ("openai", "openrouter"):
-            provider_key = getattr(config, "openai_api_key", None)
-        elif self._provider == "gemini":
-            provider_key = getattr(config, "gemini_api_key", None)
+        self._fallback_provider: Optional[str] = getattr(config, "ai_fallback_provider", None)
+        if self._fallback_provider:
+            self._fallback_provider = self._fallback_provider.lower()
+        self._base_url: Optional[str] = getattr(config, "ai_base_url", None)
 
         self._api_key: Optional[str] = (
-            provider_key
+            self._get_key_for_provider(self._provider)
             or getattr(config, "gemini_api_key", None)
             or getattr(config, "openai_api_key", None)
             or getattr(config, "anthropic_api_key", None)
+            or getattr(config, "groq_api_key", None)
+            or getattr(config, "deepseek_api_key", None)
             or getattr(config, "ai_api_key", None)
         )
-        model_val = getattr(config, "ai_model", "gemini-2.5-flash")
-        if self._provider == "anthropic" and model_val in ("gemini", "gemini-2.5-flash", "default", ""):
-            model_val = "claude-3-5-sonnet-latest"
-        elif model_val in ("gemini", "default", ""):
-            model_val = "gemini-2.5-flash"
-        self._model: str = model_val
+        if not self._api_key and self._provider == "ollama":
+            self._api_key = "ollama"
+
+        raw_model = getattr(config, "ai_model", "")
+        self._model: str = self._normalize_model_name(raw_model, self._provider)
         self._timeout_s: float = getattr(config, "ai_timeout_s", 4.0)
         self._strict_veto: bool = getattr(config, "ai_strict_veto", True)
+
 
         # Dynamic state & memory
         self._blacklisted_entities: DynamicBlacklistTracker = DynamicBlacklistTracker()
@@ -431,10 +508,98 @@ class AlphaSupervisorAI:
         self._ledger: Optional[Any] = None
         self._pattern_store: Optional[Any] = None
         self._parameter_tuner: Optional[Any] = None
+        self._episodic_memory: Optional[Any] = None
 
         # Council Integration
         from alpha_engine.council.arbiter_cro import CouncilArbiterCRO
         self._council = CouncilArbiterCRO()
+
+    def _get_key_for_provider(self, provider: str) -> Optional[str]:
+        """Resolve API key for a specific AI provider."""
+        p = provider.lower()
+        if p == "anthropic":
+            return getattr(self._cfg, "anthropic_api_key", None)
+        elif p in ("openai", "openrouter"):
+            return getattr(self._cfg, "openai_api_key", None)
+        elif p == "groq":
+            return getattr(self._cfg, "groq_api_key", None) or getattr(self._cfg, "openai_api_key", None)
+        elif p == "deepseek":
+            return getattr(self._cfg, "deepseek_api_key", None) or getattr(self._cfg, "openai_api_key", None)
+        elif p == "gemini":
+            return getattr(self._cfg, "gemini_api_key", None)
+        elif p == "ollama":
+            return getattr(self._cfg, "ai_api_key", "ollama") or "ollama"
+        return getattr(self._cfg, "ai_api_key", None)
+
+    def _get_default_model_for_provider(self, provider: str) -> str:
+        """Return the optimal default model identifier for the provider."""
+        p = provider.lower()
+        if p == "anthropic":
+            return "claude-3-5-sonnet-latest"
+        elif p == "groq":
+            return "llama-3.3-70b-versatile"
+        elif p == "deepseek":
+            return "deepseek-chat"
+        elif p == "ollama":
+            return "llama3.2"
+        elif p in ("openai", "openrouter"):
+            return "gpt-4o"
+        return "gemini-3.8-flash"
+
+    def _normalize_model_name(self, model_val: str, provider: str) -> str:
+        """Clean and normalize model aliases across AI providers."""
+        m = (model_val or "").strip()
+        p = provider.lower()
+        if not m or m in ("default", "auto", "gemini", ""):
+            return self._get_default_model_for_provider(p)
+        if p == "gemini":
+            if m in ("gemini-flash", "flash", "gemini-2.0-flash", "gemini-2.5-flash", "gemini-1.5-flash"):
+                return "gemini-3.8-flash"
+            elif m in ("gemini-pro", "pro", "gemini-1.5-pro", "gemini-2.5-pro"):
+                return "gemini-3.1-pro-preview"
+            elif m in ("gemini-lite", "flash-lite", "gemini-1.5-flash-8b"):
+                return "gemini-3.5-flash-lite"
+            elif m.startswith("models/"):
+                return m.replace("models/", "", 1)
+        elif p == "anthropic":
+            if m in ("gemini", "gemini-3.8-flash"):
+                return "claude-3-5-sonnet-latest"
+            elif m in ("claude-sonnet", "sonnet", "claude-3.5-sonnet"):
+                return "claude-3-5-sonnet-latest"
+            elif m in ("claude-3.7-sonnet", "claude-3-7-sonnet", "sonnet-3.7"):
+                return "claude-3-7-sonnet-latest"
+            elif m in ("claude-haiku", "haiku", "claude-3.5-haiku"):
+                return "claude-3-5-haiku-latest"
+        elif p in ("openai", "openrouter"):
+            if m in ("gemini", "gemini-3.8-flash", "gpt-5.6", "gpt-5", "gpt-4", "4o", "gpt4"):
+                return "gpt-4o"
+            elif m in ("gpt-4-turbo", "turbo"):
+                return "gpt-4o"
+            elif m in ("o3", "o3-mini-high"):
+                return "o3-mini"
+            elif m in ("gpt-4.5", "4.5"):
+                return "gpt-4.5-preview"
+            elif m in ("mini", "4o-mini", "gpt-4o-mini"):
+                return "gpt-4o-mini"
+        elif p == "groq":
+            if m in ("gemini", "gemini-3.8-flash", "llama-70b", "llama-3.3", "llama"):
+                return "llama-3.3-70b-versatile"
+            elif m in ("llama-8b", "instant"):
+                return "llama-3.1-8b-instant"
+        elif p == "deepseek":
+            if m in ("gemini", "gemini-3.8-flash", "chat", "deepseek-v3", "deepseek"):
+                return "deepseek-chat"
+            elif m in ("reasoner", "r1", "deepseek-r1"):
+                return "deepseek-reasoner"
+        elif p == "ollama":
+            if m in ("gemini", "gemini-3.8-flash"):
+                return "llama3.2"
+        return m
+
+    def set_episodic_memory(self, memory: Any) -> None:
+        """Connect persistent Ruflo episodic memory vector store."""
+        self._episodic_memory = memory
+
 
     async def run_council_debate(
         self,
@@ -600,7 +765,8 @@ class AlphaSupervisorAI:
             try:
                 session = await self._get_session()
                 if self._provider == "gemini":
-                    url = f"https://generativelanguage.googleapis.com/v1beta/models/{self._model}:generateContent?key={self._api_key}"
+                    clean_model = self._model.replace("models/", "", 1) if self._model.startswith("models/") else self._model
+                    url = f"https://generativelanguage.googleapis.com/v1beta/models/{clean_model}:generateContent?key={self._api_key}"
                     body = {
                         "contents": [
                             {"role": "user", "parts": [{"text": user_content}]}
@@ -625,10 +791,50 @@ class AlphaSupervisorAI:
                             resp_text = await response.text()
                             logger.warning("Gemini LLM call in answer_user_query returned status %s: %s", response.status, resp_text[:150])
 
-                elif self._provider in ("openai", "openrouter"):
-                    base_url = "https://api.openai.com/v1" if self._provider == "openai" else "https://openrouter.ai/api/v1"
+                elif self._provider == "anthropic":
+                    url = "https://api.anthropic.com/v1/messages"
+                    headers = {
+                        "x-api-key": self._api_key or "",
+                        "anthropic-version": "2023-06-01",
+                        "content-type": "application/json",
+                    }
+                    body = {
+                        "model": self._model,
+                        "max_tokens": 1024,
+                        "temperature": 0.4,
+                        "system": system_prompt,
+                        "messages": [
+                            {"role": "user", "content": user_content}
+                        ],
+                    }
+                    async with session.post(url, json=body, headers=headers, timeout=self._timeout_s) as response:
+                        if response.status == 200:
+                            data = await response.json()
+                            parts = data.get("content", [])
+                            if parts:
+                                text = parts[0].get("text", "")
+                                if text.strip():
+                                    return text.strip()
+                        else:
+                            resp_text = await response.text()
+                            logger.warning("Anthropic call in answer_user_query returned status %s: %s", response.status, resp_text[:150])
+
+                elif self._provider in ("openai", "openrouter", "groq", "deepseek", "ollama") or self._base_url:
+                    if self._base_url:
+                        base_url = self._base_url.rstrip("/")
+                    elif self._provider == "groq":
+                        base_url = "https://api.groq.com/openai/v1"
+                    elif self._provider == "deepseek":
+                        base_url = "https://api.deepseek.com/v1"
+                    elif self._provider == "ollama":
+                        base_url = "http://localhost:11434/v1"
+                    elif self._provider == "openrouter":
+                        base_url = "https://openrouter.ai/api/v1"
+                    else:
+                        base_url = "https://api.openai.com/v1"
+
                     url = f"{base_url}/chat/completions"
-                    headers = {"Authorization": f"Bearer {self._api_key}", "Content-Type": "application/json"}
+                    headers = {"Authorization": f"Bearer {self._api_key or 'ollama'}", "Content-Type": "application/json"}
                     body = {
                         "model": self._model,
                         "messages": [
@@ -649,6 +855,7 @@ class AlphaSupervisorAI:
                             logger.warning("%s call in answer_user_query returned status %s: %s", self._provider, response.status, resp_text[:150])
             except Exception as exc:
                 logger.debug("LLM call failed in answer_user_query: %s. Using heuristic fallback.", exc)
+
 
         # Deterministic localized fallback
         return self._deterministic_arabic_response(clean_q, merged_context)
@@ -1091,6 +1298,24 @@ class AlphaSupervisorAI:
         sender = trigger.sender if trigger else getattr(wallet_profile, "wallet_address", "")
         has_wallet_profile = wallet_profile is not None
 
+        # In-context episodic memory insights from Ruflo vector store
+        recent_episodes_data = []
+        if self._episodic_memory and hasattr(self._episodic_memory, "get_all_episodes"):
+            try:
+                eps = self._episodic_memory.get_all_episodes(limit=4)
+                recent_episodes_data = [
+                    {
+                        "token": e.token_address[:8],
+                        "source": e.signal_source,
+                        "roi_pct": round(e.roi_pct, 1),
+                        "pnl_usd": round(e.realized_pnl_usd, 2),
+                        "root_cause": e.root_cause_tag,
+                    }
+                    for e in eps
+                ]
+            except Exception:
+                pass
+
         return {
             "chain": signal.chain.value,
             "target_token_address": signal.token_address,
@@ -1157,16 +1382,25 @@ class AlphaSupervisorAI:
             },
             "strategy_v2_telemetry": {
                 "alpha_score": float(getattr(signal, "alpha_score", 0.0) or 0.0),
-            }
+            },
+            "episodic_memory_recent": recent_episodes_data,
         }
 
-    async def _call_llm(self, telemetry: dict[str, Any]) -> AISupervisorResponse:
-        """Execute async LLM call with strict JSON response decoding."""
+    async def _execute_provider_call(
+        self,
+        provider: str,
+        model: str,
+        api_key: Optional[str],
+        telemetry: dict[str, Any],
+    ) -> AISupervisorResponse:
+        """Internal worker executing LLM request against a designated AI provider."""
         session = await self._get_session()
         payload_text = json.dumps(telemetry, indent=2)
+        p = provider.lower()
 
-        if self._provider == "gemini":
-            url = f"https://generativelanguage.googleapis.com/v1beta/models/{self._model}:generateContent?key={self._api_key}"
+        if p == "gemini":
+            clean_model = model.replace("models/", "", 1) if model.startswith("models/") else model
+            url = f"https://generativelanguage.googleapis.com/v1beta/models/{clean_model}:generateContent?key={api_key}"
             body = {
                 "contents": [
                     {"role": "user", "parts": [{"text": f"Telemetry Input:\n{payload_text}"}]}
@@ -1187,36 +1421,15 @@ class AlphaSupervisorAI:
                 raw_json = data["candidates"][0]["content"]["parts"][0]["text"]
                 return AISupervisorResponse.from_strict_json(raw_json)
 
-        elif self._provider in ("openai", "openrouter"):
-            base_url = "https://api.openai.com/v1" if self._provider == "openai" else "https://openrouter.ai/api/v1"
-            url = f"{base_url}/chat/completions"
-            headers = {"Authorization": f"Bearer {self._api_key}", "Content-Type": "application/json"}
-            body = {
-                "model": self._model,
-                "messages": [
-                    {"role": "system", "content": ALPHA_SUPERVISOR_SYSTEM_PROMPT},
-                    {"role": "user", "content": f"Telemetry Input:\n{payload_text}"},
-                ],
-                "response_format": {"type": "json_object"},
-                "temperature": 0.1,
-            }
-            async with session.post(url, json=body, headers=headers, timeout=self._timeout_s) as response:
-                if response.status != 200:
-                    text = await response.text()
-                    raise RuntimeError(f"{self._provider} API returned status {response.status}: {text[:200]}")
-                data = await response.json()
-                raw_json = data["choices"][0]["message"]["content"]
-                return AISupervisorResponse.from_strict_json(raw_json)
-
-        elif self._provider == "anthropic":
+        elif p == "anthropic":
             url = "https://api.anthropic.com/v1/messages"
             headers = {
-                "x-api-key": self._api_key or "",
+                "x-api-key": api_key or "",
                 "anthropic-version": "2023-06-01",
                 "content-type": "application/json",
             }
             body = {
-                "model": self._model,
+                "model": model,
                 "max_tokens": 1024,
                 "temperature": 0.1,
                 "system": ALPHA_SUPERVISOR_SYSTEM_PROMPT,
@@ -1232,7 +1445,57 @@ class AlphaSupervisorAI:
                 raw_json = data["content"][0]["text"]
                 return AISupervisorResponse.from_strict_json(raw_json)
 
-        raise ValueError(f"Unsupported AI provider: {self._provider}")
+        elif p in ("openai", "openrouter", "groq", "deepseek", "ollama") or self._base_url:
+            if self._base_url:
+                base_url = self._base_url.rstrip("/")
+            elif p == "groq":
+                base_url = "https://api.groq.com/openai/v1"
+            elif p == "deepseek":
+                base_url = "https://api.deepseek.com/v1"
+            elif p == "ollama":
+                base_url = "http://localhost:11434/v1"
+            elif p == "openrouter":
+                base_url = "https://openrouter.ai/api/v1"
+            else:
+                base_url = "https://api.openai.com/v1"
+
+            url = f"{base_url}/chat/completions"
+            headers = {"Authorization": f"Bearer {api_key or 'ollama'}", "Content-Type": "application/json"}
+            body = {
+                "model": model,
+                "messages": [
+                    {"role": "system", "content": ALPHA_SUPERVISOR_SYSTEM_PROMPT},
+                    {"role": "user", "content": f"Telemetry Input:\n{payload_text}"},
+                ],
+                "response_format": {"type": "json_object"},
+                "temperature": 0.1,
+            }
+            async with session.post(url, json=body, headers=headers, timeout=self._timeout_s) as response:
+                if response.status != 200:
+                    text = await response.text()
+                    raise RuntimeError(f"{provider} API returned status {response.status}: {text[:200]}")
+                data = await response.json()
+                raw_json = data["choices"][0]["message"]["content"]
+                return AISupervisorResponse.from_strict_json(raw_json)
+
+        raise ValueError(f"Unsupported AI provider: {provider}")
+
+    async def _call_llm(self, telemetry: dict[str, Any]) -> AISupervisorResponse:
+        """Execute async LLM call with strict JSON response decoding and fallback support."""
+        try:
+            return await self._execute_provider_call(self._provider, self._model, self._api_key, telemetry)
+        except Exception as primary_exc:
+            if self._fallback_provider and self._fallback_provider != self._provider:
+                fb_key = self._get_key_for_provider(self._fallback_provider)
+                if fb_key:
+                    fb_model = self._get_default_model_for_provider(self._fallback_provider)
+                    logger.warning("Primary AI provider '%s' failed (%s); trying fallback provider '%s'", self._provider, primary_exc, self._fallback_provider)
+                    try:
+                        return await self._execute_provider_call(self._fallback_provider, fb_model, fb_key, telemetry)
+                    except Exception as fb_exc:
+                        logger.warning("Fallback AI provider '%s' also failed: %s", self._fallback_provider, fb_exc)
+            raise primary_exc
+
 
     def evaluate_deterministic(self, telemetry: dict[str, Any]) -> AISupervisorResponse:
         """
@@ -1579,6 +1842,30 @@ class AlphaSupervisorAI:
                 is_fatal=(attribution in (LossAttribution.RUG_PULL, LossAttribution.MEV_SANDWICH, LossAttribution.CABAL_DUMP)),
                 reason=attribution.value,
             )
+
+        # Record in Ruflo episodic memory if configured
+        if self._episodic_memory is not None and hasattr(self._episodic_memory, "record_episode"):
+            from alpha_engine.ruflo.memory import MemoryEpisode
+            ep = MemoryEpisode(
+                episode_id=str(getattr(reflection, "trade_id", token)),
+                token_address=token,
+                chain=str(getattr(reflection, "chain", "solana_mainnet")),
+                decision_type="ENTER",
+                signal_source=str(getattr(reflection, "signal_source", "DEX_SWAP")),
+                confidence_score=0.85,
+                feature_vector=[float(roi_pct) / 100.0, float(actual_bps) / 10000.0, 0.5, 0.5, 0.5, 0.5, 0.5],
+                realized_pnl_usd=float(getattr(reflection, "realized_pnl_usd", 0.0)),
+                roi_pct=float(roi_pct),
+                actual_slippage_bps=int(actual_bps),
+                fill_latency_ms=float(getattr(reflection, "time_to_fill_ms", 50.0)),
+                root_cause_tag=attribution.value if not is_win else "PROFIT_TARGET_HIT",
+                summary_reflection=insight,
+            )
+            try:
+                loop = asyncio.get_running_loop()
+                loop.create_task(self._episodic_memory.record_episode(ep))
+            except RuntimeError:
+                pass
 
         return FeedbackTuning(
             adjust_global_risk=self._global_risk_mode,

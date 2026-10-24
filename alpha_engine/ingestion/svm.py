@@ -40,7 +40,7 @@ from alpha_engine.models.events import (
 )
 from alpha_engine.models.state import PoolState
 from alpha_engine.rate_limiter.registry import RateLimiterRegistry
-from alpha_engine.security.constants import SOLANA_SYSTEM_PROGRAM_IDS
+from alpha_engine.security.constants import SOLANA_SYSTEM_PROGRAM_IDS, derive_pump_fun_bonding_curve
 
 
 logger = logging.getLogger(__name__)
@@ -419,8 +419,8 @@ class SVMIngester:
         async with websockets.connect(
             self._ws_url,
             ssl=ssl_ctx,
-            ping_interval=20,
-            ping_timeout=60,
+            ping_interval=None,
+            ping_timeout=None,
             close_timeout=10,
             max_size=10 * 1024 * 1024,
             max_queue=4096,
@@ -589,14 +589,32 @@ class SVMIngester:
                                 is_buy = pump_trade.get("is_buy", True)
                                 tok_amt = pump_trade.get("token_amount", Decimal("0"))
 
-                                curve_addr = mint_addr
-                                if pool_key in self._pool_registry and pool_key != PUMP_FUN_PROGRAM_ID:
+                                pda_curve, _ = (
+                                    derive_pump_fun_bonding_curve(mint_addr)
+                                    if mint_addr
+                                    else (None, None)
+                                )
+                                if pda_curve:
+                                    curve_addr = pda_curve
+                                elif pool_key in self._pool_registry and self._pool_registry[pool_key][0] == mint_addr:
                                     curve_addr = pool_key
                                 else:
+                                    curve_addr = mint_addr
                                     for c_addr, meta in self._pool_registry.items():
                                         if meta[0] == mint_addr:
                                             curve_addr = c_addr
                                             break
+
+                                if mint_addr and (
+                                    curve_addr not in self._pool_registry
+                                    or self._pool_registry[curve_addr][0] != mint_addr
+                                ):
+                                    self._pool_registry[curve_addr] = (
+                                        mint_addr,
+                                        sol_mint,
+                                        6,
+                                        9,
+                                    )
 
                                 if is_buy:
                                     token_in = sol_mint

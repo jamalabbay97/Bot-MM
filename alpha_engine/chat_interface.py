@@ -52,6 +52,7 @@ class ConversationalSupervisor:
         metrics: Optional[Any] = None,
         ai_supervisor: Optional[Any] = None,
         revival_buffer: Optional[Any] = None,
+        swarm_coordinator: Optional[Any] = None,
     ) -> None:
         self.ledger = ledger
         self.supervisor = supervisor or ai_supervisor
@@ -61,6 +62,7 @@ class ConversationalSupervisor:
         self.parameter_tuner = parameter_tuner
         self.metrics = metrics
         self.config = config or EngineConfig()
+        self.swarm_coordinator = swarm_coordinator
         self._asset_map: dict[str, str] = {}
 
     # =========================================================================
@@ -422,9 +424,30 @@ class ConversationalSupervisor:
             if not self.supervisor:
                 return "AlphaSupervisorAI is not attached, cannot perform deep web audit."
             result = await self.supervisor.deep_web_audit(query, query)
-            return f"### 🌐 Deep Research Report for {query}\n\n{result}"
         except Exception as e:
             return f"Deep Research encountered an error: {e}"
+
+    async def tool_swarm_status(self) -> str:
+        """Query and display Ruflo multi-agent swarm operational state and metrics."""
+        if not self.swarm_coordinator:
+            from alpha_engine.ruflo.swarm import RufloSwarmCoordinator
+            self.swarm_coordinator = RufloSwarmCoordinator(config=self.config)
+
+        status = self.swarm_coordinator.get_swarm_status()
+        lines = [
+            "### 🐝 حالة سرب الوكلاء التداولي المتعدد (Ruflo Trading Swarm Status)\n",
+            f"- **الهيكلية (Topology):** `{status['topology'].upper()}`",
+            f"- **بروتوكول الإجماع (Consensus):** `{status['consensus'].upper()}`",
+            f"- **حالة التشغيل:** `{'نشط (ACTIVE)' if status['is_running'] else 'متوقف (IDLE)'}`",
+            f"- **الذاكرة العرضية (Episodic Memory):** `{status['episodic_memory_episodes']}` صفقات مسجلة",
+            f"- **وزن إشارات السوشيال الحالي:** `{status['active_social_weight']:.3f}`\n",
+            "#### 🤖 وكلاء السرب التخصصيون (Specialized Swarm Agents):",
+        ]
+        for role, a in status["agents"].items():
+            lines.append(
+                f"- **`[{role}]` {a['name']}**: الحالة `{a['status']}` | أدوات مفعّلة: `{a['tools_count']}` | مهام منفذة: `{a['tasks_executed']}`"
+            )
+        return "\n".join(lines)
 
     # =========================================================================
     # Conversational RAG Router
@@ -483,6 +506,10 @@ class ConversationalSupervisor:
             if target:
                 return await self.tool_deep_research(target)
             return "Please provide a target for research. Example: `/research $TOKEN`"
+
+        # 1d. Check for swarm status
+        if lower_q in ("/swarm", "swarm", "حالة السرب", "السرب", "swarm status", "/swarm status"):
+            return await self.tool_swarm_status()
 
         # 2. Check for staging queries
         if (
@@ -594,6 +621,7 @@ class ConversationalSupervisor:
             "- *'Explain the exit decision on trade [CA].'* (اشرح قرار الخروج من الصفقة)\n"
             "- *'/assets'* (عرض العملات المكتشفة مؤخراً للتحقيق)\n"
             "- *'/investigate <id|CA>'* (تحقيق شامل وتتبع دورة حياة العملة)\n"
+            "- *'/swarm'* (عرض حالة سرب وكلاء رو فلو Ruflo Swarm والذاكرة العرضية)\n"
             "- *'/override risk <EXPAND|DEFENSIVE|NEUTRAL>'* (تعديل وضع المخاطرة)\n"
             "- *'/override blacklist <CA>'* (حظر عنوان عقد)\n"
             "- *'/override stage <CA>'* (إضافة عقد لمرحلة المراقبة)"

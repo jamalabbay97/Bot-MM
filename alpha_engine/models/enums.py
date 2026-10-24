@@ -153,10 +153,12 @@ class TradeExitReason(str, Enum):
 
     TP_25 = "tp_25"                                # Take-Profit: +25% (Scale out 50%)
     TP_50 = "tp_50"                                # Take-Profit: +50% (Sell remaining 50%)
+    TP_100 = "tp_100"                              # Take-Profit: +100% (Scale out 50% / recoup principal)
     TP_2X = "tp_2x"                                # Take Profit Ladder: 50% sold at 2x (+100%)
-    TP_3X = "tp_3x"                                # Take Profit Ladder: Incremental sold at 3x
-    TP_5X = "tp_5x"                                # Take Profit Ladder: Incremental sold at 5x
-    TP_10X = "tp_10x"                              # Take Profit Ladder: Incremental sold at 10x
+    TP_3X = "tp_3x"                                # Take Profit Ladder: Incremental sold at 3x (+200%)
+    TP_4X = "tp_4x"                                # Take Profit Ladder: Incremental sold at 4x (+300%)
+    TP_5X = "tp_5x"                                # Take Profit Ladder: Incremental sold at 5x (+400%)
+    TP_10X = "tp_10x"                              # Take Profit Ladder: Incremental sold at 10x (+900%)
     SL_INITIAL = "sl_initial"                      # Hard stop-loss (-8% / -15%)
     SL_HARD = "sl_hard"                            # Alias for hard stop-loss
     SL_TRAILING = "sl_trailing"                    # Trailing stop
@@ -291,5 +293,23 @@ def resolve_trade_platform(
             return TradingPlatform.DEX_SCAN.value
 
     return TradingPlatform.DEX_SCAN.value
+
+
+class TokenRequestState(str, Enum):
+    """Lifecycle state machine for a user-submitted token request."""
+
+    RECEIVED = "RECEIVED"
+    VALIDATING = "VALIDATING"
+    QUEUED = "QUEUED"
+    ANALYZING = "ANALYZING"
+    ELIGIBLE = "ELIGIBLE"
+    REJECTED = "REJECTED"
+    WAITING_FOR_CAPACITY = "WAITING_FOR_CAPACITY"
+    EXECUTION_PENDING = "EXECUTION_PENDING"
+    EXECUTED = "EXECUTED"
+    CLOSED = "CLOSED"
+    FAILED = "FAILED"
+    EXPIRED = "EXPIRED"
+
 
 

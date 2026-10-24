@@ -22,9 +22,9 @@ from typing import Any, Callable, Coroutine, Optional, TypeVar
 import aiosqlite
 
 from alpha_engine.models.decisions import DecisionRecord, DecisionType, PatternFeatureVector
-from alpha_engine.models.enums import LotStatus, TradeExitReason
+from alpha_engine.models.enums import ChainIdentifier, LotStatus, TokenRequestState, TradeExitReason
 from alpha_engine.models.events import SignalEvent
-from alpha_engine.models.state import PaperFill, PortfolioSnapshot, TradeRecord
+from alpha_engine.models.state import PaperFill, PortfolioSnapshot, TokenRequestRecord, TradeRecord
 
 logger = logging.getLogger(__name__)
 
@@ -209,6 +209,36 @@ class SQLiteLedger:
     )
     """
 
+    _CREATE_TOKEN_REQUESTS = """
+    CREATE TABLE IF NOT EXISTS token_requests (
+        request_id              TEXT PRIMARY KEY,
+        token_address           TEXT NOT NULL,
+        chain                   TEXT NOT NULL,
+        submitted_at_ns         INTEGER NOT NULL,
+        user_id                 TEXT,
+        message_id              INTEGER,
+        state                   TEXT NOT NULL,
+        opportunity_score       REAL NOT NULL DEFAULT 0.0,
+        opportunity_rank        INTEGER NOT NULL DEFAULT 0,
+        validation_status       TEXT NOT NULL DEFAULT 'PENDING',
+        rejection_reason        TEXT,
+        queue_entry_ts_ns       INTEGER,
+        queue_exit_ts_ns        INTEGER,
+        analysis_start_ts_ns    INTEGER,
+        analysis_end_ts_ns      INTEGER,
+        execution_start_ts_ns   INTEGER,
+        order_id                TEXT,
+        lot_id                  TEXT,
+        simulated_fill_price    TEXT,
+        tokens_filled           TEXT,
+        realized_pnl_usd        REAL,
+        close_reason            TEXT,
+        metadata_json           TEXT,
+        created_at              INTEGER NOT NULL,
+        updated_at_ns           INTEGER NOT NULL
+    )
+    """
+
     def __init__(
         self,
         db_path: str | Path = "paper_trading.db",
@@ -270,6 +300,10 @@ class SQLiteLedger:
         await conn.execute(self._CREATE_PATTERN_STORE)
         await conn.execute(self._CREATE_TRACE_LOG)
         await conn.execute(self._CREATE_SETTINGS)
+        await conn.execute(self._CREATE_TOKEN_REQUESTS)
+        await conn.execute("CREATE INDEX IF NOT EXISTS idx_token_requests_token ON token_requests(token_address);")
+        await conn.execute("CREATE INDEX IF NOT EXISTS idx_token_requests_state ON token_requests(state);")
+        await conn.execute("CREATE INDEX IF NOT EXISTS idx_token_requests_created ON token_requests(created_at);")
         await conn.execute("CREATE INDEX IF NOT EXISTS idx_trades_token ON trades(token_address);")
         await conn.execute("CREATE INDEX IF NOT EXISTS idx_trades_chain ON trades(chain);")
         try:
@@ -461,7 +495,7 @@ class SQLiteLedger:
             plat_col = "platform" if has_platform else "'DexScan'"
             nl_col = "is_new_launch" if has_new_launch else "0"
             query = (
-                f"SELECT chain, token_address, side, effective_price, realized_pnl_usd, created_at, {plat_col}, {nl_col} "
+                f"SELECT chain, token_address, side, effective_price, realized_pnl_usd, created_at, {plat_col}, {nl_col}, fill_timestamp_ns "
                 f"FROM trades ORDER BY created_at DESC LIMIT ?"
             )
             async with conn.execute(query, (limit,)) as cursor:
@@ -477,6 +511,7 @@ class SQLiteLedger:
                         "created_at": r[5],
                         "platform": r[6] or "DexScan",
                         "is_new_launch": bool(r[7]),
+                        "fill_timestamp_ns": r[8],
                     })
                 return res
         except Exception as exc:
@@ -992,6 +1027,322 @@ class SQLiteLedger:
             if row:
                 return str(row[0])
             return default
+
+    @sqlite_retry(max_retries=5, base_delay=0.1)
+    async def record_token_request(self, record: TokenRequestRecord) -> None:
+        """Persists a new or updated TokenRequestRecord into token_requests table."""
+        conn = self._conn
+        if conn is None:
+            return
+        state_str = record.state.value if hasattr(record.state, "value") else str(record.state)
+        chain_str = record.chain.value if hasattr(record.chain, "value") else str(record.chain)
+        fill_p = str(record.simulated_fill_price) if record.simulated_fill_price is not None else None
+        tokens_f = str(record.tokens_filled) if record.tokens_filled is not None else None
+
+        await conn.execute(
+            """
+            INSERT INTO token_requests (
+                request_id, token_address, chain, submitted_at_ns, user_id, message_id,
+                state, opportunity_score, opportunity_rank, validation_status, rejection_reason,
+                queue_entry_ts_ns, queue_exit_ts_ns, analysis_start_ts_ns, analysis_end_ts_ns,
+                execution_start_ts_ns, order_id, lot_id, simulated_fill_price, tokens_filled,
+                realized_pnl_usd, close_reason, metadata_json, created_at, updated_at_ns
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(request_id) DO UPDATE SET
+                state = excluded.state,
+                opportunity_score = excluded.opportunity_score,
+                opportunity_rank = excluded.opportunity_rank,
+                validation_status = excluded.validation_status,
+                rejection_reason = excluded.rejection_reason,
+                queue_entry_ts_ns = excluded.queue_entry_ts_ns,
+                queue_exit_ts_ns = excluded.queue_exit_ts_ns,
+                analysis_start_ts_ns = excluded.analysis_start_ts_ns,
+                analysis_end_ts_ns = excluded.analysis_end_ts_ns,
+                execution_start_ts_ns = excluded.execution_start_ts_ns,
+                order_id = excluded.order_id,
+                lot_id = excluded.lot_id,
+                simulated_fill_price = excluded.simulated_fill_price,
+                tokens_filled = excluded.tokens_filled,
+                realized_pnl_usd = excluded.realized_pnl_usd,
+                close_reason = excluded.close_reason,
+                metadata_json = excluded.metadata_json,
+                updated_at_ns = excluded.updated_at_ns
+            """,
+            (
+                record.request_id,
+                record.token_address,
+                chain_str,
+                record.submitted_at_ns,
+                str(record.user_id) if record.user_id else None,
+                record.message_id,
+                state_str,
+                record.opportunity_score,
+                record.opportunity_rank,
+                record.validation_status,
+                record.rejection_reason,
+                record.queue_entry_ts_ns,
+                record.queue_exit_ts_ns,
+                record.analysis_start_ts_ns,
+                record.analysis_end_ts_ns,
+                record.execution_start_ts_ns,
+                record.order_id,
+                record.lot_id,
+                fill_p,
+                tokens_f,
+                record.realized_pnl_usd,
+                record.close_reason,
+                record.metadata_json,
+                int(record.submitted_at_ns // 1_000_000_000),
+                record.updated_at_ns,
+            ),
+        )
+        await conn.commit()
+
+    @sqlite_retry(max_retries=5, base_delay=0.1)
+    async def update_token_request_status(
+        self,
+        request_id: str,
+        state: TokenRequestState | str,
+        rejection_reason: Optional[str] = None,
+        opportunity_score: Optional[float] = None,
+        order_id: Optional[str] = None,
+        lot_id: Optional[str] = None,
+        simulated_fill_price: Optional[Decimal] = None,
+        tokens_filled: Optional[Decimal] = None,
+        realized_pnl_usd: Optional[float] = None,
+        close_reason: Optional[str] = None,
+        **kwargs: Any,
+    ) -> None:
+        """Updates specific fields of a TokenRequestRecord by request_id."""
+        conn = self._conn
+        if conn is None:
+            return
+        state_str = state.value if hasattr(state, "value") else str(state)
+        updates = ["state = ?", "updated_at_ns = ?"]
+        params: list[Any] = [state_str, time.time_ns()]
+
+        if rejection_reason is not None:
+            updates.append("rejection_reason = ?")
+            params.append(rejection_reason)
+        if opportunity_score is not None:
+            updates.append("opportunity_score = ?")
+            params.append(opportunity_score)
+        if order_id is not None:
+            updates.append("order_id = ?")
+            params.append(order_id)
+        if lot_id is not None:
+            updates.append("lot_id = ?")
+            params.append(lot_id)
+        if simulated_fill_price is not None:
+            updates.append("simulated_fill_price = ?")
+            params.append(str(simulated_fill_price))
+        if tokens_filled is not None:
+            updates.append("tokens_filled = ?")
+            params.append(str(tokens_filled))
+        if realized_pnl_usd is not None:
+            updates.append("realized_pnl_usd = ?")
+            params.append(realized_pnl_usd)
+        if close_reason is not None:
+            updates.append("close_reason = ?")
+            params.append(close_reason)
+
+        for k, v in kwargs.items():
+            if k in (
+                "queue_entry_ts_ns",
+                "queue_exit_ts_ns",
+                "analysis_start_ts_ns",
+                "analysis_end_ts_ns",
+                "execution_start_ts_ns",
+                "opportunity_rank",
+                "validation_status",
+                "metadata_json",
+            ):
+                updates.append(f"{k} = ?")
+                params.append(v)
+
+        params.append(request_id)
+        sql = f"UPDATE token_requests SET {', '.join(updates)} WHERE request_id = ?"
+        await conn.execute(sql, tuple(params))
+        await conn.commit()
+
+    @sqlite_retry(max_retries=5, base_delay=0.1)
+    async def get_token_request(self, request_id: str) -> Optional[TokenRequestRecord]:
+        """Fetch a single TokenRequestRecord by request_id."""
+        conn = self._conn
+        if conn is None:
+            return None
+        async with conn.execute("SELECT * FROM token_requests WHERE request_id = ?", (request_id,)) as cursor:
+            row = await cursor.fetchone()
+            if not row:
+                return None
+            cols = [d[0] for d in cursor.description]
+            d = dict(zip(cols, row))
+            chain_val = (
+                ChainIdentifier(d["chain"])
+                if d["chain"] in ("base_mainnet", "solana_mainnet")
+                else ChainIdentifier.SOLANA_MAINNET
+            )
+            return TokenRequestRecord(
+                request_id=d["request_id"],
+                token_address=d["token_address"],
+                chain=chain_val,
+                submitted_at_ns=d["submitted_at_ns"],
+                user_id=d.get("user_id"),
+                message_id=d.get("message_id"),
+                state=(
+                    TokenRequestState(d["state"])
+                    if d["state"] in TokenRequestState._value2member_map_
+                    else TokenRequestState.RECEIVED
+                ),
+                opportunity_score=float(d.get("opportunity_score") or 0.0),
+                opportunity_rank=int(d.get("opportunity_rank") or 0),
+                validation_status=d.get("validation_status") or "PENDING",
+                rejection_reason=d.get("rejection_reason"),
+                queue_entry_ts_ns=d.get("queue_entry_ts_ns"),
+                queue_exit_ts_ns=d.get("queue_exit_ts_ns"),
+                analysis_start_ts_ns=d.get("analysis_start_ts_ns"),
+                analysis_end_ts_ns=d.get("analysis_end_ts_ns"),
+                execution_start_ts_ns=d.get("execution_start_ts_ns"),
+                order_id=d.get("order_id"),
+                lot_id=d.get("lot_id"),
+                simulated_fill_price=(
+                    Decimal(d["simulated_fill_price"]) if d.get("simulated_fill_price") else None
+                ),
+                tokens_filled=Decimal(d["tokens_filled"]) if d.get("tokens_filled") else None,
+                realized_pnl_usd=float(d["realized_pnl_usd"]) if d.get("realized_pnl_usd") is not None else None,
+                close_reason=d.get("close_reason"),
+                metadata_json=d.get("metadata_json"),
+                updated_at_ns=d.get("updated_at_ns") or d["submitted_at_ns"],
+            )
+
+    @sqlite_retry(max_retries=5, base_delay=0.1)
+    async def get_pending_token_requests(self) -> list[TokenRequestRecord]:
+        """Fetch all requests in QUEUED, WAITING_FOR_CAPACITY, or ANALYZING state."""
+        conn = self._conn
+        if conn is None:
+            return []
+        states = (
+            TokenRequestState.QUEUED.value,
+            TokenRequestState.WAITING_FOR_CAPACITY.value,
+            TokenRequestState.ANALYZING.value,
+        )
+        async with conn.execute(
+            "SELECT * FROM token_requests WHERE state IN (?, ?, ?) ORDER BY opportunity_score DESC, submitted_at_ns ASC",
+            states,
+        ) as cursor:
+            rows = await cursor.fetchall()
+            cols = [d[0] for d in cursor.description]
+            records = []
+            for row in rows:
+                d = dict(zip(cols, row))
+                chain_val = (
+                    ChainIdentifier(d["chain"])
+                    if d["chain"] in ("base_mainnet", "solana_mainnet")
+                    else ChainIdentifier.SOLANA_MAINNET
+                )
+                records.append(
+                    TokenRequestRecord(
+                        request_id=d["request_id"],
+                        token_address=d["token_address"],
+                        chain=chain_val,
+                        submitted_at_ns=d["submitted_at_ns"],
+                        user_id=d.get("user_id"),
+                        message_id=d.get("message_id"),
+                        state=(
+                            TokenRequestState(d["state"])
+                            if d["state"] in TokenRequestState._value2member_map_
+                            else TokenRequestState.QUEUED
+                        ),
+                        opportunity_score=float(d.get("opportunity_score") or 0.0),
+                        opportunity_rank=int(d.get("opportunity_rank") or 0),
+                        validation_status=d.get("validation_status") or "PENDING",
+                        rejection_reason=d.get("rejection_reason"),
+                        queue_entry_ts_ns=d.get("queue_entry_ts_ns"),
+                        queue_exit_ts_ns=d.get("queue_exit_ts_ns"),
+                        analysis_start_ts_ns=d.get("analysis_start_ts_ns"),
+                        analysis_end_ts_ns=d.get("analysis_end_ts_ns"),
+                        execution_start_ts_ns=d.get("execution_start_ts_ns"),
+                        order_id=d.get("order_id"),
+                        lot_id=d.get("lot_id"),
+                        simulated_fill_price=(
+                            Decimal(d["simulated_fill_price"]) if d.get("simulated_fill_price") else None
+                        ),
+                        tokens_filled=Decimal(d["tokens_filled"]) if d.get("tokens_filled") else None,
+                        realized_pnl_usd=(
+                            float(d["realized_pnl_usd"]) if d.get("realized_pnl_usd") is not None else None
+                        ),
+                        close_reason=d.get("close_reason"),
+                        metadata_json=d.get("metadata_json"),
+                        updated_at_ns=d.get("updated_at_ns") or d["submitted_at_ns"],
+                    )
+                )
+            return records
+
+    @sqlite_retry(max_retries=5, base_delay=0.1)
+    async def restore_open_positions_from_ledger(self) -> list[dict[str, Any]]:
+        """
+        Queries all BUY trades that have no corresponding CLOSED record in lot_lifecycle or matching SELL trade.
+        Returns a list of dicts to reconstruct OpenLot instances upon engine restart.
+        """
+        conn = self._conn
+        if conn is None:
+            return []
+        query = """
+            SELECT t.order_id, t.signal_id, t.chain, t.token_address, t.pool_address,
+                   t.native_spent, t.tokens_delta, t.effective_price, t.fill_timestamp_ns,
+                   t.platform, t.is_new_launch
+            FROM trades t
+            WHERE t.side = 'buy'
+              AND t.token_address NOT IN (
+                  SELECT token_address FROM lot_lifecycle WHERE LOWER(status) IN ('closed', 'settled')
+              )
+              AND t.token_address NOT IN (
+                  SELECT token_address FROM trades WHERE side = 'sell' AND realized_pnl_usd IS NOT NULL
+              )
+            ORDER BY t.created_at ASC
+        """
+        async with conn.execute(query) as cursor:
+            rows = await cursor.fetchall()
+            cols = [d[0] for d in cursor.description]
+            return [dict(zip(cols, r)) for r in rows]
+
+    @sqlite_retry(max_retries=5, base_delay=0.1)
+    async def clear_all_trades_and_lots(self) -> None:
+        """Clears all trades, lot lifecycles, and portfolio snapshots for a fresh paper run."""
+        conn = self._conn
+        if conn is None:
+            return
+        await conn.execute("DELETE FROM trades;")
+        await conn.execute("DELETE FROM lot_lifecycle;")
+        await conn.execute("DELETE FROM portfolio_snapshots;")
+        await conn.execute("DELETE FROM signals;")
+        await conn.commit()
+
+    @sqlite_retry(max_retries=5, base_delay=0.1)
+    async def mark_token_closed(self, token_address: str, reason: str = "MANUAL_CLOSE", pnl_usd: float = 0.0) -> None:
+        """Marks all open instances of a token as closed and settled in lot_lifecycle."""
+        conn = self._conn
+        if conn is None:
+            return
+        import uuid
+        now_ns = time.time_ns()
+        now_s = int(time.time())
+        await conn.execute(
+            """
+            INSERT INTO lot_lifecycle (lot_id, token_address, chain, status, exit_reason, pnl_usd, timestamp_ns, created_at)
+            VALUES (?, ?, 'solana_mainnet', 'closed', ?, ?, ?, ?)
+            """,
+            (str(uuid.uuid4()), token_address, reason, str(pnl_usd), now_ns, now_s),
+        )
+        await conn.execute(
+            """
+            INSERT INTO lot_lifecycle (lot_id, token_address, chain, status, exit_reason, pnl_usd, timestamp_ns, created_at)
+            VALUES (?, ?, 'solana_mainnet', 'settled', ?, ?, ?, ?)
+            """,
+            (str(uuid.uuid4()), token_address, reason, str(pnl_usd), now_ns + 1, now_s),
+        )
+        await conn.commit()
+
 
 
 __all__ = [

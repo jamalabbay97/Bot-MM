@@ -5,12 +5,13 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "alpha-engine"
 version = "0.1.0"
-description = "Multi-Chain Paper Trading & Alpha Analytics Engine"
+description = "Multi-Chain Autonomous Crypto Trading Swarm & Ruflo Multi-Agent Orchestration Engine"
 readme = "README.md"
 requires-python = ">=3.11"
 authors = [
     { name = "Principal Quantitative Systems Team" }
 ]
+keywords = ["ruflo", "multi-agent", "swarm", "crypto", "trading", "solana", "base", "evm", "svm"]
 dependencies = [
     "pydantic>=2.0.0",
     "pydantic-settings>=2.0.0",

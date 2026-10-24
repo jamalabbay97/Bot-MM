@@ -7,6 +7,7 @@ Python 3.11+
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import math
 import time
@@ -14,7 +15,7 @@ import uuid
 from collections import defaultdict
 from dataclasses import dataclass, field
 from decimal import Decimal
-from typing import Optional, Any
+from typing import Optional, Any, Callable
 from alpha_engine.models.enums import (
     ChainIdentifier,
     ExitProfile,
@@ -87,6 +88,10 @@ class OpenLot:
     initial_risk_r: Decimal = Decimal("0.08")
     scaled_out_2r: bool = False
     partial_exit_enabled: bool = False
+
+    @property
+    def tokens_remaining(self) -> Decimal:
+        return self.tokens_held
     last_confirmed_hl: Decimal = Decimal("0")
     confirmed_higher_lows: list[Decimal] = field(default_factory=list)
     confirmed_higher_highs: list[Decimal] = field(default_factory=list)
@@ -220,10 +225,199 @@ class PositionBook:
     FIFO matching on SELL orders with adaptive dynamic exit lifecycle management.
     """
 
+    max_active_positions: int = MAX_ACTIVE_POSITIONS
     _lots: dict[tuple[str, str], list[OpenLot]] = field(
         default_factory=lambda: defaultdict(list)
     )
     _closed_lots: list[OpenLot] = field(default_factory=list)
+    _reserved_slots: dict[str, dict[str, Any]] = field(default_factory=dict)
+    _token_cooldowns: dict[str, float] = field(default_factory=dict)
+    _capacity_freed_callbacks: list[Callable[[], Any]] = field(default_factory=list)
+
+    def set_token_cooldown(self, token_address: str, duration_s: float = 300.0) -> None:
+        """Sets a re-entry cooldown on a token to prevent immediate rebuying after an exit."""
+        if token_address:
+            clean = token_address.strip().lower()
+            self._token_cooldowns[clean] = time.time() + duration_s
+            logger.info("Token %s entered post-exit cooldown for %.0fs", token_address[:10], duration_s)
+
+    def is_token_in_cooldown(self, token_address: str) -> tuple[bool, float]:
+        """Check if token is actively in post-exit re-entry cooldown."""
+        if not token_address:
+            return False, 0.0
+        exp = self._token_cooldowns.get(token_address.strip().lower(), 0.0)
+        remaining = exp - time.time()
+        if remaining > 0:
+            return True, remaining
+        return False, 0.0
+
+    def clear_token_cooldown(self, token_address: str | None = None) -> None:
+        """Clear cooldown for a specific token or all tokens."""
+        if token_address:
+            self._token_cooldowns.pop(token_address.strip().lower(), None)
+        else:
+            self._token_cooldowns.clear()
+
+    def register_capacity_freed_callback(self, cb: Callable[[], Any]) -> None:
+        """Register a callback triggered whenever position capacity is released."""
+        if cb not in self._capacity_freed_callbacks:
+            self._capacity_freed_callbacks.append(cb)
+
+    def _notify_capacity_freed(self) -> None:
+        """Invoked when an open lot is fully closed or a reserved slot is released."""
+        for cb in list(self._capacity_freed_callbacks):
+            try:
+                res = cb()
+                if asyncio.iscoroutine(res):
+                    asyncio.create_task(res)
+            except Exception as exc:
+                logger.warning("Error in capacity freed callback: %s", exc)
+
+    def effective_active_position_count(self) -> int:
+        """Returns the sum of active open position lots plus outstanding reserved execution slots."""
+        now = time.time()
+        # Evict reservations older than 60s
+        stale = [req_id for req_id, slot in self._reserved_slots.items() if now - slot.get("timestamp", 0) > 60.0]
+        for req_id in stale:
+            self._reserved_slots.pop(req_id, None)
+        return self.open_position_count() + len(self._reserved_slots)
+
+    def is_slot_reserved_for_token(self, token_address: str, chain: ChainIdentifier | None = None) -> bool:
+        t_clean = token_address.strip().lower()
+        now = time.time()
+        for slot in self._reserved_slots.values():
+            if now - slot.get("timestamp", 0) <= 60.0:
+                if slot.get("token", "").strip().lower() == t_clean:
+                    if chain is None or slot.get("chain") == chain:
+                        return True
+        return False
+
+    def has_reserved_slot(self, token_address: str, chain: ChainIdentifier | None = None) -> bool:
+        """Alias for is_slot_reserved_for_token."""
+        return self.is_slot_reserved_for_token(token_address, chain=chain)
+
+    def reserve_position_slot(
+        self,
+        token_address: str,
+        chain: ChainIdentifier = ChainIdentifier.SOLANA_MAINNET,
+        request_id: str = "",
+    ) -> bool:
+        """
+        Atomically reserve a position slot before async execution starts.
+        Prevents race conditions where multiple concurrent analyses claim the last slot.
+        """
+        req_id = request_id or f"res_{token_address[:10]}_{uuid.uuid4().hex[:8]}"
+        if self.is_position_open(token_address, chain):
+            return False
+        in_cd, _ = self.is_token_in_cooldown(token_address)
+        if in_cd:
+            return False
+        if self.is_slot_reserved_for_token(token_address, chain):
+            return False
+        if self.effective_active_position_count() >= self.max_active_positions:
+            return False
+        self._reserved_slots[req_id] = {
+            "token": token_address,
+            "chain": chain,
+            "timestamp": time.time(),
+        }
+        return True
+
+    def release_position_slot(self, request_id: str = "", token_address: str = "") -> bool:
+        """Releases a reserved position slot if execution is cancelled or fails."""
+        existed = False
+        if request_id and request_id in self._reserved_slots:
+            self._reserved_slots.pop(request_id, None)
+            existed = True
+        if token_address:
+            t_clean = token_address.strip().lower()
+            matched = [
+                rid for rid, slot in self._reserved_slots.items()
+                if slot.get("token", "").strip().lower() == t_clean
+            ]
+            for rid in matched:
+                self._reserved_slots.pop(rid, None)
+                existed = True
+        if existed:
+            self._notify_capacity_freed()
+        return existed
+
+    def commit_slot_to_lot(self, request_id: str) -> None:
+        """Removes the reservation once the corresponding lot has been committed into _lots."""
+        self._reserved_slots.pop(request_id, None)
+
+    def commit_slot_to_lot_by_token(self, token_address: str, chain: ChainIdentifier | None = None) -> None:
+        """Removes matching reservation for token when lot opens."""
+        t_clean = token_address.strip().lower()
+        matched = [
+            req_id
+            for req_id, slot in self._reserved_slots.items()
+            if slot.get("token", "").strip().lower() == t_clean and (chain is None or slot.get("chain") == chain)
+        ]
+        for req_id in matched:
+            self._reserved_slots.pop(req_id, None)
+
+    def restore_open_lots(self, lot_dicts: list[dict[str, Any]], max_age_s: float = 86400.0) -> int:
+        """
+        Reconstructs OpenLot objects from restored database records upon engine reboot.
+        Discards stale zombie lots older than max_age_s (default 24h) to prevent liquidation cascades.
+        """
+        restored = 0
+        now_ns = time.time_ns()
+        for d in lot_dicts:
+            token = str(d.get("token_address", ""))
+            chain_str = str(d.get("chain", "solana_mainnet"))
+            chain = (
+                ChainIdentifier(chain_str)
+                if chain_str in ("base_mainnet", "solana_mainnet")
+                else ChainIdentifier.SOLANA_MAINNET
+            )
+            if self.is_position_open(token, chain):
+                continue
+            open_ts_ns = int(d.get("fill_timestamp_ns") or now_ns)
+            age_s = (now_ns - open_ts_ns) / 1e9
+            if max_age_s > 0 and age_s > max_age_s:
+                logger.warning(
+                    "Skipping stale lot %s (%s): age %.1fh exceeds max_age_s (%.1fh). Discarding zombie position.",
+                    str(d.get("order_id", ""))[:8],
+                    token[:10],
+                    age_s / 3600.0,
+                    max_age_s / 3600.0,
+                )
+                continue
+            tokens_held = Decimal(str(d.get("tokens_delta", 0)))
+            entry_price = Decimal(str(d.get("effective_price", 0)))
+            cost_native = Decimal(str(d.get("native_spent", 0)))
+            platform = str(d.get("platform", "DexScan"))
+            is_pump = platform.lower() == "pump.fun" or token.lower().endswith("pump")
+            entry_ts = open_ts_ns / 1e9 if open_ts_ns > 0 else time.time()
+            lot = OpenLot(
+                lot_id=str(d.get("order_id") or uuid.uuid4()),
+                token_address=token,
+                chain=chain,
+                initial_tokens=tokens_held,
+                tokens_held=tokens_held,
+                cost_basis_native=cost_native,
+                entry_price=entry_price,
+                signal_id=str(d.get("signal_id", "")),
+                open_timestamp_ns=open_ts_ns,
+                peak_price=entry_price,
+                status=LotStatus.OPEN,
+                pool_address=str(d.get("pool_address", "")),
+                platform=platform,
+                is_new_launch=bool(d.get("is_new_launch", False)),
+                bonding_curve_mode=bool(d.get("bonding_curve_mode", is_pump)),
+                strategy_name=str(d.get("strategy_name") or ("peak_trailing_50" if is_pump else "default")),
+                trailing_stop_from_peak_pct=float(d["trailing_stop_from_peak_pct"]) if d.get("trailing_stop_from_peak_pct") is not None else (0.50 if is_pump else None),
+                custom_take_profit_pct=float(d["custom_take_profit_pct"]) if d.get("custom_take_profit_pct") is not None else (0.50 if is_pump else None),
+                custom_stop_loss_pct=float(d["custom_stop_loss_pct"]) if d.get("custom_stop_loss_pct") is not None else (0.50 if is_pump else None),
+                price_history=[(entry_ts, entry_price, cost_native)],
+                tick_prices_5m=[(entry_ts, entry_price)],
+            )
+            key = (chain.value, token)
+            self._lots[key].append(lot)
+            restored += 1
+        return restored
 
     @staticmethod
     def compute_pearson_correlation(series_x: list[float], series_y: list[float]) -> float:
@@ -255,8 +449,8 @@ class PositionBook:
         self,
         token_address: str,
         chain: ChainIdentifier,
-        allocated_cost_native: Decimal,
-        total_equity_native: Decimal,
+        allocated_cost_native: Decimal = Decimal(0),
+        total_equity_native: Decimal = Decimal(0),
         pool_address: str = "",
         narrative_cluster: Optional[str] = None,
         candidate_ticks: Optional[list[Decimal | float]] = None,
@@ -274,6 +468,14 @@ class PositionBook:
         """
         if self.is_position_open(token_address, chain):
             return False, f"Duplicate position already open for token {token_address[:10]}"
+
+        if not is_manual_size:
+            in_cd, rem_s = self.is_token_in_cooldown(token_address)
+            if in_cd:
+                return False, f"Token {token_address[:10]} is in post-exit re-entry cooldown ({int(rem_s)}s remaining)"
+
+        if self.is_slot_reserved_for_token(token_address, chain):
+            return False, f"Position slot already reserved for token {token_address[:10]}"
 
         if pool_address:
             for lots in self._lots.values():
@@ -336,10 +538,10 @@ class PositionBook:
                                     f"Cross-asset correlation r={r:.4f} exceeds 0.80 threshold with active lot {lot.token_address[:10]}",
                                 )
 
-        if self.open_position_count() >= MAX_ACTIVE_POSITIONS:
+        if self.effective_active_position_count() >= self.max_active_positions:
             return (
                 False,
-                f"Active position count ({self.open_position_count()}) reached MAX_ACTIVE_POSITIONS hard cap ({MAX_ACTIVE_POSITIONS})",
+                f"Active position count ({self.effective_active_position_count()}) reached MAX_ACTIVE_POSITIONS limit ({self.max_active_positions})",
             )
 
         if total_equity_native > 0 and not is_manual_size:
@@ -450,6 +652,7 @@ class PositionBook:
         )
         key = (fill.chain.value, fill.token_address)
         self._lots[key].append(lot)
+        self.commit_slot_to_lot_by_token(fill.token_address, fill.chain)
         logger.info(
             "Opened lot %s | Platform=%s | %s tokens of %s @ %s native (reserve=%s, status=%s, cluster=%s)",
             lot.lot_id[:8],
@@ -493,6 +696,7 @@ class PositionBook:
                     lot.lot_id[:8],
                     float(pnl),
                 )
+                self._notify_capacity_freed()
             else:
                 pnl = remaining * (sell_price - lot.entry_price)
                 realized_pnl += pnl
@@ -550,6 +754,10 @@ class PositionBook:
                 continue
             result.extend(lots)
         return result
+
+    def get_all_open_lots(self) -> list[OpenLot]:
+        """Return all active open lots across all chains and tokens."""
+        return self.get_open_lots()
 
     def get_closed_lots(self) -> list[OpenLot]:
         """Return recently closed lots tracked in-memory."""
@@ -740,7 +948,7 @@ class PositionBook:
         # Drops of 50% or 60% from peak trigger exit; does not close trade simply at -25% from entry.
         is_peak_trailing_strategy = (
             lot.strategy_name in ("peak_trailing_50", "peak_trailing_60", "custom")
-            or lot.trailing_stop_from_peak_pct is not None
+            and lot.trailing_stop_from_peak_pct is not None
         )
 
         if is_peak_trailing_strategy and lot.peak_price > Decimal(0):
@@ -748,11 +956,24 @@ class PositionBook:
             if trail_from_peak is None:
                 trail_from_peak = 0.60 if lot.strategy_name == "peak_trailing_60" else 0.50
 
+            # Dynamic floor tracking from ATH peak
+            trail_floor = (lot.peak_price * (Decimal("1.0") - Decimal(str(trail_from_peak)))).quantize(Decimal("1e-18"))
+            lot.trailing_stop_active = True
+
+            # If position already scaled out 50% (moonbag mode), floor must never breach breakeven (+5%)
+            if lot.scaled_out_50_pct:
+                be_floor = (lot.entry_price * Decimal("1.05")).quantize(Decimal("1e-18"))
+                lot.trailing_stop_price = max(trail_floor, be_floor)
+            else:
+                lot.trailing_stop_price = trail_floor
+
             drawdown = (lot.peak_price - current_price) / lot.peak_price
-            if drawdown >= Decimal(str(trail_from_peak)):
+            stop_hit = (drawdown >= Decimal(str(trail_from_peak))) or (lot.trailing_stop_active and current_price < lot.trailing_stop_price)
+            if stop_hit:
                 logger.info(
-                    "PEAK TRAILING STOP (%.0f%% from ATH peak) TRIGGERED for lot %s (%s): peak=%s, curr=%s, drawdown=%.2f%%. Liquidating 100%% of remaining lot.",
+                    "PEAK TRAILING STOP (%.0f%% from ATH peak / stop %s) TRIGGERED for lot %s (%s): peak=%s, curr=%s, drawdown=%.2f%%. Liquidating position.",
                     float(trail_from_peak * 100),
+                    lot.trailing_stop_price,
                     lot.lot_id[:8],
                     lot.token_address[:10],
                     lot.peak_price,
@@ -773,7 +994,7 @@ class PositionBook:
                     action="CLOSE_ALL",
                 )
 
-            # Target Take-Profit for Peak Trailing Strategy
+            # Target Take-Profit with Multi-Stage Scale-Out Support:
             target_tp = lot.custom_take_profit_pct
             if target_tp is None:
                 target_tp = 0.60 if lot.strategy_name == "peak_trailing_60" else 0.50
@@ -781,29 +1002,162 @@ class PositionBook:
             if target_tp > 0:
                 tp_ratio = Decimal("1.0") + Decimal(str(target_tp))
                 if gain_ratio >= tp_ratio:
-                    logger.info(
-                        "TARGET TAKE-PROFIT (+%.0f%%) TRIGGERED for lot %s (%s): price=%s, entry=%s, gain_ratio=%s >= %s. Liquidating position.",
-                        float(target_tp * 100),
-                        lot.lot_id[:8],
-                        lot.token_address[:10],
-                        current_price,
-                        lot.entry_price,
-                        gain_ratio,
-                        tp_ratio,
-                    )
-                    return ExitDecision(
-                        lot_id=lot.lot_id,
-                        token_address=lot.token_address,
-                        chain=lot.chain,
-                        should_exit=True,
-                        exit_reason=TradeExitReason.TP_60 if abs(target_tp - 0.60) < 0.01 else TradeExitReason.TP_50,
-                        exit_stage=ExitStage.TP2,
-                        tokens_to_sell=lot.tokens_held,
-                        current_price=current_price,
-                        pnl_estimate_native=lot.tokens_held * (current_price - lot.entry_price),
-                        prioritized=True,
-                        action="CLOSE_ALL",
-                    )
+                    if lot.partial_exit_enabled and not lot.scaled_out_50_pct and lot.exit_stage == ExitStage.NONE:
+                        # Partial exit: Sell 50% to secure capital, keep 50% as moonbag with trailing stop locked at Breakeven+
+                        target_sell = (lot.initial_tokens * Decimal("0.50")).quantize(Decimal("1e-18"))
+                        qty = min(lot.tokens_held, target_sell if target_sell > 0 else (lot.tokens_held / Decimal("2")))
+                        if qty > 0:
+                            lot.scaled_out_50_pct = True
+                            lot.exit_stage = ExitStage.TP1
+                            lot.trailing_stop_active = True
+                            be_lock = (lot.entry_price * Decimal("1.05")).quantize(Decimal("1e-18"))
+                            if lot.trailing_stop_price is None or be_lock > lot.trailing_stop_price:
+                                lot.trailing_stop_price = be_lock
+                            logger.info(
+                                "TARGET TAKE-PROFIT (+%.0f%%) PARTIAL SCALE-OUT for lot %s (%s): Selling 50%% (%s tokens), securing principal, locking moonbag stop at %s",
+                                float(target_tp * 100),
+                                lot.lot_id[:8],
+                                lot.token_address[:10],
+                                qty,
+                                lot.trailing_stop_price,
+                            )
+                            return ExitDecision(
+                                lot_id=lot.lot_id,
+                                token_address=lot.token_address,
+                                chain=lot.chain,
+                                should_exit=True,
+                                exit_reason=TradeExitReason.TP_60 if abs(target_tp - 0.60) < 0.01 else TradeExitReason.TP_50,
+                                exit_stage=ExitStage.TP1,
+                                tokens_to_sell=qty,
+                                current_price=current_price,
+                                pnl_estimate_native=qty * (current_price - lot.entry_price),
+                                prioritized=True,
+                                action="PARTIAL",
+                            )
+
+                    # If partial exit is already taken (moonbag mode), let the runner take staged partial profits at +100%, +200%, +300%, +400%
+                    if lot.scaled_out_50_pct:
+                        if gain_ratio >= Decimal("5.0") and lot.tp_stage < 4:
+                            qty = (lot.tokens_held * Decimal("0.50")).quantize(Decimal("1e-18"))
+                            if qty > 0:
+                                lot.tp_stage = 4
+                                be_lock = (lot.entry_price * Decimal("2.50")).quantize(Decimal("1e-18"))
+                                if lot.trailing_stop_price is None or be_lock > lot.trailing_stop_price:
+                                    lot.trailing_stop_price = be_lock
+                                logger.info(
+                                    "MOONBAG TAKE-PROFIT 4 (+400%% / 5X) for lot %s (%s): Selling 50%% (%s tokens), locking stop at %s",
+                                    lot.lot_id[:8], lot.token_address[:10], qty, lot.trailing_stop_price
+                                )
+                                return ExitDecision(
+                                    lot_id=lot.lot_id,
+                                    token_address=lot.token_address,
+                                    chain=lot.chain,
+                                    should_exit=True,
+                                    exit_reason=TradeExitReason.TP_5X,
+                                    exit_stage=ExitStage.TP4,
+                                    tokens_to_sell=qty,
+                                    current_price=current_price,
+                                    pnl_estimate_native=qty * (current_price - lot.entry_price),
+                                    prioritized=True,
+                                    action="PARTIAL",
+                                )
+                        elif gain_ratio >= Decimal("4.0") and lot.tp_stage < 3:
+                            qty = (lot.tokens_held * Decimal("0.333333333333333333")).quantize(Decimal("1e-18"))
+                            if qty > 0:
+                                lot.tp_stage = 3
+                                be_lock = (lot.entry_price * Decimal("2.00")).quantize(Decimal("1e-18"))
+                                if lot.trailing_stop_price is None or be_lock > lot.trailing_stop_price:
+                                    lot.trailing_stop_price = be_lock
+                                logger.info(
+                                    "MOONBAG TAKE-PROFIT 3 (+300%% / 4X) for lot %s (%s): Selling 33%% (%s tokens), locking stop at %s",
+                                    lot.lot_id[:8], lot.token_address[:10], qty, lot.trailing_stop_price
+                                )
+                                return ExitDecision(
+                                    lot_id=lot.lot_id,
+                                    token_address=lot.token_address,
+                                    chain=lot.chain,
+                                    should_exit=True,
+                                    exit_reason=TradeExitReason.TP_4X,
+                                    exit_stage=ExitStage.TP3,
+                                    tokens_to_sell=qty,
+                                    current_price=current_price,
+                                    pnl_estimate_native=qty * (current_price - lot.entry_price),
+                                    prioritized=True,
+                                    action="PARTIAL",
+                                )
+                        elif gain_ratio >= Decimal("3.0") and lot.tp_stage < 2:
+                            qty = (lot.tokens_held * Decimal("0.333333333333333333")).quantize(Decimal("1e-18"))
+                            if qty > 0:
+                                lot.tp_stage = 2
+                                be_lock = (lot.entry_price * Decimal("1.50")).quantize(Decimal("1e-18"))
+                                if lot.trailing_stop_price is None or be_lock > lot.trailing_stop_price:
+                                    lot.trailing_stop_price = be_lock
+                                logger.info(
+                                    "MOONBAG TAKE-PROFIT 2 (+200%% / 3X) for lot %s (%s): Selling 33%% (%s tokens), locking stop at %s",
+                                    lot.lot_id[:8], lot.token_address[:10], qty, lot.trailing_stop_price
+                                )
+                                return ExitDecision(
+                                    lot_id=lot.lot_id,
+                                    token_address=lot.token_address,
+                                    chain=lot.chain,
+                                    should_exit=True,
+                                    exit_reason=TradeExitReason.TP_3X,
+                                    exit_stage=ExitStage.TP2,
+                                    tokens_to_sell=qty,
+                                    current_price=current_price,
+                                    pnl_estimate_native=qty * (current_price - lot.entry_price),
+                                    prioritized=True,
+                                    action="PARTIAL",
+                                )
+                        elif gain_ratio >= Decimal("2.0") and lot.tp_stage < 1:
+                            qty = (lot.tokens_held * Decimal("0.50")).quantize(Decimal("1e-18"))
+                            if qty > 0:
+                                lot.tp_stage = 1
+                                be_lock = (lot.entry_price * Decimal("1.10")).quantize(Decimal("1e-18"))
+                                if lot.trailing_stop_price is None or be_lock > lot.trailing_stop_price:
+                                    lot.trailing_stop_price = be_lock
+                                logger.info(
+                                    "MOONBAG TAKE-PROFIT 1 (+100%% / 2X) for lot %s (%s): Selling 50%% (%s tokens), securing principal, locking stop at %s",
+                                    lot.lot_id[:8], lot.token_address[:10], qty, lot.trailing_stop_price
+                                )
+                                return ExitDecision(
+                                    lot_id=lot.lot_id,
+                                    token_address=lot.token_address,
+                                    chain=lot.chain,
+                                    should_exit=True,
+                                    exit_reason=TradeExitReason.TP_100,
+                                    exit_stage=ExitStage.TP2,
+                                    tokens_to_sell=qty,
+                                    current_price=current_price,
+                                    pnl_estimate_native=qty * (current_price - lot.entry_price),
+                                    prioritized=True,
+                                    action="PARTIAL",
+                                )
+                    elif not lot.partial_exit_enabled:
+                        # Full liquidation if partial scale-out is not enabled
+                        logger.info(
+                            "TARGET TAKE-PROFIT (+%.0f%%) TRIGGERED for lot %s (%s): price=%s, entry=%s, gain_ratio=%s >= %s. Liquidating position.",
+                            float(target_tp * 100),
+                            lot.lot_id[:8],
+                            lot.token_address[:10],
+                            current_price,
+                            lot.entry_price,
+                            gain_ratio,
+                            tp_ratio,
+                        )
+                        return ExitDecision(
+                            lot_id=lot.lot_id,
+                            token_address=lot.token_address,
+                            chain=lot.chain,
+                            should_exit=True,
+                            exit_reason=TradeExitReason.TP_60 if abs(target_tp - 0.60) < 0.01 else TradeExitReason.TP_50,
+                            exit_stage=ExitStage.TP2,
+                            tokens_to_sell=lot.tokens_held,
+                            current_price=current_price,
+                            pnl_estimate_native=lot.tokens_held * (current_price - lot.entry_price),
+                            prioritized=True,
+                            action="CLOSE_ALL",
+                        )
 
             # In peak trailing mode, prevent premature -14%/-25% entry-based stop outs and velocity decay:
             # Let the trade develop unless emergency liquidity drain (rugpull) occurs.
@@ -1208,26 +1562,140 @@ class PositionBook:
                             pnl_estimate_native=qty * (current_price - lot.entry_price),
                         )
 
-            # Take-Profit (TP): +25% (Scale out 50% of position size), +50% (Sell remaining 50%)
-            # +50% Take Profit
-            if gain_ratio >= Decimal("1.50") and lot.exit_stage in (ExitStage.NONE, ExitStage.TP1):
+            # Take-Profit Ladder for Tokens (+100%, +200%, +300%, +400%, 10x):
+            # 10x (+900%): Liquidate remaining position
+            if gain_ratio >= Decimal("10.0"):
                 return ExitDecision(
                     lot_id=lot.lot_id,
                     token_address=lot.token_address,
                     chain=lot.chain,
                     should_exit=True,
-                    exit_reason=TradeExitReason.TP_50,
-                    exit_stage=ExitStage.TP2,
+                    exit_reason=TradeExitReason.TP_10X,
+                    exit_stage=ExitStage.TP4,
                     tokens_to_sell=lot.tokens_held,
                     current_price=current_price,
                     pnl_estimate_native=lot.tokens_held * (current_price - lot.entry_price),
+                    action="CLOSE_ALL",
                 )
+
+            # 5x (+400%): Sell 50% of remaining tokens
+            if gain_ratio >= Decimal("5.0") and lot.tp_stage < 4:
+                qty = (lot.tokens_held * Decimal("0.50")).quantize(Decimal("1e-18"))
+                if qty > 0:
+                    lot.tp_stage = 4
+                    stop = (lot.entry_price * Decimal("2.50")).quantize(Decimal("1e-18"))
+                    if stop > lot.trailing_stop_price:
+                        lot.trailing_stop_price = stop
+                    return ExitDecision(
+                        lot_id=lot.lot_id,
+                        token_address=lot.token_address,
+                        chain=lot.chain,
+                        should_exit=True,
+                        exit_reason=TradeExitReason.TP_5X,
+                        exit_stage=ExitStage.TP4,
+                        tokens_to_sell=qty,
+                        current_price=current_price,
+                        pnl_estimate_native=qty * (current_price - lot.entry_price),
+                        action="PARTIAL",
+                    )
+
+            # 4x (+300%): Sell 33% of remaining tokens
+            if gain_ratio >= Decimal("4.0") and lot.tp_stage < 3:
+                qty = (lot.tokens_held * Decimal("0.333333333333333333")).quantize(Decimal("1e-18"))
+                if qty > 0:
+                    lot.tp_stage = 3
+                    stop = (lot.entry_price * Decimal("2.00")).quantize(Decimal("1e-18"))
+                    if stop > lot.trailing_stop_price:
+                        lot.trailing_stop_price = stop
+                    return ExitDecision(
+                        lot_id=lot.lot_id,
+                        token_address=lot.token_address,
+                        chain=lot.chain,
+                        should_exit=True,
+                        exit_reason=TradeExitReason.TP_4X,
+                        exit_stage=ExitStage.TP3,
+                        tokens_to_sell=qty,
+                        current_price=current_price,
+                        pnl_estimate_native=qty * (current_price - lot.entry_price),
+                        action="PARTIAL",
+                    )
+
+            # 3x (+200%): Sell 33% of remaining tokens
+            if gain_ratio >= Decimal("3.0") and lot.tp_stage < 2:
+                qty = (lot.tokens_held * Decimal("0.333333333333333333")).quantize(Decimal("1e-18"))
+                if qty > 0:
+                    lot.tp_stage = 2
+                    stop = (lot.entry_price * Decimal("1.50")).quantize(Decimal("1e-18"))
+                    if stop > lot.trailing_stop_price:
+                        lot.trailing_stop_price = stop
+                    return ExitDecision(
+                        lot_id=lot.lot_id,
+                        token_address=lot.token_address,
+                        chain=lot.chain,
+                        should_exit=True,
+                        exit_reason=TradeExitReason.TP_3X,
+                        exit_stage=ExitStage.TP2,
+                        tokens_to_sell=qty,
+                        current_price=current_price,
+                        pnl_estimate_native=qty * (current_price - lot.entry_price),
+                        action="PARTIAL",
+                    )
+
+            # 2x (+100%): Sell 50% of tokens to recoup principal, keep remaining as runner
+            if gain_ratio >= Decimal("2.0") and lot.tp_stage < 1 and not lot.scaled_out_50_pct:
+                target_sell = (lot.initial_tokens * Decimal("0.50")).quantize(Decimal("1e-18"))
+                qty = min(lot.tokens_held, target_sell if target_sell > 0 else (lot.tokens_held / Decimal("2")))
+                if qty > 0:
+                    lot.tp_stage = 1
+                    lot.scaled_out_50_pct = True
+                    stop = (lot.entry_price * Decimal("1.10")).quantize(Decimal("1e-18"))
+                    if stop > lot.trailing_stop_price:
+                        lot.trailing_stop_price = stop
+                    return ExitDecision(
+                        lot_id=lot.lot_id,
+                        token_address=lot.token_address,
+                        chain=lot.chain,
+                        should_exit=True,
+                        exit_reason=TradeExitReason.TP_2X,
+                        exit_stage=ExitStage.TP1,
+                        tokens_to_sell=qty,
+                        current_price=current_price,
+                        pnl_estimate_native=qty * (current_price - lot.entry_price),
+                        action="PARTIAL",
+                    )
+
+            # +50% Take Profit: If not scaled out, sell 50% of initial tokens; if already scaled out at +25%, lock stop and let runner run
+            if gain_ratio >= Decimal("1.50"):
+                if not lot.scaled_out_50_pct and lot.exit_stage == ExitStage.NONE:
+                    target_sell = (lot.initial_tokens * Decimal("0.50")).quantize(Decimal("1e-18"))
+                    qty = min(lot.tokens_held, target_sell if target_sell > 0 else (lot.tokens_held / Decimal("2")))
+                    if qty > 0:
+                        lot.scaled_out_50_pct = True
+                        stop = (lot.entry_price * Decimal("1.20")).quantize(Decimal("1e-18"))
+                        if stop > lot.trailing_stop_price:
+                            lot.trailing_stop_price = stop
+                        return ExitDecision(
+                            lot_id=lot.lot_id,
+                            token_address=lot.token_address,
+                            chain=lot.chain,
+                            should_exit=True,
+                            exit_reason=TradeExitReason.TP_50,
+                            exit_stage=ExitStage.TP1,
+                            tokens_to_sell=qty,
+                            current_price=current_price,
+                            pnl_estimate_native=qty * (current_price - lot.entry_price),
+                            action="PARTIAL",
+                        )
 
             # +25% Take Profit (Scale out 50%)
             if gain_ratio >= Decimal("1.25") and not lot.scaled_out_50_pct and lot.exit_stage == ExitStage.NONE:
                 target_sell = (lot.initial_tokens * Decimal("0.50")).quantize(Decimal("1e-18"))
                 qty = min(lot.tokens_held, target_sell if target_sell > 0 else (lot.tokens_held / Decimal("2")))
                 if qty > 0:
+                    lot.scaled_out_50_pct = True
+                    stop = lot.entry_price.quantize(Decimal("1e-18"))
+                    if stop > lot.trailing_stop_price:
+                        lot.trailing_stop_price = stop
                     return ExitDecision(
                         lot_id=lot.lot_id,
                         token_address=lot.token_address,
@@ -1238,6 +1706,7 @@ class PositionBook:
                         tokens_to_sell=qty,
                         current_price=current_price,
                         pnl_estimate_native=qty * (current_price - lot.entry_price),
+                        action="PARTIAL",
                     )
 
             return None
@@ -1322,6 +1791,7 @@ class PositionBook:
                 tokens_to_sell=lot.tokens_held,
                 current_price=current_price,
                 pnl_estimate_native=lot.tokens_held * (current_price - lot.entry_price),
+                action="CLOSE_ALL",
             )
 
         # 5x (+400%): Sell 50% of remaining tokens
@@ -1342,6 +1812,28 @@ class PositionBook:
                     tokens_to_sell=qty,
                     current_price=current_price,
                     pnl_estimate_native=qty * (current_price - lot.entry_price),
+                    action="PARTIAL",
+                )
+
+        # 4x (+300%): Sell 33% of remaining tokens
+        if gain_ratio >= Decimal("4.0") and lot.exit_stage in (
+            ExitStage.NONE,
+            ExitStage.TP1,
+            ExitStage.TP2,
+        ):
+            qty = (lot.tokens_held / Decimal("3")).quantize(Decimal("1e-18"))
+            if qty > 0:
+                return ExitDecision(
+                    lot_id=lot.lot_id,
+                    token_address=lot.token_address,
+                    chain=lot.chain,
+                    should_exit=True,
+                    exit_reason=TradeExitReason.TP_4X,
+                    exit_stage=ExitStage.TP3,
+                    tokens_to_sell=qty,
+                    current_price=current_price,
+                    pnl_estimate_native=qty * (current_price - lot.entry_price),
+                    action="PARTIAL",
                 )
 
         # 3x (+200%): Sell 25% of initial tokens
@@ -1365,6 +1857,7 @@ class PositionBook:
                     tokens_to_sell=qty,
                     current_price=current_price,
                     pnl_estimate_native=qty * (current_price - lot.entry_price),
+                    action="PARTIAL",
                 )
 
         # Dynamic +2R Take Profit / Partial Scale-Out (e.g. at +2R, scale out 25% of initial position):
@@ -1386,6 +1879,7 @@ class PositionBook:
                         tokens_to_sell=qty,
                         current_price=current_price,
                         pnl_estimate_native=qty * (current_price - lot.entry_price),
+                        action="PARTIAL",
                     )
 
         # 2x (+100%): Sell 50% of initial tokens (recouping initial investment)
@@ -1406,6 +1900,7 @@ class PositionBook:
                     tokens_to_sell=qty,
                     current_price=current_price,
                     pnl_estimate_native=qty * (current_price - lot.entry_price),
+                    action="PARTIAL",
                 )
 
         return None
@@ -1445,6 +1940,7 @@ class PositionBook:
         decision: ExitDecision,
         sell_price: Decimal,
         lot: OpenLot | None = None,
+        net_native_received: Decimal | None = None,
     ) -> tuple[Decimal, Decimal]:
         """
         Apply an ExitDecision to its corresponding lot.
@@ -1460,16 +1956,36 @@ class PositionBook:
                     break
         if target_lot is not None:
             qty_to_sell = min(target_lot.tokens_held, decision.tokens_to_sell)
-            pnl = qty_to_sell * (sell_price - target_lot.entry_price)
-            target_lot.tokens_held -= qty_to_sell
-            target_lot.cost_basis_native -= qty_to_sell * target_lot.entry_price
+            fraction_sold = qty_to_sell / target_lot.tokens_held if target_lot.tokens_held > Decimal(0) else Decimal(1)
+            cost_basis_sold = (target_lot.cost_basis_native * fraction_sold).quantize(Decimal("1e-18"))
+
+            if net_native_received is not None:
+                pnl = net_native_received - cost_basis_sold
+            else:
+                pnl = (qty_to_sell * sell_price) - cost_basis_sold
+
+            target_lot.tokens_held = max(Decimal(0), target_lot.tokens_held - qty_to_sell)
+            target_lot.cost_basis_native = max(Decimal(0), target_lot.cost_basis_native - cost_basis_sold)
             target_lot.exit_stage = decision.exit_stage
-            if decision.exit_reason == TradeExitReason.TP_25:
+
+            if decision.exit_reason in (
+                TradeExitReason.TP_25,
+                TradeExitReason.TP_50,
+                TradeExitReason.TP_100,
+                TradeExitReason.TP_2X,
+            ):
                 target_lot.scaled_out_50_pct = True
-            if getattr(decision, "action", "") == "CLOSE_ALL" or target_lot.tokens_held <= Decimal("1e-18"):
+
+            is_full_close = (getattr(decision, "action", "") == "CLOSE_ALL" or target_lot.tokens_held <= Decimal("1e-18"))
+            if is_full_close:
                 target_lot.status = LotStatus.CLOSED
                 if target_lot in lots:
                     lots.remove(target_lot)
+                self._notify_capacity_freed()
+                self.set_token_cooldown(target_lot.token_address, duration_s=300.0)
+            else:
+                target_lot.status = LotStatus.OPEN
+
             logger.debug(
                 "Applied exit decision [%s] on lot %s: sold %s @ %s | PnL=%.8f native | remaining=%s | status=%s",
                 decision.exit_reason.value if decision.exit_reason else "custom",
@@ -1520,9 +2036,19 @@ class RunningMetrics:
         if time.time() - self.circuit_breaker_tripped_at > freeze_duration_s:
             self.circuit_breaker_active = False
             self.circuit_breaker_reason = ""
+            self.consecutive_losses = 0
             logger.info("Circuit breaker freeze period elapsed (%.0f min). Resuming normal execution.", freeze_duration_s / 60.0)
             return False
         return True
+
+    def reset_circuit_breaker(self) -> None:
+        """Manually or programmatically reset circuit breakers and zero out loss streaks."""
+        self.circuit_breaker_active = False
+        self.launch_circuit_breaker_active = False
+        self.circuit_breaker_reason = ""
+        self.consecutive_losses = 0
+        self.consecutive_launch_losses = 0
+        logger.info("Circuit breakers and consecutive loss streak reset successfully.")
 
     def trip_circuit_breaker(self, reason: str, freeze_duration_s: float = 300.0) -> None:
         """Trip global circuit breaker flag and log critical alert."""

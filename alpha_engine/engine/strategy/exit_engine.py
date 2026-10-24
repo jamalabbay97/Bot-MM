@@ -36,11 +36,12 @@ class ExitEngine:
         pnl_pct = float((current_price - entry_price) / entry_price)
 
         # 2. Hard Stop Loss
-        # Skip if within grace period to avoid micro-tick noise
+        # Emergency stop triggers even inside grace period if price collapses catastrophically
+        if pnl_pct <= self.config.emergency_stop_pct:
+            return True, TradeExitReason.SL_HARD
+        # Standard hard stop applies after grace period to avoid micro-tick noise
         if age_seconds > self.config.exit_grace_period_sec:
             if pnl_pct <= self.config.stop_loss_pct:
-                return True, TradeExitReason.SL_HARD
-            if pnl_pct <= self.config.emergency_stop_pct:
                 return True, TradeExitReason.SL_HARD
 
         # 3. Take Profit

@@ -262,6 +262,7 @@ class PaperExecutor:
         apply_drag: bool = False,
         portfolio_equity_usd: Decimal = Decimal("10000.0"),
         platform: Optional[str] = None,
+        min_fill_timestamp_ns: Optional[int] = None,
     ) -> PaperFill | None:
         """
         Produce a PaperFill for a dynamic exit SELL order (TP ladder, trailing stop, emergency drain).
@@ -292,8 +293,25 @@ class PaperExecutor:
 
         tokens_acquired = tokens_to_sell
         simulated_native_spent = quote.amount_out
+        max_allowed_native = adjusted_pool.native_reserve * Decimal("0.30")
+        if simulated_native_spent > max_allowed_native and max_allowed_native > Decimal(0):
+            logger.warning(
+                "CPMM SELL quote native output %s exceeded 30%% of pool native reserve %s; capping to prevent unrealistic paper fills.",
+                simulated_native_spent,
+                adjusted_pool.native_reserve,
+            )
+            simulated_native_spent = max_allowed_native
+
+        if reason in (TradeExitReason.EMERGENCY_DRAIN, TradeExitReason.RUG_LIQUIDITY_DRAIN):
+            # In confirmed emergency drain / rug pull, liquidity is collapsed: apply heavy slippage cap
+            max_drain_native = adjusted_pool.native_reserve * Decimal("0.05")
+            if simulated_native_spent > max_drain_native and max_drain_native > Decimal(0):
+                simulated_native_spent = max_drain_native
+
         effective_price = simulated_native_spent / tokens_acquired
         price_impact_bps = quote.price_impact_bps
+        if reason in (TradeExitReason.EMERGENCY_DRAIN, TradeExitReason.RUG_LIQUIDITY_DRAIN):
+            price_impact_bps = max(price_impact_bps, 5000)
 
         if apply_drag:
             simulated_native_spent, effective_price, _ = apply_paper_trading_drag(
@@ -316,6 +334,12 @@ class PaperExecutor:
             chain=chain,
             pool_address=pool.pool_address,
         )
+        computed_fill_ts = latency_result.fill_timestamp_ns
+        if min_fill_timestamp_ns is not None and computed_fill_ts < min_fill_timestamp_ns:
+            computed_fill_ts = min_fill_timestamp_ns + 1_000_000
+        if computed_fill_ts < now_ns:
+            computed_fill_ts = now_ns + 1_000_000
+
         fill = PaperFill(
             token_address=token_address,
             pool_address=pool.pool_address,
@@ -328,7 +352,7 @@ class PaperExecutor:
             simulated_gas_cost_usd=gas,
             fill_latency_ms=latency_result.latency_ms,
             signal_timestamp_ns=now_ns,
-            fill_timestamp_ns=latency_result.fill_timestamp_ns,
+            fill_timestamp_ns=computed_fill_ts,
             kelly_fraction=0.0,
             portfolio_equity_usd=portfolio_equity_usd,
             platform=resolved_platform,

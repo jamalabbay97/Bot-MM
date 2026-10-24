@@ -393,6 +393,7 @@ class TelegramIngester:
         self._manual_trade_amount: Optional[Decimal] = None
         self._manual_trade_currency: str = "SOL"
         self._wallet_tracker: Optional[Any] = None
+        self._market_oracle: Optional[Any] = None
 
         # Determine if running in dormant/mock mode
         self._is_dormant = False
@@ -414,6 +415,18 @@ class TelegramIngester:
     def set_ai_supervisor(self, supervisor: Any) -> None:
         """Assign or update AI supervisor instance."""
         self._ai_supervisor = supervisor
+
+    def set_market_oracle(self, oracle: Any) -> None:
+        """Assign or update MarketOracle instance."""
+        self._market_oracle = oracle
+
+    @property
+    def market_oracle(self) -> Any:
+        """Access or lazily initialize MarketOracle instance."""
+        if self._market_oracle is None:
+            from alpha_engine.ingestion.market_oracle import MarketOracle
+            self._market_oracle = MarketOracle()
+        return self._market_oracle
 
     @property
     def wallet_tracker(self) -> Any:
@@ -861,30 +874,25 @@ class TelegramIngester:
             if chunk_buttons is not None:
                 kwargs["buttons"] = chunk_buttons
 
+            async def _do_call(fn: Any, *args: Any, **kw: Any) -> None:
+                try:
+                    res = fn(*args, **kw)
+                    if asyncio.iscoroutine(res):
+                        await res
+                except TypeError:
+                    res = fn(*args)
+                    if asyncio.iscoroutine(res):
+                        await res
+
             try:
                 if hasattr(event, "reply"):
-                    try:
-                        res = event.reply(chunk, **kwargs)
-                    except TypeError:
-                        res = event.reply(chunk)
-                    if asyncio.iscoroutine(res):
-                        await res
+                    await _do_call(event.reply, chunk, **kwargs)
                 elif hasattr(event, "respond"):
-                    try:
-                        res = event.respond(chunk, **kwargs)
-                    except TypeError:
-                        res = event.respond(chunk)
-                    if asyncio.iscoroutine(res):
-                        await res
+                    await _do_call(event.respond, chunk, **kwargs)
                 elif self._client is not None and hasattr(self._client, "send_message"):
                     sender_id = getattr(event, "sender_id", None)
                     if sender_id is not None:
-                        try:
-                            res = self._client.send_message(sender_id, chunk, **kwargs)
-                        except TypeError:
-                            res = self._client.send_message(sender_id, chunk)
-                        if asyncio.iscoroutine(res):
-                            await res
+                        await _do_call(self._client.send_message, sender_id, chunk, **kwargs)
             except FloodWaitError as exc:
                 logger.warning("[TelegramIngester] FloodWaitError: %s. Aborting reply.", exc)
                 break
@@ -892,19 +900,13 @@ class TelegramIngester:
                 logger.warning("[TelegramIngester] First reply attempt failed (%s), retrying as raw text...", exc)
                 try:
                     if hasattr(event, "reply"):
-                        res = event.reply(chunk, parse_mode=None, **kwargs)
-                        if asyncio.iscoroutine(res):
-                            await res
+                        await _do_call(event.reply, chunk)
                     elif hasattr(event, "respond"):
-                        res = event.respond(chunk, parse_mode=None, **kwargs)
-                        if asyncio.iscoroutine(res):
-                            await res
+                        await _do_call(event.respond, chunk)
                     elif self._client is not None and hasattr(self._client, "send_message"):
                         sender_id = getattr(event, "sender_id", None)
                         if sender_id is not None:
-                            res = self._client.send_message(sender_id, chunk, parse_mode=None, **kwargs)
-                            if asyncio.iscoroutine(res):
-                                await res
+                            await _do_call(self._client.send_message, sender_id, chunk)
                 except FloodWaitError as final_exc:
                     logger.warning("[TelegramIngester] FloodWaitError on raw text retry: %s. Aborting.", final_exc)
                     break
@@ -1019,6 +1021,10 @@ class TelegramIngester:
                     await self._cmd_copytrade(event, "", sender_id)
                 elif cmd in ("alerts", "notifications"):
                     await self._cmd_token_alerts(event, "", sender_id)
+                elif cmd in ("close_all", "closeall"):
+                    await self._cmd_close_all(event)
+                elif cmd in ("reset_ledger", "resetledger"):
+                    await self._cmd_reset_ledger(event)
                 elif cmd == "help":
                     await self._cmd_start_help(event)
             elif data.startswith("strat:"):
@@ -1339,13 +1345,22 @@ class TelegramIngester:
         elif first_token in ("/buy", "buy", "شراء", "دخول"):
             args = clean_text[len(parts[0]):].strip() if len(parts) > 1 else ""
             await self._cmd_manual_buy(event, args, sender_id=sender_id)
-        elif first_token in ("/sell", "/close", "/exit", "sell", "close", "exit", "بيع", "اغلاق", "إغلاق", "خروج"):
+        elif first_token in ("/sell", "/close", "sell", "close", "بيع", "اغلاق", "إغلاق"):
             args = clean_text[len(parts[0]):].strip() if len(parts) > 1 else ""
             await self._cmd_manual_sell(event, args, sender_id=sender_id)
         elif first_token in ("/start", "/help", "help", "start", "مساعدة", "تعليمات"):
             await self._cmd_start_help(event)
         elif first_token in ("/status", "status", "حالة", "الحالة"):
             await self._cmd_status(event)
+        elif first_token in ("/unfreeze", "/reset_breaker", "/resume", "unfreeze", "فك_التجميد", "إلغاء_التجميد"):
+            if self._execution_target and hasattr(self._execution_target, "reset_circuit_breaker"):
+                self._execution_target.reset_circuit_breaker()
+                await self._safe_reply(event, "🔓 **تم فك تجميد المحرك وإعادة تفعيل التداول بنجاح!**\n• تم تصفير عداد الخسائر المتتالية.\n• المحرك جاهز الآن لتنفيذ إشارات الشراء الجديدة فوراً.")
+            else:
+                await self._safe_reply(event, "⚠️ محرك التداول غير مرتبط حالياً لإعادة ضبط قاطع الدائرة.")
+        elif first_token in ("/oracle", "/macro", "/fng", "oracle", "macro", "fng", "اوراكل", "المؤشرات"):
+            args = clean_text[len(parts[0]):].strip() if len(parts) > 1 else ""
+            await self._cmd_oracle(event, args)
         elif first_token in ("/veto", "veto", "/vetoes", "vetoes", "فيتو", "الفيتو", "مرفوضات", "المرفوضات"):
             await self._cmd_ai(event, "vetoes")
         elif first_token in ("/ai", "/supervisor", "ai", "supervisor", "مشرف", "المشرف"):
@@ -1433,6 +1448,10 @@ class TelegramIngester:
                 await self._safe_reply(event, "✅ تم إعادة ضبط حاكم وتيرة التداول (Trade Frequency Governor) بنجاح.")
             else:
                 await self._safe_reply(event, "⚠️ محرك التداول غير متاح لإعادة ضبط الحاكم.")
+        elif first_token in ("/close_all", "/closeall", "close_all", "closeall", "إغلاق_الكل", "اغلاق_الكل"):
+            await self._cmd_close_all(event)
+        elif first_token in ("/reset_ledger", "/resetledger", "reset_ledger", "تصفير_السجل", "مسح_السجل"):
+            await self._cmd_reset_ledger(event)
         elif first_token in ("/ask", "ask", "سؤال", "اسأل"):
             args = clean_text[len(clean_text.split()[0]):].strip() if len(clean_text.split()) > 1 else ""
             query_to_send = args or clean_text
@@ -1506,6 +1525,7 @@ class TelegramIngester:
             "**المشرف الذكي:** AlphaSupervisor-AI نشط 🧠\n\n"
             "📊 **المراقبة والقياسات (Telemetry & Performance):**\n"
             "• `/status` — تقرير مباشر: Uptime، الذاكرة، رأس المال، PnL، والقوائم.\n"
+            "• `/unfreeze` — فك تجميد قاطع الدائرة فوراً وتصفير عداد الخسائر واستئناف التداول.\n"
             "• `/strategy` — إعدادات واستراتيجيات التداول (Trailing Stop 50%/60%, Take-Profit, Auto-Trade).\n"
             "• `/trades` — المراكز المفتوحة النشطة والصفقات المغلقة مع الأسعار.\n"
             "• `/perf [hours]` — أداء الاستراتيجيات وأنماط التداول الأعلى فوزاً (Win Rate).\n"
@@ -1545,6 +1565,8 @@ class TelegramIngester:
             "• `/untrack <ADDR>` — إزالة المحفظة بالكامل من المراقبة والتتبع.\n"
             "• `/copytrade toggle` — تفعيل أو تعطيل ميزة النسخ عالمياً.\n\n"
             "⚙️ **التحكم والحوكمة (Engine Controls):**\n"
+            "• `/close_all` — إغلاق جميع الصفقات المفتوحة فوراً بسعر السوق وتحرير السعة.\n"
+            "• `/reset_ledger` — تصفير سجل التداول الافتراضي ومسح الصفقات القديمة وإعادة الرصيد الأصلي.\n"
             "• `/override <param> <val>` — تعديل المعاملات (risk, blacklist, ttl, surge_k).\n"
             "• `/reset_governor` — إعادة ضبط حاكم وتيرة التداول (Trading Governor).\n"
             "• `/help` — عرض هذا الدليل الشامل.\n\n"
@@ -1672,43 +1694,44 @@ class TelegramIngester:
             return
 
         for chain, ca in cas:
-            addr_type = await self.wallet_tracker.detect_address_type(ca)
-            if addr_type == "WALLET":
-                logger.info("[TelegramIngester] Admin DM scan detected wallet address: %s", ca)
-                header = (
-                    f"👛 **تم التعرف على العنوان: محفظة متداول (Wallet Address) على شبكة {chain.value}**\n"
-                    f"• العنوان: `{ca}`"
+            target = getattr(self, "_execution_target", None)
+            req_id_str = ""
+            if target and hasattr(target, "submit_token_request"):
+                rec = await target.submit_token_request(
+                    ca,
+                    chain=chain,
+                    user_id=sender_id,
+                    message_id=int(getattr(event, "id", 0) or 0),
+                    originating_channel=f"DM:{sender_id or 'admin'}",
                 )
-                await self._cmd_wallet_page(event, ca, sender_id, header=header)
-                continue
+                req_id_str = f" | Request ID: `{rec.request_id}`"
+            else:
+                raw_signal = RawSignalEvent(
+                    timestamp_ns=time.time_ns(),
+                    chain=chain,
+                    token_address=ca,
+                    source=SignalSource.TELEGRAM_SCRAPER,
+                    originating_channel=f"DM:{sender_id or 'admin'}",
+                    channel_id=int(sender_id or 0),
+                    message_id=int(getattr(event, "id", 0) or 0),
+                    raw_text=args,
+                    status=NewsSignalStatus.VALID,
+                    sybil_channel_count=1,
+                    is_edit=False,
+                    is_direct_dm=True,
+                )
+                await self._enqueue_event(raw_signal)
 
-            raw_signal = RawSignalEvent(
-                timestamp_ns=time.time_ns(),
-                chain=chain,
-                token_address=ca,
-                source=SignalSource.TELEGRAM_SCRAPER,
-                originating_channel=f"DM:{sender_id or 'admin'}",
-                channel_id=int(sender_id or 0),
-                message_id=int(getattr(event, "id", 0) or 0),
-                raw_text=args,
-                status=NewsSignalStatus.VALID,
-                sybil_channel_count=1,
-                is_edit=False,
-                is_direct_dm=True,
-            )
             logger.info(
                 "[TelegramIngester] Admin DM scan dispatched: %s on %s by user %s",
                 ca,
                 chain.value,
                 sender_id,
             )
-            header = (
-                f"🪙 **تم التعرف على العنوان: عقد عملة رقمية (Token Contract Address) على شبكة {chain.value}**\n"
-                f"• العنوان: `{ca}`\n"
-                f"⚡ **جاري تنفيذ استراتيجية التداول الفوري واستثناء شرط القيمة السوقية (Direct DM Priority)...**"
+            await self._safe_reply(
+                event,
+                f"🔎 Ingested CA: `{ca}` | Dispatching to SecurityGatekeeper & AMM Math Engine... (تم استلام العقد وتمريره للفحص والتنفيذ){req_id_str}",
             )
-            await self._enqueue_event(raw_signal)
-            await self._cmd_token_page(event, ca, sender_id, header=header)
 
     async def _cmd_direct_ca_or_help(self, event: Any, text: str, sender_id: Optional[int]) -> None:
         """Handle raw messages containing contract addresses, questions, or general queries in DM."""
@@ -1727,21 +1750,35 @@ class TelegramIngester:
                     continue
 
                 # Token CA detected:
-                # 1. Enqueue raw signal for trading pipeline & security gatekeeper (with Direct DM priority)
-                raw_signal = RawSignalEvent(
-                    timestamp_ns=time.time_ns(),
-                    chain=chain,
-                    token_address=ca,
-                    source=SignalSource.TELEGRAM_SCRAPER,
-                    originating_channel=f"DM:{sender_id or 'admin'}",
-                    channel_id=int(sender_id or 0),
-                    message_id=int(getattr(event, "id", 0) or 0),
-                    raw_text=text,
-                    status=NewsSignalStatus.VALID,
-                    sybil_channel_count=1,
-                    is_edit=False,
-                    is_direct_dm=True,
-                )
+                # 1. Enqueue via reliable submit_token_request or fallback to raw_signal
+                target = getattr(self, "_execution_target", None)
+                req_id_str = ""
+                if target and hasattr(target, "submit_token_request"):
+                    rec = await target.submit_token_request(
+                        ca,
+                        chain=chain,
+                        user_id=sender_id,
+                        message_id=int(getattr(event, "id", 0) or 0),
+                        originating_channel=f"DM:{sender_id or 'admin'}",
+                    )
+                    req_id_str = f"\n• **معرف الطلب (Request ID):** `{rec.request_id}`"
+                else:
+                    raw_signal = RawSignalEvent(
+                        timestamp_ns=time.time_ns(),
+                        chain=chain,
+                        token_address=ca,
+                        source=SignalSource.TELEGRAM_SCRAPER,
+                        originating_channel=f"DM:{sender_id or 'admin'}",
+                        channel_id=int(sender_id or 0),
+                        message_id=int(getattr(event, "id", 0) or 0),
+                        raw_text=text,
+                        status=NewsSignalStatus.VALID,
+                        sybil_channel_count=1,
+                        is_edit=False,
+                        is_direct_dm=True,
+                    )
+                    await self._enqueue_event(raw_signal)
+
                 logger.info(
                     "[TelegramIngester] Direct DM CA dispatched: %s on %s by user %s",
                     ca,
@@ -1750,10 +1787,9 @@ class TelegramIngester:
                 )
                 header = (
                     f"🪙 **تم التعرف على العنوان: عقد عملة رقمية (Token Contract Address) على شبكة {chain.value}**\n"
-                    f"• العنوان: `{ca}`\n"
+                    f"• العنوان: `{ca}`{req_id_str}\n"
                     f"⚡ **جاري تنفيذ استراتيجية التداول الفوري واستثناء شرط القيمة السوقية (Direct DM Priority)...**"
                 )
-                await self._enqueue_event(raw_signal)
 
                 # 2. Immediately capture and display live token page with controls and enabled alerts
                 await self._cmd_token_page(event, ca, sender_id, header=header)
@@ -1818,11 +1854,8 @@ class TelegramIngester:
                 _, dec_part = s.split(".", 1)
                 leading_zeros = len(dec_part) - len(dec_part.lstrip("0"))
                 sig = dec_part.lstrip("0")
-                if len(sig) > 1:
-                    sig_fmt = f"{sig[0]}.{sig[1:5]}".rstrip("0").rstrip(".")
-                else:
-                    sig_fmt = sig
-                if leading_zeros >= 4:
+                sig_fmt = sig[:4]
+                if leading_zeros >= 3:
                     subscript_map = str.maketrans("0123456789", "₀₁₂₃₄₅₆₇₈₉")
                     sub = str(leading_zeros).translate(subscript_map)
                     return f"$0.0{sub}{sig_fmt}"
@@ -2065,7 +2098,7 @@ class TelegramIngester:
         lines = [
             "🧠 **AlphaSupervisor-AI Autonomous Risk Engine | محرك إدارة المخاطر المستقل**\n",
             "• **الحالة (Status):** نشط (Active) 🟢",
-            f"• **المزود (Provider):** `{ai_status.get('provider', 'gemini')}` (`{ai_status.get('model', 'gemini-2.5-flash')}`)",
+            f"• **المزود (Provider):** `{ai_status.get('provider', 'gemini')}` (`{ai_status.get('model', 'gemini-3.8-flash')}`)",
             f"• **Global Risk Stance:** {mode_icon} **{mode}**",
             f"• **وضع الحظر الصارم (Strict Veto Mode):** {strict_icon}",
             f"• **عدادات التدقيق (Audit Counters):** Total: `{total_audits}` | Approved: `{approved}` | Vetoed: `{vetoed}`",
@@ -2097,6 +2130,82 @@ class TelegramIngester:
         ])
 
         await self._safe_reply(event, "\n".join(lines))
+
+    async def _cmd_oracle(self, event: Any, args: str = "") -> None:
+        """
+        Display live macroeconomic sentiment and on-chain oracle telemetry:
+        - Alternative.me Crypto Fear & Greed Index + Risk Position Multiplier
+        - DefiLlama Cross-Chain Coin Price (SOL & ETH)
+        - DefiLlama Solana & Base Total Value Locked (TVL)
+        - Optional: GeckoTerminal Pool Analytics if a token CA is supplied
+        """
+        oracle = self.market_oracle
+        target_token = args.strip() if args else ""
+
+        summary = await oracle.get_macro_market_summary()
+        fng = summary.get("fear_and_greed", {})
+        prices = summary.get("prices", {})
+        tvl = summary.get("tvl", {})
+
+        fng_val = fng.get("value", 50)
+        fng_class = fng.get("classification", "Neutral")
+        fng_mod = fng.get("risk_modifier", 1.0)
+
+        if fng_val <= 25:
+            fng_icon = "😱"
+        elif fng_val <= 45:
+            fng_icon = "😨"
+        elif fng_val <= 55:
+            fng_icon = "⚖️"
+        elif fng_val <= 75:
+            fng_icon = "🤑"
+        else:
+            fng_icon = "🔥"
+
+        sol_price = prices.get("solana")
+        eth_price = prices.get("base_eth")
+        sol_price_str = f"${sol_price:,.2f}" if sol_price else "N/A"
+        eth_price_str = f"${eth_price:,.2f}" if eth_price else "N/A"
+
+        sol_tvl = tvl.get("solana")
+        base_tvl = tvl.get("base")
+        sol_tvl_str = f"${sol_tvl / 1e9:,.2f}B" if sol_tvl else "N/A"
+        base_tvl_str = f"${base_tvl / 1e9:,.2f}B" if base_tvl else "N/A"
+
+        out_lines = [
+            "🔮 **Public Market Oracle & Macro Telemetry | مؤشرات السوق الكلية**\n",
+            "📊 **مؤشر الخوف والجشع (Fear & Greed Index):**",
+            f"• القيمة (Score): `{fng_val}/100` {fng_icon} **{fng_class}**",
+            f"• معامل تعديل حجم الصفقات (Risk Multiplier): `{fng_mod:.2f}x`",
+            "",
+            "💰 **أسعار الأصول المرجعية (DefiLlama Price Feed):**",
+            f"• **SOL:** `{sol_price_str}` | **ETH (Base):** `{eth_price_str}`",
+            "",
+            "🏦 **القيمة الإجمالية المقفلة (DefiLlama Chain TVL):**",
+            f"• **Solana TVL:** `{sol_tvl_str}`",
+            f"• **Base TVL:** `{base_tvl_str}`",
+        ]
+
+        if target_token:
+            out_lines.append("")
+            out_lines.append(f"🦎 **GeckoTerminal On-Chain Pool Metrics:** `{target_token[:12]}...`")
+            dex_data = await oracle.get_geckoterminal_pool_stats("solana", target_token)
+            if not dex_data:
+                dex_data = await oracle.get_geckoterminal_pool_stats("base", target_token)
+
+            if dex_data:
+                out_lines.append(f"• المجمع (Pool): `{dex_data.get('pool_name', 'N/A')}` ({dex_data.get('dex', 'N/A')})")
+                out_lines.append(f"• السعر (Price USD): `${dex_data.get('base_token_price_usd', 0.0):.6f}`")
+                out_lines.append(f"• السيولة (Liquidity): `${dex_data.get('reserve_in_usd', 0.0):,.0f}`")
+                out_lines.append(f"• القيمة السوقية المخففة (FDV): `${dex_data.get('fdv_usd', 0.0):,.0f}`")
+                out_lines.append(f"• حجم 24 ساعة (24h Volume): `${dex_data.get('volume_usd_24h', 0.0):,.0f}`")
+            else:
+                out_lines.append("• ⚠️ لم يتم العثور على مجمع سيولة نشط في GeckoTerminal لهذا العنوان.")
+
+        out_lines.append("")
+        out_lines.append("⚡ *Powered by Alternative.me, DefiLlama & GeckoTerminal Public APIs*")
+
+        await self._safe_reply(event, "\n".join(out_lines))
 
     async def _cmd_audit(self, event: Any, args: str) -> None:
         """Handle /audit <CA> command in DMs: execute an on-demand AI risk audit."""
@@ -3261,6 +3370,7 @@ class TelegramIngester:
                     f"{short_token:<10} | {platform_str:<8} | {type_str:<5} | {side_str:<4} | {fill_p:<11} | {pnl_str:<8}"
                 )
             lines.append("```")
+            response_sections.append("\n".join(lines))
         buttons = []
         if open_trades and TELETHON_AVAILABLE:
             try:
@@ -3269,11 +3379,42 @@ class TelegramIngester:
                     tok_str = str(t.get("token_address", ""))
                     short_tok = f"{tok_str[:4]}..{tok_str[-4:]}" if len(tok_str) > 10 else tok_str
                     buttons.append([Button.inline(f"🔴 إغلاق صفقة {short_tok} (Sell)", data=f"trade:close:{tok_str}".encode("utf-8"))])
+                buttons.append([Button.inline("🛑 إغلاق جميع الصفقات (Close All)", data=b"cmd:close_all")])
                 buttons.append([Button.inline("🔄 تحديث الصفقات", data=b"cmd:trades"), Button.inline("❌ إغلاق", data=b"tok:close:trades")])
             except Exception:
                 buttons = []
 
         await self._safe_reply(event, "\n\n".join(response_sections), buttons=buttons if buttons else None)
+
+    async def _cmd_close_all(self, event: Any) -> None:
+        """Handle /close_all command in DMs: emergency force-close all open positions at market."""
+        target = self.execution_target
+        if target and hasattr(target, "force_close_all_open_lots"):
+            closed = await target.force_close_all_open_lots()
+            msg = (
+                f"🛑 **تم إغلاق جميع الصفقات المفتوحة بنجاح (Emergency Market Exit)**\n\n"
+                f"• **عدد الصفقات المغلقة:** `{closed}`\n"
+                f"• **حالة المحرك:** تم تحرير مساحات التداول بالكامل وتحديث سجل الأوامر.\n"
+                f"• All `{closed}` active lots force-closed at market prices."
+            )
+            await self._safe_reply(event, msg)
+        else:
+            await self._safe_reply(event, "⚠️ محرك التداول غير مرتبط حالياً لتنفيذ الإغلاق الكلي.")
+
+    async def _cmd_reset_ledger(self, event: Any) -> None:
+        """Handle /reset_ledger command in DMs: wipe ledger history for fresh run."""
+        target = self.execution_target
+        if target and hasattr(target, "reset_paper_trading_ledger"):
+            await target.reset_paper_trading_ledger()
+            msg = (
+                "🧹 **تم تصفير سجل التداول الافتراضي بالكامل (Paper Ledger Reset)**\n\n"
+                "• تم مسح سجل الصفقات التاريخية، ومراحل العقود، ومخططات المحفظة.\n"
+                "• تمت استعادة الرصيد الافتراضي الابتدائي ($8,300 USD / 50 SOL / 1 ETH).\n"
+                "• المحرك جاهز لبدء دورة اختبار نقية تماماً."
+            )
+            await self._safe_reply(event, msg)
+        else:
+            await self._safe_reply(event, "⚠️ محرك التداول غير مرتبط حالياً لإعادة ضبط السجل.")
 
     # -------------------------------------------------------------------------
     # 3. Lifecycle & Connection Management
@@ -3404,6 +3545,7 @@ class TelegramIngester:
 
                     commands = [
                         BotCommand(command="status", description="📊 Live Engine Telemetry & PnL"),
+                        BotCommand(command="oracle", description="🔮 Macro Fear & Greed, TVL & Public Oracles"),
                         BotCommand(command="strategy", description="🎯 Manage Strategies, TP/SL & Auto-Trade"),
                         BotCommand(command="ai", description="🧠 AlphaSupervisor-AI Control & Risk"),
                         BotCommand(command="trades", description="📋 Active Positions & Closed Ledger"),
@@ -3421,6 +3563,8 @@ class TelegramIngester:
                         BotCommand(command="why", description="❓ Explain Entry/Skip Decision for Token"),
                         BotCommand(command="exit", description="🛑 Explain Exit Rationale for Position"),
                         BotCommand(command="override", description="⚙️ Tune Risk, TTL, Blacklist, Hyperparams"),
+                        BotCommand(command="close_all", description="🛑 Force Market Close All Active Positions"),
+                        BotCommand(command="reset_ledger", description="🧹 Reset Paper Trading Ledger & Equity"),
                         BotCommand(command="reset_governor", description="🔄 Reset Trading Frequency Governor"),
                         BotCommand(command="ask", description="💬 Ask Supervisor AI Anything (AR/EN)"),
                         BotCommand(command="help", description="📖 Full Command Reference & Usage"),

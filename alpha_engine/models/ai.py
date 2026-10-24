@@ -165,6 +165,30 @@ class AISupervisorResponse(BaseModel):
     wallet_audit: WalletAudit
     security_assessment: SecurityAssessment
     feedback_tuning: FeedbackTuning
+    reasoning_summary: Optional[str] = Field(
+        default=None,
+        description="Chain-of-thought or high-level risk synthesis rationale",
+    )
+
+    @property
+    def risk_rationale(self) -> str:
+        """Convenient human-readable summary of risk rationale."""
+        if self.reasoning_summary:
+            return self.reasoning_summary
+        if self.wallet_audit and getattr(self.wallet_audit, "rationale", None):
+            return self.wallet_audit.rationale
+        if self.security_assessment and getattr(self.security_assessment, "flags", None):
+            return f"Security assessment: {', '.join(self.security_assessment.flags)}"
+        if self.feedback_tuning and getattr(self.feedback_tuning, "insights_learned", None):
+            return self.feedback_tuning.insights_learned
+        return "Deterministic risk evaluation"
+
+    @property
+    def risk_score(self) -> float:
+        """Calculated risk score (0-100) based on confidence and security health."""
+        if self.security_assessment and not getattr(self.security_assessment, "is_secure", True):
+            return 95.0
+        return round(max(0.0, min(100.0, (1.0 - self.confidence_score) * 100.0)), 2)
 
     def to_strict_json(self) -> str:
         """Serialize into exact strict JSON string required by prompt specification."""
@@ -174,12 +198,19 @@ class AISupervisorResponse(BaseModel):
     def from_strict_json(cls, json_str: str) -> "AISupervisorResponse":
         """Parse from raw JSON string, stripping any accidental markdown fences or enclosing commentary."""
         clean = json_str.strip()
+        # Strip potential markdown fences ```json ... ```
+        if clean.startswith("```"):
+            clean = clean.split("\n", 1)[-1]
+        if clean.endswith("```"):
+            clean = clean.rsplit("```", 1)[0]
+        clean = clean.strip()
         start = clean.find("{")
         end = clean.rfind("}")
         if start != -1 and end != -1 and end > start:
             clean = clean[start : end + 1]
         data = json.loads(clean)
         return cls.model_validate(data)
+
 
 
 class AuditedTokenOutcome(BaseModel):

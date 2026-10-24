@@ -10,6 +10,7 @@ from alpha_engine.engine.feedback import AdaptiveFeedbackEngine, TradeReflection
 from alpha_engine.engine.registry import PoolRegistry
 from alpha_engine.engine.rpc_health import RPCEndpoint, RPCHealthMonitor
 from alpha_engine.engine.runner import (
+    AlphaEngine,
     PaperTradingEngine,
     _async_main,
     _build_example_config,
@@ -17,6 +18,7 @@ from alpha_engine.engine.runner import (
 from alpha_engine.engine.signals import SignalGenerator
 
 __all__ = [
+    "AlphaEngine",
     "EngineConfig",
     "_require_env",
     "_optional_env",

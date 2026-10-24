@@ -15,6 +15,7 @@ from typing import Annotated, Any, Optional
 
 from pydantic import (
     BaseModel,
+    ConfigDict,
     Field,
     model_validator,
 )
@@ -26,6 +27,7 @@ from alpha_engine.models.enums import (
     ExitStage,
     OrderSide,
     SecurityTier,
+    TokenRequestState,
     TradeExitReason,
     resolve_trade_platform,
 )
@@ -64,6 +66,7 @@ class PoolState(BaseModel):
     token_decimals: Annotated[int, Field(ge=0, le=18)] = 18
     native_decimals: Annotated[int, Field(ge=0, le=18)] = 18
     token_address: Optional[str] = None
+    timestamp_s: Optional[float] = Field(default_factory=time.time)
 
     @model_validator(mode="after")
     def fee_fraction_sane(self) -> "PoolState":
@@ -462,6 +465,50 @@ class PortfolioSnapshot(BaseModel):
     total_gas_spent_usd: Annotated[Decimal, Field(ge=Decimal(0))]
 
 
+class TokenRequestRecord(BaseModel):
+    """
+    Persistent state tracking for an independent token evaluation request.
+    Traceable from submission to execution or terminal rejection/close.
+    """
+
+    model_config = ConfigDict(
+        frozen=False,
+        arbitrary_types_allowed=True,
+        str_strip_whitespace=True,
+        validate_default=True,
+        populate_by_name=True,
+    )
+
+    request_id: str
+    token_address: str
+    chain: ChainIdentifier
+    submitted_at_ns: int = Field(default_factory=time.time_ns)
+    created_at_ns: Optional[int] = None
+    user_id: Optional[str | int] = None
+    message_id: Optional[int] = None
+    originating_channel: Optional[str] = "DM:User"
+    custom_amount_native: Optional[Decimal] = None
+    note: Optional[str] = None
+    state: TokenRequestState = TokenRequestState.RECEIVED
+    opportunity_score: float = 0.0
+    opportunity_rank: int = 0
+    validation_status: str = "PENDING"
+    rejection_reason: Optional[str] = None
+    queue_entry_ts_ns: Optional[int] = None
+    queue_exit_ts_ns: Optional[int] = None
+    analysis_start_ts_ns: Optional[int] = None
+    analysis_end_ts_ns: Optional[int] = None
+    execution_start_ts_ns: Optional[int] = None
+    order_id: Optional[str] = None
+    lot_id: Optional[str] = None
+    simulated_fill_price: Optional[Decimal] = None
+    tokens_filled: Optional[Decimal] = None
+    realized_pnl_usd: Optional[float] = None
+    close_reason: Optional[str] = None
+    metadata_json: Optional[str] = None
+    updated_at_ns: int = Field(default_factory=time.time_ns)
+
+
 __all__ = [
     "PoolState",
     "SecurityReport",
@@ -471,6 +518,8 @@ __all__ = [
     "ExitDecision",
     "ExitOrder",
     "PortfolioSnapshot",
+    "TokenRequestRecord",
 ]
+
 
 
