@@ -100,19 +100,20 @@ class PatternFeatureVector(BaseModel):
 
         cons_dur = getattr(signal, "consolidation_duration_s", None)
         if cons_dur is None:
-            cons_dur = 1800.0
+            cons_h = getattr(signal, "consolidation_length_hours", None)
+            cons_dur = float(cons_h) * 3600.0 if cons_h is not None else 0.0
         dip_pct = getattr(signal, "dip_depth_pct", None)
         if dip_pct is None:
-            dip_pct = 40.0
+            dip_pct = 0.0
         surge_mult = getattr(signal, "volume_surge_multiplier", None)
         if surge_mult is None:
-            surge_mult = 2.5
+            surge_mult = 1.0
         net_delta = getattr(signal, "net_buy_delta", None)
         if net_delta is None:
-            net_delta = 0.70
+            net_delta = 0.50
         liq_ratio = getattr(signal, "liquidity_to_mc_ratio", None)
         if liq_ratio is None:
-            liq_ratio = 0.20
+            liq_ratio = 0.10
         peak_gain = getattr(signal, "peak_gain_multiplier", None)
         if peak_gain is None:
             peak_gain = 1.0

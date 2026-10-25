@@ -114,6 +114,7 @@ class SignalEvent(BaseModel):
     consolidation_length_hours: Optional[float] = Field(default=None, description="Consolidation duration in hours")
     volume_surge_multiplier: Optional[float] = Field(default=None, description="Volume surge over SMA")
     net_buy_delta: Optional[float] = Field(default=None, description="Net buy volume ratio")
+    dip_depth_pct: Optional[float] = Field(default=None, description="Dip depth from peak in pct")
     execution_venue: Optional[ExecutionVenue] = Field(default=None, description="Execution venue (e.g. RAYDIUM_AMM, UNISWAP_V3)")
     originating_channel: Optional[str] = Field(default=None, description="Originating channel or DM handle")
     is_direct_dm: bool = Field(default=False, description="Flag indicating signal was directly sent via Telegram DM")

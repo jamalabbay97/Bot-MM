@@ -88,6 +88,7 @@ class StrategyType(str, Enum):
     FAST_SNIPE = "fast_snipe"
     WAVE2_BREAKOUT = "wave2_breakout"
     REVIVAL_SWING = "revival_swing"
+    EARLY_RALLY_BREAKOUT = "early_rally_breakout"
     GRADUATED_PRIORITY = "graduated_priority"
     MOVERS_PRIORITY = "movers_priority"
 
@@ -97,11 +98,13 @@ class ExitProfile(str, Enum):
     Position exit profile and risk management regime.
     FAST_SNIPE: Short-lived scalps (120s velocity decay, -25% SL, +25%/+50% TP).
     REVIVAL_SWING: Multi-hour/day hold, 35% trailing ATH drawdown, +100%/+200%/+400%/+800% ladder.
+    EARLY_RALLY_SWING: Strict -15% hard stop-loss, 50% partial take-profit at +50%/+100%, 25-30% ATH trailing stop on moonbag runner.
     """
 
     FAST_SNIPE = "FAST_SNIPE"            # Existing 120s velocity decay, -25% SL, +25%/+50% TP
     REVIVAL_SWING = "REVIVAL_SWING"      # Multi-hour/day hold, 35% trailing drawdown, 100%/200% TP ladder
     PEAK_TRAILING = "PEAK_TRAILING"      # Trailing stop from ATH peak, +50%/+60% TP target
+    EARLY_RALLY_SWING = "EARLY_RALLY_SWING"  # Strict -15% hard SL, 50% partial TP, 28% ATH trailing stop
 
 
 class SignalSource(str, Enum):
@@ -116,6 +119,7 @@ class SignalSource(str, Enum):
     DYNAMIC_EXIT = "dynamic_exit"
     WAVE2_BREAKOUT = "wave2_breakout"
     REVIVAL_BREAKOUT = "revival_breakout"
+    EARLY_RALLY_BREAKOUT = "early_rally_breakout"
     RAYDIUM_NEW_POOL = "raydium_new_pool"
     MEME_RADAR_BURST = "meme_radar_burst"
     SCREENER_GRADUATED = "screener_graduated"
@@ -161,6 +165,7 @@ class TradeExitReason(str, Enum):
     TP_10X = "tp_10x"                              # Take Profit Ladder: Incremental sold at 10x (+900%)
     SL_INITIAL = "sl_initial"                      # Hard stop-loss (-8% / -15%)
     SL_HARD = "sl_hard"                            # Alias for hard stop-loss
+    EARLY_RALLY_SL_15 = "early_rally_sl_15"        # Early Rally strict -15% hard stop-loss
     SL_TRAILING = "sl_trailing"                    # Trailing stop
     TRAILING_PEAK_STOP = "sl_peak_trail"          # Trailing stop from highest recorded price (ATH peak)
     TP_60 = "tp_60"                                # Take-Profit: +60% target
@@ -173,6 +178,7 @@ class TradeExitReason(str, Enum):
     LIQUIDITY_RUG = "rug_liquidity_drain"          # Alias for strategy V2
     EMERGENCY_DRAIN = "emergency_drain"            # Pool reserves dropped >30% or insolvency collapse
     EMERGENCY_HONEYPOT_MUTATION = "emergency_honeypot_mutation"  # Contract variables mutated post-entry
+    ILLIQUID_MARKET = "illiquid_market"            # Genuinely illiquid or market unavailable; safe liquidation write-off
     MANUAL_CLOSE = "manual_close"
 
 

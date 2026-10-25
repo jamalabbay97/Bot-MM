@@ -95,7 +95,12 @@ class SQLiteLedger:
         fill_timestamp_ns   INTEGER NOT NULL,
         created_at          INTEGER NOT NULL,
         platform            TEXT NOT NULL DEFAULT 'DexScan',
-        is_new_launch       INTEGER NOT NULL DEFAULT 0
+        is_new_launch       INTEGER NOT NULL DEFAULT 0,
+        hard_stop_loss_pct  REAL,
+        custom_stop_loss_pct REAL,
+        custom_take_profit_pct REAL,
+        trailing_stop_from_peak_pct REAL,
+        strategy_name       TEXT
     )
     """
 
@@ -316,6 +321,16 @@ class SQLiteLedger:
                     await conn.execute("ALTER TABLE trades ADD COLUMN platform TEXT NOT NULL DEFAULT 'DexScan';")
                 if "is_new_launch" not in cols:
                     await conn.execute("ALTER TABLE trades ADD COLUMN is_new_launch INTEGER NOT NULL DEFAULT 0;")
+                if "hard_stop_loss_pct" not in cols:
+                    await conn.execute("ALTER TABLE trades ADD COLUMN hard_stop_loss_pct REAL;")
+                if "custom_stop_loss_pct" not in cols:
+                    await conn.execute("ALTER TABLE trades ADD COLUMN custom_stop_loss_pct REAL;")
+                if "custom_take_profit_pct" not in cols:
+                    await conn.execute("ALTER TABLE trades ADD COLUMN custom_take_profit_pct REAL;")
+                if "trailing_stop_from_peak_pct" not in cols:
+                    await conn.execute("ALTER TABLE trades ADD COLUMN trailing_stop_from_peak_pct REAL;")
+                if "strategy_name" not in cols:
+                    await conn.execute("ALTER TABLE trades ADD COLUMN strategy_name TEXT;")
         except Exception as exc:
             logger.debug("Migration check for trades schema: %s", exc)
         await conn.execute("CREATE INDEX IF NOT EXISTS idx_trades_platform ON trades(platform);")
@@ -347,9 +362,10 @@ class SQLiteLedger:
                 side, native_spent, tokens_delta, effective_price, price_impact_bps,
                 gas_cost_usd, fill_latency_ms, kelly_fraction, portfolio_equity_usd,
                 realized_pnl_usd, signal_timestamp_ns, fill_timestamp_ns, created_at,
-                platform, is_new_launch
+                platform, is_new_launch, hard_stop_loss_pct, custom_stop_loss_pct,
+                custom_take_profit_pct, trailing_stop_from_peak_pct, strategy_name
             ) VALUES (
-                ?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?
+                ?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?
             )
             """,
             (
@@ -374,6 +390,11 @@ class SQLiteLedger:
                 time.time_ns(),
                 getattr(record, "platform", "DexScan") or "DexScan",
                 1 if getattr(record, "is_new_launch", False) else 0,
+                getattr(record, "hard_stop_loss_pct", None),
+                getattr(record, "custom_stop_loss_pct", None),
+                getattr(record, "custom_take_profit_pct", None),
+                getattr(record, "trailing_stop_from_peak_pct", None),
+                getattr(record, "strategy_name", None),
             ),
         )
         await conn.commit()
@@ -1290,21 +1311,44 @@ class SQLiteLedger:
         query = """
             SELECT t.order_id, t.signal_id, t.chain, t.token_address, t.pool_address,
                    t.native_spent, t.tokens_delta, t.effective_price, t.fill_timestamp_ns,
-                   t.platform, t.is_new_launch
+                   t.platform, t.is_new_launch,
+                   t.hard_stop_loss_pct, t.custom_stop_loss_pct, t.custom_take_profit_pct,
+                   t.trailing_stop_from_peak_pct, t.strategy_name
             FROM trades t
             WHERE t.side = 'buy'
-              AND t.token_address NOT IN (
-                  SELECT token_address FROM lot_lifecycle WHERE LOWER(status) IN ('closed', 'settled')
-              )
-              AND t.token_address NOT IN (
-                  SELECT token_address FROM trades WHERE side = 'sell' AND realized_pnl_usd IS NOT NULL
+              AND t.order_id NOT IN (
+                  SELECT lot_id FROM lot_lifecycle WHERE LOWER(status) IN ('closed', 'settled')
               )
             ORDER BY t.created_at ASC
         """
         async with conn.execute(query) as cursor:
             rows = await cursor.fetchall()
             cols = [d[0] for d in cursor.description]
-            return [dict(zip(cols, r)) for r in rows]
+            lot_dicts = [dict(zip(cols, r)) for r in rows]
+
+        restored_lots = []
+        for d in lot_dicts:
+            token = d["token_address"]
+            bought_tokens = Decimal(str(d.get("tokens_delta", 0)))
+            buy_ts = d.get("fill_timestamp_ns", 0)
+            sell_query = """
+                SELECT tokens_delta FROM trades
+                WHERE side = 'sell' AND token_address = ? AND fill_timestamp_ns >= ?
+            """
+            async with conn.execute(sell_query, (token, buy_ts)) as s_cursor:
+                s_rows = await s_cursor.fetchall()
+                total_sold = sum(abs(Decimal(str(r[0]))) for r in s_rows)
+
+            remaining_tokens = bought_tokens - total_sold
+            if remaining_tokens <= Decimal("0"):
+                continue  # All tokens already sold, lot is completely closed!
+
+            d["initial_tokens"] = str(bought_tokens)
+            d["tokens_delta"] = str(remaining_tokens)
+            d["scaled_out_50_pct"] = (total_sold > Decimal("0"))
+            restored_lots.append(d)
+
+        return restored_lots
 
     @sqlite_retry(max_retries=5, base_delay=0.1)
     async def clear_all_trades_and_lots(self) -> None:

@@ -54,8 +54,6 @@ class PoolRegistry:
                 }
             )
             self._pools[target_pool_address] = new_pool
-            if target_token:
-                self._pools[target_token] = new_pool
             return new_pool
 
         # 2. Determine swap direction: BUY vs SELL of target_token
@@ -89,19 +87,60 @@ class PoolRegistry:
             }
         )
         self._pools[target_pool_address] = new_pool
-        if target_token:
-            self._pools[target_token] = new_pool
         return new_pool
 
     def get(self, pool_or_token_address: str, expected_token: str | None = None) -> PoolState | None:
         if not pool_or_token_address:
             return None
-        target_lower = pool_or_token_address.lower()
+
+        # 1. Exact pool address lookup
         pool = self._pools.get(pool_or_token_address)
+        if pool is not None:
+            if expected_token:
+                tok = getattr(pool, "token_address", None)
+                if tok and tok.lower() != expected_token.lower():
+                    return None
+            return pool
+
+        # 2. Case-insensitive pool address lookup
+        target_lower = pool_or_token_address.lower()
+        for p_addr, p in self._pools.items():
+            if p_addr.lower() == target_lower:
+                if expected_token:
+                    tok = getattr(p, "token_address", None)
+                    if tok and tok.lower() != expected_token.lower():
+                        return None
+                return p
+
+        # 3. Fallback: Lookup by token address if no pool address matched
+        matching_pools = [
+            p for p in self._pools.values()
+            if getattr(p, "token_address", None) and p.token_address.lower() == target_lower
+        ]
+        if expected_token:
+            matching_pools = [
+                p for p in matching_pools
+                if getattr(p, "token_address", None) and p.token_address.lower() == expected_token.lower()
+            ]
+
+        if len(matching_pools) == 1:
+            return matching_pools[0]
+        elif len(matching_pools) > 1:
+            # Ambiguous token lookup: multiple pools exist for this token!
+            # Do NOT treat an arbitrary pool as the authoritative state.
+            return None
+
+        return None
+
+    def get_pool(self, pool_address: str, expected_token: str | None = None) -> PoolState | None:
+        """Lookup pool strictly by pool address."""
+        if not pool_address:
+            return None
+        pool = self._pools.get(pool_address)
         if pool is None:
-            for p in self._pools.values():
-                tok = getattr(p, "token_address", None)
-                if p.pool_address.lower() == target_lower or (tok and tok.lower() == target_lower):
+            target_lower = pool_address.lower()
+            for p_addr, p in self._pools.items():
+                if p_addr.lower() == target_lower:
                     pool = p
                     break
         if pool is not None and expected_token:
@@ -110,11 +149,22 @@ class PoolRegistry:
                 return None
         return pool
 
+    def get_pools_for_token(self, token_address: str) -> list[PoolState]:
+        """Return all distinct pool states associated with a token."""
+        if not token_address:
+            return []
+        target_lower = token_address.lower()
+        return [
+            p for p in self._pools.values()
+            if getattr(p, "token_address", None) and p.token_address.lower() == target_lower
+        ]
+
     def set(self, pool_address: str, state: PoolState) -> None:
-        self._pools[pool_address] = state
-        tok = getattr(state, "token_address", None)
-        if tok:
-            self._pools[tok] = state
+        """Store pool state keyed by pool address."""
+        target_addr = pool_address or state.pool_address
+        self._pools[target_addr] = state
+        if state.pool_address and state.pool_address != target_addr:
+            self._pools[state.pool_address] = state
 
 
 import asyncio

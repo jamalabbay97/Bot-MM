@@ -692,9 +692,10 @@ class TelegramIngester:
         try:
             from telethon import Button
             return [
-                [Button.inline("🚀 Peak Trail 50% (+50% TP)", data=b"strat:peak50"), Button.inline("🦅 Peak Trail 60% (+60% TP)", data=b"strat:peak60")],
-                [Button.inline("🏛️ Default Strategy", data=b"strat:default"), Button.inline("🔄 Auto-Trade On/Off", data=b"strat:toggle_auto")],
-                [Button.inline("🎯 Screener Exclusive", data=b"strat:toggle_screener"), Button.inline("📊 Live Status", data=b"cmd:status")],
+                [Button.inline("⚡ Early Rally (+50% TP, -15% SL)", data=b"strat:early_rally"), Button.inline("🚀 Peak Trail 50%", data=b"strat:peak50")],
+                [Button.inline("🦅 Peak Trail 60%", data=b"strat:peak60"), Button.inline("🏛️ Default Strategy", data=b"strat:default")],
+                [Button.inline("🔄 Auto-Trade On/Off", data=b"strat:toggle_auto"), Button.inline("🎯 Screener Exclusive", data=b"strat:toggle_screener")],
+                [Button.inline("📊 Live Status", data=b"cmd:status")],
             ]
         except Exception:
             return None
@@ -1858,6 +1859,8 @@ class TelegramIngester:
                 if leading_zeros >= 3:
                     subscript_map = str.maketrans("0123456789", "₀₁₂₃₄₅₆₇₈₉")
                     sub = str(leading_zeros).translate(subscript_map)
+                    if len(sig) > 1:
+                        return f"$0.0{sub}{sig[0]}.{sig[1:4]}"
                     return f"$0.0{sub}{sig_fmt}"
                 return f"{f:.8f}".rstrip("0")
             return f"{f:.8f}".rstrip("0")
@@ -2377,10 +2380,15 @@ class TelegramIngester:
         tp_val = status.get("custom_take_profit_pct")
         tp_str = f"+{float(tp_val)*100.0:.0f}%" if tp_val is not None else "Dynamic Ladder (Default)"
         sl_val = status.get("custom_stop_loss_pct")
-        sl_str = f"-{float(sl_val)*100.0:.0f}% from ATH Peak" if strat_name.startswith("peak") else "Dynamic / -8% VWAP"
+        if strat_name in ("early_rally", "early_rally_breakout"):
+            sl_str = "-15% Hard SL | +50% Scale-out | 28% ATH Trail"
+        elif strat_name.startswith("peak"):
+            sl_str = f"-{float(sl_val)*100.0:.0f}% from ATH Peak"
+        else:
+            sl_str = "Dynamic / -8% VWAP"
         auto_trade = status.get("auto_trade_enabled", True)
         screener_focus = status.get("screener_exclusive_focus", False)
-        min_mcap = status.get("min_market_cap_usd", 10000.0)
+        min_mcap = status.get("early_rally_min_market_cap_usd", 3500.0) if strat_name in ("early_rally", "early_rally_breakout") else status.get("min_market_cap_usd", 10000.0)
         amt_disp, _ = self._get_current_trade_amount_display()
 
         lines = [
@@ -2398,6 +2406,7 @@ class TelegramIngester:
             "💡 *Tap a preset button below or use commands:*",
             "• `/setamount <amount>` — Set fixed trade amount (e.g. 0.1 SOL, $50 USD)",
             "• `/balance` — Check available wallet balance & risk safety",
+            "• `/strategy set early_rally` — Early rally entry ($3.5k+ mcap), -15% SL, +50% TP1, 28% ATH Trail",
             "• `/strategy set peak50` — Trail 50% from ATH, +50% TP",
             "• `/strategy set peak60` — Trail 60% from ATH, +60% TP",
             "• `/strategy set default` — Restore default ladders & stops",
@@ -2420,7 +2429,10 @@ class TelegramIngester:
         action = data[6:].strip()  # Remove "strat:"
         status = target.get_strategy_status() if hasattr(target, "get_strategy_status") else {}
 
-        if action == "peak50":
+        if action in ("early_rally", "rally"):
+            target.set_trading_strategy(strategy_name="early_rally", custom_take_profit_pct=0.50, custom_stop_loss_pct=0.15, trailing_stop_from_peak_pct=0.28)
+            await self._safe_reply(event, "✅ Strategy switched to: **Early Rally & Reversal Breakout** (Targeting bottom rallies, -15% Hard SL, +50% TP scale-out, 28% Trailing Stop from ATH).")
+        elif action == "peak50":
             target.set_trading_strategy(strategy_name="peak_trailing_50", custom_take_profit_pct=0.50, trailing_stop_from_peak_pct=0.50)
             await self._safe_reply(event, "✅ Strategy switched to: **Peak Trailing 50%** (+50% Take-Profit, 50% Trailing Stop from ATH).")
         elif action == "peak60":

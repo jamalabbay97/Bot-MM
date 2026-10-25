@@ -319,6 +319,11 @@ class TradeRecord(BaseModel):
     exit_stage: Optional[ExitStage] = None
     platform: str = Field(default="DexScan", description="Platform source: Pump.fun or DexScan")
     is_new_launch: bool = False
+    hard_stop_loss_pct: Optional[float] = None
+    custom_stop_loss_pct: Optional[float] = None
+    custom_take_profit_pct: Optional[float] = None
+    trailing_stop_from_peak_pct: Optional[float] = None
+    strategy_name: Optional[str] = None
     signal_timestamp_ns: int
     fill_timestamp_ns: int
 
@@ -331,6 +336,11 @@ class TradeRecord(BaseModel):
         exit_reason: Optional[TradeExitReason] = None,
         exit_stage: Optional[ExitStage] = None,
         platform: Optional[str] = None,
+        hard_stop_loss_pct: Optional[float] = None,
+        custom_stop_loss_pct: Optional[float] = None,
+        custom_take_profit_pct: Optional[float] = None,
+        trailing_stop_from_peak_pct: Optional[float] = None,
+        strategy_name: Optional[str] = None,
     ) -> "TradeRecord":
         """
         Construct a TradeRecord from a completed PaperFill and its signal ID.
@@ -371,6 +381,11 @@ class TradeRecord(BaseModel):
             exit_stage=exit_stage,
             platform=resolved_platform,
             is_new_launch=getattr(fill, "is_new_launch", False),
+            hard_stop_loss_pct=hard_stop_loss_pct if hard_stop_loss_pct is not None else getattr(fill, "hard_stop_loss_pct", None),
+            custom_stop_loss_pct=custom_stop_loss_pct if custom_stop_loss_pct is not None else getattr(fill, "custom_stop_loss_pct", None),
+            custom_take_profit_pct=custom_take_profit_pct if custom_take_profit_pct is not None else getattr(fill, "custom_take_profit_pct", None),
+            trailing_stop_from_peak_pct=trailing_stop_from_peak_pct if trailing_stop_from_peak_pct is not None else getattr(fill, "trailing_stop_from_peak_pct", None),
+            strategy_name=strategy_name or getattr(fill, "strategy_name", None),
             signal_timestamp_ns=fill.signal_timestamp_ns,
             fill_timestamp_ns=fill.fill_timestamp_ns,
         )

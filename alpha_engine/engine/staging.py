@@ -24,6 +24,7 @@ from alpha_engine.models.enums import (
     SecurityTier,
     SignalSource,
     SignalStrength,
+    StrategyType,
 )
 from alpha_engine.models.events import RawSignalEvent, SignalEvent, SwapEvent
 from alpha_engine.models.state import PoolState, SecurityReport
@@ -672,10 +673,13 @@ class Wave2StagingBuffer:
         # 15m volume excluding current 5m surge gives the prior 10m consolidation volume
         prior_consolidation_vol = max(0.0, v_15m - v_5m)
         if prior_consolidation_vol > 0:
-            sma_15m_5min_equiv = max(0.05, prior_consolidation_vol / 2.0)
+            sma_15m_5min_equiv = max(0.10, prior_consolidation_vol / 2.0)
             surge_mult = v_5m / sma_15m_5min_equiv
         else:
-            surge_mult = 1.0
+            # Baseline when prior 10m was quiet/flat: compare against 0.50 native units (e.g. 0.5 SOL)
+            # so tiny noise trades (< 1.25 SOL) do not trigger false breakouts on quiet tokens
+            sma_15m_5min_equiv = 0.50
+            surge_mult = (v_5m / sma_15m_5min_equiv) if v_5m > 0 else 0.0
         tok.volume_surge_multiplier = round(surge_mult, 2)
         volume_surge_passed = surge_mult >= self.volume_surge_multiplier_k
 
@@ -743,12 +747,20 @@ class Wave2StagingBuffer:
                 tok.top10_concentration * 100,
             )
 
+        # Anti-FOMO Guard: Reject if current price has already expanded > 120% from consolidation floor
+        curr_p = tok.latest_price
+        base_p = tok.trough_price if tok.trough_price > Decimal(0) else (tok.consolidation_min_price if tok.consolidation_min_price > Decimal(0) else tok.initial_price)
+        pump_from_base_pct = float((curr_p - base_p) / base_p * 100) if base_p > Decimal(0) else 0.0
+        anti_fomo_passed = (pump_from_base_pct <= 120.0)
+        tok.active_rules_status["AntiFOMOPassed"] = anti_fomo_passed
+
         # 8. High-Priority Breakout Signal Generation
-        # Requires surge, net buy delta, CTO confirmed, and overall accumulation score >= threshold
+        # Requires surge, net buy delta, CTO confirmed, anti-FOMO within bounds, and overall accumulation score >= threshold
         if (
             volume_surge_passed
             and net_buy_passed
             and cto_indicators_passed
+            and anti_fomo_passed
             and accumulation_score >= self.min_accumulation_score
         ):
             tok.breakout_signaled = True
@@ -808,7 +820,15 @@ class Wave2StagingBuffer:
                 strength=SignalStrength.STRONG,
                 alpha_score=tok.accumulation_score,
                 source=SignalSource.WAVE2_BREAKOUT,
+                exit_profile=ExitProfile.EARLY_RALLY_SWING,
                 narrative_cluster=tok.narrative_cluster,
+                consolidation_length_hours=age / 3600.0,
+                volume_surge_multiplier=round(surge_mult, 2),
+                net_buy_delta=round(net_buy_delta, 3),
+                dip_depth_pct=round(dip_depth_pct, 2),
+                strategy_pattern="early_rally_breakout",
+                strategy_type=StrategyType.EARLY_RALLY_BREAKOUT,
+                base_market_cap=base_p,
             )
             self._dispatch_signal(signal)
             return signal

@@ -1154,21 +1154,21 @@ class AlphaSupervisorAI:
                         top10 = getattr(effective_sec, "top10_concentration", 0.15) if effective_sec else 0.15
                         candidate_vector = PatternFeatureVector(
                             token_address=target_token,
-                            consolidation_duration_s=1800.0,
-                            dip_depth_pct=40.0,
-                            volume_surge_multiplier=2.5,
-                            net_buy_delta=0.70,
+                            consolidation_duration_s=0.0,
+                            dip_depth_pct=0.0,
+                            volume_surge_multiplier=1.0,
+                            net_buy_delta=0.50,
                             top10_concentration=float(top10 if top10 is not None else 0.15),
-                            liquidity_to_mc_ratio=0.20,
-                            smart_wallet_inflows=5.0,
+                            liquidity_to_mc_ratio=0.10,
+                            smart_wallet_inflows=0.0,
                             peak_gain_multiplier=1.0,
                         )
                         pattern_match_score = self._pattern_store.calculate_pattern_match(candidate_vector)
                     except Exception:
-                        pattern_match_score = 0.85
+                        pattern_match_score = 0.50
                 except Exception as exc:
                     logger.debug("Failed computing pattern match score: %s", exc)
-                    pattern_match_score = 0.85
+                    pattern_match_score = 0.50
 
             # Apply dynamic parameter tuning if available
             if self._parameter_tuner is not None and hasattr(self._parameter_tuner, "current_params"):

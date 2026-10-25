@@ -207,6 +207,10 @@ class PaperTradingEngine:
         self.trailing_stop_from_peak_pct: float = getattr(config, "trailing_stop_from_peak_pct", 0.50)
         self.custom_take_profit_pct: Optional[float] = getattr(config, "custom_take_profit_pct", 0.50)
         self.custom_stop_loss_pct: Optional[float] = getattr(config, "custom_stop_loss_pct", 0.50)
+        self.hard_stop_loss_pct: float = getattr(config, "hard_stop_loss_pct", 0.20)
+        self.early_rally_min_market_cap_usd: Decimal = Decimal(
+            str(getattr(config, "early_rally_min_market_cap_usd", 3500.0))
+        )
         self.auto_trade_enabled: bool = getattr(config, "auto_trade_enabled", True)
         self.screener_exclusive_focus: bool = getattr(config, "screener_exclusive_focus", False)
         self.screener_poll_interval_s: float = getattr(config, "screener_poll_interval_s", 25.0)
@@ -383,10 +387,12 @@ class PaperTradingEngine:
             "trailing_stop_from_peak_pct": getattr(self, "trailing_stop_from_peak_pct", getattr(self._cfg, "trailing_stop_from_peak_pct", 0.50)),
             "custom_take_profit_pct": getattr(self, "custom_take_profit_pct", getattr(self._cfg, "custom_take_profit_pct", 0.50)),
             "custom_stop_loss_pct": getattr(self, "custom_stop_loss_pct", getattr(self._cfg, "custom_stop_loss_pct", 0.50)),
+            "hard_stop_loss_pct": getattr(self, "hard_stop_loss_pct", getattr(self._cfg, "hard_stop_loss_pct", 0.20)),
             "auto_trade_enabled": getattr(self, "auto_trade_enabled", getattr(self._cfg, "auto_trade_enabled", True)),
             "screener_exclusive_focus": getattr(self, "screener_exclusive_focus", getattr(self._cfg, "screener_exclusive_focus", False)),
             "screener_poll_interval_s": getattr(self, "screener_poll_interval_s", getattr(self._cfg, "screener_poll_interval_s", 25.0)),
             "min_market_cap_usd": float(getattr(self, "min_market_cap_usd", getattr(self._cfg, "min_market_cap_usd", 10000.0))),
+            "early_rally_min_market_cap_usd": float(getattr(self, "early_rally_min_market_cap_usd", getattr(self._cfg, "early_rally_min_market_cap_usd", 3500.0))),
             "manual_trade_amount": float(self.manual_trade_amount) if self.manual_trade_amount is not None else None,
             "manual_trade_currency": self.manual_trade_currency,
         }
@@ -581,6 +587,7 @@ class PaperTradingEngine:
         trailing_stop_from_peak_pct: Optional[float] = None,
         custom_take_profit_pct: Optional[float] = None,
         custom_stop_loss_pct: Optional[float] = None,
+        hard_stop_loss_pct: Optional[float] = None,
         auto_trade_enabled: Optional[bool] = None,
         screener_exclusive_focus: Optional[bool] = None,
         min_market_cap_usd: Optional[float] = None,
@@ -595,19 +602,31 @@ class PaperTradingEngine:
                 self.trailing_stop_from_peak_pct = 0.50
                 self.custom_take_profit_pct = 0.50
                 self.custom_stop_loss_pct = 0.50
+                self.hard_stop_loss_pct = 0.20
             elif strat_lower in ("peak_trailing_60", "peak60", "trail60"):
                 self.active_strategy = "peak_trailing_60"
                 self.trailing_stop_from_peak_pct = 0.60
                 self.custom_take_profit_pct = 0.60
                 self.custom_stop_loss_pct = 0.60
+                self.hard_stop_loss_pct = 0.20
+            elif strat_lower in ("early_rally", "early_rally_breakout", "rally"):
+                self.active_strategy = "early_rally"
+                self.trailing_stop_from_peak_pct = 0.28
+                self.custom_take_profit_pct = 0.50
+                self.custom_stop_loss_pct = 0.15
+                self.hard_stop_loss_pct = 0.15
             elif strat_lower in ("default", "legacy", "classic", "ai", "ai_adaptive"):
                 self.active_strategy = "default"
                 self.trailing_stop_from_peak_pct = None
                 self.custom_take_profit_pct = None
                 self.custom_stop_loss_pct = None
+                self.hard_stop_loss_pct = 0.20
             else:
                 self.active_strategy = strategy_name
+                self.hard_stop_loss_pct = 0.20
 
+        if hard_stop_loss_pct is not None:
+            self.hard_stop_loss_pct = float(hard_stop_loss_pct)
         if trailing_stop_from_peak_pct is not None:
             self.trailing_stop_from_peak_pct = float(trailing_stop_from_peak_pct)
         if custom_take_profit_pct is not None:
@@ -788,11 +807,12 @@ class PaperTradingEngine:
 
     @staticmethod
     def _is_new_launch_signal(signal_item: SignalEvent) -> bool:
-        """يحدد إذا كانت العملة إطلاقاً حديثاً أو عملة قديمة/مستقرة."""
-        # عملات الـ Revival وعملات الـ Wave-2 المتماسكة ليست إطلاقاً حديثاً
-        if getattr(signal_item, "exit_profile", None) == ExitProfile.REVIVAL_SWING or str(getattr(signal_item, "exit_profile", "")).lower() == "revival_swing":
+        # Early Rally, Revival, and consolidated Wave-2 tokens are not brand new launches
+        exit_prof = getattr(signal_item, "exit_profile", None)
+        if exit_prof in (ExitProfile.REVIVAL_SWING, ExitProfile.EARLY_RALLY_SWING) or str(exit_prof or "").lower() in ("revival_swing", "early_rally_swing"):
             return False
-        if getattr(signal_item, "source", None) in (SignalSource.REVIVAL_BREAKOUT, SignalSource.WAVE2_BREAKOUT, "revival_breakout", "wave2_breakout"):
+        sig_src = getattr(signal_item, "source", None)
+        if sig_src in (SignalSource.REVIVAL_BREAKOUT, SignalSource.WAVE2_BREAKOUT, SignalSource.EARLY_RALLY_BREAKOUT, "revival_breakout", "wave2_breakout", "early_rally_breakout"):
             return False
         if getattr(signal_item, "source", None) in (SignalSource.SCREENER_GRADUATED, SignalSource.SCREENER_MOVERS, "screener_graduated", "screener_movers"):
             return False
@@ -926,7 +946,9 @@ class PaperTradingEngine:
         t_str = f"{lot.token_address[:4]}..{lot.token_address[-4:]}"
         usd_sign = "+" if exit_pnl_usd > 0 else ""
         chain_val = lot.chain.value if hasattr(lot.chain, "value") else str(lot.chain)
-        is_swing = getattr(lot, "exit_profile", None) == ExitProfile.REVIVAL_SWING
+        exit_prof = getattr(lot, "exit_profile", None)
+        is_early_rally = exit_prof == ExitProfile.EARLY_RALLY_SWING or getattr(lot, "strategy_name", "") in ("early_rally", "early_rally_breakout")
+        is_swing = exit_prof == ExitProfile.REVIVAL_SWING
 
         logger.info(
             "%s | Platform=%s | Token=%s (%s) | Entry=%s | Exit=%s | PnL=%+.2f%% (%s$%.2f) | Reason=%s | Duration=%.1fs",
@@ -943,7 +965,23 @@ class PaperTradingEngine:
             dur_s,
         )
 
-        if is_swing:
+        if is_early_rally:
+            peak_p = getattr(lot, "peak_price", ep)
+            peak_roi = float((peak_p - ep) / ep * 100) if ep > 0 else 0.0
+            exit_msg = (
+                f"{status_icon} **EARLY RALLY SWING EXIT ({title})**\n\n"
+                f"• **Platform:** `{platform_name}`\n"
+                f"• **Token:** `{t_str}` (`{lot.token_address}`)\n"
+                f"• **Chain:** {chain_val}\n"
+                f"• **Strategy Profile:** `EARLY_RALLY_SWING`\n"
+                f"• **Entry Price:** `{ep_str}`\n"
+                f"• **Exit Price:** `{xp_str}`\n"
+                f"• **Peak Price:** `{self._format_price_clean(peak_p, native_price, unit)}` (Peak: `{peak_roi:+.1f}%`)\n"
+                f"• **Return %:** `{pct:+.2f}%` ({usd_sign}${float(exit_pnl_usd):.2f})\n"
+                f"• **Exit Reason:** `{decision_reason}`\n"
+                f"• **Holding Time:** `{dur_s / 60.0:.1f}m`"
+            )
+        elif is_swing:
             peak_p = getattr(lot, "peak_price", ep)
             peak_roi = float((peak_p - ep) / ep * 100) if ep > 0 else 0.0
             revival_vec = RevivalPatternFeatureVector(
@@ -1694,19 +1732,27 @@ class PaperTradingEngine:
             execution_venue=getattr(signal, "execution_venue", None),
             pool_address=getattr(signal, "pool_address", ""),
         )
+        strat_name = getattr(self, "active_strategy", getattr(self.config, "active_strategy", "default"))
+        trail_peak = getattr(self, "trailing_stop_from_peak_pct", getattr(self.config, "trailing_stop_from_peak_pct", None))
+        cust_tp = getattr(self, "custom_take_profit_pct", getattr(self.config, "custom_take_profit_pct", None))
+        cust_sl = getattr(self, "custom_stop_loss_pct", getattr(self.config, "custom_stop_loss_pct", None))
+        hard_sl = getattr(self, "hard_stop_loss_pct", getattr(self.config, "hard_stop_loss_pct", 0.20))
         lot = self._position_book.open_lot(
             fill,
             signal.signal_id,
             initial_pool_reserve_native=pool.native_reserve if pool else Decimal(0),
-            pool_address=pool.pool_address if pool else "",
+            pool_address=pool.pool_address if pool else (getattr(signal, "pool_address", "") or ""),
             bonding_curve_mode=(platform_name == "Pump.fun"),
             platform=platform_name,
+            strategy_name=strat_name,
+            trailing_stop_from_peak_pct=trail_peak,
+            custom_take_profit_pct=cust_tp,
+            custom_stop_loss_pct=cust_sl,
+            hard_stop_loss_pct=hard_sl,
         )
         self._position_book.commit_slot_to_lot_by_token(record.token_address, record.chain)
-        if pool is not None:
-            self._pool_registry.set(record.token_address, pool)
-            if lot.pool_address:
-                self._pool_registry.set(lot.pool_address, pool)
+        if pool is not None and lot.pool_address:
+            self._pool_registry.set(lot.pool_address, pool)
 
         native_price = self._eth_price if record.chain == ChainIdentifier.BASE_MAINNET else self._sol_price
         gas_usd = fill.simulated_gas_cost_usd or Decimal("0.05")
@@ -1725,6 +1771,11 @@ class PaperTradingEngine:
                 fill=fill,
                 signal_id=signal.signal_id,
                 platform=platform_name,
+                hard_stop_loss_pct=hard_sl,
+                custom_stop_loss_pct=cust_sl,
+                custom_take_profit_pct=cust_tp,
+                trailing_stop_from_peak_pct=trail_peak,
+                strategy_name=strat_name,
             )
             await self._ledger.record_trade(trade_rec)
             await self._ledger.record_lot_transition(
@@ -2343,25 +2394,25 @@ class PaperTradingEngine:
                                 staged.slot_buy_counts[slot] += 1
                                 staged.buy_blocks.add(slot)
                         logger.info("Auto-discovery staged Pump.fun launch %s in PendingLaunchBuffer", token_address[:10])
-                    elif not is_pump:
-                        # Established DEX token: register in Wave2 or Revival buffer
-                        if not self._wave2_buffer.is_staged(token_address) and not self._revival_buffer.is_staged(token_address):
-                            self._wave2_buffer.stage_token(
-                                token_address=token_address,
-                                chain=chain,
-                                pool_address=pool_address,
-                                initial_price=init_price,
-                                report=disc_report,
-                            )
-                            self._revival_buffer.stage_token(
-                                token_address=token_address,
-                                chain=chain,
-                                pool_address=pool_address,
-                                initial_price=init_price,
-                                report=disc_report,
-                                token_creation_timestamp=time.time() - (24 * 3600),
-                            )
-                            logger.info("Auto-discovery registered established DEX token %s in Wave-2 and Revival Watchlists", token_address[:10])
+                    
+                    # Register in Wave2 and Revival buffers for early rally and revival breakout monitoring
+                    if not self._wave2_buffer.is_staged(token_address) and not self._revival_buffer.is_staged(token_address):
+                        self._wave2_buffer.stage_token(
+                            token_address=token_address,
+                            chain=chain,
+                            pool_address=pool_address,
+                            initial_price=init_price,
+                            report=disc_report,
+                        )
+                        self._revival_buffer.stage_token(
+                            token_address=token_address,
+                            chain=chain,
+                            pool_address=pool_address,
+                            initial_price=init_price,
+                            report=disc_report,
+                            token_creation_timestamp=time.time() - (24 * 3600),
+                        )
+                        logger.info("Auto-discovery registered token %s in Wave-2 and Revival Watchlists", token_address[:10])
             except Exception as exc:  # noqa: BLE001
                 logger.debug("Auto-discovery failed for %s: %s", token_address[:10], exc)
 
@@ -2676,7 +2727,7 @@ class PaperTradingEngine:
                             self._cash_sol += exit_fill.simulated_native_spent
 
                         new_equity = self._current_equity_usd()
-                        is_launch = (getattr(lot, "exit_profile", None) != ExitProfile.REVIVAL_SWING and 
+                        is_launch = (getattr(lot, "exit_profile", None) not in (ExitProfile.REVIVAL_SWING, ExitProfile.EARLY_RALLY_SWING) and 
                                      getattr(lot, "bonding_curve_mode", False) is True)
                         if exit_fill.simulated_gas_cost_usd:
                             self._metrics.total_gas_usd += exit_fill.simulated_gas_cost_usd
@@ -3016,8 +3067,9 @@ class PaperTradingEngine:
                     # 3. Market Movers: High-conviction alpha signals, volume surges, or momentum breakouts
                     is_mover = (
                         is_screener_src
-                        or signal_item.source in (SignalSource.REVIVAL_BREAKOUT, SignalSource.WAVE2_BREAKOUT, SignalSource.MEME_RADAR_BURST)
-                        or getattr(signal_item, "exit_profile", None) == ExitProfile.REVIVAL_SWING
+                        or signal_item.source in (SignalSource.REVIVAL_BREAKOUT, SignalSource.WAVE2_BREAKOUT, SignalSource.EARLY_RALLY_BREAKOUT, SignalSource.MEME_RADAR_BURST)
+                        or getattr(signal_item, "exit_profile", None) in (ExitProfile.REVIVAL_SWING, ExitProfile.EARLY_RALLY_SWING)
+                        or getattr(signal_item, "strategy_pattern", "") in ("early_rally_breakout", "wave2_breakout", "revival_breakout")
                         or (signal_item.strength in (SignalStrength.MODERATE, SignalStrength.STRONG) and signal_item.alpha_score >= 0.40)
                     )
                     
@@ -3031,8 +3083,29 @@ class PaperTradingEngine:
                         )
                         continue
 
-                # 0a. Mandatory Minimum Market Cap Requirement ($10,000 USD)
-                min_mcap_usd = Decimal(str(getattr(self, "min_market_cap_usd", getattr(self._cfg, "min_market_cap_usd", 10000.0))))
+                # 0a. Mandatory Minimum Market Cap Requirement ($10,000 USD default, $3,500 USD for Early Rally / Breakouts)
+                is_early_rally_or_breakout = (
+                    getattr(signal_item, "source", None) in (
+                        SignalSource.EARLY_RALLY_BREAKOUT,
+                        SignalSource.WAVE2_BREAKOUT,
+                        SignalSource.REVIVAL_BREAKOUT,
+                        "early_rally_breakout",
+                        "wave2_breakout",
+                        "revival_breakout",
+                    )
+                    or getattr(signal_item, "exit_profile", None) in (
+                        ExitProfile.EARLY_RALLY_SWING,
+                        ExitProfile.REVIVAL_SWING,
+                        "early_rally_swing",
+                        "revival_swing",
+                    )
+                    or getattr(signal_item, "strategy_pattern", "") in ("early_rally_breakout", "wave2_breakout", "revival_breakout")
+                    or getattr(self, "active_strategy", "") in ("early_rally", "early_rally_breakout")
+                )
+                if is_early_rally_or_breakout:
+                    min_mcap_usd = Decimal(str(getattr(self, "early_rally_min_market_cap_usd", getattr(self._cfg, "early_rally_min_market_cap_usd", 3500.0))))
+                else:
+                    min_mcap_usd = Decimal(str(getattr(self, "min_market_cap_usd", getattr(self._cfg, "min_market_cap_usd", 10000.0))))
                 sig_mcap = getattr(signal_item, "market_cap_usd", None)
                 if (sig_mcap is None or sig_mcap <= Decimal("0")) and signal_item.pool_state is not None:
                     native_p = (
@@ -3335,6 +3408,7 @@ class PaperTradingEngine:
                     trailing_stop_from_peak_pct=getattr(self, "trailing_stop_from_peak_pct", getattr(self.config, "trailing_stop_from_peak_pct", None)),
                     custom_take_profit_pct=getattr(self, "custom_take_profit_pct", getattr(self.config, "custom_take_profit_pct", None)),
                     custom_stop_loss_pct=getattr(self, "custom_stop_loss_pct", getattr(self.config, "custom_stop_loss_pct", None)),
+                    hard_stop_loss_pct=getattr(self, "hard_stop_loss_pct", getattr(self.config, "hard_stop_loss_pct", 0.20)),
                 )
 
                 if self._ledger:
@@ -3345,10 +3419,8 @@ class PaperTradingEngine:
                         status=LotStatus.OPEN.value,
                     )
                 self._position_book.commit_slot_to_lot_by_token(signal_item.token_address, lot.lot_id)
-                if signal_item.pool_state is not None:
-                    self._pool_registry.set(signal_item.token_address, signal_item.pool_state)
-                    if lot.pool_address:
-                        self._pool_registry.set(lot.pool_address, signal_item.pool_state)
+                if signal_item.pool_state is not None and lot.pool_address:
+                    self._pool_registry.set(lot.pool_address, signal_item.pool_state)
                 native_price = self._eth_price if signal_item.chain == ChainIdentifier.BASE_MAINNET else self._sol_price
                 gas_usd = fill.simulated_gas_cost_usd or Decimal("0.05")
                 gas_native = (gas_usd / native_price).quantize(Decimal("1e-18")) if native_price > Decimal(0) else Decimal("0.0005")
@@ -3380,7 +3452,22 @@ class PaperTradingEngine:
                     tok_val,
                 )
 
-                if getattr(signal_item, "exit_profile", None) == ExitProfile.REVIVAL_SWING:
+                if getattr(signal_item, "exit_profile", None) == ExitProfile.EARLY_RALLY_SWING or getattr(signal_item, "source", None) == SignalSource.EARLY_RALLY_BREAKOUT:
+                    buy_alert = (
+                        f"⚡ **EARLY RALLY BREAKOUT DETECTED**\n\n"
+                        f"• **Platform:** `{platform_name}`\n"
+                        f"• **Token:** `{t_str}` (`{fill.token_address}`)\n"
+                        f"• **Chain:** {signal_item.chain.value}\n"
+                        f"• **Strategy Profile:** `EARLY_RALLY_SWING`\n"
+                        f"• **Buy Price:** `{p_str}`\n"
+                        f"• **Spent:** `{spent_val:.4f} {unit}`\n"
+                        f"• **Tokens Acquired:** `{tok_val:,.2f}`\n"
+                        f"• **Market Cap at Entry:** `${float(sig_mcap or 0.0):,.0f}`\n"
+                        f"• **Volume Surge:** `{float(getattr(signal_item, 'volume_surge_multiplier', 0.0)):.1f}x` | **Net Buy Delta:** `{float(getattr(signal_item, 'net_buy_delta', 0.0))*100:.1f}%`\n"
+                        f"• **Trade Plan:** Hard SL `-15%` | Scale-out 50% at `+50%` | Runner Trail `28%` from ATH\n"
+                        f"• **Order ID:** `{fill.order_id[:8]}`"
+                    )
+                elif getattr(signal_item, "exit_profile", None) == ExitProfile.REVIVAL_SWING:
                     buy_alert = (
                         f"🚀 **REVIVAL & CTO BREAKOUT DETECTED**\n\n"
                         f"• **Platform:** `{platform_name}`\n"
@@ -4026,29 +4113,51 @@ class PaperTradingEngine:
                             sol_price = Decimal(str(getattr(self.config, "sol_price_usd", self._sol_price or 180.0)))
                             for lot in sol_lots:
                                 t_addr = lot.token_address
-                                t_pairs = pairs_by_mint.get(t_addr, [])
-                                if t_pairs:
-                                    best_pair = max(
+                                t_pairs = [p for p in pairs_by_mint.get(t_addr, []) if str(p.get("chainId", "")).lower() == "solana"]
+                                
+                                selected_pair = None
+                                # Explicit pool mapping: check designated lot pool_address first
+                                if lot.pool_address:
+                                    selected_pair = next(
+                                        (p for p in t_pairs if str(p.get("pairAddress", "")).lower() == str(lot.pool_address).lower()),
+                                        None,
+                                    )
+                                # If entry pool is unavailable, allow alternate pool only through an explicit, validated routing decision
+                                if selected_pair is None and t_pairs:
+                                    best_alt = max(
                                         t_pairs,
                                         key=lambda x: float((x.get("liquidity") or {}).get("usd") or 0.0),
                                     )
-                                    price_usd = float(best_pair.get("priceUsd") or 0.0)
-                                    liq_usd = float((best_pair.get("liquidity") or {}).get("usd") or 0.0)
-                                    if price_usd > 0:
+                                    alt_liq = float((best_alt.get("liquidity") or {}).get("usd") or 0.0)
+                                    alt_addr = best_alt.get("pairAddress")
+                                    if alt_addr and alt_liq > 0:
+                                        logger.info(
+                                            "Explicit routing decision for lot %s (%s): routing from %s to alternate pair %s (liquidity=$%.2f)",
+                                            lot.lot_id[:8],
+                                            t_addr[:10],
+                                            lot.pool_address,
+                                            alt_addr,
+                                            alt_liq,
+                                        )
+                                        lot.pool_address = alt_addr
+                                        selected_pair = best_alt
+
+                                if selected_pair is not None:
+                                    price_usd = float(selected_pair.get("priceUsd") or 0.0)
+                                    liq_usd = float((selected_pair.get("liquidity") or {}).get("usd") or 0.0)
+                                    pair_addr = selected_pair.get("pairAddress") or lot.pool_address
+                                    if price_usd > 0 and pair_addr:
                                         spot_p = Decimal(str(price_usd)) / sol_price if sol_price > Decimal(0) else Decimal("0.000000028")
                                         liq_dec = Decimal(str(liq_usd))
-                                        existing_pool = self._pool_registry.get(t_addr, expected_token=t_addr)
-                                        if existing_pool is not None and existing_pool.native_reserve > Decimal(0):
-                                            native_res = existing_pool.native_reserve
-                                            token_res = native_res / spot_p
-                                        elif liq_dec > Decimal(0) and sol_price > Decimal(0):
+                                        # Strictly derive reserves from selected pair; never mix with another pool's reserves
+                                        if liq_dec > Decimal(0) and sol_price > Decimal(0):
                                             native_res = liq_dec / Decimal("2.0") / sol_price
                                             token_res = native_res / spot_p
                                         else:
                                             native_res = Decimal("50.0")
                                             token_res = native_res / spot_p
                                         pool = PoolState(
-                                            pool_address=lot.pool_address or best_pair.get("pairAddress") or t_addr,
+                                            pool_address=pair_addr,
                                             chain=ChainIdentifier.SOLANA_MAINNET,
                                             token_address=t_addr,
                                             token_reserve=token_res,
@@ -4060,42 +4169,31 @@ class PaperTradingEngine:
                                             token_decimals=6,
                                             native_decimals=9,
                                         )
-                                        self._pool_registry.set(t_addr, pool)
-                                        if lot.pool_address:
-                                            self._pool_registry.set(lot.pool_address, pool)
+                                        self._pool_registry.set(pair_addr, pool)
+                                        lot.pool_address = pair_addr
+                                        lot.unresolved_price = False
+                                        lot.stale_price_retries = 0
+                                        lot.price_unresolved_since_s = 0.0
                                         logger.info(
-                                            "Active price poller updated open lot %s (%s): price=%s SOL ($%.6f), reserve=%.2f SOL",
+                                            "Active price poller updated open lot %s (%s) from pool %s: price=%s SOL ($%.6f), reserve=%.2f SOL",
                                             lot.lot_id[:8],
                                             t_addr[:10],
+                                            pair_addr[:10],
                                             spot_p,
                                             price_usd,
                                             float(native_res),
                                         )
                                 else:
-                                    lot_dur_s = (now - (lot.open_timestamp_ns / 1e9 if lot.open_timestamp_ns > 0 else now))
-                                    if lot_dur_s > 60.0:
-                                        logger.warning(
-                                            "Open lot %s (%s) has no active market pairs on DexScreener (age=%.0fs). Marking as collapsed liquidity.",
-                                            lot.lot_id[:8],
-                                            t_addr[:10],
-                                            lot_dur_s,
-                                        )
-                                        pool = PoolState(
-                                            pool_address=lot.pool_address or t_addr,
-                                            chain=ChainIdentifier.SOLANA_MAINNET,
-                                            token_address=t_addr,
-                                            token_reserve=Decimal("1000000000"),
-                                            native_reserve=Decimal("0.0001"),
-                                            fee_numerator=25,
-                                            fee_denominator=10000,
-                                            last_updated_block=1000,
-                                            timestamp_s=now,
-                                            token_decimals=6,
-                                            native_decimals=9,
-                                        )
-                                        self._pool_registry.set(t_addr, pool)
-                                        if lot.pool_address:
-                                            self._pool_registry.set(lot.pool_address, pool)
+                                    lot.stale_price_retries += 1
+                                    lot.unresolved_price = True
+                                    if lot.price_unresolved_since_s <= 0.0:
+                                        lot.price_unresolved_since_s = now
+                                    logger.warning(
+                                        "Active price poller: lot %s (%s) has no validated executable market pair (retries=%d). Marking unresolved.",
+                                        lot.lot_id[:8],
+                                        t_addr[:10],
+                                        lot.stale_price_retries,
+                                    )
                 except Exception as exc:
                     logger.debug("Active price poll for Solana lots encountered error: %s", exc)
 
@@ -4124,29 +4222,48 @@ class PaperTradingEngine:
                             eth_price = Decimal(str(getattr(self.config, "eth_price_usd", self._eth_price or 2500.0)))
                             for lot in evm_lots:
                                 t_addr = lot.token_address.lower()
-                                t_pairs = pairs_by_mint.get(t_addr, [])
-                                if t_pairs:
-                                    best_pair = max(
+                                t_pairs = [p for p in pairs_by_mint.get(t_addr, []) if str(p.get("chainId", "")).lower() == "base"]
+
+                                selected_pair = None
+                                if lot.pool_address:
+                                    selected_pair = next(
+                                        (p for p in t_pairs if str(p.get("pairAddress", "")).lower() == str(lot.pool_address).lower()),
+                                        None,
+                                    )
+                                if selected_pair is None and t_pairs:
+                                    best_alt = max(
                                         t_pairs,
                                         key=lambda x: float((x.get("liquidity") or {}).get("usd") or 0.0),
                                     )
-                                    price_usd = float(best_pair.get("priceUsd") or 0.0)
-                                    liq_usd = float((best_pair.get("liquidity") or {}).get("usd") or 0.0)
-                                    if price_usd > 0:
+                                    alt_liq = float((best_alt.get("liquidity") or {}).get("usd") or 0.0)
+                                    alt_addr = best_alt.get("pairAddress")
+                                    if alt_addr and alt_liq > 0:
+                                        logger.info(
+                                            "Explicit routing decision for Base lot %s (%s): routing from %s to alternate pair %s (liquidity=$%.2f)",
+                                            lot.lot_id[:8],
+                                            t_addr[:10],
+                                            lot.pool_address,
+                                            alt_addr,
+                                            alt_liq,
+                                        )
+                                        lot.pool_address = alt_addr
+                                        selected_pair = best_alt
+
+                                if selected_pair is not None:
+                                    price_usd = float(selected_pair.get("priceUsd") or 0.0)
+                                    liq_usd = float((selected_pair.get("liquidity") or {}).get("usd") or 0.0)
+                                    pair_addr = selected_pair.get("pairAddress") or lot.pool_address
+                                    if price_usd > 0 and pair_addr:
                                         spot_p = Decimal(str(price_usd)) / eth_price if eth_price > Decimal(0) else Decimal("0.0000001")
                                         liq_dec = Decimal(str(liq_usd))
-                                        existing_pool = self._pool_registry.get(t_addr, expected_token=t_addr)
-                                        if existing_pool is not None and existing_pool.native_reserve > Decimal(0):
-                                            native_res = existing_pool.native_reserve
-                                            token_res = native_res / spot_p
-                                        elif liq_dec > Decimal(0) and eth_price > Decimal(0):
+                                        if liq_dec > Decimal(0) and eth_price > Decimal(0):
                                             native_res = liq_dec / Decimal("2.0") / eth_price
                                             token_res = native_res / spot_p
                                         else:
                                             native_res = Decimal("5.0")
                                             token_res = native_res / spot_p
                                         pool = PoolState(
-                                            pool_address=lot.pool_address or best_pair.get("pairAddress") or lot.token_address,
+                                            pool_address=pair_addr,
                                             chain=ChainIdentifier.BASE_MAINNET,
                                             token_address=lot.token_address,
                                             token_reserve=token_res,
@@ -4158,9 +4275,22 @@ class PaperTradingEngine:
                                             token_decimals=18,
                                             native_decimals=18,
                                         )
-                                        self._pool_registry.set(lot.token_address, pool)
-                                        if lot.pool_address:
-                                            self._pool_registry.set(lot.pool_address, pool)
+                                        self._pool_registry.set(pair_addr, pool)
+                                        lot.pool_address = pair_addr
+                                        lot.unresolved_price = False
+                                        lot.stale_price_retries = 0
+                                        lot.price_unresolved_since_s = 0.0
+                                else:
+                                    lot.stale_price_retries += 1
+                                    lot.unresolved_price = True
+                                    if lot.price_unresolved_since_s <= 0.0:
+                                        lot.price_unresolved_since_s = now
+                                    logger.warning(
+                                        "Active price poller: Base lot %s (%s) has no validated executable market pair (retries=%d). Marking unresolved.",
+                                        lot.lot_id[:8],
+                                        t_addr[:10],
+                                        lot.stale_price_retries,
+                                    )
                 except Exception as exc:
                     logger.debug("Active price poll for Base lots encountered error: %s", exc)
 
@@ -4172,9 +4302,8 @@ class PaperTradingEngine:
         - Stale tick guard: ticks > 3.0s old halt exit triggers.
         - Slippage insolvency guard: curves unable to absorb lot without >15% collapse trigger emergency dump.
         - Velocity/time decay: duration > 120s and PnL < +3% triggers liquidation.
-        - Hard SL (-8%): prioritized if price impact > 300 bps.
-        - Trailing Stop: activates at +15%, locks at +8%, trails 5% from peak.
-        - TP: +25% (scale out 50%), +50% (sell remaining 50%).
+        - Hard SL: prioritized if price impact > 300 bps or independent entry stop reached.
+        - Trailing Stop: dynamic trailing from ATH peak.
         - Monotonic state recovery: PENDING_BUY -> OPEN -> PENDING_SELL -> CLOSED -> SETTLED.
         """
         logger.info("Adaptive high-speed position price poller started (500ms tick interval).")
@@ -4192,17 +4321,17 @@ class PaperTradingEngine:
                 now_s = time.time()
                 now_ns = time.time_ns()
 
-                # Actively resolve market prices for lots lacking fresh live ticks (>15s old or uninitialized)
+                # Actively resolve market prices for lots lacking fresh live ticks or with unresolved status
                 lots_needing_price = [
                     l for l in open_lots
                     if (
-                        not (l.bonding_curve_mode and self._pool_registry.get(l.token_address, expected_token=l.token_address) is not None)
-                        and (
-                            self._pool_registry.get(l.token_address, expected_token=l.token_address) is None
-                            or getattr(self._pool_registry.get(l.token_address, expected_token=l.token_address), "last_updated_block", 0) <= 0
-                            or (
-                                (now_s - (l.open_timestamp_ns / 1e9 if l.open_timestamp_ns > 0 else now_s) > 15.0)
-                                and (now_s - getattr(self._pool_registry.get(l.token_address, expected_token=l.token_address), "timestamp_s", now_s) > 15.0)
+                        l.unresolved_price
+                        or (l.pool_address and self._pool_registry.get_pool(l.pool_address) is None)
+                        or (
+                            not (l.bonding_curve_mode and self._pool_registry.get_pool(l.pool_address) is not None)
+                            and (
+                                (l.pool_address and (now_s - getattr(self._pool_registry.get_pool(l.pool_address), "timestamp_s", 0) > 3.0))
+                                or (not l.pool_address and self._pool_registry.get(l.token_address, expected_token=l.token_address) is None)
                             )
                         )
                     )
@@ -4225,70 +4354,81 @@ class PaperTradingEngine:
                         else:
                             continue
 
-                    pool = self._pool_registry.get(lot.token_address, expected_token=lot.token_address)
-                    if pool is None and lot.pool_address:
-                        pool = self._pool_registry.get(lot.pool_address, expected_token=lot.token_address)
+                    pool = None
+                    if lot.pool_address:
+                        pool = self._pool_registry.get_pool(lot.pool_address) or self._pool_registry.get(lot.pool_address, expected_token=lot.token_address)
+                    if pool is None:
+                        pool = self._pool_registry.get(lot.token_address, expected_token=lot.token_address)
 
-                    if pool is None or getattr(pool, "last_updated_block", 0) <= 0:
-                        dur_s = (now_ns - lot.open_timestamp_ns) / 1e9 if lot.open_timestamp_ns > 0 else 0.0
-                        if dur_s > 120.0:
-                            logger.warning(
-                                "Stagnant unpriced lot %s (%s) held for %.1fs with no liquidity/price. Liquidating via TIMEOUT.",
+                    # If pool is missing or tick is stale, request fresh price
+                    if pool is None or (now_s - getattr(pool, "timestamp_s", 0)) > 3.0:
+                        await self._poll_open_lots_prices([lot])
+                        if lot.pool_address:
+                            pool = self._pool_registry.get_pool(lot.pool_address) or self._pool_registry.get(lot.pool_address, expected_token=lot.token_address)
+                        if pool is None:
+                            pool = self._pool_registry.get(lot.token_address, expected_token=lot.token_address)
+
+                    dur_s = (now_ns - lot.open_timestamp_ns) / 1e9 if lot.open_timestamp_ns > 0 else 0.0
+                    if pool is None or getattr(pool, "last_updated_block", 0) <= 0 or lot.unresolved_price:
+                        if dur_s > 120.0 or lot.stale_price_retries >= 5:
+                            native_price = self._eth_price if lot.chain == ChainIdentifier.BASE_MAINNET else self._sol_price
+                            logger.error(
+                                "Lot %s (%s) market is genuinely illiquid or unavailable (retries=%d, dur=%.1fs). Safely writing off under ILLIQUID_MARKET without fabricating synthetic market quotes.",
                                 lot.lot_id[:8],
                                 lot.token_address[:10],
+                                lot.stale_price_retries,
                                 dur_s,
                             )
-                            pool = PoolState(
-                                pool_address=lot.pool_address or lot.token_address,
-                                chain=lot.chain,
-                                token_reserve=Decimal("1000000000"),
-                                native_reserve=Decimal("0.0001"),
-                                fee_numerator=25,
-                                fee_denominator=10000,
-                                last_updated_block=1000,
-                                timestamp_s=now_s,
-                                token_decimals=6 if lot.chain == ChainIdentifier.SOLANA_MAINNET else 18,
-                                native_decimals=9 if lot.chain == ChainIdentifier.SOLANA_MAINNET else 18,
-                            )
-                            self._pool_registry.set(lot.token_address, pool)
-                            decision = ExitDecision(
-                                lot_id=lot.lot_id,
-                                token_address=lot.token_address,
-                                chain=lot.chain,
-                                should_exit=True,
-                                exit_reason=TradeExitReason.TIMEOUT_VELOCITY_DECAY,
-                                exit_stage=ExitStage.TIMEOUT,
-                                tokens_to_sell=lot.tokens_held,
-                                current_price=lot.entry_price * Decimal("0.01"),
-                                pnl_estimate_native=Decimal("0"),
-                                prioritized=True,
-                                action="CLOSE_ALL",
-                            )
+                            lot.is_illiquid = True
+                            lot.status = LotStatus.CLOSED
+                            lot.unresolved_price = False
+                            self._position_book.set_token_cooldown(lot.token_address, duration_s=300.0)
+                            if self._ledger:
+                                loss_usd = -float(lot.cost_basis_native * native_price)
+                                await self._ledger.record_lot_transition(
+                                    lot_id=lot.lot_id,
+                                    token_address=lot.token_address,
+                                    chain=lot.chain.value,
+                                    status=LotStatus.CLOSED.value,
+                                    exit_reason=TradeExitReason.ILLIQUID_MARKET.value,
+                                    pnl_usd=loss_usd,
+                                )
+                                await self._ledger.record_lot_transition(
+                                    lot_id=lot.lot_id,
+                                    token_address=lot.token_address,
+                                    chain=lot.chain.value,
+                                    status=LotStatus.SETTLED.value,
+                                    exit_reason=TradeExitReason.ILLIQUID_MARKET.value,
+                                    pnl_usd=loss_usd,
+                                )
+                            self._position_book._notify_capacity_freed()
+                            continue
                         else:
                             logger.debug(
-                                "Awaiting live on-chain tick for lot %s (%s) before evaluating exits (pool uninitialized).",
+                                "Awaiting valid market quote for lot %s (%s) before evaluating exits (pool uninitialized or tick unresolved).",
                                 lot.lot_id[:8],
                                 lot.token_address[:10],
                             )
                             continue
-                    else:
-                        current_price = pool.spot_price_native_per_token
-                        self._ai_supervisor.record_price_update(
-                            lot.token_address,
-                            current_price,
-                            now_s,
-                        )
-                        tick_timestamp_s = getattr(pool, "timestamp_s", None) or now_s
-                        grace_sec = getattr(self.config, "exit_grace_period_sec", 15.0)
-                        decision = self._position_book.evaluate_lot_exit(
-                            lot=lot,
-                            current_price=current_price,
-                            current_pool_reserve_native=pool.native_reserve,
-                            tick_timestamp_s=tick_timestamp_s,
-                            current_timestamp_ns=now_ns,
-                            bonding_curve_mode=lot.bonding_curve_mode,
-                            exit_grace_period_sec=grace_sec,
-                        )
+
+                    current_price = pool.spot_price_native_per_token
+                    self._ai_supervisor.record_price_update(
+                        lot.token_address,
+                        current_price,
+                        now_s,
+                    )
+                    tick_timestamp_s = getattr(pool, "timestamp_s", None) or now_s
+                    grace_sec = getattr(self.config, "exit_grace_period_sec", 15.0)
+                    decision = self._position_book.evaluate_lot_exit(
+                        lot=lot,
+                        current_price=current_price,
+                        current_pool_reserve_native=pool.native_reserve,
+                        tick_timestamp_s=tick_timestamp_s,
+                        current_timestamp_ns=now_ns,
+                        bonding_curve_mode=lot.bonding_curve_mode,
+                        exit_grace_period_sec=grace_sec,
+                        hard_stop_loss_pct=getattr(self, "hard_stop_loss_pct", 0.20),
+                    )
                     if decision is not None and decision.should_exit:
                         # Idempotent state transition: OPEN -> PENDING_SELL
                         lot.status = LotStatus.PENDING_SELL
@@ -4329,7 +4469,7 @@ class PaperTradingEngine:
                                 self._cash_sol += exit_fill.simulated_native_spent
 
                             new_equity = self._current_equity_usd()
-                            is_launch = (getattr(lot, "exit_profile", None) != ExitProfile.REVIVAL_SWING and 
+                            is_launch = (getattr(lot, "exit_profile", None) not in (ExitProfile.REVIVAL_SWING, ExitProfile.EARLY_RALLY_SWING) and 
                                          getattr(lot, "bonding_curve_mode", False) is True)
                             if exit_fill.simulated_gas_cost_usd:
                                 self._metrics.total_gas_usd += exit_fill.simulated_gas_cost_usd

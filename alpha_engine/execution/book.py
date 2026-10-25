@@ -99,6 +99,11 @@ class OpenLot:
     trailing_stop_from_peak_pct: Optional[float] = None
     custom_take_profit_pct: Optional[float] = None
     custom_stop_loss_pct: Optional[float] = None
+    hard_stop_loss_pct: Optional[float] = None
+    unresolved_price: bool = False
+    stale_price_retries: int = 0
+    price_unresolved_since_s: float = 0.0
+    is_illiquid: bool = False
 
     def record_tick(
         self,
@@ -216,6 +221,26 @@ class OpenLot:
             return True
         return False
 
+
+def normalize_stop_loss_pct(val: float | Decimal | None) -> Decimal | None:
+    """
+    Normalizes stop-loss percentage representation into a positive fractional Decimal in (0.0, 1.0].
+
+    Representation normalization:
+      - Fractional representation: 0.20 represents 20% loss from entry.
+      - Fractional negative: -0.20 represents 20% loss from entry.
+      - Percentage-point negative: -20.0 represents 20% loss from entry.
+      - Percentage-point positive: 20.0 represents 20% loss from entry.
+    """
+    if val is None:
+        return None
+    d = Decimal(str(val))
+    if d == Decimal(0):
+        return Decimal(0)
+    d = abs(d)
+    if d > Decimal("1.0"):
+        d = d / Decimal("100.0")
+    return d
 
 
 @dataclass
@@ -386,17 +411,21 @@ class PositionBook:
                 )
                 continue
             tokens_held = Decimal(str(d.get("tokens_delta", 0)))
+            initial_tokens = Decimal(str(d.get("initial_tokens", tokens_held)))
             entry_price = Decimal(str(d.get("effective_price", 0)))
             cost_native = Decimal(str(d.get("native_spent", 0)))
             platform = str(d.get("platform", "DexScan"))
             is_pump = platform.lower() == "pump.fun" or token.lower().endswith("pump")
             entry_ts = open_ts_ns / 1e9 if open_ts_ns > 0 else time.time()
+            scaled_out = bool(d.get("scaled_out_50_pct", False)) or (tokens_held < initial_tokens)
             lot = OpenLot(
                 lot_id=str(d.get("order_id") or uuid.uuid4()),
                 token_address=token,
                 chain=chain,
-                initial_tokens=tokens_held,
+                initial_tokens=initial_tokens,
                 tokens_held=tokens_held,
+                scaled_out_50_pct=scaled_out,
+                exit_stage=ExitStage.TP1 if scaled_out else ExitStage.NONE,
                 cost_basis_native=cost_native,
                 entry_price=entry_price,
                 signal_id=str(d.get("signal_id", "")),
@@ -411,6 +440,7 @@ class PositionBook:
                 trailing_stop_from_peak_pct=float(d["trailing_stop_from_peak_pct"]) if d.get("trailing_stop_from_peak_pct") is not None else (0.50 if is_pump else None),
                 custom_take_profit_pct=float(d["custom_take_profit_pct"]) if d.get("custom_take_profit_pct") is not None else (0.50 if is_pump else None),
                 custom_stop_loss_pct=float(d["custom_stop_loss_pct"]) if d.get("custom_stop_loss_pct") is not None else (0.50 if is_pump else None),
+                hard_stop_loss_pct=float(d["hard_stop_loss_pct"]) if d.get("hard_stop_loss_pct") is not None else (0.20 if is_pump else 0.20),
                 price_history=[(entry_ts, entry_price, cost_native)],
                 tick_prices_5m=[(entry_ts, entry_price)],
             )
@@ -594,6 +624,7 @@ class PositionBook:
         trailing_stop_from_peak_pct: Optional[float] = None,
         custom_take_profit_pct: Optional[float] = None,
         custom_stop_loss_pct: Optional[float] = None,
+        hard_stop_loss_pct: Optional[float] = None,
     ) -> OpenLot:
         if fill.effective_price <= Decimal(0):
             raise ValueError(
@@ -646,6 +677,7 @@ class PositionBook:
             trailing_stop_from_peak_pct=trailing_stop_from_peak_pct,
             custom_take_profit_pct=custom_take_profit_pct,
             custom_stop_loss_pct=custom_stop_loss_pct,
+            hard_stop_loss_pct=hard_stop_loss_pct,
             price_history=[(entry_ts, fill.effective_price, fill.simulated_native_spent)],
             tick_prices_5m=[(entry_ts, fill.effective_price)],
             tick_returns_5m=[],
@@ -791,11 +823,12 @@ class PositionBook:
         emergency_stop_pct: Decimal = Decimal("-0.25"),
         security_report: Any | None = None,
         partial_exit_fraction: Decimal | None = None,
+        hard_stop_loss_pct: Optional[float | Decimal] = None,
     ) -> ExitDecision | None:
         """
         Evaluate adaptive dynamic exit rules for an open lot:
         If bonding_curve_mode is True:
-        1. Stale-Tick Guard: If tick > 3s old, halt triggers.
+        1. Stale-Tick Guard: If tick > 3s old, halt triggers and mark unresolved price state.
         2. Slippage Insolvency Guard: If curve reserve cannot absorb without > 15% price collapse, trigger emergency dump.
         3. Emergency Hard-Stop (-25%): Unconditionally liquidates even in grace period.
         4. Grace Period / Noise Immunity Window: Suppresses premature trailing stops & tight stop churn in first N seconds.
@@ -849,6 +882,9 @@ class PositionBook:
             now_s = time.time()
             now_ns = time.time_ns()
 
+        duration_s = (now_ns - lot.open_timestamp_ns) / 1e9 if lot.open_timestamp_ns > 0 else 0.0
+        in_grace_period = (lot.open_timestamp_ns > 0) and (duration_s < exit_grace_period_sec)
+
         # Record tick in moving price/volume history
         vol = trade_volume_native if trade_volume_native is not None and trade_volume_native > 0 else Decimal("0.1")
         lot.record_tick(current_price, volume_native=vol, timestamp_s=tick_timestamp_s or now_s, is_sell=is_sell)
@@ -857,12 +893,20 @@ class PositionBook:
         if tick_timestamp_s is not None:
             lot.last_tick_timestamp_s = tick_timestamp_s
             if (now_s - tick_timestamp_s) > 3.0:
+                lot.unresolved_price = True
+                lot.stale_price_retries += 1
+                if lot.price_unresolved_since_s <= 0.0:
+                    lot.price_unresolved_since_s = now_s
                 logger.warning(
                     "STALE TICK GUARD: Tick for %s is %.2fs old (> 3.0s). Halting exit triggers.",
                     lot.token_address[:10],
                     now_s - tick_timestamp_s,
                 )
                 return None
+            else:
+                lot.unresolved_price = False
+                lot.stale_price_retries = 0
+                lot.price_unresolved_since_s = 0.0
 
         # Track peak price and peak unrealized PnL
         if current_price > lot.peak_price:
@@ -943,18 +987,76 @@ class PositionBook:
 
         gain_ratio = current_price / lot.entry_price
 
+        # --- INDEPENDENT ENTRY HARD STOP-LOSS ---
+        # Evaluated independently of peak-trailing stop. A 50% or 60% peak trail must never disable this.
+        # Evaluated BEFORE permissive trailing-stop or time-decay rules can postpone it.
+        is_early_rally_strategy = (
+            lot.strategy_name in ("early_rally", "early_rally_breakout")
+            or lot.exit_profile == ExitProfile.EARLY_RALLY_SWING
+        )
+        entry_sl_threshold = None
+        if lot.hard_stop_loss_pct is not None:
+            entry_sl_threshold = normalize_stop_loss_pct(lot.hard_stop_loss_pct)
+        elif hard_stop_loss_pct is not None:
+            entry_sl_threshold = normalize_stop_loss_pct(hard_stop_loss_pct)
+        elif is_early_rally_strategy:
+            entry_sl_threshold = normalize_stop_loss_pct(lot.custom_stop_loss_pct) or Decimal("0.15")
+        elif lot.custom_stop_loss_pct is not None and lot.custom_stop_loss_pct <= 0.25:
+            entry_sl_threshold = normalize_stop_loss_pct(lot.custom_stop_loss_pct)
+        elif lot.ai_hard_stop_loss_pct is not None:
+            entry_sl_threshold = normalize_stop_loss_pct(lot.ai_hard_stop_loss_pct)
+        else:
+            entry_sl_threshold = None
+
+        loss_from_entry = (lot.entry_price - current_price) / lot.entry_price if lot.entry_price > 0 else Decimal(0)
+
+        # Narrow grace period: Only suppresses hard stop if loss is < 20% and not early_rally
+        can_trigger_hard_stop = True
+        if in_grace_period:
+            if loss_from_entry < Decimal("0.20") and not is_early_rally_strategy:
+                can_trigger_hard_stop = False
+
+        if entry_sl_threshold is not None and loss_from_entry >= entry_sl_threshold and can_trigger_hard_stop:
+            logger.info(
+                "INDEPENDENT ENTRY HARD STOP-LOSS (-%.1f%% from entry) TRIGGERED for lot %s (%s): entry=%s, curr=%s, loss=%.2f%%. Liquidating position.",
+                float(entry_sl_threshold * 100),
+                lot.lot_id[:8],
+                lot.token_address[:10],
+                lot.entry_price,
+                current_price,
+                float(loss_from_entry * 100),
+            )
+            return ExitDecision(
+                lot_id=lot.lot_id,
+                token_address=lot.token_address,
+                chain=lot.chain,
+                should_exit=True,
+                exit_reason=TradeExitReason.EARLY_RALLY_SL_15 if is_early_rally_strategy else TradeExitReason.SL_HARD,
+                exit_stage=ExitStage.SL,
+                tokens_to_sell=lot.tokens_held,
+                current_price=current_price,
+                pnl_estimate_native=lot.tokens_held * (current_price - lot.entry_price),
+                prioritized=True,
+                action="CLOSE_ALL",
+            )
+
         # --- TRAILING STOP-LOSS BASED ON HIGHEST RECORDED PRICE (ATH PEAK) ---
         # Requirement 2: Trailing stop-loss based on highest price reached after entering trade.
-        # Drops of 50% or 60% from peak trigger exit; does not close trade simply at -25% from entry.
+        # Drops of 28%, 50%, or 60% from peak trigger exit; does not close trade simply at -25% from entry.
         is_peak_trailing_strategy = (
-            lot.strategy_name in ("peak_trailing_50", "peak_trailing_60", "custom")
-            and lot.trailing_stop_from_peak_pct is not None
-        )
+            lot.strategy_name in ("peak_trailing_50", "peak_trailing_60", "early_rally", "early_rally_breakout", "custom")
+            and (lot.trailing_stop_from_peak_pct is not None or is_early_rally_strategy)
+        ) or is_early_rally_strategy
 
         if is_peak_trailing_strategy and lot.peak_price > Decimal(0):
             trail_from_peak = lot.trailing_stop_from_peak_pct
             if trail_from_peak is None:
-                trail_from_peak = 0.60 if lot.strategy_name == "peak_trailing_60" else 0.50
+                if is_early_rally_strategy:
+                    trail_from_peak = 0.28
+                elif lot.strategy_name == "peak_trailing_60":
+                    trail_from_peak = 0.60
+                else:
+                    trail_from_peak = 0.50
 
             # Dynamic floor tracking from ATH peak
             trail_floor = (lot.peak_price * (Decimal("1.0") - Decimal(str(trail_from_peak)))).quantize(Decimal("1e-18"))
@@ -1686,6 +1788,20 @@ class PositionBook:
                             pnl_estimate_native=qty * (current_price - lot.entry_price),
                             action="PARTIAL",
                         )
+                elif lot.scaled_out_50_pct and lot.exit_stage == ExitStage.TP1:
+                    lot.exit_stage = ExitStage.TP2
+                    return ExitDecision(
+                        lot_id=lot.lot_id,
+                        token_address=lot.token_address,
+                        chain=lot.chain,
+                        should_exit=True,
+                        exit_reason=TradeExitReason.TP_50,
+                        exit_stage=ExitStage.TP2,
+                        tokens_to_sell=lot.tokens_held,
+                        current_price=current_price,
+                        pnl_estimate_native=lot.tokens_held * (current_price - lot.entry_price),
+                        action="CLOSE_ALL",
+                    )
 
             # +25% Take Profit (Scale out 50%)
             if gain_ratio >= Decimal("1.25") and not lot.scaled_out_50_pct and lot.exit_stage == ExitStage.NONE:

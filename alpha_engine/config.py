@@ -502,6 +502,10 @@ class EngineConfig(BaseSettings):
         default=0.50,
         description="Hard stop-loss percentage for custom strategy",
     )
+    hard_stop_loss_pct: Optional[float] = Field(
+        default=0.20,
+        description="Independent hard stop-loss percentage measured from entry price (fractional: 0.20 = 20% loss from entry). Evaluated independently of trailing peak stop.",
+    )
     auto_trade_enabled: bool = Field(
         default=True,
         description="Whether the bot should automatically execute trades whenever qualifying opportunities are detected",
@@ -572,6 +576,53 @@ class EngineConfig(BaseSettings):
         ge=0.0,
         le=1.0,
         description="Minimum composite score to trigger revival breakout signal",
+    )
+
+    # -------------------------------------------------------------------------
+    # 5d-2. Early Rally & Reversal Strategy Tuning Parameters
+    # -------------------------------------------------------------------------
+    early_rally_min_market_cap_usd: Decimal = Field(
+        default=Decimal("3500.0"),
+        ge=Decimal(0),
+        description="Minimum USD market cap required for early rally bottom entries ($3,500)",
+    )
+    early_rally_volume_surge_multiplier: float = Field(
+        default=2.5,
+        ge=1.0,
+        description="Volume surge multiplier to qualify early rally breakout (2.5x)",
+    )
+    early_rally_min_net_buy_delta: float = Field(
+        default=0.70,
+        ge=-1.0,
+        le=1.0,
+        description="Minimum net buy volume delta for early rally (+70%)",
+    )
+    early_rally_min_price_expansion_pct: float = Field(
+        default=8.0,
+        ge=1.0,
+        description="Minimum percentage price rise from consolidation trough to confirm green reversal candle (+8%)",
+    )
+    early_rally_max_fomo_expansion_pct: float = Field(
+        default=120.0,
+        ge=20.0,
+        description="Maximum percentage price rise from base before entry is rejected as overextended FOMO (+120%)",
+    )
+    early_rally_hard_sl_pct: float = Field(
+        default=0.15,
+        ge=0.05,
+        le=0.50,
+        description="Strict hard stop-loss from entry for early rally trades (-15%)",
+    )
+    early_rally_tp1_pct: float = Field(
+        default=0.50,
+        ge=0.20,
+        description="Partial take profit target for 50% scale-out (+50%)",
+    )
+    early_rally_runner_trailing_stop_pct: float = Field(
+        default=0.28,
+        ge=0.10,
+        le=0.50,
+        description="ATH trailing stop percentage on moonbag runner (28% from peak)",
     )
 
     # -------------------------------------------------------------------------
