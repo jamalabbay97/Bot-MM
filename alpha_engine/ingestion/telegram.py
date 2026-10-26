@@ -1378,6 +1378,15 @@ class TelegramIngester:
                 await self._safe_reply(event, resp)
             else:
                 await self._safe_reply(event, "🏛️ مجلس الوكلاء غير متصل حالياً.")
+        elif first_token in ("/experiments", "experiments", "تجارب", "البطولة", "التجارب", "المنافسة"):
+            if self._chat_explainer and hasattr(self._chat_explainer, "tool_experiments"):
+                resp = await self._chat_explainer.tool_experiments()
+                await self._safe_reply(event, resp)
+            elif self._chat_explainer:
+                resp = await self._chat_explainer.ask(clean_text)
+                await self._safe_reply(event, resp)
+            else:
+                await self._safe_reply(event, "🏆 محرك منافسة الاستراتيجيات غير متاح حالياً.")
         elif first_token in ("/assets", "/tokens", "assets", "tokens", "العملات", "عملات", "العملات المكتشفة"):
             if self._chat_explainer and hasattr(self._chat_explainer, "tool_list_assets"):
                 resp = await self._chat_explainer.tool_list_assets()
@@ -1530,6 +1539,7 @@ class TelegramIngester:
             "• `/strategy` — إعدادات واستراتيجيات التداول (Trailing Stop 50%/60%, Take-Profit, Auto-Trade).\n"
             "• `/trades` — المراكز المفتوحة النشطة والصفقات المغلقة مع الأسعار.\n"
             "• `/perf [hours]` — أداء الاستراتيجيات وأنماط التداول الأعلى فوزاً (Win Rate).\n"
+            "• `/experiments` — لوحة صدارة تجارب الاستراتيجيات والمنافسة الكمية (Champion vs Challengers).\n"
             "• `/exit <CA|ID>` — شرح سبب إغلاق صفقة معينة وتفاصيل الوقف المتحرك.\n\n"
             "🧠 **المشرف الذكي والتدقيق (AI Risk & Forensics):**\n"
             "• `/ai` — حالة المشرف الذكي، نمط المخاطرة، ونتائج التعلم الذاتي.\n"

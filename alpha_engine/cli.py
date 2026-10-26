@@ -104,6 +104,16 @@ def main(args: list[str] | None = None) -> int:
         action="store_true",
         help="Reset paper trading ledger: clear all historical trades, lots, and snapshots",
     )
+    parser.add_argument(
+        "--experiments",
+        action="store_true",
+        help="Display live Strategy Tournament Leaderboard (Champion vs Challengers)",
+    )
+    parser.add_argument(
+        "--backtest",
+        action="store_true",
+        help="Run walk-forward historical backtesting replay on SQLite ledger trades",
+    )
     parsed = parser.parse_args(args)
 
     try:
@@ -115,6 +125,28 @@ def main(args: list[str] | None = None) -> int:
     if config.asyncio_debug:
         os.environ["PYTHONASYNCIODEBUG"] = "1"
         logging.getLogger("asyncio").setLevel(logging.DEBUG)
+
+    if parsed.experiments:
+        from alpha_engine.engine.experimentation import StrategyTournamentRegistry
+        reg = StrategyTournamentRegistry()
+        board = reg.get_leaderboard()
+        print("\n=== 🏆 Quantitative Strategy Tournament Leaderboard ===")
+        print(f"{'Status':<14} | {'Strategy Name':<34} | {'Regime':<18} | {'Trades':<8} | {'Win Rate':<10} | {'PF':<6} | {'Sortino':<8} | {'Max DD':<8} | {'Net PnL':<10} | {'Promotion'}")
+        print("-" * 135)
+        for b in board:
+            print(f"{b['status']:<14} | {b['name']:<34} | {b['regime']:<18} | {b['trades']:<8} | {b['win_rate']:<10} | {b['profit_factor']:<6} | {b['sortino']:<8} | {b['max_dd']:<8} | {b['net_pnl']:<10} | {b['promotion_ready']}")
+        print("-" * 135)
+        return 0
+
+    if parsed.backtest:
+        from alpha_engine.engine.backtester import WalkForwardBacktester, StrategyParameters
+        bt = WalkForwardBacktester(config.db_path)
+        count = bt.load_historical_data()
+        print(f"Loaded {count} historical trades from {config.db_path} for replay.")
+        champ_params = StrategyParameters(strategy_name="champion_peak_trailing_50", hard_stop_loss_pct=0.15, take_profit_pct=0.50, trailing_stop_from_peak_pct=0.35)
+        res = bt.evaluate_strategy(champ_params)
+        print(res.print_summary())
+        return 0
 
     if parsed.swarm:
         from alpha_engine.ruflo.swarm import RufloSwarmCoordinator

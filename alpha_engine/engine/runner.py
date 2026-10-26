@@ -42,6 +42,7 @@ from alpha_engine.engine.signals import PendingLaunchBuffer, SignalGenerator
 from alpha_engine.engine.staging import RevivalBreakoutBuffer, Wave2StagingBuffer
 from alpha_engine.ruflo.protocol import ConsensusProtocol, SwarmTopology
 from alpha_engine.ruflo.swarm import RufloSwarmCoordinator
+from alpha_engine.engine.experimentation import StrategyTournamentRegistry
 from alpha_engine.execution.book import OpenLot, PositionBook, RunningMetrics
 from alpha_engine.execution.executor import PaperExecutor
 from alpha_engine.execution.ledger import SQLiteLedger
@@ -279,6 +280,13 @@ class PaperTradingEngine:
                 consensus=cons,
             )
             self._ai_supervisor.set_episodic_memory(self._swarm_coordinator.memory)
+
+        # Multi-Strategy Tournament & Evolution Framework
+        self._strategy_tournament: StrategyTournamentRegistry = StrategyTournamentRegistry(ledger=None)
+
+    @property
+    def strategy_tournament(self) -> StrategyTournamentRegistry:
+        return self._strategy_tournament
 
     @property
     def swarm_coordinator(self) -> Optional[RufloSwarmCoordinator]:
@@ -1034,6 +1042,7 @@ class PaperTradingEngine:
                 realized_pnl_usd=exit_pnl_usd,
                 realized_pnl_native=pnl_native,
                 time_to_fill_ms=getattr(exit_fill, "fill_latency_ms", 50.0),
+                entry_feature_vector=getattr(lot, "entry_feature_vector", []),
             )
             asyncio.create_task(self._ai_supervisor.reflect_on_trade(reflection))
 
@@ -1045,8 +1054,32 @@ class PaperTradingEngine:
                     realized_pnl_usd=float(exit_pnl_usd),
                     roi_pct=pct,
                     chain=lot.chain.value if hasattr(lot.chain, "value") else str(lot.chain),
+                    feature_vector=getattr(lot, "entry_feature_vector", None),
                 )
             )
+
+    def _propagate_dynamic_hyperparameters(self, params: Any) -> None:
+        """
+        Dynamically propagate tuned hyperparameters to live staging buffers,
+        strategy exit rules, and position sizing governors.
+        """
+        if params is None:
+            return
+        if hasattr(self, "_wave2_buffer") and self._wave2_buffer:
+            self._wave2_buffer.set_hyperparameters(
+                volume_surge_multiplier_k=getattr(params, "wave2_surge_k", None),
+                min_net_buy_delta_pct=getattr(params, "wave2_net_buy_delta_pct", None),
+            )
+        if hasattr(self, "_revival_buffer") and self._revival_buffer:
+            self._revival_buffer.set_hyperparameters(
+                volume_surge_multiplier_k=getattr(params, "wave2_surge_k", None),
+                min_net_buy_delta_pct=getattr(params, "wave2_net_buy_delta_pct", None),
+            )
+        # Adapt hard stop-loss within safe bounds
+        raw_sl = getattr(params, "hard_stop_loss_pct", None)
+        if raw_sl is not None:
+            safe_sl = max(0.08, min(0.25, abs(float(raw_sl)) / 100.0))
+            self.hard_stop_loss_pct = safe_sl
 
 
     def _install_signal_handlers(self) -> None:
@@ -1737,6 +1770,7 @@ class PaperTradingEngine:
         cust_tp = getattr(self, "custom_take_profit_pct", getattr(self.config, "custom_take_profit_pct", None))
         cust_sl = getattr(self, "custom_stop_loss_pct", getattr(self.config, "custom_stop_loss_pct", None))
         hard_sl = getattr(self, "hard_stop_loss_pct", getattr(self.config, "hard_stop_loss_pct", 0.20))
+        entry_vec = PatternFeatureVector.from_signal(signal).to_vector()
         lot = self._position_book.open_lot(
             fill,
             signal.signal_id,
@@ -1749,6 +1783,7 @@ class PaperTradingEngine:
             custom_take_profit_pct=cust_tp,
             custom_stop_loss_pct=cust_sl,
             hard_stop_loss_pct=hard_sl,
+            entry_feature_vector=entry_vec,
         )
         self._position_book.commit_slot_to_lot_by_token(record.token_address, record.chain)
         if pool is not None and lot.pool_address:
@@ -2789,11 +2824,12 @@ class PaperTradingEngine:
                             getattr(self._metrics, "cumulative_realized_usd",
                             getattr(self._metrics, "total_realized_pnl_usd", 0.0))
                         )
-                        self._feedback.parameter_tuner.update_from_performance(
+                        tuned_params = self._feedback.parameter_tuner.update_from_performance(
                             win_rate_24h=self._metrics.win_rate_pct,
                             realized_pnl_usd=realized_pnl,
                             total_trades_24h=self._metrics.total_trades,
                         )
+                        self._propagate_dynamic_hyperparameters(tuned_params)
 
                         reflection = TradeReflection.from_trade(
                             trade_id=exit_fill.order_id,
@@ -2805,6 +2841,7 @@ class PaperTradingEngine:
                             realized_pnl_usd=exit_pnl_usd,
                             realized_pnl_native=pnl_native,
                             time_to_fill_ms=exit_fill.fill_latency_ms,
+                            entry_feature_vector=getattr(lot, "entry_feature_vector", []),
                         )
                         await self._feedback.record_closed_trade(reflection)
                         self._record_closed_trade_and_notify(
@@ -3313,6 +3350,56 @@ class PaperTradingEngine:
                     pool_address=getattr(signal_item, "pool_address", "") or "",
                 )
 
+            # True Normalized Market State Feature Vector Extraction
+            feature_vec_obj = PatternFeatureVector.from_signal(
+                signal=signal_item,
+                sec=getattr(signal_item, "security_report", None),
+                wallet_profile=getattr(signal_item, "wallet_profile", None),
+            )
+            entry_feature_vector = feature_vec_obj.to_vector()
+
+            # Record Shadow Lots for Tournament Registry
+            if hasattr(self, "_strategy_tournament") and self._strategy_tournament and signal_item.pool_state:
+                native_p = self._eth_price if signal_item.chain == ChainIdentifier.BASE_MAINNET else self._sol_price
+                try:
+                    self._strategy_tournament.evaluate_signal_and_record_shadow_lots(
+                        signal=signal_item,
+                        pool=signal_item.pool_state,
+                        native_price_usd=native_p,
+                    )
+                except Exception as exc:
+                    logger.debug("Shadow tournament evaluation skipped for %s: %s", signal_item.token_address[:10], exc)
+
+            # Unified Ruflo Multi-Agent Swarm Deliberation & BFT Consensus
+            if signal_item.suggested_side == OrderSide.BUY and self._swarm_coordinator:
+                try:
+                    swarm_result = await self._swarm_coordinator.execute_trade_consensus(
+                        token_address=signal_item.token_address,
+                        chain=signal_item.chain,
+                        signal=signal_item,
+                        feature_vector=entry_feature_vector,
+                        pool=signal_item.pool_state,
+                        report=getattr(signal_item, "security_report", None),
+                        execute_fill=False,
+                    )
+                    if swarm_result and not swarm_result.passed:
+                        logger.info(
+                            "Ruflo Swarm BFT VETO enforced for %s: %s (votes: %s)",
+                            signal_item.token_address[:10],
+                            swarm_result.rationale,
+                            swarm_result.agent_votes,
+                        )
+                        self._record_gatekeeper_eval(
+                            signal_item.token_address,
+                            signal_item.chain,
+                            f"Ruflo Swarm Veto: {swarm_result.rationale}",
+                            passed=False,
+                        )
+                        self._position_book.release_position_slot(token_address=signal_item.token_address)
+                        continue
+                except Exception as exc:
+                    logger.error("Ruflo Swarm consensus raised for %s: %s", signal_item.token_address[:10], exc)
+
             # AlphaSupervisor-AI Pre-Flight Audit & Dynamic Tuning
             ai_action_params: Optional[ActionParameters] = None
             if signal_item.suggested_side == OrderSide.BUY and getattr(self._cfg, "ai_supervisor_enabled", True):
@@ -3409,6 +3496,7 @@ class PaperTradingEngine:
                     custom_take_profit_pct=getattr(self, "custom_take_profit_pct", getattr(self.config, "custom_take_profit_pct", None)),
                     custom_stop_loss_pct=getattr(self, "custom_stop_loss_pct", getattr(self.config, "custom_stop_loss_pct", None)),
                     hard_stop_loss_pct=getattr(self, "hard_stop_loss_pct", getattr(self.config, "hard_stop_loss_pct", 0.20)),
+                    entry_feature_vector=entry_feature_vector,
                 )
 
                 if self._ledger:
@@ -3814,6 +3902,70 @@ class PaperTradingEngine:
                                 peak_gain_multiplier=gain_mult,
                             )
                         self._feedback.pattern_store.add_pattern(vec)
+
+                # 3. Query external top gainers / boosts and cross-reference with audited & vetoed tokens
+                if self._session and not self._session.closed:
+                    try:
+                        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+                        async with self._session.get(
+                            "https://api.dexscreener.com/token-boosts/top/v1",
+                            headers=headers,
+                            timeout=aiohttp.ClientTimeout(total=8.0),
+                        ) as resp:
+                            if resp.status == 200:
+                                boosts = await resp.json()
+                                if isinstance(boosts, list):
+                                    sol_mints = [
+                                        b.get("tokenAddress") for b in boosts
+                                        if isinstance(b, dict) and b.get("chainId") == "solana" and b.get("tokenAddress")
+                                    ][:20]
+                                    if sol_mints:
+                                        batch_param = ",".join(sol_mints)
+                                        url = f"https://api.dexscreener.com/latest/dex/tokens/{batch_param}"
+                                        async with self._session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=8.0)) as b_resp:
+                                            if b_resp.status == 200:
+                                                data = await b_resp.json()
+                                                pairs = data.get("pairs", [])
+                                                if isinstance(pairs, list):
+                                                    market_gainers = []
+                                                    for p in pairs:
+                                                        ch = p.get("priceChange", {})
+                                                        pct = max(float(ch.get("h24") or 0.0), float(ch.get("h6") or 0.0), float(ch.get("h1") or 0.0))
+                                                        if pct >= 100.0:  # >= 2x
+                                                            base = p.get("baseToken", {})
+                                                            market_gainers.append({
+                                                                "token_address": base.get("address", ""),
+                                                                "symbol": base.get("symbol", ""),
+                                                                "multiplier": 1.0 + pct / 100.0,
+                                                                "priceChange": ch,
+                                                                "source": "DexScreener",
+                                                                "volume_surge_multiplier": 3.0,
+                                                                "net_buy_delta": 0.70,
+                                                                "dip_depth_pct": 35.0,
+                                                                "consolidation_duration_s": 1800.0,
+                                                            })
+
+                                                    if market_gainers:
+                                                        # Aggregate audited outcomes & gatekeeper negative cache
+                                                        audited_outcomes = dict(getattr(self._ai_supervisor, "_outcome_tracker", {}))
+                                                        if hasattr(self, "_gatekeeper") and self._gatekeeper:
+                                                            neg_cache = getattr(self._gatekeeper, "_negative_cache", {})
+                                                            for t_addr, reason in neg_cache.items():
+                                                                if t_addr not in audited_outcomes:
+                                                                    from types import SimpleNamespace
+                                                                    audited_outcomes[t_addr] = SimpleNamespace(
+                                                                        decision="PASS",
+                                                                        flags=[str(reason)],
+                                                                    )
+
+                                                        staged_map = dict(self._wave2_buffer.get_all_staged())
+                                                        await self._feedback.missed_opportunity_analyzer.cross_reference_market_gainers(
+                                                            market_gainers=market_gainers,
+                                                            audited_outcomes=audited_outcomes,
+                                                            staged_tokens=staged_map,
+                                                        )
+                    except Exception as exc:
+                        logger.debug("Missed opportunity live gainer fetch skipped: %s", exc)
 
             except Exception as exc:  # noqa: BLE001
                 logger.error("Error in missed opportunity watchdog: %s", exc)
@@ -4417,6 +4569,14 @@ class PaperTradingEngine:
                         current_price,
                         now_s,
                     )
+                    # Update shadow strategy tournament prices
+                    if hasattr(self, "_strategy_tournament") and self._strategy_tournament:
+                        native_p = self._eth_price if lot.chain == ChainIdentifier.BASE_MAINNET else self._sol_price
+                        self._strategy_tournament.update_token_prices(
+                            token_address=lot.token_address,
+                            current_price=current_price,
+                            native_price_usd=native_p,
+                        )
                     tick_timestamp_s = getattr(pool, "timestamp_s", None) or now_s
                     grace_sec = getattr(self.config, "exit_grace_period_sec", 15.0)
                     decision = self._position_book.evaluate_lot_exit(
@@ -4547,11 +4707,12 @@ class PaperTradingEngine:
                                 getattr(self._metrics, "cumulative_realized_usd",
                                 getattr(self._metrics, "total_realized_pnl_usd", 0.0))
                             )
-                            self._feedback.parameter_tuner.update_from_performance(
+                            tuned_params = self._feedback.parameter_tuner.update_from_performance(
                                 win_rate_24h=self._metrics.win_rate_pct,
                                 realized_pnl_usd=realized_pnl,
                                 total_trades_24h=self._metrics.total_trades,
                             )
+                            self._propagate_dynamic_hyperparameters(tuned_params)
 
                             reflection = TradeReflection.from_trade(
                                 trade_id=exit_fill.order_id,
@@ -4563,6 +4724,7 @@ class PaperTradingEngine:
                                 realized_pnl_usd=exit_pnl_usd,
                                 realized_pnl_native=pnl_native,
                                 time_to_fill_ms=exit_fill.fill_latency_ms,
+                                entry_feature_vector=getattr(lot, "entry_feature_vector", []),
                             )
                             await self._feedback.record_closed_trade(reflection)
                             self._record_closed_trade_and_notify(
@@ -4766,6 +4928,19 @@ class PaperTradingEngine:
             self._ai_supervisor.set_pattern_store(self._feedback.pattern_store)
             self._ai_supervisor.set_parameter_tuner(self._feedback.parameter_tuner)
 
+            if hasattr(self, "_strategy_tournament") and self._strategy_tournament:
+                self._strategy_tournament.ledger = self._ledger
+
+            if self._swarm_coordinator:
+                self._swarm_coordinator.set_live_dependencies(
+                    coordinator=coordinator,
+                    gatekeeper=self._gatekeeper,
+                    executor=self._executor,
+                    ledger=self._ledger,
+                    position_book=self._position_book,
+                )
+                await self._swarm_coordinator.start()
+
             async with coordinator:
                 self._coordinator = coordinator
                 self._telegram = coordinator.telegram_ingester
@@ -4919,6 +5094,13 @@ class PaperTradingEngine:
                     screener_poller_task.cancel()
                     shutdown_waiter.cancel()
                     await asyncio.gather(user_request_task, poller_task, snapshot_task, heartbeat_task, buffer_task, missed_opp_task, screener_poller_task, return_exceptions=True)
+
+                    # 3b. Stop multi-agent swarm orchestrator
+                    if self._swarm_coordinator:
+                        try:
+                            await self._swarm_coordinator.stop()
+                        except Exception:
+                            pass
 
                     # 4. Flush traces and checkpoint SQLite database
                     try:

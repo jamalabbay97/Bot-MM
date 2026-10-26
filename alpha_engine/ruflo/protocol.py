@@ -72,6 +72,7 @@ class SwarmMessage:
     target_role: Optional[AgentRole] = None  # None indicates broadcast
     message_type: str = "SIGNAL"
     action: Optional[str] = None
+    content: Optional[str] = None
     payload: dict[str, Any] = field(default_factory=dict)
     correlation_id: Optional[str] = None
     timestamp_ns: int = field(default_factory=time.time_ns)
@@ -86,6 +87,7 @@ class SwarmMessage:
             "sender_role": self.sender_role.value,
             "target_role": self.target_role.value if self.target_role else "BROADCAST",
             "message_type": self.message_type,
+            "content": self.content,
             "payload": self.payload,
             "correlation_id": self.correlation_id,
             "timestamp_ns": self.timestamp_ns,

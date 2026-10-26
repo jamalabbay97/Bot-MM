@@ -118,6 +118,8 @@ def test_early_rally_breakout_detection_at_bottom(clean_security_report, sample_
             break
 
     assert breakout_sig is not None
+    assert isinstance(breakout_sig, SignalEvent)
+    assert breakout_sig.source in (SignalSource.WAVE2_BREAKOUT, SignalSource.EARLY_RALLY_BREAKOUT)
     assert breakout_sig.suggested_side == OrderSide.BUY
     assert breakout_sig.exit_profile == ExitProfile.EARLY_RALLY_SWING
     assert breakout_sig.strategy_type == StrategyType.EARLY_RALLY_BREAKOUT
@@ -232,6 +234,7 @@ def test_early_rally_scale_out_and_peak_trailing_stop(sample_pool):
         partial_exit_enabled=True,
     )
     assert lot is not None
+    assert lot.status == LotStatus.OPEN
 
     # 1. Price runs up to 1.52 (+52%): Triggers 50% Take Profit Scale-Out
     tp1_decision = book.evaluate_lot_exit(lot, current_price=Decimal("1.520"))

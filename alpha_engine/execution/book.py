@@ -104,6 +104,7 @@ class OpenLot:
     stale_price_retries: int = 0
     price_unresolved_since_s: float = 0.0
     is_illiquid: bool = False
+    entry_feature_vector: list[float] = field(default_factory=list)
 
     def record_tick(
         self,
@@ -625,6 +626,7 @@ class PositionBook:
         custom_take_profit_pct: Optional[float] = None,
         custom_stop_loss_pct: Optional[float] = None,
         hard_stop_loss_pct: Optional[float] = None,
+        entry_feature_vector: Optional[list[float]] = None,
     ) -> OpenLot:
         if fill.effective_price <= Decimal(0):
             raise ValueError(
@@ -678,6 +680,7 @@ class PositionBook:
             custom_take_profit_pct=custom_take_profit_pct,
             custom_stop_loss_pct=custom_stop_loss_pct,
             hard_stop_loss_pct=hard_stop_loss_pct,
+            entry_feature_vector=list(entry_feature_vector) if entry_feature_vector else [],
             price_history=[(entry_ts, fill.effective_price, fill.simulated_native_spent)],
             tick_prices_5m=[(entry_ts, fill.effective_price)],
             tick_returns_5m=[],
@@ -995,16 +998,16 @@ class PositionBook:
             or lot.exit_profile == ExitProfile.EARLY_RALLY_SWING
         )
         entry_sl_threshold = None
-        if lot.hard_stop_loss_pct is not None:
+        if lot.ai_hard_stop_loss_pct is not None:
+            entry_sl_threshold = normalize_stop_loss_pct(lot.ai_hard_stop_loss_pct)
+        elif lot.custom_stop_loss_pct is not None and lot.custom_stop_loss_pct <= 0.25:
+            entry_sl_threshold = normalize_stop_loss_pct(lot.custom_stop_loss_pct)
+        elif is_early_rally_strategy:
+            entry_sl_threshold = normalize_stop_loss_pct(lot.custom_stop_loss_pct) or Decimal("0.15")
+        elif lot.hard_stop_loss_pct is not None:
             entry_sl_threshold = normalize_stop_loss_pct(lot.hard_stop_loss_pct)
         elif hard_stop_loss_pct is not None:
             entry_sl_threshold = normalize_stop_loss_pct(hard_stop_loss_pct)
-        elif is_early_rally_strategy:
-            entry_sl_threshold = normalize_stop_loss_pct(lot.custom_stop_loss_pct) or Decimal("0.15")
-        elif lot.custom_stop_loss_pct is not None and lot.custom_stop_loss_pct <= 0.25:
-            entry_sl_threshold = normalize_stop_loss_pct(lot.custom_stop_loss_pct)
-        elif lot.ai_hard_stop_loss_pct is not None:
-            entry_sl_threshold = normalize_stop_loss_pct(lot.ai_hard_stop_loss_pct)
         else:
             entry_sl_threshold = None
 

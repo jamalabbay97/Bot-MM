@@ -207,9 +207,11 @@ class RufloSupervisorAgent(BaseRufloAgent):
         actual_slippage_bps: int = 50,
         fill_latency_ms: float = 45.0,
         root_cause: Optional[str] = None,
+        feature_vector: Optional[list[float]] = None,
     ) -> dict[str, Any]:
         if root_cause is None:
             root_cause = "PROFIT_TARGET_HIT" if realized_pnl_usd > 0 else "STOP_LOSS_TRIGGERED"
+        fv = list(feature_vector) if feature_vector and len(feature_vector) == 7 else [0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5]
         episode = MemoryEpisode(
             episode_id=trade_id,
             token_address=token_address,
@@ -217,7 +219,7 @@ class RufloSupervisorAgent(BaseRufloAgent):
             decision_type="ENTER",
             signal_source=signal_source,
             confidence_score=0.85,
-            feature_vector=[0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5],
+            feature_vector=fv,
             realized_pnl_usd=realized_pnl_usd,
             roi_pct=roi_pct,
             actual_slippage_bps=actual_slippage_bps,

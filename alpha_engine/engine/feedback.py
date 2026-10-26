@@ -52,6 +52,7 @@ class TradeReflection:
     is_win: bool = False
     strategy_horizon: StrategyHorizon = StrategyHorizon.SHORT_TERM_SCALP
     custom_metadata: Optional[dict[str, Any]] = None
+    entry_feature_vector: list[float] = field(default_factory=list)
     timestamp_ns: int = field(default_factory=time.time_ns)
 
     @property
@@ -78,6 +79,7 @@ class TradeReflection:
         wallet_address: Optional[str] = None,
         strategy_horizon: StrategyHorizon = StrategyHorizon.SHORT_TERM_SCALP,
         custom_metadata: Optional[dict[str, Any]] = None,
+        entry_feature_vector: Optional[list[float]] = None,
     ) -> TradeReflection:
         if entry_price > Decimal(0):
             roi = float((exit_price - entry_price) / entry_price * 100)
@@ -105,6 +107,7 @@ class TradeReflection:
             is_win=is_win,
             strategy_horizon=strategy_horizon,
             custom_metadata=custom_metadata,
+            entry_feature_vector=list(entry_feature_vector) if entry_feature_vector else [],
             timestamp_ns=time.time_ns(),
         )
 
@@ -279,6 +282,11 @@ class AdaptiveFeedbackEngine:
             root_cause = "PROFIT_TARGET_HIT" if reflection.is_win else (
                 "SLIPPAGE_DECAY" if slippage_decay_flag else "STOP_LOSS_TRIGGERED"
             )
+            fv = (
+                list(reflection.entry_feature_vector)
+                if getattr(reflection, "entry_feature_vector", None) and len(reflection.entry_feature_vector) == 7
+                else [min(1.0, max(0.0, float(recent_win_rate) / 100.0)), min(1.0, max(0.0, (float(reflection.roi_pct) + 100.0) / 200.0)), 0.5, 0.5, 0.5, 0.5, 0.5]
+            )
             ep = MemoryEpisode(
                 episode_id=reflection.trade_id,
                 token_address=reflection.token_address,
@@ -286,7 +294,7 @@ class AdaptiveFeedbackEngine:
                 decision_type="ENTER",
                 signal_source=reflection.signal_source.value,
                 confidence_score=float(tuned_params.confidence_multiplier),
-                feature_vector=[float(recent_win_rate) / 100.0, float(reflection.roi_pct) / 100.0, 0.5, 0.5, 0.5, 0.5, 0.5],
+                feature_vector=fv,
                 realized_pnl_usd=float(reflection.realized_pnl_usd),
                 roi_pct=float(reflection.roi_pct),
                 actual_slippage_bps=reflection.actual_slippage_bps,

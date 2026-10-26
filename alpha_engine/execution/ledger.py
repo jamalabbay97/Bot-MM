@@ -244,6 +244,38 @@ class SQLiteLedger:
     )
     """
 
+    _CREATE_STRATEGY_EXPERIMENTS = """
+    CREATE TABLE IF NOT EXISTS strategy_experiments (
+        experiment_id       TEXT PRIMARY KEY,
+        strategy_name       TEXT NOT NULL,
+        parameters_json     TEXT NOT NULL,
+        regime              TEXT NOT NULL DEFAULT 'ALL',
+        status              TEXT NOT NULL CHECK(status IN ('SHADOW','CHAMPION','RETIRED')),
+        trades_count        INTEGER NOT NULL DEFAULT 0,
+        win_rate            REAL NOT NULL DEFAULT 0.0,
+        profit_factor       REAL NOT NULL DEFAULT 0.0,
+        sharpe_ratio        REAL NOT NULL DEFAULT 0.0,
+        max_drawdown_pct    REAL NOT NULL DEFAULT 0.0,
+        net_pnl_usd         REAL NOT NULL DEFAULT 0.0,
+        created_at          INTEGER NOT NULL,
+        updated_at          INTEGER NOT NULL
+    )
+    """
+
+    _CREATE_AGENT_DELIBERATION_LOGS = """
+    CREATE TABLE IF NOT EXISTS agent_deliberation_logs (
+        deliberation_id             TEXT PRIMARY KEY,
+        signal_id                   TEXT NOT NULL,
+        token_address               TEXT NOT NULL,
+        agent_votes_json            TEXT NOT NULL,
+        episodic_memory_matches_json TEXT NOT NULL,
+        selected_strategy_id        TEXT NOT NULL,
+        final_decision              TEXT NOT NULL,
+        rationale                   TEXT NOT NULL,
+        timestamp_ns                INTEGER NOT NULL
+    )
+    """
+
     def __init__(
         self,
         db_path: str | Path = "paper_trading.db",
@@ -306,11 +338,17 @@ class SQLiteLedger:
         await conn.execute(self._CREATE_TRACE_LOG)
         await conn.execute(self._CREATE_SETTINGS)
         await conn.execute(self._CREATE_TOKEN_REQUESTS)
+        await conn.execute(self._CREATE_STRATEGY_EXPERIMENTS)
+        await conn.execute(self._CREATE_AGENT_DELIBERATION_LOGS)
         await conn.execute("CREATE INDEX IF NOT EXISTS idx_token_requests_token ON token_requests(token_address);")
         await conn.execute("CREATE INDEX IF NOT EXISTS idx_token_requests_state ON token_requests(state);")
         await conn.execute("CREATE INDEX IF NOT EXISTS idx_token_requests_created ON token_requests(created_at);")
         await conn.execute("CREATE INDEX IF NOT EXISTS idx_trades_token ON trades(token_address);")
         await conn.execute("CREATE INDEX IF NOT EXISTS idx_trades_chain ON trades(chain);")
+        await conn.execute("CREATE INDEX IF NOT EXISTS idx_strategy_experiments_status ON strategy_experiments(status);")
+        await conn.execute("CREATE INDEX IF NOT EXISTS idx_agent_deliberations_token ON agent_deliberation_logs(token_address);")
+        await conn.execute("CREATE INDEX IF NOT EXISTS idx_agent_deliberations_signal ON agent_deliberation_logs(signal_id);")
+        await conn.execute("CREATE INDEX IF NOT EXISTS idx_agent_deliberations_ts ON agent_deliberation_logs(timestamp_ns);")
         try:
             cursor = await conn.execute("PRAGMA table_info(trades)")
             cols = [row[1] for row in await cursor.fetchall()]
@@ -1386,6 +1424,121 @@ class SQLiteLedger:
             (str(uuid.uuid4()), token_address, reason, str(pnl_usd), now_ns + 1, now_s),
         )
         await conn.commit()
+
+    @sqlite_retry(max_retries=5, base_delay=0.1)
+    async def record_strategy_experiment(self, experiment: Optional[dict[str, Any]] = None, **kwargs: Any) -> None:
+        """Insert or replace a strategy tournament experiment record."""
+        conn = self._conn
+        if conn is None:
+            return
+        exp = dict(experiment or {})
+        exp.update(kwargs)
+        now_s = int(time.time())
+        params_json = exp.get("parameters_json") or json.dumps(exp.get("parameters", {}))
+        await conn.execute(
+            """
+            INSERT INTO strategy_experiments (
+                experiment_id, strategy_name, parameters_json, regime, status,
+                trades_count, win_rate, profit_factor, sharpe_ratio, max_drawdown_pct,
+                net_pnl_usd, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(experiment_id) DO UPDATE SET
+                strategy_name=excluded.strategy_name,
+                parameters_json=excluded.parameters_json,
+                regime=excluded.regime,
+                status=excluded.status,
+                trades_count=excluded.trades_count,
+                win_rate=excluded.win_rate,
+                profit_factor=excluded.profit_factor,
+                sharpe_ratio=excluded.sharpe_ratio,
+                max_drawdown_pct=excluded.max_drawdown_pct,
+                net_pnl_usd=excluded.net_pnl_usd,
+                updated_at=excluded.updated_at;
+            """,
+            (
+                str(exp["experiment_id"]),
+                str(exp["strategy_name"]),
+                params_json,
+                str(exp.get("regime", "ALL")),
+                str(exp.get("status", "SHADOW")),
+                int(exp.get("trades_count", 0)),
+                float(exp.get("win_rate", 0.0)),
+                float(exp.get("profit_factor", 0.0)),
+                float(exp.get("sharpe_ratio", 0.0)),
+                float(exp.get("max_drawdown_pct", 0.0)),
+                float(exp.get("net_pnl_usd", 0.0)),
+                int(exp.get("created_at", now_s)),
+                now_s,
+            ),
+        )
+        await conn.commit()
+
+    @sqlite_retry(max_retries=5, base_delay=0.1)
+    async def get_strategy_experiments(self, status: Optional[str] = None) -> list[dict[str, Any]]:
+        """Retrieve strategy experiments, optionally filtered by status (CHAMPION, SHADOW, RETIRED)."""
+        conn = self._conn
+        if conn is None:
+            return []
+        conn.row_factory = aiosqlite.Row
+        if status:
+            cursor = await conn.execute(
+                "SELECT * FROM strategy_experiments WHERE status = ? ORDER BY net_pnl_usd DESC;",
+                (status.upper(),),
+            )
+        else:
+            cursor = await conn.execute("SELECT * FROM strategy_experiments ORDER BY net_pnl_usd DESC;")
+        rows = await cursor.fetchall()
+        return [dict(r) for r in rows]
+
+    @sqlite_retry(max_retries=5, base_delay=0.1)
+    async def record_agent_deliberation(self, deliberation: Optional[dict[str, Any]] = None, **kwargs: Any) -> None:
+        """Record a structured multi-agent deliberation audit log."""
+        conn = self._conn
+        if conn is None:
+            return
+        import uuid
+        d = dict(deliberation or {})
+        d.update(kwargs)
+        delib_id = str(d.get("deliberation_id") or uuid.uuid4())
+        sig_id = str(d.get("signal_id", ""))
+        token_addr = str(d.get("token_address", ""))
+        votes_json = d.get("agent_votes_json") or json.dumps(d.get("votes", {}))
+        matches_json = d.get("episodic_memory_matches_json") or json.dumps(d.get("episodic_matches", []))
+        strat_id = str(d.get("selected_strategy_id", "default"))
+        decision = str(d.get("final_decision", "PASS"))
+        rationale = str(d.get("rationale", ""))
+        ts_ns = int(d.get("timestamp_ns", time.time_ns()))
+        await conn.execute(
+            """
+            INSERT OR REPLACE INTO agent_deliberation_logs (
+                deliberation_id, signal_id, token_address, agent_votes_json,
+                episodic_memory_matches_json, selected_strategy_id, final_decision,
+                rationale, timestamp_ns
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?);
+            """,
+            (delib_id, sig_id, token_addr, votes_json, matches_json, strat_id, decision, rationale, ts_ns),
+        )
+        await conn.commit()
+
+    @sqlite_retry(max_retries=5, base_delay=0.1)
+    async def get_agent_deliberations(self, token_address: Optional[str] = None, limit: int = 20) -> list[dict[str, Any]]:
+        """Retrieve recent agent deliberation logs."""
+        conn = self._conn
+        if conn is None:
+            return []
+        conn.row_factory = aiosqlite.Row
+        if token_address:
+            cursor = await conn.execute(
+                "SELECT * FROM agent_deliberation_logs WHERE token_address = ? ORDER BY timestamp_ns DESC LIMIT ?;",
+                (token_address, limit),
+            )
+        else:
+            cursor = await conn.execute(
+                "SELECT * FROM agent_deliberation_logs ORDER BY timestamp_ns DESC LIMIT ?;",
+                (limit,),
+            )
+        rows = await cursor.fetchall()
+        return [dict(r) for r in rows]
 
 
 

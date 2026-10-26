@@ -107,8 +107,48 @@ class RufloEpisodicMemory:
                     """
                 )
                 await self._conn.commit()
+                # Preload recent episodes from SQLite into memory for sub-millisecond retrieval
+                cursor = await self._conn.execute(
+                    """
+                    SELECT episode_id, token_address, chain, decision_type, signal_source,
+                           confidence_score, feature_vector, realized_pnl_usd, roi_pct,
+                           actual_slippage_bps, fill_latency_ms, root_cause_tag, summary_reflection, timestamp_ns
+                    FROM ruflo_episodic_memory
+                    ORDER BY timestamp_ns ASC
+                    LIMIT ?;
+                    """,
+                    (self._max_episodes,),
+                )
+                rows = await cursor.fetchall()
+                loaded = []
+                for r in rows:
+                    try:
+                        fv = json.loads(r["feature_vector"])
+                        if not isinstance(fv, list):
+                            fv = [0.5] * 7
+                    except Exception:
+                        fv = [0.5] * 7
+                    loaded.append(
+                        MemoryEpisode(
+                            episode_id=r["episode_id"],
+                            token_address=r["token_address"],
+                            chain=r["chain"],
+                            decision_type=r["decision_type"],
+                            signal_source=r["signal_source"],
+                            confidence_score=float(r["confidence_score"]),
+                            feature_vector=fv,
+                            realized_pnl_usd=float(r["realized_pnl_usd"]),
+                            roi_pct=float(r["roi_pct"]),
+                            actual_slippage_bps=int(r["actual_slippage_bps"]),
+                            fill_latency_ms=float(r["fill_latency_ms"]),
+                            root_cause_tag=r["root_cause_tag"],
+                            summary_reflection=r["summary_reflection"],
+                            timestamp_ns=int(r["timestamp_ns"]),
+                        )
+                    )
+                self._episodes = loaded
                 self._initialized = True
-                logger.info("RufloEpisodicMemory initialized with SQLite persistence at %s", self.db_path)
+                logger.info("RufloEpisodicMemory initialized with SQLite persistence at %s (%d episodes loaded)", self.db_path, len(self._episodes))
             except Exception as exc:
                 logger.warning("Could not initialize SQLite connection for RufloEpisodicMemory: %s", exc)
 
@@ -177,6 +217,15 @@ class RufloEpisodicMemory:
         results.sort(key=lambda x: x[1], reverse=True)
         return results[:top_k]
 
+    async def search_similar_episodes(
+        self,
+        query_vector: list[float],
+        top_k: int = 5,
+        min_similarity: float = 0.50,
+    ) -> list[tuple[MemoryEpisode, float]]:
+        """Async convenience alias returning (MemoryEpisode, similarity_score) tuples."""
+        return self.query_similar_episodes(query_vector, top_k=top_k, min_similarity=min_similarity)
+
     @staticmethod
     def _cosine_similarity(v1: list[float], v2: list[float]) -> float:
         if not v1 or not v2 or len(v1) != len(v2):
@@ -217,16 +266,27 @@ class RufloEpisodicMemory:
     async def get_episode_count(self) -> int:
         return len(self._episodes)
 
-    async def search_similar_episodes(
+    async def get_recent_reflections(self, limit: int = 10) -> list[str]:
+        """Return list of non-empty summary reflections from recent episodes."""
+        return [ep.summary_reflection for ep in self._episodes[-limit:] if ep.summary_reflection]
+
+    def retrieve_similar_episodes(
         self,
         query_vector: list[float],
         top_k: int = 5,
         min_similarity: float = 0.50,
-    ) -> list[tuple[MemoryEpisode, float]]:
-        return self.query_similar_episodes(query_vector, top_k=top_k, min_similarity=min_similarity)
+    ) -> list[dict[str, Any]]:
+        """Retrieve top_k similar historical episodes formatted as dictionaries with similarity score."""
+        pairs = self.query_similar_episodes(query_vector, top_k=top_k, min_similarity=min_similarity)
+        results: list[dict[str, Any]] = []
+        for ep, sim in pairs:
+            d = ep.to_dict()
+            d["similarity"] = round(sim, 4)
+            d["realized_roi_pct"] = ep.roi_pct
+            results.append(d)
+        return results
 
-    async def get_recent_reflections(self, limit: int = 20) -> list[str]:
-        return [ep.summary_reflection for ep in self._episodes[-limit:] if ep.summary_reflection]
+    save_episode = record_episode
 
     async def record_from_trade(
         self,
@@ -240,10 +300,19 @@ class RufloEpisodicMemory:
         pnl = float(trade.realized_pnl_usd or 0.0)
         roi = float(trade.roi_pct or 0.0)
         src = trade.signal_source.value if isinstance(trade.signal_source, SignalSource) else str(trade.signal_source or "UNKNOWN")
-        vec = list(feature_vector) if feature_vector is not None else [0.5] * 7
-        if decision and getattr(decision, "feature_vector", None):
-            if hasattr(decision.feature_vector, "to_list"):
-                vec = decision.feature_vector.to_list()
+        vec = list(feature_vector) if feature_vector is not None else None
+        if vec is None and hasattr(trade, "entry_feature_vector") and getattr(trade, "entry_feature_vector"):
+            vec = list(trade.entry_feature_vector)
+        if vec is None and decision and getattr(decision, "feature_vector", None):
+            dfv = getattr(decision, "feature_vector")
+            if hasattr(dfv, "to_vector"):
+                vec = dfv.to_vector()
+            elif hasattr(dfv, "to_list"):
+                vec = dfv.to_list()
+            elif isinstance(dfv, list):
+                vec = dfv
+        if vec is None or len(vec) != 7:
+            vec = [0.5] * 7
 
         episode = MemoryEpisode(
             episode_id=trade.trade_id,
@@ -260,7 +329,7 @@ class RufloEpisodicMemory:
             root_cause_tag=trade.exit_reason.value if hasattr(trade, "exit_reason") and hasattr(trade.exit_reason, "value") else "EXIT",
             summary_reflection=summary_reflection or f"Trade {trade.trade_id} on {trade.token_address[:8]} with PnL ${pnl:.2f}",
         )
-        await self.save_episode(episode)
+        await self.record_episode(episode)
         return episode
 
     async def close(self) -> None:

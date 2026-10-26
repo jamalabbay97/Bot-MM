@@ -1853,7 +1853,11 @@ class AlphaSupervisorAI:
                 decision_type="ENTER",
                 signal_source=str(getattr(reflection, "signal_source", "DEX_SWAP")),
                 confidence_score=0.85,
-                feature_vector=[float(roi_pct) / 100.0, float(actual_bps) / 10000.0, 0.5, 0.5, 0.5, 0.5, 0.5],
+                feature_vector=(
+                    list(reflection.entry_feature_vector)
+                    if getattr(reflection, "entry_feature_vector", None) and len(reflection.entry_feature_vector) == 7
+                    else [max(0.0, min(1.0, (float(roi_pct) + 100.0) / 200.0)), min(1.0, float(actual_bps) / 1000.0), 0.5, 0.5, 0.5, 0.5, 0.5]
+                ),
                 realized_pnl_usd=float(getattr(reflection, "realized_pnl_usd", 0.0)),
                 roi_pct=float(roi_pct),
                 actual_slippage_bps=int(actual_bps),

@@ -991,6 +991,23 @@ class RevivalBreakoutBuffer:
         if cb not in self._on_decision_callbacks:
             self._on_decision_callbacks.append(cb)
 
+    def set_hyperparameters(
+        self,
+        volume_surge_multiplier_k: Optional[float] = None,
+        min_net_buy_delta: Optional[float] = None,
+        min_net_buy_delta_pct: Optional[float] = None,
+        ttl_seconds: Optional[float] = None,
+    ) -> None:
+        """Dynamically update hyperparameter thresholds from feedback adaptation loop."""
+        if volume_surge_multiplier_k is not None:
+            self.volume_surge_multiplier_k = max(2.0, min(5.0, volume_surge_multiplier_k))
+        if min_net_buy_delta is not None:
+            self.min_net_buy_delta = max(0.50, min(0.85, min_net_buy_delta))
+        elif min_net_buy_delta_pct is not None:
+            self.min_net_buy_delta = max(0.50, min(0.85, min_net_buy_delta_pct / 100.0))
+        if ttl_seconds is not None:
+            self.ttl_seconds = max(86400.0, min(86400.0 * 14, ttl_seconds))
+
     def stage_token(
         self,
         token_address: str,

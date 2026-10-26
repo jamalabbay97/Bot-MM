@@ -303,7 +303,10 @@ async def test_manual_trade_amount_sizing_in_pipeline(tmp_path):
 
     # Run queue processing for one tick
     task = asyncio.create_task(runner._process_signal_queue())
-    await asyncio.sleep(0.08)
+    for _ in range(40):
+        if runner._executor.execute_signal.called:
+            break
+        await asyncio.sleep(0.05)
     task.cancel()
     try:
         await task

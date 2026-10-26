@@ -76,45 +76,79 @@ class ConversationalSupervisor:
         """
         clean_addr = token_address.strip()
         records = await self.ledger.get_token_decision_history(clean_addr, limit=20)
-        if not records:
+        
+        # Check Agent Deliberation Logs (Unified Ruflo Swarm + Council Arbiter)
+        delibs = []
+        if hasattr(self.ledger, "get_agent_deliberations"):
+            try:
+                delibs = await self.ledger.get_agent_deliberations(token_address=clean_addr, limit=3)
+            except Exception as exc:
+                logger.debug("Failed to fetch agent deliberations: %s", exc)
+
+        if not records and not delibs:
             return f"❌ No decision records found in ledger for token `{clean_addr}`."
 
-        # Chronological order
-        records = sorted(records, key=lambda r: r.timestamp_ns)
-
         lines = [f"### 📋 Audit Trail & Decision Analysis for `{clean_addr[:12]}...`\n"]
-        lines.append(f"**Total Evaluations Recorded:** {len(records)}\n")
 
-        for idx, rec in enumerate(records, 1):
-            dt = datetime.fromtimestamp(rec.timestamp_ns / 1_000_000_000, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
-            dt_color = "🟢 ENTER" if rec.decision_type == DecisionType.ENTER else "🔴 SKIP"
-            lines.append(f"#### Evaluation #{idx}: {dt_color} at `{dt}`")
-            lines.append(f"- **Strategy / Pattern:** `{rec.strategy_pattern}`")
-            lines.append(f"- **Confidence Score:** `{rec.confidence_score:.2f}`")
-            lines.append(f"- **Explicit Rationale:** {rec.reason}")
+        if records:
+            # Chronological order
+            records = sorted(records, key=lambda r: r.timestamp_ns)
+            lines.append(f"**Total Evaluations Recorded:** {len(records)}\n")
 
-            if rec.active_rules:
-                rules_str = ", ".join(f"`{k}`: {v}" for k, v in rec.active_rules.items())
-                lines.append(f"- **Active Rule Triggers:** {rules_str}")
+            for idx, rec in enumerate(records, 1):
+                dt = datetime.fromtimestamp(rec.timestamp_ns / 1_000_000_000, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+                dt_color = "🟢 ENTER" if rec.decision_type == DecisionType.ENTER else "🔴 SKIP"
+                lines.append(f"#### Evaluation #{idx}: {dt_color} at `{dt}`")
+                lines.append(f"- **Strategy / Pattern:** `{rec.strategy_pattern}`")
+                lines.append(f"- **Confidence Score:** `{rec.confidence_score:.2f}`")
+                lines.append(f"- **Explicit Rationale:** {rec.reason}")
 
-            if rec.metadata:
-                meta_items = [f"{k}={v}" for k, v in rec.metadata.items() if k != "global_risk_mode"]
-                if meta_items:
-                    lines.append(f"- **State Snapshot:** {', '.join(meta_items)}")
-            lines.append("")
+                if rec.active_rules:
+                    rules_str = ", ".join(f"`{k}`: {v}" for k, v in rec.active_rules.items())
+                    lines.append(f"- **Active Rule Triggers:** {rules_str}")
 
-        if len(records) >= 2:
-            first = records[0]
-            last = records[-1]
-            if first.decision_type == DecisionType.SKIP and last.decision_type == DecisionType.ENTER:
-                t1 = datetime.fromtimestamp(first.timestamp_ns / 1_000_000_000, tz=timezone.utc).strftime("%H:%M")
-                t2 = datetime.fromtimestamp(last.timestamp_ns / 1_000_000_000, tz=timezone.utc).strftime("%H:%M")
-                lines.append("### 🔍 Inflection Shift Analysis:")
-                lines.append(
-                    f"At **{t1}**, the token was **SKIPPED** due to unmet criteria ({first.reason}).\n"
-                    f"By **{t2}**, the token underwent accumulation and confirmed an inflection "
-                    f"breakout pattern ({last.reason}), satisfying all mathematical gates for **ENTER**."
-                )
+                if rec.metadata:
+                    meta_items = [f"{k}={v}" for k, v in rec.metadata.items() if k != "global_risk_mode"]
+                    if meta_items:
+                        lines.append(f"- **State Snapshot:** {', '.join(meta_items)}")
+                lines.append("")
+
+            if len(records) >= 2:
+                first = records[0]
+                last = records[-1]
+                if first.decision_type == DecisionType.SKIP and last.decision_type == DecisionType.ENTER:
+                    t1 = datetime.fromtimestamp(first.timestamp_ns / 1_000_000_000, tz=timezone.utc).strftime("%H:%M")
+                    t2 = datetime.fromtimestamp(last.timestamp_ns / 1_000_000_000, tz=timezone.utc).strftime("%H:%M")
+                    lines.append("### 🔍 Inflection Shift Analysis:")
+                    lines.append(
+                        f"At **{t1}**, the token was **SKIPPED** due to unmet criteria ({first.reason}).\n"
+                        f"By **{t2}**, the token underwent accumulation and confirmed an inflection "
+                        f"breakout pattern ({last.reason}), satisfying all mathematical gates for **ENTER**."
+                    )
+
+        if delibs:
+            lines.append("\n### 🏛️ مداولات سرب الوكلاء والذاكرة العرضية (Multi-Agent Deliberations & Episodic Memory):")
+            for d in delibs:
+                dt = datetime.fromtimestamp(d["timestamp_ns"] / 1e9, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+                lines.append(f"**جلسة التداول [{dt}]** — القرار: `{d['final_decision']}` | الاستراتيجية: `{d['selected_strategy_id']}`")
+                lines.append(f"- **خلاصة القرار:** {d['rationale']}")
+                try:
+                    votes = json.loads(d["agent_votes_json"])
+                    vote_parts = [f"`{role}`: {'🟢' if v else '🔴'}" for role, v in votes.items()]
+                    lines.append(f"- **أصوات الوكلاء (Agent Votes):** {' | '.join(vote_parts)}")
+                except Exception:
+                    pass
+                try:
+                    matches = json.loads(d["episodic_memory_matches_json"])
+                    if matches:
+                        lines.append("- **تطابقات الذاكرة التاريخية (Cosine Similarity Matches):**")
+                        for m in matches:
+                            lines.append(
+                                f"  * عملة `{m.get('token_address', '')[:10]}...` | تشابه كوزين: `{float(m.get('similarity', 0.0))*100:.1f}%` | العائد: `{float(m.get('realized_roi_pct', 0.0)):+.1f}%`"
+                            )
+                except Exception:
+                    pass
+                lines.append("")
 
         return "\n".join(lines)
 
@@ -453,8 +487,33 @@ class ConversationalSupervisor:
     # Conversational RAG Router
     # =========================================================================
 
+    async def tool_experiments(self) -> str:
+        """Display the live leaderboard of Champion vs Challenger strategies."""
+        from alpha_engine.engine.experimentation import StrategyTournamentRegistry
+        target = getattr(self, "execution_target", None)
+        reg = getattr(target, "strategy_tournament", None) if target else None
+        if reg is None:
+            reg = StrategyTournamentRegistry(ledger=self.ledger)
+        board = reg.get_leaderboard()
+        lines = [
+            "### 🏆 لوحة صدارة تجارب الاستراتيجيات (Strategy Tournament Leaderboard)\n",
+            "| الحالة (Status) | الاستراتيجية | النظام (Regime) | الصفقات | نسبة الفوز | معامل الربح (PF) | Sortino | Max DD | صافي الأرباح | الترقية |",
+            "| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |",
+        ]
+        for b in board:
+            lines.append(
+                f"| {b['status']} | `{b['name']}` | `{b['regime']}` | {b['trades']} | {b['win_rate']} | {b['profit_factor']} | {b['sortino']} | {b['max_dd']} | {b['net_pnl']} | {b['promotion_ready']} |"
+            )
+        lines.append("\n💡 **شروط ترقية الاستراتيجية للبطولة (Champion Promotion Rules):**")
+        lines.append("- إتمام ما لا يقل عن 30 صفقة في وضع الاختبار الظلي (Shadow Mode)")
+        lines.append("- معامل ربح (PF) > 1.35 ومعدل Sortino أعلى من البطل الحالي")
+        lines.append("- أقصى تراجع (Max Drawdown) < 8.0%")
+        lines.append("- اعتماد أرباح الصفقات الشاذة (Outlier Dependency) <= 60%")
+        lines.append("- اجتياز اختبار استقرار المعلمات (Perturbation Test +/-10%)")
+        return "\n".join(lines)
+
     async def tool_council_debate(self, token_ca: str) -> str:
-        """Runs the 4-agent Council deliberation and formats transcript."""
+        """Runs the unified Multi-Agent Swarm & Council deliberation and formats transcript."""
         clean_ca = token_ca.strip()
         if not clean_ca:
             return "الرجاء إدخال عنوان العقد. مثال: `/council 7xKXtg...`"
@@ -463,19 +522,37 @@ class ConversationalSupervisor:
         from alpha_engine.models.enums import ChainIdentifier
         chain = ChainIdentifier.BASE_MAINNET if is_evm else ChainIdentifier.SOLANA_MAINNET
 
-        from alpha_engine.council.arbiter_cro import CouncilArbiterCRO
-        council = CouncilArbiterCRO()
-        res = await council.deliberate(token_ca=clean_ca, chain=chain)
+        if not self.swarm_coordinator:
+            from alpha_engine.ruflo.swarm import RufloSwarmCoordinator
+            self.swarm_coordinator = RufloSwarmCoordinator(config=self.config)
 
-        status_icon = "🟢 APPROVED" if res.decision == "EXECUTE_BUY" else "🔴 VETO / REJECT"
+        res = await self.swarm_coordinator.execute_trade_consensus(
+            token_address=clean_ca,
+            chain=chain,
+            execute_fill=False,
+        )
+
+        status_icon = "🟢 APPROVED" if res.passed else "🔴 VETO / REJECT"
         lines = [
-            f"### 🏛️ مجلس الوكلاء الأربعة: تقرير المناظرة لعقد `{clean_ca[:12]}...`\n",
-            f"**القرار النهائي للمجلس:** `{status_icon}` | **درجة الإجماع:** `{res.consensus_score*100:.1f}%`",
-            f"**حجم الصفقة المعتمد (Kelly Size):** `{res.recommended_position_pct}%`\n",
-            "**محضر مناظرة الوكلاء (Council Debate Transcript):**",
+            f"### 🏛️ مجلس الوكلاء التداولي المتحد: تقرير المناظرة لعقد `{clean_ca[:12]}...`\n",
+            f"**القرار النهائي:** `{status_icon}` | **السبب:** {res.rationale}",
+            f"**الاستراتيجية المقترحة:** `{res.selected_strategy_id}`\n",
+            "**أصوات الوكلاء (Unified Agent Votes):**",
         ]
-        for line in res.debate_transcript:
-            lines.append(f"- {line}")
+        for role, passed in res.agent_votes.items():
+            lines.append(f"- **`[{role}]`**: {'🟢 APPROVED' if passed else '🔴 VETO'}")
+
+        if res.episodic_memory_matches:
+            lines.append("\n**تطابقات الذاكرة العرضية (Episodic Memory Cosine Matches):**")
+            for m in res.episodic_memory_matches:
+                lines.append(
+                    f"- عملة `{m.get('token_address', '')[:10]}...` | تشابه: `{float(m.get('similarity', 0.0))*100:.1f}%` | عائد تاريخي: `{float(m.get('realized_roi_pct', 0.0)):+.1f}%`"
+                )
+
+        if res.debate_transcript:
+            lines.append("\n**محضر مناظرة الوكلاء (Council Debate Transcript):**")
+            for line in res.debate_transcript:
+                lines.append(f"- {line}")
 
         return "\n".join(lines)
 
@@ -486,6 +563,9 @@ class ConversationalSupervisor:
         """
         q = query.strip()
         lower_q = q.lower()
+
+        if lower_q in ("/experiments", "experiments", "تجارب", "البطولة", "التجارب", "المنافسة"):
+            return await self.tool_experiments()
 
         if lower_q.startswith("/council") or lower_q.startswith("/debate") or lower_q.startswith("مناظرة") or lower_q.startswith("المجلس"):
             target = re.sub(r"^(/council|/debate|مناظرة|المجلس)\s*", "", q, flags=re.IGNORECASE).strip()
