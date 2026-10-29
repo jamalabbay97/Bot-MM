@@ -141,10 +141,13 @@ class ExecutionLedgerAgent(BaseRufloAgent):
             ChainIdentifier.BASE_MAINNET if "base" in chain.lower() or "evm" in chain.lower()
             else ChainIdentifier.SOLANA_MAINNET
         )
-        can_open, reason = self.position_book.can_open_position(
-            token_address=token_address,
-            chain=chain_enum,
-        )
+        if self.position_book.is_slot_reserved_for_token(token_address, chain_enum):
+            can_open, reason = True, "Position slot already reserved for execution"
+        else:
+            can_open, reason = self.position_book.can_open_position(
+                token_address=token_address,
+                chain=chain_enum,
+            )
         return {
             "can_open": can_open,
             "reason": reason,

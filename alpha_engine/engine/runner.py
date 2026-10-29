@@ -42,11 +42,12 @@ from alpha_engine.engine.signals import PendingLaunchBuffer, SignalGenerator
 from alpha_engine.engine.staging import RevivalBreakoutBuffer, Wave2StagingBuffer
 from alpha_engine.ruflo.protocol import ConsensusProtocol, SwarmTopology
 from alpha_engine.ruflo.swarm import RufloSwarmCoordinator
-from alpha_engine.engine.experimentation import StrategyTournamentRegistry
+from alpha_engine.engine.experimentation import AutonomousStrategyGenerator, StrategyTournamentRegistry
 from alpha_engine.execution.book import OpenLot, PositionBook, RunningMetrics
 from alpha_engine.execution.executor import PaperExecutor
 from alpha_engine.execution.ledger import SQLiteLedger
 from alpha_engine.tracer import tracer
+from alpha_engine.models.observability import TraceStage, TraceStatus
 from alpha_engine.ingestion.coordinator import IngestionCoordinator
 from alpha_engine.ingestion.market_oracle import MarketOracle
 from alpha_engine.logging_config import setup_production_logging
@@ -283,10 +284,15 @@ class PaperTradingEngine:
 
         # Multi-Strategy Tournament & Evolution Framework
         self._strategy_tournament: StrategyTournamentRegistry = StrategyTournamentRegistry(ledger=None)
+        self._strategy_generator: Optional[AutonomousStrategyGenerator] = None
 
     @property
     def strategy_tournament(self) -> StrategyTournamentRegistry:
         return self._strategy_tournament
+
+    @property
+    def strategy_generator(self) -> Optional[AutonomousStrategyGenerator]:
+        return self._strategy_generator
 
     @property
     def swarm_coordinator(self) -> Optional[RufloSwarmCoordinator]:
@@ -3382,17 +3388,20 @@ class PaperTradingEngine:
                         report=getattr(signal_item, "security_report", None),
                         execute_fill=False,
                     )
-                    if swarm_result and not swarm_result.passed:
+                    passed = swarm_result.get("approved", False) if isinstance(swarm_result, dict) else getattr(swarm_result, "passed", True)
+                    if swarm_result and not passed:
+                        rationale = swarm_result.get("veto_reason", swarm_result.get("reason", "Veto")) if isinstance(swarm_result, dict) else getattr(swarm_result, "rationale", "Veto")
+                        agent_votes = swarm_result.get("votes", {}) if isinstance(swarm_result, dict) else getattr(swarm_result, "agent_votes", {})
                         logger.info(
                             "Ruflo Swarm BFT VETO enforced for %s: %s (votes: %s)",
                             signal_item.token_address[:10],
-                            swarm_result.rationale,
-                            swarm_result.agent_votes,
+                            rationale,
+                            agent_votes,
                         )
                         self._record_gatekeeper_eval(
                             signal_item.token_address,
                             signal_item.chain,
-                            f"Ruflo Swarm Veto: {swarm_result.rationale}",
+                            f"Ruflo Swarm Veto: {rationale}",
                             passed=False,
                         )
                         self._position_book.release_position_slot(token_address=signal_item.token_address)
@@ -3439,22 +3448,45 @@ class PaperTradingEngine:
                     logger.error("AlphaSupervisor-AI audit raised for %s: %s", signal_item.token_address[:10], exc)
 
             equity = self._current_equity_usd()
-            fill = await executor.execute_signal(
-                signal_item,
-                portfolio_equity_usd=equity,
-                is_new_launch=is_new_launch,
-                fixed_trade_amount_native=preliminary_cost if (signal_item.suggested_side == OrderSide.BUY and is_manual_size) else None,
-            )
-            if fill is None or fill.effective_price <= Decimal(0):
-                if fill is not None and fill.effective_price <= Decimal(0):
-                    logger.warning(
-                        "Fill rejected for %s: zero or negative effective price: %s",
-                        signal_item.token_address[:10],
-                        fill.effective_price,
-                    )
-                if signal_item.suggested_side == OrderSide.BUY:
-                    self._position_book.release_position_slot(token_address=signal_item.token_address)
-                continue
+            chain_str = signal_item.chain.value if hasattr(signal_item.chain, "value") else str(signal_item.chain)
+            async with tracer.span(
+                token_address=signal_item.token_address,
+                chain=chain_str,
+                stage=TraceStage.EXECUTION,
+                component="PaperExecutor",
+                function_name="execute_signal",
+                input_data={
+                    "side": signal_item.suggested_side.value if hasattr(signal_item.suggested_side, "value") else str(signal_item.suggested_side),
+                    "is_new_launch": is_new_launch,
+                    "equity": float(equity),
+                },
+            ) as exec_trace:
+                fill = await executor.execute_signal(
+                    signal_item,
+                    portfolio_equity_usd=equity,
+                    is_new_launch=is_new_launch,
+                    fixed_trade_amount_native=preliminary_cost if (signal_item.suggested_side == OrderSide.BUY and is_manual_size) else None,
+                )
+                if fill is None or fill.effective_price <= Decimal(0):
+                    exec_trace.status = TraceStatus.REJECTED
+                    exec_trace.reason = "Execution returned no fill or non-positive price"
+                    if fill is not None and fill.effective_price <= Decimal(0):
+                        logger.warning(
+                            "Fill rejected for %s: zero or negative effective price: %s",
+                            signal_item.token_address[:10],
+                            fill.effective_price,
+                        )
+                    if signal_item.suggested_side == OrderSide.BUY:
+                        self._position_book.release_position_slot(token_address=signal_item.token_address)
+                    continue
+                else:
+                    exec_trace.status = TraceStatus.PASSED
+                    exec_trace.output_data = {
+                        "fill_price": float(fill.effective_price),
+                        "fill_amount": float(fill.amount_token),
+                        "slippage_bps": fill.slippage_bps,
+                        "tx_hash": getattr(fill, "tx_hash", None),
+                    }
 
             realized_pnl_usd: Decimal | None = None
 
@@ -4930,6 +4962,22 @@ class PaperTradingEngine:
 
             if hasattr(self, "_strategy_tournament") and self._strategy_tournament:
                 self._strategy_tournament.ledger = self._ledger
+
+            # 1. Continuous closed-loop self-learning bootstrap from real ledger (1,725+ trades)
+            try:
+                bootstrap_summary = await self._feedback.bootstrap_from_ledger(self._ledger)
+                self._ai_supervisor.set_global_risk_mode(self._feedback.get_risk_mode())
+                logger.info("Runner: Self-learning bootstrapped: %s", bootstrap_summary)
+            except Exception as exc:
+                logger.warning("Runner: Error during ledger self-learning bootstrap: %s", exc)
+
+            # 2. Autonomous strategy generator synthesis & shadow staging
+            try:
+                self._strategy_generator = AutonomousStrategyGenerator(ledger=self._ledger)
+                self._strategy_generator.discover_and_deploy_strategy_portfolio(self._strategy_tournament)
+                logger.info("Runner: Autonomous strategy generator deployed portfolio to tournament.")
+            except Exception as exc:
+                logger.warning("Runner: Error initializing autonomous strategy generator: %s", exc)
 
             if self._swarm_coordinator:
                 self._swarm_coordinator.set_live_dependencies(

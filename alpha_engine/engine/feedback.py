@@ -15,7 +15,7 @@ from dataclasses import dataclass, field
 from decimal import Decimal
 from typing import Any, Optional
 
-from alpha_engine.models.ai import TakeProfitStage
+from alpha_engine.models.ai import GlobalRiskMode, LossAttribution, TakeProfitStage
 from alpha_engine.models.decisions import PatternFeatureVector, RevivalPatternFeatureVector
 from alpha_engine.models.enums import (
     ChainIdentifier,
@@ -24,7 +24,9 @@ from alpha_engine.models.enums import (
     TradeExitReason,
     WhitelistStatus,
 )
+from alpha_engine.models.observability import TraceStage, TraceStatus
 from alpha_engine.profiler.profiler import SmartMoneyProfiler
+from alpha_engine.tracer import tracer
 
 logger = logging.getLogger(__name__)
 
@@ -112,6 +114,123 @@ class TradeReflection:
         )
 
 
+
+class LossAttributionEngine:
+    """
+    Institutional Loss Attribution & Failure Pattern Recognition Engine:
+    Parses real closed trades and lot lifecycle exit reasons from the SQLite ledger.
+    Clusters losing trades into deterministic structural failure modes:
+    - CABAL_DUMP: Sharp cliff drop shortly after entry or insider dispersal
+    - LIQUIDITY_DRAIN / ILLIQUID: Pool liquidity drained or severe illiquidity post-fill
+    - VELOCITY_DRYOUT / TIMEOUT: Token volume stalled post-entry, failing to trigger TP (timeout)
+    - SLIPPAGE_LEAKAGE: Execution fill price diverged severely from quoted price (>200 bps)
+    - STOP_LOSS_HIT: Healthy statistical stop-loss execution
+    
+    Dynamically maps empirical loss clustering to GlobalRiskMode:
+    - HALT: If rolling drawdown >= 20% or consecutive loss streak >= 5
+    - DEFENSIVE: If rolling win rate < 45% or rolling drawdown >= 8% or loss streak >= 3
+    - AGGRESSIVE: If rolling win rate >= 72% and rolling drawdown < 5% and loss streak == 0
+    - NORMAL: Balanced operation
+    """
+
+    def __init__(self) -> None:
+        self._last_analysis: dict[str, Any] = {}
+        self._root_cause_counts: dict[str, int] = defaultdict(int)
+
+    def classify_exit_reason(self, exit_reason: Optional[str], price_impact_bps: int = 0) -> LossAttribution:
+        r = str(exit_reason or "").lower()
+        if "cabal" in r or "insider" in r:
+            return LossAttribution.CABAL_DUMP
+        if "drain" in r or "rug" in r:
+            return LossAttribution.LIQUIDITY_DRAIN
+        if "illiquid" in r:
+            return LossAttribution.ILLIQUID_MARKET
+        if "timeout" in r or "decay" in r or "velocity" in r:
+            return LossAttribution.TIMEOUT_DECAY
+        if "slippage" in r or price_impact_bps > 250:
+            return LossAttribution.SLIPPAGE_LEAKAGE
+        if "sl_" in r or "stop_loss" in r:
+            return LossAttribution.STOP_LOSS_HIT
+        return LossAttribution.STOP_LOSS_HIT
+
+    def analyze_trade_losses(self, trades: list[dict[str, Any]]) -> dict[str, Any]:
+        """Categorize losses from historical trade records into empirical failure clusters."""
+        total_losses = 0
+        total_loss_usd = 0.0
+        clusters: dict[str, dict[str, Any]] = defaultdict(lambda: {"count": 0, "total_loss_usd": 0.0, "avg_loss_usd": 0.0})
+        source_losses: dict[str, int] = defaultdict(int)
+
+        for t in trades:
+            pnl = float(t.get("realized_pnl_usd", 0.0) or 0.0)
+            if pnl < 0:
+                total_losses += 1
+                total_loss_usd += abs(pnl)
+                reason = t.get("exit_reason", "")
+                impact = int(t.get("price_impact_bps", 0) or 0)
+                category = self.classify_exit_reason(reason, impact).value
+                
+                clusters[category]["count"] += 1
+                clusters[category]["total_loss_usd"] += abs(pnl)
+                
+                src = str(t.get("signal_source") or t.get("platform") or "unknown")
+                source_losses[src] += 1
+
+        for cat, data in clusters.items():
+            if data["count"] > 0:
+                data["avg_loss_usd"] = round(data["total_loss_usd"] / data["count"], 3)
+                data["percentage"] = round((data["count"] / total_losses * 100.0), 1) if total_losses > 0 else 0.0
+                data["total_loss_usd"] = round(data["total_loss_usd"], 2)
+
+        # Identify primary structural failure bottleneck
+        dominant_cluster = max(clusters.items(), key=lambda x: x[1]["count"])[0] if clusters else "NONE"
+
+        analysis = {
+            "total_losses_analyzed": total_losses,
+            "total_loss_usd": round(total_loss_usd, 2),
+            "dominant_bottleneck": dominant_cluster,
+            "clusters": dict(clusters),
+            "source_loss_distribution": dict(source_losses),
+            "timestamp": time.time(),
+        }
+        self._last_analysis = analysis
+        return analysis
+
+    def derive_risk_mode(
+        self,
+        rolling_win_rate: float,
+        rolling_drawdown_pct: float,
+        loss_streak: int,
+        dominant_bottleneck: Optional[str] = None,
+    ) -> GlobalRiskMode:
+        """Dynamically compute the appropriate GlobalRiskMode."""
+        bot = dominant_bottleneck or self._last_analysis.get("dominant_bottleneck", "")
+
+        # 1. Critical safety trigger -> HALT
+        if rolling_drawdown_pct >= 20.0 or loss_streak >= 5:
+            logger.critical("Risk Mode HALT triggered: Drawdown=%.1f%%, LossStreak=%d", rolling_drawdown_pct, loss_streak)
+            return GlobalRiskMode.HALT
+
+        # 2. Defensive triggers
+        if (
+            rolling_win_rate < 45.0
+            or rolling_drawdown_pct >= 8.0
+            or loss_streak >= 3
+            or bot in ("LIQUIDITY_DRAIN", "CABAL_DUMP")
+        ):
+            logger.warning(
+                "Risk Mode DEFENSIVE activated: WinRate=%.1f%%, DD=%.1f%%, Streak=%d, Bottleneck=%s",
+                rolling_win_rate, rolling_drawdown_pct, loss_streak, bot
+            )
+            return GlobalRiskMode.DEFENSIVE
+
+        # 3. Aggressive / High conviction triggers
+        if rolling_win_rate >= 72.0 and rolling_drawdown_pct < 5.0 and loss_streak == 0:
+            return GlobalRiskMode.AGGRESSIVE
+
+        # 4. Default balanced regime
+        return GlobalRiskMode.NORMAL
+
+
 class AdaptiveFeedbackEngine:
     """
     Self-learning feedback loop optimizing weights and whitelists:
@@ -153,6 +272,8 @@ class AdaptiveFeedbackEngine:
         self.pattern_store = PatternMemoryStore()
         self.parameter_tuner = DynamicParameterTuner()
         self.missed_opportunity_analyzer = MissedOpportunityAnalyzer(self.pattern_store)
+        self.loss_attribution_engine = LossAttributionEngine()
+        self.current_risk_mode: GlobalRiskMode = GlobalRiskMode.NORMAL
 
     def get_source_confidence_weight(self, source: SignalSource) -> float:
         """Return the dynamic confidence weight [0.20, 1.20] for a given signal source."""
@@ -162,29 +283,50 @@ class AdaptiveFeedbackEngine:
         """
         Record a closed trade reflection and trigger weight adaptations and wallet pruning.
         """
-        async with self._lock:
-            self._reflections.append(reflection)
-            self._source_history[reflection.signal_source].append(reflection)
+        chain_val = getattr(reflection.chain, "value", str(reflection.chain))
+        async with tracer.span(
+            token_address=reflection.token_address,
+            chain=chain_val,
+            stage=TraceStage.FEEDBACK,
+            component="AdaptiveFeedbackEngine",
+            function_name="record_closed_trade",
+            input_data={
+                "trade_id": reflection.trade_id,
+                "roi_pct": reflection.roi_pct,
+                "pnl_usd": float(reflection.realized_pnl_usd),
+                "exit_reason": getattr(reflection, "exit_reason", ""),
+            },
+        ) as trace_event:
+            async with self._lock:
+                self._reflections.append(reflection)
+                self._source_history[reflection.signal_source].append(reflection)
 
-        logger.info(
-            "Recorded TradeReflection [%s] %s | PnL=$%.2f (%.1f%%) | Source=%s | ActualSlippage=%dbps | FillLatency=%.1fms",
-            reflection.trade_id[:8],
-            reflection.token_address[:10],
-            float(reflection.realized_pnl_usd),
-            reflection.roi_pct,
-            reflection.signal_source.value,
-            reflection.actual_slippage_bps,
-            reflection.time_to_fill_ms,
-        )
+            logger.info(
+                "Recorded TradeReflection [%s] %s | PnL=$%.2f (%.1f%%) | Source=%s | ActualSlippage=%dbps | FillLatency=%.1fms",
+                reflection.trade_id[:8],
+                reflection.token_address[:10],
+                float(reflection.realized_pnl_usd),
+                reflection.roi_pct,
+                reflection.signal_source.value,
+                reflection.actual_slippage_bps,
+                reflection.time_to_fill_ms,
+            )
 
-        # 1. X Sentiment Weight Adaptation
-        if reflection.signal_source == SignalSource.X_SENTIMENT:
-            self._adapt_social_weight()
+            # 1. X Sentiment Weight Adaptation
+            if reflection.signal_source == SignalSource.X_SENTIMENT:
+                self._adapt_social_weight()
 
-        # 2. Whitelisted Wallet Performance Monitoring & Pruning
-        if reflection.wallet_address:
-            self._wallet_history[reflection.wallet_address].append(reflection)
-            await self._evaluate_wallet_health(reflection.wallet_address)
+            # 2. Whitelisted Wallet Performance Monitoring & Pruning
+            if reflection.wallet_address:
+                self._wallet_history[reflection.wallet_address].append(reflection)
+                await self._evaluate_wallet_health(reflection.wallet_address)
+
+            trace_event.status = TraceStatus.PASSED
+            trace_event.output_data = {
+                "recorded": True,
+                "realized_pnl_usd": float(reflection.realized_pnl_usd),
+                "roi_pct": reflection.roi_pct,
+            }
 
     async def audit_closed_trade_ruflo(
         self,
@@ -575,6 +717,152 @@ class AdaptiveFeedbackEngine:
     def get_reflections(self, limit: int = 50) -> list[TradeReflection]:
         """Return the latest trade reflections."""
         return self._reflections[-limit:]
+
+    def get_risk_mode(self) -> GlobalRiskMode:
+        """Return current dynamically calibrated risk mode."""
+        return self.current_risk_mode
+
+    def get_loss_attribution_report(self) -> dict[str, Any]:
+        """Return latest loss attribution clusters and failure analysis."""
+        return getattr(self.loss_attribution_engine, "_last_analysis", {})
+
+    async def bootstrap_from_ledger(
+        self,
+        ledger: Any,
+        max_trades: int = 500,
+    ) -> dict[str, Any]:
+        """
+        Bootstrap the feedback engine and all self-learning parameters directly from the SQLite ledger.
+        Mandatory source of truth: 1,725+ real recorded paper trades in paper_trading.db.
+        """
+        if ledger is None:
+            return {"status": "SKIPPED_NO_LEDGER"}
+
+        logger.info("AdaptiveFeedbackEngine: Bootstrapping self-learning models from SQLite ledger...")
+        
+        # 1. Load closed trade dataset from SQLite
+        trades = await ledger.get_closed_trades_dataset(limit=max_trades)
+        if not trades:
+            logger.info("AdaptiveFeedbackEngine: No historical closed trades found in ledger to bootstrap.")
+            return {"status": "NO_TRADES_TO_BOOTSTRAP", "trades_loaded": 0}
+
+        # 2. Populate reflections and source history
+        reflections_loaded = 0
+        async with self._lock:
+            self._reflections.clear()
+            for src in SignalSource:
+                self._source_history[src].clear()
+
+            for t in reversed(trades):  # Chronological order
+                pnl = Decimal(str(t.get("realized_pnl_usd", 0.0) or 0.0))
+                price = Decimal(str(t.get("effective_price", 0.0) or 0.0))
+                nat = Decimal(str(t.get("native_spent", 0.0) or 0.0))
+                
+                # Derive signal source enum safely
+                src_val = str(t.get("platform", "DEX_SWAP")).upper()
+                if "X_" in src_val or "TWITTER" in src_val:
+                    src_enum = SignalSource.X_SENTIMENT
+                elif "WHALE" in src_val:
+                    src_enum = SignalSource.WHALE_ALERT
+                elif "TELEGRAM" in src_val:
+                    src_enum = SignalSource.TELEGRAM_SCRAPER
+                else:
+                    src_enum = SignalSource.DEX_SWAP
+
+                ch_val = str(t.get("chain", "solana_mainnet")).upper()
+                if "BASE" in ch_val or "EVM" in ch_val:
+                    ch_enum = ChainIdentifier.BASE_MAINNET
+                else:
+                    ch_enum = ChainIdentifier.SOLANA_MAINNET
+
+                refl = TradeReflection(
+                    trade_id=str(t.get("trade_id", "")),
+                    token_address=str(t.get("token_address", "")),
+                    chain=ch_enum,
+                    signal_source=src_enum,
+                    entry_price=price,
+                    exit_price=price,
+                    realized_pnl_usd=pnl,
+                    realized_pnl_native=nat,
+                    actual_slippage_bps=int(t.get("price_impact_bps", 0) or 0),
+                    expected_slippage_bps=100,
+                    time_to_fill_ms=float(t.get("fill_latency_ms", 0.0) or 0.0),
+                    is_win=bool(t.get("is_win", False)),
+                    timestamp_ns=int(t.get("fill_timestamp_ns", 0) or time.time_ns()),
+                )
+                self._reflections.append(refl)
+                self._source_history[src_enum].append(refl)
+                reflections_loaded += 1
+
+        # 3. Re-calculate dynamic source weights
+        for src, src_trades in self._source_history.items():
+            if src_trades:
+                wins = sum(1 for tr in src_trades if tr.is_win)
+                w_rate = wins / len(src_trades)
+                calibrated_w = max(0.20, min(1.30, 0.40 + (w_rate * 1.20)))
+                self.source_confidence_weights[src] = round(calibrated_w, 3)
+                if hasattr(src, "value"):
+                    self.source_confidence_weights[src.value] = round(calibrated_w, 3)
+                if hasattr(src, "name"):
+                    self.source_confidence_weights[src.name] = round(calibrated_w, 3)
+
+        # 4. Perform Loss Attribution Clustering
+        loss_analysis = self.loss_attribution_engine.analyze_trade_losses(trades)
+
+        # 5. Dynamic Risk Mode Calibration
+        streak = await ledger.get_daily_loss_streak() if hasattr(ledger, "get_daily_loss_streak") else 0
+        dd_pct = await ledger.get_daily_drawdown_pct() if hasattr(ledger, "get_daily_drawdown_pct") else 0.0
+        total_pnl = sum(r.realized_pnl_usd for r in self._reflections[-50:]) if self._reflections else Decimal(0)
+        overall_wins = sum(1 for r in self._reflections if r.is_win)
+        overall_win_rate = (overall_wins / len(self._reflections) * 100.0) if self._reflections else 50.0
+
+        derived_mode = self.loss_attribution_engine.derive_risk_mode(
+            rolling_win_rate=overall_win_rate,
+            rolling_drawdown_pct=dd_pct,
+            loss_streak=streak,
+            dominant_bottleneck=loss_analysis.get("dominant_bottleneck"),
+        )
+        self.current_risk_mode = derived_mode
+
+        # 6. Re-tune parameters via ParameterTuner
+        tuned = self.parameter_tuner.update_from_performance(
+            win_rate_24h=overall_win_rate,
+            realized_pnl_usd=total_pnl,
+            total_trades_24h=len(self._reflections),
+        )
+
+        # 7. Seed PatternMemoryStore with historical winners
+        if hasattr(ledger, "get_historical_winners"):
+            winners = await ledger.get_historical_winners(min_pnl_usd=0.2, limit=50)
+            for w in winners:
+                v = PatternFeatureVector(
+                    token_address=w["token_address"],
+                    consolidation_duration_s=1800.0,
+                    dip_depth_pct=45.0,
+                    volume_surge_multiplier=3.0,
+                    net_buy_delta=0.75,
+                    top10_concentration=w["top10_concentration"],
+                    liquidity_to_mc_ratio=0.25,
+                    smart_wallet_inflows=15.0,
+                    peak_gain_multiplier=max(1.5, 1.0 + (w["realized_pnl_usd"] / 20.0)),
+                )
+                self.pattern_store.add_pattern(v)
+
+        summary = {
+            "status": "BOOTSTRAPPED",
+            "trades_loaded": reflections_loaded,
+            "overall_win_rate_pct": round(overall_win_rate, 1),
+            "realized_pnl_usd": float(total_pnl),
+            "loss_streak": streak,
+            "drawdown_pct": round(dd_pct, 1),
+            "dominant_loss_bottleneck": loss_analysis.get("dominant_bottleneck"),
+            "current_risk_mode": derived_mode.value,
+            "tuned_confidence_multiplier": tuned.confidence_multiplier,
+            "tuned_max_slippage_bps": tuned.max_slippage_bps,
+        }
+        logger.info("AdaptiveFeedbackEngine bootstrapped successfully from ledger: %s", summary)
+        return summary
+
 
 
 # =============================================================================

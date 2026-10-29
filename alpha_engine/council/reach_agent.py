@@ -5,6 +5,7 @@ Inspired by Panniantong/Agent-Reach:
 - Public Reddit Crypto Multi-Subreddit Search JSON
 - Public DuckDuckGo/X Web Syndication Fallback
 - Bot-Farm & Paid Shilling Deception Filter
+- Multi-Turn Cross-Examination and Rebuttal
 """
 from __future__ import annotations
 
@@ -13,27 +14,34 @@ import logging
 import re
 import time
 import urllib.parse
-from typing import Optional
+from typing import Any, Optional
 
 import aiohttp
 
-from alpha_engine.council.models import AgentVerdict, AgentVote
+from alpha_engine.council.llm_client import CouncilLLMClient
+from alpha_engine.council.models import AgentVerdict, AgentVote, DebateRound, DebateStance
 
 logger = logging.getLogger(__name__)
 
-BULLISH_KEYWORDS = {"bull", "gem", "alpha", "buy", "holding", "undervalued", "solana", "launch", "pump", "breakout", "listing"}
-BEARISH_KEYWORDS = {"rug", "scam", "dump", "honeypot", "fake", "drainer", "bot", "sell", "exploit", "hack"}
-BOT_PROMO_KEYWORDS = {"dm to promote", "fast pump", "airdrop bot", "free giveaway", "automated raid", "send dm"}
+BULLISH_KEYWORDS = {"bull", "gem", "alpha", "buy", "holding", "undervalued", "solana", "launch", "pump", "breakout", "listing", "cto", "dev burned"}
+BEARISH_KEYWORDS = {"rug", "scam", "dump", "honeypot", "fake", "drainer", "bot", "sell", "exploit", "hack", "abandoned"}
+BOT_PROMO_KEYWORDS = {"dm to promote", "fast pump", "airdrop bot", "free giveaway", "automated raid", "send dm", "boost service", "trend boost"}
 
 
 class ReachAnalystAgent:
-    def __init__(self, session: Optional[aiohttp.ClientSession] = None, timeout_s: float = 4.0):
+    def __init__(
+        self,
+        session: Optional[aiohttp.ClientSession] = None,
+        timeout_s: float = 4.0,
+        llm_client: Optional[CouncilLLMClient] = None,
+    ):
         self._session = session
         self._owns_session = False
         self._timeout_s = timeout_s
         self._headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
         }
+        self.llm_client = llm_client or CouncilLLMClient(timeout_s=timeout_s)
 
     async def _get_session(self) -> aiohttp.ClientSession:
         if self._session is None or self._session.closed:
@@ -107,7 +115,9 @@ class ReachAnalystAgent:
         token_ca: str,
         symbol: str = "",
         website_url: Optional[str] = None,
+        extra_metrics: Optional[dict[str, Any]] = None,
     ) -> AgentVerdict:
+        """Round 1: Initial evaluation of sentiment, organic mindshare, and bot spam."""
         t0 = time.perf_counter()
         query = f"${symbol}" if symbol else token_ca[:12]
 
@@ -128,6 +138,8 @@ class ReachAnalystAgent:
             flags.append("PAID_BOT_RAID_DETECTED")
         if neg_hits > pos_hits and neg_hits >= 3:
             flags.append("COMMUNITY_FUD_OR_SCAM_WARNING")
+        if pos_hits >= 4 and promo_hits == 0:
+            flags.append("ORGANIC_NARRATIVE_BREAKOUT")
 
         total = pos_hits + neg_hits
         sentiment = (pos_hits - neg_hits) / total if total > 0 else 0.0
@@ -157,6 +169,15 @@ class ReachAnalystAgent:
                 vote = AgentVote.NEUTRAL
                 rationale = f"Moderate sentiment ({sentiment:+.2f}) with limited mentions ({len(all_posts)} posts)."
 
+        reach_metrics: dict[str, Any] = {
+            "mentions_found": len(all_posts),
+            "sentiment": round(sentiment, 2),
+            "website_verified": bool(site_md),
+            "promo_hits": promo_hits,
+        }
+        if extra_metrics:
+            reach_metrics.update(extra_metrics)
+
         duration_ms = (time.perf_counter() - t0) * 1000
         return AgentVerdict(
             agent_name="ReachAnalystAgent",
@@ -165,10 +186,85 @@ class ReachAnalystAgent:
             score=round(score, 1),
             rationale=rationale,
             flags=flags,
-            metrics={
-                "mentions_found": len(all_posts),
-                "sentiment": round(sentiment, 2),
-                "website_verified": bool(site_md),
-            },
+            metrics=reach_metrics,
             execution_time_ms=round(duration_ms, 1),
         )
+
+    async def cross_examine_peer(
+        self,
+        peer_name: str,
+        peer_verdict: AgentVerdict,
+        my_verdict: AgentVerdict,
+        token_ca: str,
+    ) -> DebateRound:
+        """Round 2: Cross-examine peer findings."""
+        logger.debug("ReachAnalyst cross-examining peer %s for token %s", peer_name, token_ca)
+        if "PAID_BOT_RAID_DETECTED" in my_verdict.flags:
+            stance = DebateStance.CHALLENGE
+            args = f"Challenge to {peer_name}: Social telemetry confirms artificial paid bot raid. Any volume or buy delta is likely manufactured exit liquidity."
+        elif "ORGANIC_NARRATIVE_BREAKOUT" in my_verdict.flags and peer_verdict.vote != AgentVote.APPROVE:
+            stance = DebateStance.CHALLENGE
+            args = f"Counter-argument to {peer_name}: Genuine viral organic community conviction is spreading. Microstructure latency should not prevent early positioning."
+        elif peer_verdict.vote == AgentVote.REJECT and "FATAL" in peer_verdict.rationale:
+            stance = DebateStance.REVISE
+            args = f"Conceding to {peer_name}: Narrative momentum cannot override severe security breach ({peer_verdict.rationale})."
+        else:
+            stance = DebateStance.APPROVE
+            args = f"Social narrative aligns with {peer_name} analysis."
+
+        return DebateRound(
+            round_number=2,
+            agent_name="ReachAnalyst",
+            stance=stance.value,
+            arguments=args,
+            counter_arguments=peer_verdict.rationale,
+            target_agent=peer_name,
+            vote_weight=1.0,
+            confidence=my_verdict.confidence,
+            score=my_verdict.score,
+            flags=my_verdict.flags,
+        )
+
+    async def defend_or_revise(
+        self,
+        peer_rounds: list[DebateRound],
+        current_verdict: AgentVerdict,
+    ) -> tuple[AgentVerdict, DebateRound]:
+        """Round 3: Rebuttal/Revision based on peer cross-examinations."""
+        revised_score = current_verdict.score
+        revised_vote = current_verdict.vote
+
+        # If Forensic declared a fatal veto or critical risk, downgrade Reach score
+        forensic_vetos = [r for r in peer_rounds if r.agent_name == "ChainForensic" and (r.stance == "VETO" or "FATAL" in r.arguments)]
+        if forensic_vetos:
+            revised_score = min(30.0, current_verdict.score * 0.5)
+            revised_vote = AgentVote.REJECT
+            stance = DebateStance.REVISE
+            args = "Revising downward: Narrative conviction yields to irrevocable forensic risk."
+        elif "PAID_BOT_RAID_DETECTED" in current_verdict.flags:
+            stance = DebateStance.DEFEND
+            args = "Defending veto stance: Paid shill raid presents extreme dump hazard for entry."
+        else:
+            stance = DebateStance.DEFEND
+            args = f"Defending social evaluation (Score: {revised_score:.1f}/100)."
+
+        revised_verdict = AgentVerdict(
+            agent_name="ReachAnalystAgent",
+            vote=revised_vote,
+            confidence=current_verdict.confidence,
+            score=round(revised_score, 1),
+            rationale=args,
+            flags=current_verdict.flags,
+            metrics=current_verdict.metrics,
+            execution_time_ms=current_verdict.execution_time_ms,
+        )
+        round_entry = DebateRound(
+            round_number=3,
+            agent_name="ReachAnalyst",
+            stance=stance.value,
+            arguments=args,
+            confidence=revised_verdict.confidence,
+            score=revised_verdict.score,
+            flags=revised_verdict.flags,
+        )
+        return revised_verdict, round_entry

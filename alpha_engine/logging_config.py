@@ -21,7 +21,64 @@ try:
 except ImportError:  # pragma: no cover
     RICH_AVAILABLE = False
     Console = None       # type: ignore
-    RichHandler = None   # type: ignore
+import re
+
+# Compiled regex patterns for credential scrubber
+SENSITIVE_PATTERNS = [
+    # Telegram Bot Token (e.g. 123456789:ABCdefGHIjklMNOpqrsTUVwxyz123456789)
+    (re.compile(r"\b\d{8,11}:[A-Za-z0-9_-]{35}\b"), "[REDACTED_TG_BOT_TOKEN]"),
+    # Google / Gemini API Key (e.g. AIzaSyD...)
+    (re.compile(r"\bAIza[0-9A-Za-z-_]{30,45}\b"), "[REDACTED_GEMINI_KEY]"),
+    # Anthropic API Key (e.g. sk-ant-...)
+    (re.compile(r"\bsk-ant-[A-Za-z0-9_-]{32,}\b"), "[REDACTED_ANTHROPIC_KEY]"),
+    # Groq API Key (e.g. gsk_...)
+    (re.compile(r"\bgsk_[A-Za-z0-9_-]{32,}\b"), "[REDACTED_GROQ_KEY]"),
+    # OpenAI API Key (e.g. sk-...)
+    (re.compile(r"\bsk-(?:proj-)?[A-Za-z0-9_-]{32,}\b"), "[REDACTED_OPENAI_KEY]"),
+    # Explicit private key keywords followed by hex or base58
+    (
+        re.compile(
+            r"(?i)(private_key|priv_key|secret_key|privatekey)\s*[:=]\s*['\"]?(0x[a-fA-F0-9]{64}|[a-fA-F0-9]{64}|[1-9A-HJ-NP-za-km-z]{64,88})['\"]?"
+        ),
+        r"\1=[REDACTED_PRIVATE_KEY]",
+    ),
+    # Standalone Solana base58/base64 private key (80-88 characters)
+    (re.compile(r"\b[A-Za-z0-9]{80,88}\b"), "[REDACTED_SOLANA_KEY]"),
+]
+
+
+def scrub_sensitive_data(text: str) -> str:
+    """Masks secret API tokens and private keys from a string."""
+    if not isinstance(text, str):
+        return text
+    scrubbed = text
+    for pattern, repl in SENSITIVE_PATTERNS:
+        scrubbed = pattern.sub(repl, scrubbed)
+    return scrubbed
+
+
+class LogCredentialFilter(logging.Filter):
+    """
+    Logging filter that intercepts log records and scrubs any sensitive credentials,
+    private keys, and API tokens before emitting them to disk or terminal.
+    """
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        if isinstance(record.msg, str):
+            record.msg = scrub_sensitive_data(record.msg)
+        if record.args:
+            if isinstance(record.args, dict):
+                record.args = {
+                    k: scrub_sensitive_data(v) if isinstance(v, str) else v
+                    for k, v in record.args.items()
+                }
+            elif isinstance(record.args, tuple):
+                record.args = tuple(
+                    scrub_sensitive_data(a) if isinstance(a, str) else a
+                    for a in record.args
+                )
+        return True
+
 
 # Guard against duplicate handler additions
 _LOGGING_INITIALIZED = False
@@ -103,6 +160,12 @@ def setup_production_logging(
             datefmt="%H:%M:%S",
         )
         console_handler.setFormatter(console_formatter)
+
+    # Attach credential scrubber filter to prevent token/key leaks
+    cred_filter = LogCredentialFilter()
+    root_logger.addFilter(cred_filter)
+    file_handler.addFilter(cred_filter)
+    console_handler.addFilter(cred_filter)
 
     console_handler.setLevel(numeric_level)
     root_logger.addHandler(console_handler)

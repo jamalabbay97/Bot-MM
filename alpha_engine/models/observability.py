@@ -17,15 +17,22 @@ from alpha_engine.models.base import _STRICT_MODEL_CFG
 
 
 class TraceStage(str, Enum):
-    DETECTION = "DETECTION"
+    # 7 Institutional Lifecycle Stages
     INGESTION = "INGESTION"
+    SECURITY = "SECURITY"
+    STAGING = "STAGING"
+    COUNCIL = "COUNCIL"
+    SUPERVISOR = "SUPERVISOR"
+    EXECUTION = "EXECUTION"
+    FEEDBACK = "FEEDBACK"
+
+    # Sub-stages and backwards-compatible aliases
+    DETECTION = "DETECTION"
     DEDUPLICATION = "DEDUPLICATION"
     SECURITY_SCREENING = "SECURITY_SCREENING"
     FILTERING = "FILTERING"
-    STAGING = "STAGING"
     AI_ANALYSIS = "AI_ANALYSIS"
     DECISION = "DECISION"
-    EXECUTION = "EXECUTION"
 
 
 class TraceStatus(str, Enum):

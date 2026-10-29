@@ -578,6 +578,190 @@ class SQLiteLedger:
             return []
 
     @sqlite_retry(max_retries=5, base_delay=0.1)
+    async def get_closed_trades_dataset(
+        self,
+        limit: int = 1000,
+        lookback_hours: Optional[float] = None,
+    ) -> list[dict[str, Any]]:
+        """
+        Extract institutional dataset of closed trades joined with exit lifecycle reasons.
+        Serves as the mandatory source of truth for self-learning, attribution, and tuner calibration.
+        """
+        conn = self._conn
+        if conn is None:
+            return []
+        try:
+            time_filter = ""
+            params: list[Any] = []
+            if lookback_hours is not None and lookback_hours > 0:
+                cutoff_ns = int((time.time() - (lookback_hours * 3600)) * 1_000_000_000)
+                time_filter = " AND t.fill_timestamp_ns >= ? "
+                params.append(cutoff_ns)
+            params.append(limit)
+
+            query = f"""
+                SELECT 
+                    t.trade_id, t.order_id, t.signal_id, t.chain, t.token_address, t.pool_address,
+                    t.effective_price, t.realized_pnl_usd, t.native_spent, t.fill_latency_ms,
+                    t.price_impact_bps, t.platform, t.is_new_launch, t.strategy_name,
+                    t.fill_timestamp_ns, t.created_at,
+                    l.exit_reason
+                FROM trades t
+                LEFT JOIN (
+                    SELECT token_address, exit_reason, MAX(timestamp_ns) as max_ts
+                    FROM lot_lifecycle 
+                    WHERE exit_reason IS NOT NULL 
+                    GROUP BY token_address
+                ) l ON t.token_address = l.token_address
+                WHERE t.side = 'sell' AND t.realized_pnl_usd IS NOT NULL
+                {time_filter}
+                ORDER BY t.created_at DESC
+                LIMIT ?
+            """
+            async with conn.execute(query, tuple(params)) as cursor:
+                rows = await cursor.fetchall()
+                dataset = []
+                for r in rows:
+                    pnl_f = float(r[7]) if r[7] is not None else 0.0
+                    dataset.append({
+                        "trade_id": r[0],
+                        "order_id": r[1],
+                        "signal_id": r[2],
+                        "chain": r[3],
+                        "token_address": r[4],
+                        "pool_address": r[5],
+                        "effective_price": float(r[6]) if r[6] else 0.0,
+                        "realized_pnl_usd": pnl_f,
+                        "is_win": pnl_f > 0.0,
+                        "native_spent": float(r[8]) if r[8] else 0.0,
+                        "fill_latency_ms": int(r[9]) if r[9] else 0,
+                        "price_impact_bps": int(r[10]) if r[10] else 0,
+                        "platform": r[11] or "DexScan",
+                        "is_new_launch": bool(r[12]),
+                        "strategy_name": r[13] or "unassigned",
+                        "fill_timestamp_ns": r[14],
+                        "created_at": r[15],
+                        "exit_reason": r[16] or "unspecified_exit",
+                    })
+                return dataset
+        except Exception as exc:
+            logger.error("Failed to query closed trades dataset: %s", exc)
+            return []
+
+    @sqlite_retry(max_retries=5, base_delay=0.1)
+    async def get_loss_attribution_clusters(
+        self,
+        lookback_hours: Optional[float] = None,
+        limit: int = 500,
+    ) -> dict[str, Any]:
+        """
+        Group closed losing trades into empirical root cause failure modes.
+        Enables closed-loop feedback engine to adjust risk posture and entry filters.
+        """
+        conn = self._conn
+        if conn is None:
+            return {"total_losses": 0, "clusters": {}, "loss_pnl_usd": 0.0}
+        try:
+            time_filter = ""
+            params: list[Any] = []
+            if lookback_hours is not None and lookback_hours > 0:
+                cutoff_ns = int((time.time() - (lookback_hours * 3600)) * 1_000_000_000)
+                time_filter = " AND t.fill_timestamp_ns >= ? "
+                params.append(cutoff_ns)
+            params.append(limit)
+
+            query = f"""
+                SELECT 
+                    COALESCE(l.exit_reason, 'unknown_loss') as reason,
+                    COUNT(*) as cnt,
+                    SUM(CAST(t.realized_pnl_usd AS REAL)) as total_loss,
+                    AVG(CAST(t.realized_pnl_usd AS REAL)) as avg_loss,
+                    AVG(t.fill_latency_ms) as avg_latency,
+                    AVG(t.price_impact_bps) as avg_impact
+                FROM trades t
+                LEFT JOIN (
+                    SELECT token_address, exit_reason, MAX(timestamp_ns) as max_ts
+                    FROM lot_lifecycle 
+                    WHERE exit_reason IS NOT NULL 
+                    GROUP BY token_address
+                ) l ON t.token_address = l.token_address
+                WHERE t.side = 'sell' 
+                  AND CAST(t.realized_pnl_usd AS REAL) < 0
+                  {time_filter}
+                GROUP BY COALESCE(l.exit_reason, 'unknown_loss')
+                ORDER BY cnt DESC
+                LIMIT ?
+            """
+            async with conn.execute(query, tuple(params)) as cursor:
+                rows = await cursor.fetchall()
+                clusters: dict[str, Any] = {}
+                total_loss_count = 0
+                total_loss_pnl = 0.0
+                for r in rows:
+                    cnt = r[1] or 0
+                    t_loss = float(r[2] or 0.0)
+                    clusters[r[0]] = {
+                        "count": cnt,
+                        "total_loss_usd": round(t_loss, 2),
+                        "avg_loss_usd": round(float(r[3] or 0.0), 3),
+                        "avg_fill_latency_ms": round(float(r[4] or 0.0), 1),
+                        "avg_price_impact_bps": round(float(r[5] or 0.0), 1),
+                    }
+                    total_loss_count += cnt
+                    total_loss_pnl += t_loss
+
+                return {
+                    "total_losses": total_loss_count,
+                    "total_loss_usd": round(total_loss_pnl, 2),
+                    "clusters": clusters,
+                }
+        except Exception as exc:
+            logger.error("Failed to query loss attribution clusters: %s", exc)
+            return {"total_losses": 0, "clusters": {}, "loss_pnl_usd": 0.0}
+
+    @sqlite_retry(max_retries=5, base_delay=0.1)
+    async def get_historical_winners(
+        self,
+        min_pnl_usd: float = 0.50,
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        """Extract top historical profitable trades to seed PatternMemoryStore."""
+        conn = self._conn
+        if conn is None:
+            return []
+        try:
+            query = """
+                SELECT 
+                    t.token_address, t.chain, t.effective_price, t.realized_pnl_usd,
+                    t.fill_latency_ms, t.price_impact_bps, t.created_at,
+                    COALESCE(s.alpha_score, 0.70), COALESCE(s.top10_concentration, 0.15)
+                FROM trades t
+                LEFT JOIN signals s ON t.signal_id = s.signal_id
+                WHERE t.side = 'sell' AND CAST(t.realized_pnl_usd AS REAL) >= ?
+                ORDER BY CAST(t.realized_pnl_usd AS REAL) DESC
+                LIMIT ?
+            """
+            async with conn.execute(query, (min_pnl_usd, limit)) as cursor:
+                rows = await cursor.fetchall()
+                winners = []
+                for r in rows:
+                    winners.append({
+                        "token_address": r[0],
+                        "chain": r[1],
+                        "effective_price": float(r[2] or 0.0),
+                        "realized_pnl_usd": float(r[3] or 0.0),
+                        "fill_latency_ms": int(r[4] or 0),
+                        "price_impact_bps": int(r[5] or 0),
+                        "created_at": r[6],
+                        "alpha_score": float(r[7] or 0.7),
+                        "top10_concentration": float(r[8] or 0.15),
+                    })
+                return winners
+        except Exception as exc:
+            logger.error("Failed to query historical winners: %s", exc)
+            return []
+
+    @sqlite_retry(max_retries=5, base_delay=0.1)
     async def record_lot_transition(
         self,
         lot_id: str,
@@ -1009,23 +1193,50 @@ class SQLiteLedger:
         conn = self._conn
         if conn is None:
             return
-        stage_val = event.stage.value if hasattr(event.stage, "value") else str(event.stage)
-        status_val = event.status.value if hasattr(event.status, "value") else str(event.status)
+        if isinstance(event, dict):
+            stg = event.get("stage")
+            stage_val = stg.value if hasattr(stg, "value") else str(stg)
+            stat = event.get("status")
+            status_val = stat.value if hasattr(stat, "value") else str(stat)
+            trace_id = event.get("trace_id")
+            token_address = event.get("token_address")
+            chain_val = event.get("chain")
+            component = event.get("component")
+            function_name = event.get("function_name")
+            reason = event.get("reason")
+            input_data = event.get("input_data", {})
+            output_data = event.get("output_data", {})
+            duration_ms = float(event.get("duration_ms", 0.0))
+            timestamp_ns = int(event.get("timestamp_ns", time.time_ns()))
+        else:
+            stage_val = event.stage.value if hasattr(event.stage, "value") else str(event.stage)
+            status_val = event.status.value if hasattr(event.status, "value") else str(event.status)
+            trace_id = event.trace_id
+            token_address = event.token_address
+            chain_val = event.chain
+            component = event.component
+            function_name = event.function_name
+            reason = event.reason
+            input_data = event.input_data
+            output_data = event.output_data
+            duration_ms = event.duration_ms
+            timestamp_ns = event.timestamp_ns
+
         await conn.execute(
             """INSERT INTO token_lifecycle_trace VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
             (
-                event.trace_id,
-                event.token_address,
-                event.chain,
+                trace_id,
+                token_address,
+                chain_val,
                 stage_val,
-                event.component,
-                event.function_name,
+                component,
+                function_name,
                 status_val,
-                event.reason,
-                json.dumps(event.input_data, default=str),
-                json.dumps(event.output_data, default=str),
-                event.duration_ms,
-                event.timestamp_ns,
+                reason,
+                json.dumps(input_data, default=str),
+                json.dumps(output_data, default=str),
+                duration_ms,
+                timestamp_ns,
             ),
         )
         await conn.commit()
@@ -1054,6 +1265,37 @@ class SQLiteLedger:
             cols = [d[0] for d in cursor.description] if cursor.description else []
             rows = await cursor.fetchall()
             return [dict(r) if hasattr(r, "keys") else dict(zip(cols, r)) for r in rows]
+
+    @sqlite_retry(max_retries=5, base_delay=0.1)
+    async def get_stage_flow_summary(self, lookback_hours: float = 24.0) -> dict[str, dict[str, int]]:
+        """
+        Calculates throughput and drop-off counts across lifecycle stages
+        over the specified lookback window.
+        """
+        conn = self._conn
+        if conn is None:
+            return {}
+        cutoff_ns = int((time.time() - (lookback_hours * 3600)) * 1e9)
+        summary: dict[str, dict[str, int]] = {}
+        try:
+            async with conn.execute(
+                """
+                SELECT stage, status, COUNT(*)
+                FROM token_lifecycle_trace
+                WHERE timestamp_ns >= ?
+                GROUP BY stage, status
+                """,
+                (cutoff_ns,),
+            ) as cursor:
+                rows = await cursor.fetchall()
+                for stage, status, count in rows:
+                    if stage not in summary:
+                        summary[stage] = {"PASSED": 0, "REJECTED": 0, "ERROR": 0, "TOTAL": 0}
+                    summary[stage][status] = summary[stage].get(status, 0) + count
+                    summary[stage]["TOTAL"] = summary[stage].get("TOTAL", 0) + count
+        except Exception as exc:
+            logger.debug("Failed to query stage flow summary: %s", exc)
+        return summary
 
     @sqlite_retry(max_retries=5, base_delay=0.1)
     async def set_setting(self, key: str, value: str) -> None:

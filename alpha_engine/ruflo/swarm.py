@@ -334,7 +334,11 @@ class RufloSwarmCoordinator:
                     return rejection
 
             # 2. Security Check
-            if liquidity_usd < 5000.0:
+            is_direct_dm = bool(getattr(signal, "is_direct_dm", False)) or (
+                bool(getattr(signal, "originating_channel", ""))
+                and str(getattr(signal, "originating_channel", "")).startswith("DM:")
+            )
+            if liquidity_usd < 5000.0 and not is_direct_dm:
                 votes = {"SCOUT": True, "PROFILER": True, "GATEKEEPER": False}
                 rejection = {
                     "approved": False,

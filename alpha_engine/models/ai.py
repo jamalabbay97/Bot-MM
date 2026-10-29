@@ -10,7 +10,7 @@ from __future__ import annotations
 import json
 from decimal import Decimal
 from enum import Enum
-from typing import Annotated, Optional
+from typing import Annotated, Optional, Any
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -55,9 +55,27 @@ class LiquidityHealth(str, Enum):
 class GlobalRiskMode(str, Enum):
     """Feedback-driven global risk appetite tuning."""
 
-    EXPAND = "EXPAND"
-    NEUTRAL = "NEUTRAL"
+    NORMAL = "NORMAL"
+    NEUTRAL = "NEUTRAL"      # Backward compatible alias for NORMAL
     DEFENSIVE = "DEFENSIVE"
+    AGGRESSIVE = "AGGRESSIVE"
+    EXPAND = "EXPAND"        # Backward compatible alias for AGGRESSIVE
+    HALT = "HALT"
+
+    @classmethod
+    def from_str(cls, val: Any) -> "GlobalRiskMode":
+        if isinstance(val, cls):
+            return val
+        s = str(val).upper().strip()
+        if s in ("NORMAL", "NEUTRAL", "BALANCED"):
+            return cls.NORMAL
+        if s in ("DEFENSIVE", "CONSERVATIVE", "RISK_OFF"):
+            return cls.DEFENSIVE
+        if s in ("AGGRESSIVE", "EXPAND", "RISK_ON"):
+            return cls.AGGRESSIVE
+        if s in ("HALT", "STOP", "PAUSE"):
+            return cls.HALT
+        return cls.NORMAL
 
 
 class LossAttribution(str, Enum):
@@ -68,6 +86,11 @@ class LossAttribution(str, Enum):
     MEV_SANDWICH = "MEV_SANDWICH"
     VOLUME_DRYOUT = "VOLUME_DRYOUT"
     CABAL_DUMP = "CABAL_DUMP"
+    LIQUIDITY_DRAIN = "LIQUIDITY_DRAIN"
+    SLIPPAGE_LEAKAGE = "SLIPPAGE_LEAKAGE"
+    STOP_LOSS_HIT = "STOP_LOSS_HIT"
+    ILLIQUID_MARKET = "ILLIQUID_MARKET"
+    TIMEOUT_DECAY = "TIMEOUT_DECAY"
 
 
 class TakeProfitStage(BaseModel):

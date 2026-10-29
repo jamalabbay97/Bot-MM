@@ -556,6 +556,234 @@ class ConversationalSupervisor:
 
         return "\n".join(lines)
 
+    async def tool_trace_lifecycle(self, token_ca: str) -> str:
+        """
+        Trace the 7-stage lifecycle of a token through the engine:
+        INGESTION -> SECURITY -> STAGING -> COUNCIL -> SUPERVISOR -> EXECUTION -> FEEDBACK.
+        """
+        clean_ca = token_ca.strip()
+        if not clean_ca:
+            return "الرجاء إدخال عنوان العقد المراد تتبعه. مثال: `/trace 7xKXtg...`"
+
+        events = await self.ledger.get_asset_trace(clean_ca)
+        if not events:
+            delibs = await self.ledger.get_agent_deliberations(token_address=clean_ca, limit=1)
+            if delibs:
+                d = delibs[0]
+                dt = datetime.fromtimestamp(d["timestamp_ns"] / 1e9, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+                return (
+                    f"### 🔍 تتبع مسار العملة (Lifecycle Trace) لعقد `{clean_ca[:12]}...`\n"
+                    f"- **تاريخ المعالجة:** `{dt}`\n"
+                    f"- **مرحلة المجلس (COUNCIL):** `{d['final_decision']}` (استراتيجية: `{d['selected_strategy_id']}`)\n"
+                    f"- **الخلاصة:** {d['rationale'][:250]}...\n\n"
+                    f"💡 لمزيد من التفاصيل استخدم `/council_debate {clean_ca}` أو `/why {clean_ca}`"
+                )
+            return f"❌ لم يتم العثور على سجلات تتبع (Trace Events) للعملة `{clean_ca}`."
+
+        stage_emojis = {
+            "INGESTION": "📥",
+            "SECURITY": "🛡️",
+            "SECURITY_SCREENING": "🛡️",
+            "STAGING": "🌊",
+            "FILTERING": "🌊",
+            "COUNCIL": "🏛️",
+            "DECISION": "🏛️",
+            "SUPERVISOR": "🤖",
+            "AI_ANALYSIS": "🤖",
+            "EXECUTION": "⚡",
+            "FEEDBACK": "🔄",
+        }
+
+        status_emojis = {
+            "PASSED": "✅",
+            "REJECTED": "🔴",
+            "ERROR": "⚠️",
+            "PENDING": "⏳",
+            "IGNORED": "⚪",
+        }
+
+        lines = [
+            f"### 🔍 المسار المؤسسي للعملة (7-Stage Institutional Lifecycle Trace)\n",
+            f"**عنوان العقد:** `{clean_ca}`\n",
+            f"**عدد المحطات المسجلة:** {len(events)} محطة\n",
+        ]
+
+        total_duration = 0.0
+        for idx, ev in enumerate(events, 1):
+            stage = ev.get("stage", "UNKNOWN")
+            status = ev.get("status", "PENDING")
+            comp = ev.get("component", "engine")
+            fn = ev.get("function_name", "")
+            dur = float(ev.get("duration_ms", 0.0))
+            reason = ev.get("reason") or "Passed checks"
+            ts_ns = int(ev.get("timestamp_ns", 0))
+            dt = datetime.fromtimestamp(ts_ns / 1e9, tz=timezone.utc).strftime("%H:%M:%S.%f")[:-3] if ts_ns else "N/A"
+            total_duration += dur
+
+            s_icon = stage_emojis.get(stage, "📍")
+            stat_icon = status_emojis.get(status, "❓")
+
+            lines.append(f"**{idx}. {s_icon} [{stage}]** {stat_icon} `{status}` (`{dt}` | {dur:.1f}ms)")
+            lines.append(f"   - **المكون:** `{comp}::{fn}`")
+            lines.append(f"   - **النتيجة / السبب:** {reason}")
+            out_data = ev.get("output_data")
+            if out_data and out_data != "{}":
+                try:
+                    parsed_out = json.loads(out_data) if isinstance(out_data, str) else out_data
+                    if isinstance(parsed_out, dict):
+                        compact_out = ", ".join(f"{k}: {v}" for k, v in list(parsed_out.items())[:3] if k != "traceback")
+                        if compact_out:
+                            lines.append(f"   - **المخرجات:** `{compact_out}`")
+                except Exception:
+                    pass
+            lines.append("")
+
+        lines.append(f"⏱️ **إجمالي زمن المعالجة عبر المراحل:** `{total_duration:.1f}ms`")
+        return "\n".join(lines)
+
+    async def tool_pipeline_flow(self, lookback_hours: float = 24.0) -> str:
+        """
+        Visual ASCII & emoji pipeline state diagram displaying stage throughput
+        and drop-off rates across all 7 stages over the lookback window.
+        """
+        summary = await self.ledger.get_stage_flow_summary(lookback_hours=lookback_hours)
+
+        stages_order = [
+            ("INGESTION", "📥 Ingestion", "Raw pool detections & mint listener"),
+            ("SECURITY", "🛡️ Security", "Honeypot, mint/freeze authority & LP locks"),
+            ("STAGING", "🌊 Staging", "Wave-2 micro-velocity & revival buffers"),
+            ("COUNCIL", "🏛️ Council", "Reach, Forensic & Quant 4-round debate"),
+            ("SUPERVISOR", "🤖 Supervisor", "Global risk posture & Bayesian telemetry"),
+            ("EXECUTION", "⚡ Execution", "Dual-engine CPMM routing & MEV protection"),
+            ("FEEDBACK", "🔄 Feedback", "Closed-loop ledger loss attribution & self-tuning"),
+        ]
+
+        lines = [
+            f"### 🔬 مخطط تدفق خط الأنابيب المؤسسي (Institutional Pipeline Flow)\n",
+            f"**النافذة الزمنية:** آخر `{lookback_hours:.0f}` ساعة | **المراحل السبع المؤسسية:**\n",
+            "```text",
+        ]
+
+        for stage_key, label, desc in stages_order:
+            data = summary.get(stage_key, {})
+            if stage_key == "SECURITY" and "SECURITY_SCREENING" in summary:
+                s_data = summary["SECURITY_SCREENING"]
+                data = {k: data.get(k, 0) + s_data.get(k, 0) for k in ("PASSED", "REJECTED", "ERROR", "TOTAL")}
+            elif stage_key == "STAGING" and "FILTERING" in summary:
+                s_data = summary["FILTERING"]
+                data = {k: data.get(k, 0) + s_data.get(k, 0) for k in ("PASSED", "REJECTED", "ERROR", "TOTAL")}
+            elif stage_key == "COUNCIL" and "DECISION" in summary:
+                s_data = summary["DECISION"]
+                data = {k: data.get(k, 0) + s_data.get(k, 0) for k in ("PASSED", "REJECTED", "ERROR", "TOTAL")}
+            elif stage_key == "SUPERVISOR" and "AI_ANALYSIS" in summary:
+                s_data = summary["AI_ANALYSIS"]
+                data = {k: data.get(k, 0) + s_data.get(k, 0) for k in ("PASSED", "REJECTED", "ERROR", "TOTAL")}
+
+            total = data.get("TOTAL", 0)
+            passed = data.get("PASSED", 0)
+            rejected = data.get("REJECTED", 0)
+
+            pass_rate = (passed / total * 100.0) if total > 0 else 0.0
+            drop_rate = 100.0 - pass_rate if total > 0 else 0.0
+
+            lines.append(f"[{label.upper()}] ─── ({total:,} tokens)")
+            lines.append(f"  ├── ✅ Passed: {passed:,} ({pass_rate:.1f}%)")
+            lines.append(f"  └── ❌ Rejected / Filtered: {rejected:,} ({drop_rate:.1f}%)")
+            lines.append(f"        │")
+
+        lines.append("        ▼")
+        lines.append("  [CLOSED-LOOP REINFORCEMENT & SELF-LEARNING]")
+        lines.append("```")
+
+        lines.append("\n💡 **توجيه:** استخدم `/trace <CA>` لتتبع عملة بعينها عبر المحطات السبع بالتفصيل.")
+        return "\n".join(lines)
+
+    async def tool_status_detailed(self) -> str:
+        """
+        Deep institutional telemetry card: active risk mode, tournament leaderboard,
+        open lots, cash balance, loss attribution clusters, and win-rate.
+        """
+        risk_mode = "NORMAL"
+        try:
+            mode_setting = await self.ledger.get_setting("global_risk_mode")
+            if mode_setting:
+                risk_mode = mode_setting.upper()
+        except Exception:
+            pass
+
+        # Cash balance & open lots
+        open_lots_count = len(self.position_book.get_open_lots()) if self.position_book else 0
+        stats = await self.ledger.get_decision_stats(lookback_hours=24.0)
+
+        # Loss attribution clusters
+        clusters = await self.ledger.get_loss_attribution_clusters(lookback_hours=48.0, limit=3)
+
+        # Tournament champions
+        from alpha_engine.engine.experimentation import StrategyTournamentRegistry
+        target = getattr(self, "execution_target", None)
+        reg = getattr(target, "strategy_tournament", None) if target else None
+        if reg is None:
+            reg = StrategyTournamentRegistry(ledger=self.ledger)
+        board = reg.get_leaderboard()
+        champ = next((b for b in board if b["status"] == "CHAMPION"), None)
+        champ_name = champ["name"] if champ else "champion_fast_snipe"
+
+        lines = [
+            "### 📊 التقرير التفصيلي المتكامل لحالة المحرك (Detailed Institutional Status)\n",
+            f"- **وضع المخاطر العالمي (Global Risk Mode):** `🛡️ {risk_mode}`",
+            f"- **بطل البطولة الحالي (Active Champion):** `{champ_name}`",
+            f"- **المراكز المفتوحة (Open Positions):** `{open_lots_count}` صفقات قيد الإدارة",
+            f"- **إجمالي القرارات (24h):** `{stats.get('total_decisions', 0)}` قرار",
+            f"- **نسبة الفوز المحققة:** `{stats.get('win_rate_pct', 0.0):.1f}%`",
+            f"- **معامل الربح (Profit Factor):** `{stats.get('profit_factor', 0.0):.2f}`\n",
+            "#### 📉 تحليل أسباب الخسارة الجذري (Loss Root Cause Clusters - 48h):",
+        ]
+        clusters_map = {}
+        if isinstance(clusters, dict):
+            clusters_map = clusters.get("clusters", clusters)
+        elif isinstance(clusters, list):
+            for item in clusters:
+                if isinstance(item, dict):
+                    r_name = item.get("exit_reason", item.get("reason", "unknown"))
+                    clusters_map[r_name] = item
+
+        if clusters_map:
+            for reason, c in clusters_map.items():
+                if isinstance(c, dict):
+                    cnt = c.get('count', c.get('cnt', 0))
+                    tot = float(c.get('total_loss_usd', 0.0))
+                    avg_l = float(c.get('avg_loss_usd', c.get('avg_loss', 0.0)))
+                    lines.append(
+                        f"- **`{reason}`**: {cnt} حالات | الخسارة الكلية: `${tot:,.2f}` | متوسط: `${avg_l:,.2f}`"
+                    )
+        else:
+            lines.append("- لا توجد خسائر مسجلة في نافذة المراقبة الحالية.")
+
+        lines.append("\n#### ⚙️ الأوامر المتاحة السريعة:")
+        lines.append("• `/flow` — مخطط تدفق المراحل ونسب الاستبعاد")
+        lines.append("• `/experiments` — لوحة صدارة تجارب الاستراتيجيات")
+        lines.append("• `/trace <CA>` — تتبع عملة محددة عبر المحطات السبع")
+        lines.append("• `/report` — التقرير الكمي المؤسسي (daily / weekly / csv / json)")
+
+        return "\n".join(lines)
+
+    async def tool_generate_report(self, report_type: str = "daily") -> str:
+        """Generates quantitative performance digests or data exports."""
+        from alpha_engine.execution.reports import QuantitativePerformanceReporter
+        reporter = QuantitativePerformanceReporter(ledger=self.ledger)
+        clean_type = report_type.strip().lower()
+
+        if "weekly" in clean_type or "أسبوعي" in clean_type:
+            return await reporter.generate_weekly_digest(lookback_days=7.0)
+        elif "csv" in clean_type:
+            csv_data = await reporter.export_report_csv(lookback_hours=24.0)
+            return f"```csv\n{csv_data[:3500]}\n```"
+        elif "json" in clean_type:
+            json_data = await reporter.export_report_json(lookback_hours=24.0)
+            return f"```json\n{json.dumps(json_data, indent=2, default=str)[:3500]}\n```"
+        else:
+            return await reporter.generate_daily_digest(lookback_hours=24.0)
+
     async def ask(self, query: str) -> str:
         """
         Process a natural language question or command using RAG over the
@@ -564,8 +792,27 @@ class ConversationalSupervisor:
         q = query.strip()
         lower_q = q.lower()
 
+        # Lifecycle trace
+        if lower_q.startswith("/trace") or lower_q.startswith("trace ") or lower_q.startswith("تتبع"):
+            target = re.sub(r"^(/trace|trace|تتبع)\s*", "", q, flags=re.IGNORECASE).strip()
+            return await self.tool_trace_lifecycle(target)
+
+        # Pipeline flow
+        if lower_q in ("/flow", "flow", "تدفق", "مسار التدفق", "مخطط التدفق"):
+            return await self.tool_pipeline_flow()
+
+        # Detailed status
+        if lower_q in ("/status_detailed", "/detailed_status", "status_detailed", "حالة مفصلة", "تقرير مفصل"):
+            return await self.tool_status_detailed()
+
         if lower_q in ("/experiments", "experiments", "تجارب", "البطولة", "التجارب", "المنافسة"):
             return await self.tool_experiments()
+
+        # Quantitative performance report
+        if lower_q.startswith(("/report", "report", "تقرير")):
+            parts = lower_q.split()
+            rtype = parts[1] if len(parts) > 1 else "daily"
+            return await self.tool_generate_report(rtype)
 
         if lower_q.startswith("/council") or lower_q.startswith("/debate") or lower_q.startswith("مناظرة") or lower_q.startswith("المجلس"):
             target = re.sub(r"^(/council|/debate|مناظرة|المجلس)\s*", "", q, flags=re.IGNORECASE).strip()
@@ -748,6 +995,9 @@ class ConversationalSupervisor:
             except Exception as exc:
                 logger.error("Error in conversational CLI loop: %s", exc)
                 print(f"Error: {exc}")
+
+
+ChatInterface = ConversationalSupervisor
 
 
 async def main() -> None:

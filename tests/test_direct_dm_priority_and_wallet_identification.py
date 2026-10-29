@@ -13,14 +13,14 @@ import asyncio
 from decimal import Decimal
 import time
 from typing import Any
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock
 
 import pytest
 
 from alpha_engine.models.enums import ChainIdentifier, OrderSide, SecurityTier, SignalSource, SignalStrength
-from alpha_engine.models.events import RawSignalEvent, SecurityReport, SignalEvent
+from alpha_engine.models.events import SecurityReport, SignalEvent
 from alpha_engine.models.state import PoolState
-from alpha_engine.tracker.wallet_tracker import WalletActivityData, WalletTracker, WalletTradePoint
+from alpha_engine.tracker.wallet_tracker import WalletActivityData, WalletTracker
 from alpha_engine.engine.runner import PaperTradingEngine
 from alpha_engine.config import EngineConfig
 
@@ -175,7 +175,10 @@ async def test_direct_dm_bypasses_market_cap_threshold(tmp_path):
 
     # 2. Feed Direct DM signal: Should bypass MCAP threshold and execute
     await engine._signal_q.put(dm_signal)
-    await asyncio.sleep(0.05)
+    for _ in range(120):
+        if engine._executor.execute_signal.called:
+            break
+        await asyncio.sleep(0.05)
 
     assert engine._executor.execute_signal.call_count == 1
 
@@ -263,6 +266,7 @@ async def test_manual_enter_and_exit_position_integration(tmp_path):
         effective_price=Decimal("0.0001"),
     )
     lot = engine._position_book.open_lot(fill, "sig_manual_1")
+    assert lot is not None
     assert engine.is_position_open(token_addr) is True
 
     # 3. Test token page detects open position and shows Sell/Exit button

@@ -644,12 +644,12 @@ class TelegramIngester:
         try:
             from telethon import Button
             return [
+                [Button.text("🎯 Strategies", resize=True), Button.text("💰 Trade Amount", resize=True), Button.text("💳 Balance", resize=True)],
                 [Button.text("📊 Status", resize=True), Button.text("🧠 AI Supervisor", resize=True), Button.text("📋 Trades", resize=True)],
                 [Button.text("🔍 Assets", resize=True), Button.text("🌊 Staging", resize=True), Button.text("🔄 Revival", resize=True)],
                 [Button.text("🛡️ AI Vetoes", resize=True), Button.text("📈 Performance", resize=True), Button.text("📡 Signals", resize=True)],
                 [Button.text("📰 News", resize=True), Button.text("🐋 Whales", resize=True), Button.text("❓ Help", resize=True)],
-                [Button.text("🩺 Doctor", resize=True), Button.text("🌐 Research", resize=True), Button.text("🎯 Strategies", resize=True)],
-                [Button.text("💰 Trade Amount", resize=True), Button.text("💳 Balance", resize=True)],
+                [Button.text("🩺 Doctor", resize=True), Button.text("🌐 Research", resize=True)],
             ]
         except Exception:
             return None
@@ -801,6 +801,35 @@ class TelegramIngester:
         except Exception:
             return None
 
+    def _get_persistent_reply_keyboard(self) -> Any:
+        """Persistent custom reply keyboard at the bottom of the chat."""
+        if not TELETHON_AVAILABLE:
+            return None
+        try:
+            from telethon import Button
+            return [
+                [Button.text("📊 Status", resize=True), Button.text("🌊 Staging"), Button.text("🏛️ Council")],
+                [Button.text("🏆 Strategies"), Button.text("🔬 Flow"), Button.text("⚙️ Risk Mode")],
+            ]
+        except Exception:
+            return None
+
+    def _get_trade_alert_inline_buttons(self, token_ca: str) -> Any:
+        """Inline action buttons attached to live trade alerts."""
+        if not TELETHON_AVAILABLE:
+            return None
+        try:
+            from telethon import Button
+            return [
+                [
+                    Button.inline("🔍 Trace", data=f"trace:{token_ca}".encode("utf-8")),
+                    Button.inline("🏛️ Debate", data=f"debate:{token_ca}".encode("utf-8")),
+                    Button.inline("🔴 Exit Now", data=f"tok:sell:{token_ca}".encode("utf-8")),
+                ]
+            ]
+        except Exception:
+            return None
+
     def get_status_inline_buttons(self) -> Any:
         """Inline interactive buttons under /status telemetry card."""
         if not TELETHON_AVAILABLE:
@@ -926,20 +955,24 @@ class TelegramIngester:
                 logger.debug("Failed to edit message in callback: %s", exc)
         await self._safe_reply(event, text, buttons=buttons)
 
-    async def broadcast_trade_alert(self, message: str) -> None:
+    async def broadcast_trade_alert(self, message: str, token_ca: Optional[str] = None) -> None:
         """
         Broadcast real-time trade alert to all configured admin user IDs
-        and active DM participants.
+        and active DM participants with interactive inline buttons.
         """
         targets = set(self._admin_ids) | set(self._active_dm_chat_ids)
         if not targets:
             logger.debug("[TelegramIngester] No admin or DM recipients registered for trade broadcast.")
             return
 
+        buttons = self._get_trade_alert_inline_buttons(token_ca) if token_ca else None
         for chat_id in targets:
             try:
                 if self._client is not None and hasattr(self._client, "send_message"):
-                    res = self._client.send_message(chat_id, message)
+                    if buttons is not None:
+                        res = self._client.send_message(chat_id, message, buttons=buttons)
+                    else:
+                        res = self._client.send_message(chat_id, message)
                     if asyncio.iscoroutine(res):
                         await res
             except FloodWaitError as exc:
@@ -968,7 +1001,23 @@ class TelegramIngester:
         data = raw_data.decode("utf-8", errors="ignore") if isinstance(raw_data, (bytes, bytearray)) else str(raw_data)
 
         try:
-            if data.startswith("cmd:"):
+            if data.startswith("trace:"):
+                ca = data[6:].strip()
+                if self._chat_explainer and hasattr(self._chat_explainer, "tool_trace_lifecycle"):
+                    resp = await self._chat_explainer.tool_trace_lifecycle(ca)
+                else:
+                    resp = f"Trace for `{ca}` unavailable."
+                await self._safe_reply(event, resp)
+                return
+            elif data.startswith("debate:"):
+                ca = data[7:].strip()
+                if self._chat_explainer and hasattr(self._chat_explainer, "tool_council_debate"):
+                    resp = await self._chat_explainer.tool_council_debate(ca)
+                else:
+                    resp = f"Council debate for `{ca}` unavailable."
+                await self._safe_reply(event, resp)
+                return
+            elif data.startswith("cmd:"):
                 cmd = data[4:].strip().lower()
                 if cmd == "status":
                     await self._cmd_status(event)
@@ -1351,8 +1400,81 @@ class TelegramIngester:
             await self._cmd_manual_sell(event, args, sender_id=sender_id)
         elif first_token in ("/start", "/help", "help", "start", "مساعدة", "تعليمات"):
             await self._cmd_start_help(event)
-        elif first_token in ("/status", "status", "حالة", "الحالة"):
+        elif first_token in ("/status", "status", "حالة", "الحالة", "📊 status"):
             await self._cmd_status(event)
+        elif first_token in ("/status_detailed", "/detailed_status", "status_detailed", "حالة_مفصلة"):
+            if self._chat_explainer and hasattr(self._chat_explainer, "tool_status_detailed"):
+                resp = await self._chat_explainer.tool_status_detailed()
+            elif self._chat_explainer:
+                resp = await self._chat_explainer.ask(clean_text)
+            else:
+                resp = "📊 التقرير التفصيلي غير متاح حالياً."
+            await self._safe_reply(event, resp)
+        elif first_token in ("/report", "report", "تقرير", "التقرير"):
+            args = clean_text[len(parts[0]):].strip() if len(parts) > 1 else "daily"
+            if self._chat_explainer and hasattr(self._chat_explainer, "tool_generate_report"):
+                resp = await self._chat_explainer.tool_generate_report(args)
+            elif self._chat_explainer:
+                resp = await self._chat_explainer.ask(clean_text)
+            else:
+                resp = "📊 التقرير الكمي غير متاح حالياً."
+            await self._safe_reply(event, resp)
+        elif first_token in ("/trace", "trace"):
+            args = clean_text[len(parts[0]):].strip() if len(parts) > 1 else ""
+            if self._chat_explainer and hasattr(self._chat_explainer, "tool_trace_lifecycle"):
+                resp = await self._chat_explainer.tool_trace_lifecycle(args)
+            elif self._chat_explainer:
+                resp = await self._chat_explainer.ask(clean_text)
+            else:
+                resp = "🔍 متتبع مسار العملة غير متاح حالياً."
+            await self._safe_reply(event, resp)
+        elif first_token in ("/flow", "flow", "تدفق", "مخطط_التدفق", "مسار_التدفق", "🔬 flow"):
+            if self._chat_explainer and hasattr(self._chat_explainer, "tool_pipeline_flow"):
+                resp = await self._chat_explainer.tool_pipeline_flow()
+            elif self._chat_explainer:
+                resp = await self._chat_explainer.ask(clean_text)
+            else:
+                resp = "🔬 مخطط التدفق غير متاح حالياً."
+            await self._safe_reply(event, resp)
+        elif first_token in ("/council_debate", "/debate_transcript", "مناظرة_المجلس", "🏛️ council"):
+            args = clean_text[len(parts[0]):].strip() if len(parts) > 1 else ""
+            if self._chat_explainer and hasattr(self._chat_explainer, "tool_council_debate"):
+                resp = await self._chat_explainer.tool_council_debate(args)
+            elif self._chat_explainer:
+                resp = await self._chat_explainer.ask(clean_text)
+            else:
+                resp = "🏛️ مجلس الوكلاء غير متصل حالياً."
+            await self._safe_reply(event, resp)
+        elif first_token in ("/why", "why", "لماذا"):
+            args = clean_text[len(parts[0]):].strip() if len(parts) > 1 else ""
+            is_ca = bool(re.match(r"^([1-9A-HJ-NP-za-km-z]{32,44}|0x[a-fA-F0-9]{40})$", args))
+            if is_ca and self._chat_explainer and hasattr(self._chat_explainer, "tool_why_decision"):
+                resp = await self._chat_explainer.tool_why_decision(args)
+            elif self._chat_explainer:
+                resp = await self._chat_explainer.ask(clean_text)
+            elif self.ai_supervisor and hasattr(self.ai_supervisor, "answer_user_query"):
+                resp = await self.ai_supervisor.answer_user_query(clean_text)
+            else:
+                resp = "❓ أداة الاستفسار والتحليل غير متاحة حالياً."
+            await self._safe_reply(event, resp)
+        elif first_token in ("⚙️ risk mode", "risk mode", "/risk"):
+            if self._chat_explainer and hasattr(self._chat_explainer, "tool_status_detailed"):
+                resp = await self._chat_explainer.tool_status_detailed()
+            else:
+                resp = "⚙️ فحص وضع المخاطر الحالي."
+            await self._safe_reply(event, resp)
+        elif first_token in ("🌊 staging",):
+            if self._chat_explainer and hasattr(self._chat_explainer, "tool_list_staged_tokens"):
+                resp = await self._chat_explainer.tool_list_staged_tokens()
+            else:
+                resp = "🌊 قائمة ستيجينغ غير متاحة حالياً."
+            await self._safe_reply(event, resp)
+        elif first_token in ("🏆 strategies",):
+            if self._chat_explainer and hasattr(self._chat_explainer, "tool_experiments"):
+                resp = await self._chat_explainer.tool_experiments()
+            else:
+                resp = "🏆 لوحة صدارة الاستراتيجيات غير متاحة حالياً."
+            await self._safe_reply(event, resp)
         elif first_token in ("/unfreeze", "/reset_breaker", "/resume", "unfreeze", "فك_التجميد", "إلغاء_التجميد"):
             if self._execution_target and hasattr(self._execution_target, "reset_circuit_breaker"):
                 self._execution_target.reset_circuit_breaker()

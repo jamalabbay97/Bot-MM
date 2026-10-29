@@ -288,6 +288,16 @@ class PaperFill(BaseModel):
     def effective_price_consistent(self) -> "PaperFill":
         return self
 
+    @property
+    def amount_token(self) -> Decimal:
+        """Alias for tokens_acquired."""
+        return self.tokens_acquired
+
+    @property
+    def slippage_bps(self) -> int:
+        """Alias for price_impact_bps."""
+        return self.price_impact_bps
+
 
 class TradeRecord(BaseModel):
     """
