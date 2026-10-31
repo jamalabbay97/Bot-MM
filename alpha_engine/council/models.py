@@ -24,7 +24,54 @@ class DebateStance(str, Enum):
     CHALLENGE = "CHALLENGE"
     DEFEND = "DEFEND"
     REVISE = "REVISE"
+    QUESTION = "QUESTION"
+    ANSWER = "ANSWER"
+    DEVILS_ADVOCATE = "DEVILS_ADVOCATE"
     SYNTHESIS = "SYNTHESIS"
+
+
+@dataclass
+class InformationRequest:
+    """Inter-agent request for specific telemetry or audit clarification."""
+    request_id: str
+    requester_agent: str
+    target_agent: str
+    question: str
+    context: dict[str, Any] = field(default_factory=dict)
+    timestamp: float = field(default_factory=time.time)
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass
+class InformationResponse:
+    """Response to an inter-agent information request."""
+    request_id: str
+    responder_agent: str
+    answer: str
+    confidence: float = 0.90
+    data_points: dict[str, Any] = field(default_factory=dict)
+    timestamp: float = field(default_factory=time.time)
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass
+class DevilsAdvocateStressTest:
+    """Stress-test objections generated when Council reaches unanimous approval."""
+    challenger_agent: str
+    liquidity_challenge: str
+    insider_cluster_challenge: str
+    narrative_novelty_challenge: str
+    fatal_flaw_detected: bool = False
+    flaw_summary: str = ""
+    mitigation_required: bool = False
+    timestamp: float = field(default_factory=time.time)
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
 
 
 @dataclass
@@ -48,9 +95,9 @@ class AgentVerdict:
 @dataclass
 class DebateRound:
     """Represents a discrete turn/round in multi-agent deliberation."""
-    round_number: int  # 1: Initial evaluation, 2: Cross-examination, 3: Rebuttal/Revision, 4: Arbiter Synthesis
+    round_number: int  # 1: Initial evaluation, 2: Cross-examination / Q&A, 3: Rebuttal/Revision/Devil's Advocate, 4: Arbiter Synthesis
     agent_name: str    # "ReachAnalyst", "ChainForensic", "QuantTechnicals", "CouncilArbiterCRO"
-    stance: str        # "APPROVE", "REJECT", "CHALLENGE", "DEFEND", "REVISE", "VETO", "SYNTHESIS"
+    stance: str        # "APPROVE", "REJECT", "CHALLENGE", "DEFEND", "REVISE", "VETO", "DEVILS_ADVOCATE", "SYNTHESIS"
     arguments: str
     counter_arguments: Optional[str] = None
     target_agent: Optional[str] = None
@@ -81,6 +128,9 @@ class CouncilConsensusResult:
     debate_rounds: list[DebateRound] = field(default_factory=list)
     kelly_size_pct: float = 0.0
     exit_profile: Optional[str] = None
+    devils_advocate_invoked: bool = False
+    devils_advocate_report: Optional[dict[str, Any]] = None
+    retrieved_episodes_count: int = 0
     created_at: float = field(default_factory=time.time)
 
     def to_dict(self) -> dict[str, Any]:
@@ -100,5 +150,8 @@ class CouncilConsensusResult:
             "debate_rounds": [r.to_dict() for r in self.debate_rounds],
             "kelly_size_pct": self.kelly_size_pct,
             "exit_profile": self.exit_profile,
+            "devils_advocate_invoked": self.devils_advocate_invoked,
+            "devils_advocate_report": self.devils_advocate_report,
+            "retrieved_episodes_count": self.retrieved_episodes_count,
             "created_at": self.created_at,
         }

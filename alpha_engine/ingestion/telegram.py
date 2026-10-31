@@ -128,7 +128,7 @@ async def _connect_aiosqlite(db_path: str):
     finally:
         await conn.close()
 
-from alpha_engine.models.enums import ChainIdentifier, NewsSignalStatus, SignalSource, resolve_trade_platform, TradingPlatform
+from alpha_engine.models.enums import ChainIdentifier, NewsSignalStatus, SignalSource, resolve_trade_platform
 from alpha_engine.models.events import RawSignalEvent, ShutdownSentinel
 from alpha_engine.models.news import NewsEvent
 from alpha_engine.rate_limiter.registry import RateLimiterRegistry
@@ -1584,6 +1584,19 @@ class TelegramIngester:
             await self._cmd_close_all(event)
         elif first_token in ("/reset_ledger", "/resetledger", "reset_ledger", "تصفير_السجل", "مسح_السجل"):
             await self._cmd_reset_ledger(event)
+        elif first_token in ("/dashboard", "dashboard", "/dash", "dash", "لوحة_التحكم", "لوحة_المراقبة", "داشبورد"):
+            port = 8000
+            target = self.execution_target
+            if target and hasattr(target, "dashboard_server") and target.dashboard_server:
+                port = target.dashboard_server.port
+            msg = (
+                "🌐 **لوحة المراقبة اللحظية للمحرك (Institutional Observability Dashboard)**\n\n"
+                f"• **رابط اللوحة (Dashboard URL):** http://localhost:{port}/\n"
+                f"• **واجهة البيانات (REST API):** http://localhost:{port}/api/status\n"
+                f"• **البث المباشر (WebSocket):** ws://localhost:{port}/ws/telemetry\n\n"
+                "💡 افتح الرابط في متصفحك لمشاهدة تفريغ نقاشات مجلس الوكلاء (Council)، الرسوم البيانية، ومقاييس الأداء اللحظية."
+            )
+            await self._safe_reply(event, msg)
         elif first_token in ("/ask", "ask", "سؤال", "اسأل"):
             args = clean_text[len(clean_text.split()[0]):].strip() if len(clean_text.split()) > 1 else ""
             query_to_send = args or clean_text
@@ -1981,7 +1994,7 @@ class TelegramIngester:
             if f >= 0.0001:
                 return f"{f:.6f}"
             # Micro-prices: eliminate scientific notation (e.g. 2.865e-08)
-            # Format using subscript notation (e.g. $0.0₇2865 / $0.0₇2.8) or fixed decimals
+            # Format using subscript notation (e.g. $0.0₇2865) or fixed decimals
             s = f"{f:.14f}".rstrip("0")
             if "." in s:
                 _, dec_part = s.split(".", 1)
@@ -1991,13 +2004,45 @@ class TelegramIngester:
                 if leading_zeros >= 3:
                     subscript_map = str.maketrans("0123456789", "₀₁₂₃₄₅₆₇₈₉")
                     sub = str(leading_zeros).translate(subscript_map)
-                    if len(sig) > 1:
-                        return f"$0.0{sub}{sig[0]}.{sig[1:4]}"
                     return f"$0.0{sub}{sig_fmt}"
                 return f"{f:.8f}".rstrip("0")
             return f"{f:.8f}".rstrip("0")
         except Exception:
             return str(val)[:10]
+
+    @classmethod
+    def _format_price_clean(cls, price: Any, native_price_usd: Any = None, unit: str = "") -> str:
+        try:
+            val = float(price)
+            if val <= 0:
+                return "$0.00"
+            subscript_map = str.maketrans("0123456789", "₀₁₂₃₄₅₆₇₈₉")
+
+            def _fmt(v: float) -> str:
+                if v >= 1.0:
+                    return f"{v:.4f}"
+                if v >= 0.01:
+                    return f"{v:.4f}"
+                if v >= 0.0001:
+                    return f"{v:.6f}"
+                s_v = f"{v:.14f}".rstrip("0")
+                if "." in s_v:
+                    _, dec = s_v.split(".", 1)
+                    lz = len(dec) - len(dec.lstrip("0"))
+                    sg = dec.lstrip("0")[:4]
+                    if lz >= 3:
+                        sub = str(lz).translate(subscript_map)
+                        sig_dot = f"{sg[0]}.{sg[1:]}" if len(sg) > 1 else sg
+                        return f"0.0{sub}{sig_dot}"
+                    return f"{v:.8f}".rstrip("0")
+                return f"{v:.8f}".rstrip("0")
+
+            if native_price_usd is not None and float(native_price_usd) > 0 and unit:
+                usd_val = val * float(native_price_usd)
+                return f"${_fmt(usd_val)} ({_fmt(val)} {unit})"
+            return f"${_fmt(val)}"
+        except Exception:
+            return f"${price}"
 
     async def _cmd_news(self, event: Any) -> None:
         """Handle /news command in DMs: returns rolling buffer of verified ingested news headlines, channel name, elapsed time, and sentiment score."""
@@ -2413,13 +2458,13 @@ class TelegramIngester:
 
         dec_icon = "🟢" if str(ai_resp.decision) == "EXECUTE_BUY" else "🔴"
         reply_lines = [
-            f"🧠 **AlphaSupervisor-AI Audit Report | تقرير التدقيق الأمني والفني**\n",
+            "🧠 **AlphaSupervisor-AI Audit Report | تقرير التدقيق الأمني والفني**\n",
             f"• **Target:** `{token_ca}` ({chain.value})",
             f"• **Verdict:** {dec_icon} **{ai_resp.decision}** (Confidence: {ai_resp.confidence_score:.2f})",
             f"• **Kelly Position Size:** `{ai_resp.action_parameters.recommended_position_pct}%`",
             f"• **Max Slippage:** `{ai_resp.action_parameters.max_slippage_bps} bps`",
             f"• **Stop-Loss / Inactivity Exit:** `{ai_resp.action_parameters.hard_stop_loss_pct}%` / `{ai_resp.action_parameters.time_exit_minutes} mins`",
-            f"\n🛡️ **التقييم الأمني (Security Assessment):**",
+            "\n🛡️ **التقييم الأمني (Security Assessment):**",
             f"• Secure: {'Yes 🟢' if ai_resp.security_assessment.is_secure else 'No 🔴'}",
             f"• Honeypot Risk: `{ai_resp.security_assessment.honeypot_risk}`",
             f"• Liquidity Health: `{ai_resp.security_assessment.liquidity_health}`",
@@ -2427,7 +2472,7 @@ class TelegramIngester:
         if ai_resp.security_assessment.flags:
             reply_lines.append(f"• Flags: `{', '.join(ai_resp.security_assessment.flags)}`")
         reply_lines.extend([
-            f"\n👤 **تدقيق المحفظة وسلوك المطور (Wallet Audit):**",
+            "\n👤 **تدقيق المحفظة وسلوك المطور (Wallet Audit):**",
             f"• Classification: `{ai_resp.wallet_audit.risk_classification}`",
             f"• Rationale: {ai_resp.wallet_audit.rationale}",
         ])
@@ -2692,8 +2737,8 @@ class TelegramIngester:
             "━━━━━━━━━━━━━━━━━━━━━━━━━",
             f"• **القيمة المعتمدة:** `{amt_disp}`",
             f"• **النمط:** `{'🟢 محدد يدويًا (Manual Override)' if is_manual else '⚪ افتراضي (Dynamic Kelly Sizing)'}`",
-            f"• **نطاق التطبيق:** جميع الصفقات الجديدة (Graduated, Movers, Scalps, New Mints)",
-            f"• **الحفظ الدائم:** 💾 دائم ومحفوظ في قاعدة البيانات",
+            "• **نطاق التطبيق:** جميع الصفقات الجديدة (Graduated, Movers, Scalps, New Mints)",
+            "• **الحفظ الدائم:** 💾 دائم ومحفوظ في قاعدة البيانات",
             "",
             f"💳 **الرصيد المتاح حالياً:** `{avail_sol} SOL` (≈ `${avail_usd} USD`)",
             "",
@@ -3384,8 +3429,11 @@ class TelegramIngester:
                 ))
                 ep_raw = t.get("entry_price", 0)
                 cp_raw = t.get("current_price", 0)
-                entry_p = self._format_price(ep_raw)
-                curr_p = self._format_price(cp_raw)
+                unit = "ETH" if "base" in chain_str.lower() else "SOL"
+                eng = getattr(self, "_execution_target", None)
+                native_rate = float(getattr(eng, "_sol_price", 150.0) or 150.0) if unit == "SOL" else float(getattr(eng, "_eth_price", 3400.0) or 3400.0)
+                entry_p = self._format_price_clean(ep_raw, native_rate, unit)
+                curr_p = self._format_price_clean(cp_raw, native_rate, unit)
 
                 # Dynamic PnL recalculation
                 pnl_f = float(t.get("unrealized_pnl_usd", 0.0))
@@ -3454,8 +3502,11 @@ class TelegramIngester:
                 ))
                 ep_raw = ct.get("entry_price", 0)
                 xp_raw = ct.get("exit_price", 0)
-                entry_p = self._format_price(ep_raw)
-                exit_p = self._format_price(xp_raw)
+                unit = "ETH" if "base" in chain_str.lower() else "SOL"
+                eng = getattr(self, "_execution_target", None)
+                native_rate = float(getattr(eng, "_sol_price", 150.0) or 150.0) if unit == "SOL" else float(getattr(eng, "_eth_price", 3400.0) or 3400.0)
+                entry_p = self._format_price_clean(ep_raw, native_rate, unit)
+                exit_p = self._format_price_clean(xp_raw, native_rate, unit)
                 pnl_f = float(ct.get("realized_pnl_usd", 0.0))
                 pnl_pct = float(ct.get("realized_pnl_pct", 0.0))
                 is_win = ct.get("is_win", pnl_f > 0)
@@ -3627,16 +3678,16 @@ class TelegramIngester:
                         continue
 
                     # String username or channel link: resolve safely via Telethon
-                    clean_ch = ch
+                    clean_ch = ch.strip() if isinstance(ch, str) else ch
                     if hasattr(self._client, "get_input_entity"):
                         try:
-                            entity_res = self._client.get_input_entity(ch)
+                            entity_res = self._client.get_input_entity(clean_ch)
                             if asyncio.iscoroutine(entity_res):
                                 entity = await entity_res
                             else:
                                 entity = entity_res
                             resolved_chats.append(entity)
-                            logger.info("[TelegramIngester] Target channel '%s' resolved successfully.", ch)
+                            logger.info("[TelegramIngester] Target channel '%s' resolved successfully.", clean_ch)
                         except FloodWaitError as exc:
                             logger.warning(
                                 "[TelegramIngester] FloodWaitError resolving channel '%s' (%s s). Skipping.",
@@ -3689,6 +3740,7 @@ class TelegramIngester:
 
                     commands = [
                         BotCommand(command="status", description="📊 Live Engine Telemetry & PnL"),
+                        BotCommand(command="dashboard", description="🌐 Live Web Observability Dashboard URL"),
                         BotCommand(command="oracle", description="🔮 Macro Fear & Greed, TVL & Public Oracles"),
                         BotCommand(command="strategy", description="🎯 Manage Strategies, TP/SL & Auto-Trade"),
                         BotCommand(command="ai", description="🧠 AlphaSupervisor-AI Control & Risk"),

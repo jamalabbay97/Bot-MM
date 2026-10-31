@@ -29,15 +29,22 @@ from alpha_engine.profiler.whitelist_db import WhitelistDatabase
 from alpha_engine.ruflo.agents.base import BaseRufloAgent
 from alpha_engine.ruflo.agents.execution_agent import ExecutionLedgerAgent
 from alpha_engine.ruflo.agents.gatekeeper_agent import SecurityGatekeeperAgent
+from alpha_engine.ruflo.agents.learning_agent import RufloLearningAgent
 from alpha_engine.ruflo.agents.profiler_agent import SmartMoneyProfilerAgent
 from alpha_engine.ruflo.agents.quant_agent import QuantRiskSizingAgent
 from alpha_engine.ruflo.agents.scouting_agent import IngestionScoutingAgent
 from alpha_engine.ruflo.agents.supervisor_agent import RufloSupervisorAgent
-from alpha_engine.ruflo.memory import RufloEpisodicMemory
+from alpha_engine.ruflo.memory import (
+    LightweightVectorStore,
+    RufloEpisodicMemory,
+    RufloIntelligencePipeline,
+    RufloSemanticMemory,
+)
 from alpha_engine.ruflo.protocol import (
     AgentRole,
     AgentStatus,
     ConsensusProtocol,
+    MessageType,
     SwarmMessage,
     SwarmTopology,
 )
@@ -91,16 +98,23 @@ class RufloSwarmCoordinator:
         self._shutdown_event = asyncio.Event()
         self._ledger: Optional[SQLiteLedger] = ledger
 
-        # Shared Persistent Memory
+        # Shared Persistent Memory & Vector Store
         db_path = getattr(config, "db_path", "paper_trading.db")
         self.memory = episodic_memory or RufloEpisodicMemory(db_path=db_path)
+        self.semantic_memory = RufloSemanticMemory(db_path=db_path)
+        self.vector_store = LightweightVectorStore(dimension=7)
+        self.pipeline = RufloIntelligencePipeline(
+            episodic_memory=self.memory,
+            semantic_memory=self.semantic_memory,
+            vector_store=self.vector_store,
+        )
 
         # Unify with Council Arbiter CRO
         self.council_cro = council_cro or (
             ai_supervisor._council if ai_supervisor and hasattr(ai_supervisor, "_council") else CouncilArbiterCRO()
         )
 
-        # Initialize the 6 specialized agents
+        # Initialize the 7 specialized agents
         self.scout_agent = IngestionScoutingAgent(coordinator=coordinator)
         self.profiler_agent = SmartMoneyProfilerAgent(profiler=profiler, whitelist_db=whitelist_db)
         self.gatekeeper_agent = SecurityGatekeeperAgent(gatekeeper=gatekeeper)
@@ -116,6 +130,11 @@ class RufloSwarmCoordinator:
             rpc_monitor=rpc_monitor,
             episodic_memory=self.memory,
         )
+        self.learner_agent = RufloLearningAgent(
+            episodic_memory=self.memory,
+            semantic_memory=self.semantic_memory,
+            pipeline=self.pipeline,
+        )
 
         self._agents: dict[AgentRole, BaseRufloAgent] = {
             AgentRole.SCOUT: self.scout_agent,
@@ -124,9 +143,11 @@ class RufloSwarmCoordinator:
             AgentRole.QUANT: self.quant_agent,
             AgentRole.EXECUTOR: self.execution_agent,
             AgentRole.SUPERVISOR: self.supervisor_agent,
+            AgentRole.LEARNER: self.learner_agent,
         }
 
-        # Background maintenance tasks
+        # Background maintenance tasks & RPC tracking
+        self._rpc_futures: dict[str, asyncio.Future[SwarmMessage]] = {}
         self._reflection_task: Optional[asyncio.Task[Any]] = None
         self._is_running = False
 
@@ -159,14 +180,15 @@ class RufloSwarmCoordinator:
             self.execution_agent.position_book = position_book
 
     async def start(self) -> None:
-        """Start all specialized swarm agents and periodic reflection background tasks."""
+        """Start all specialized swarm agents, memory stores, and reflection loops."""
         if self._is_running:
             return
         self._is_running = True
         self._shutdown_event.clear()
 
-        # Connect episodic memory
+        # Connect episodic and semantic memory
         await self.memory.connect()
+        await self.semantic_memory.connect()
 
         # Start each agent
         for role, agent in self._agents.items():
@@ -186,7 +208,7 @@ class RufloSwarmCoordinator:
         )
 
     async def stop(self) -> None:
-        """Gracefully stop all swarm agents and episodic memory persistence."""
+        """Gracefully stop all swarm agents and memory persistence."""
         if not self._is_running:
             return
         self._is_running = False
@@ -204,6 +226,7 @@ class RufloSwarmCoordinator:
             await agent.stop()
 
         await self.memory.close()
+        await self.semantic_memory.close()
         logger.info("Ruflo Swarm Coordinator stopped cleanly.")
 
     start_swarm = start
@@ -216,6 +239,54 @@ class RufloSwarmCoordinator:
         else:
             for agent in self._agents.values():
                 await agent.post_message(message)
+
+    async def send_rpc_request(
+        self,
+        target_role: AgentRole,
+        action: str,
+        payload: dict[str, Any],
+        sender_role: AgentRole = AgentRole.SUPERVISOR,
+        timeout_s: float = 2.0,
+    ) -> Optional[SwarmMessage]:
+        """
+        Send a typed RPC request message to a target agent and await correlated response.
+        Enables structured cross-agent queries with timeout fallbacks.
+        """
+        if target_role not in self._agents:
+            return None
+
+        corr_id = str(uuid.uuid4())
+        loop = asyncio.get_running_loop()
+        future: asyncio.Future[SwarmMessage] = loop.create_future()
+        self._rpc_futures[corr_id] = future
+
+        msg = SwarmMessage(
+            sender_role=sender_role,
+            target_role=target_role,
+            message_type=MessageType.REQUEST.value,
+            action=action,
+            payload=payload,
+            correlation_id=corr_id,
+            is_request=True,
+        )
+
+        try:
+            await self._agents[target_role].post_message(msg)
+            response = await asyncio.wait_for(future, timeout=timeout_s)
+            return response
+        except asyncio.TimeoutError:
+            logger.debug("[RufloSwarm] RPC request %s to %s timed out after %.1fs", action, target_role.value, timeout_s)
+            return None
+        finally:
+            self._rpc_futures.pop(corr_id, None)
+
+    async def on_trade_closed(self, trade_outcome: dict[str, Any]) -> dict[str, Any]:
+        """
+        Closed trade lifecycle hook:
+        Triggers Ruflo Intelligence Pipeline (Distill -> Consolidate)
+        via the specialized RufloLearningAgent.
+        """
+        return await self.learner_agent.tool_distill_and_consolidate(trade_outcome)
 
     async def execute_trade_consensus(
         self,
@@ -275,27 +346,54 @@ class RufloSwarmCoordinator:
             )
 
         async with self._lock:
-            # Query similar episodic memories via Cosine Similarity
+            # Query similar episodic memories & semantic rules via Ruflo Intelligence Pipeline
             query_vec = feature_vector if (feature_vector and len(feature_vector) == 7) else [0.5] * 7
-            similar_eps = self.memory.query_similar_episodes(query_vec, top_k=3, min_similarity=0.40)
-            episodic_matches = [
-                {
-                    "episode_id": ep.episode_id,
-                    "similarity": round(sim, 3),
-                    "realized_pnl_usd": ep.realized_pnl_usd,
-                    "roi_pct": ep.roi_pct,
-                    "root_cause_tag": ep.root_cause_tag,
-                    "summary_reflection": ep.summary_reflection,
+            token_ctx = {
+                "token_address": token_address,
+                "chain": chain_str,
+                "liquidity_usd": liquidity_usd,
+                "top10_concentration": getattr(report, "top10_concentration", 0.15) if report else 0.15,
+                "regime": kwargs.get("regime", "NORMAL"),
+            }
+            pipeline_retrieval = await self.pipeline.retrieve(
+                query_vector=query_vec,
+                token_context=token_ctx,
+                top_k=5,
+            )
+            pipeline_judgment = self.pipeline.judge(
+                retrieval=pipeline_retrieval,
+                proposed_signal=token_ctx,
+            )
+            episodic_matches = pipeline_retrieval.matched_episodes
+
+            # Adaptive Topology Adjustment: High risk/volatility enforces strict hierarchy
+            active_topology = self.topology
+            if self.topology == SwarmTopology.ADAPTIVE:
+                if pipeline_judgment.verdict == "CAUTION" or kwargs.get("regime") == "HIGH_VOLATILITY":
+                    active_topology = SwarmTopology.HIERARCHICAL
+                else:
+                    active_topology = SwarmTopology.MESH
+
+            # Early VETO check from Ruflo Cognitive Pipeline
+            if pipeline_judgment.verdict == "VETO":
+                rejection_msg = f"Ruflo Pipeline VETO: {'; '.join(pipeline_judgment.warning_flags or ['Adverse historical heuristic precedent'])}"
+                return {
+                    "approved": False,
+                    "consensus_approved": False,
+                    "rejection_agent": AgentRole.LEARNER.value,
+                    "veto_reason": rejection_msg,
+                    "reason": rejection_msg,
+                    "details": {"pipeline_judgment": pipeline_judgment.__dict__},
+                    "votes": {"SCOUT": True, "LEARNER": False},
+                    "episodic_matches": episodic_matches,
                 }
-                for ep, sim in similar_eps
-            ]
 
             # Broadcast signal announcement
             await self.broadcast_message(
                 SwarmMessage(
                     sender_role=AgentRole.SCOUT,
                     target_role=None,
-                    content=f"Deliberating signal on {token_address[:10]} ({chain_str}) from {src_str}",
+                    content=f"Deliberating signal on {token_address[:10]} ({chain_str}) from {src_str} [topology={active_topology.value}]",
                     payload={"token_address": token_address, "chain": chain_str, "liquidity_usd": liquidity_usd},
                 )
             )
@@ -571,13 +669,16 @@ class RufloSwarmCoordinator:
                     })
                 return rejection
 
-            # 7. Consensus Approved: Compute dynamic sizing and optionally execute paper fill
+            # 7. Consensus Approved: Compute dynamic sizing with pipeline multiplier and optionally execute paper fill
             position_usd = float(sizing_result.get("recommended_position_usd", 100.0))
             if audit_result.get("action_parameters"):
                 rec_pct = audit_result["action_parameters"].get("recommended_position_pct")
                 if rec_pct and rec_pct > 0:
                     tuned_usd = 10000.0 * (rec_pct / 100.0)
                     position_usd = min(position_usd, tuned_usd) if position_usd > 0 else tuned_usd
+
+            # Apply empirical pipeline sizing multiplier
+            position_usd = max(20.0, position_usd * float(pipeline_judgment.size_multiplier))
 
             exec_res = await self.execution_agent.tool_execute_paper_trade(
                 token_address=token_address,
@@ -588,6 +689,12 @@ class RufloSwarmCoordinator:
                 strategy_pattern="RUFLO_CONSENSUS",
                 confidence=raw_confidence,
             )
+            exec_res["execute_fill"] = execute_fill
+            if execute_fill:
+                logger.info(
+                    "[RufloSwarm] execute_fill=True: Active paper trade fill triggered for %s (%s)",
+                    token_address, chain_str,
+                )
 
             votes = {
                 "SCOUT": True,
@@ -598,13 +705,15 @@ class RufloSwarmCoordinator:
                 "CRO": True,
                 "EXECUTOR": True,
                 "SUPERVISOR": True,
+                "LEARNER": True,
             }
 
             debate_transcript = (getattr(council_res, "debate_transcript", []) if council_res else []) + [
                 f"🛡️ [RufloSwarm] Security passed (score={sec_result.get('score', 100.0):.0f}).",
-                f"📐 [RufloSwarm] Position sized to ${position_usd:.2f} USD.",
+                f"📐 [RufloSwarm] Position sized to ${position_usd:.2f} USD (pipeline mult: {pipeline_judgment.size_multiplier:.2f}).",
                 f"🧠 [RufloSwarm] Historical episodic memories matched: {len(episodic_matches)} episodes.",
-                "⚖️ [RufloSwarm] BFT Consensus Reached: APPROVED.",
+                f"🔮 [RufloPipeline] Win prob={pipeline_judgment.empirical_win_prob*100:.1f}%, verdict={pipeline_judgment.verdict}.",
+                f"⚖️ [RufloSwarm] {self.consensus.value.upper()} Consensus Reached: APPROVED [topology={active_topology.value}].",
             ]
 
             if self._ledger and hasattr(self._ledger, "record_agent_deliberation"):
@@ -616,7 +725,7 @@ class RufloSwarmCoordinator:
                     "episodic_memory_matches_json": json.dumps(episodic_matches),
                     "selected_strategy_id": getattr(signal, "strategy_name", "champion_peak_trailing_50"),
                     "final_decision": "APPROVE",
-                    "rationale": "Multi-agent consensus approved; all 8 agent checks and BFT quorum passed.",
+                    "rationale": "Multi-agent consensus approved; all 9 agent checks passed.",
                     "timestamp_ns": time.time_ns(),
                 })
 
@@ -624,7 +733,7 @@ class RufloSwarmCoordinator:
                 "approved": True,
                 "consensus_approved": True,
                 "protocol": self.consensus.value,
-                "topology": self.topology.value,
+                "topology": active_topology.value,
                 "token_address": token_address,
                 "chain": chain_str,
                 "signal_source": src_str,
@@ -634,6 +743,12 @@ class RufloSwarmCoordinator:
                 "supervisor_decision": audit_result,
                 "profiler_result": prof_result,
                 "council_result": council_res.to_dict() if council_res and hasattr(council_res, "to_dict") else {},
+                "pipeline_judgment": {
+                    "verdict": pipeline_judgment.verdict,
+                    "empirical_win_prob": pipeline_judgment.empirical_win_prob,
+                    "size_multiplier": pipeline_judgment.size_multiplier,
+                    "warning_flags": pipeline_judgment.warning_flags,
+                },
                 "votes": votes,
                 "episodic_matches": episodic_matches,
                 "debate": debate_transcript,

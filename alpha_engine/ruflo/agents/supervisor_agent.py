@@ -10,11 +10,13 @@ from __future__ import annotations
 import logging
 from typing import Any, Optional
 
+from decimal import Decimal
+
 from alpha_engine.engine.ai_supervisor import AlphaSupervisorAI
 from alpha_engine.engine.feedback import AdaptiveFeedbackEngine, TradeReflection
 from alpha_engine.engine.rpc_health import RPCHealthMonitor
 from alpha_engine.models.ai import AISupervisorResponse
-from alpha_engine.models.enums import ChainIdentifier
+from alpha_engine.models.enums import ChainIdentifier, SignalSource
 from alpha_engine.ruflo.agents.base import BaseRufloAgent
 from alpha_engine.ruflo.memory import MemoryEpisode, RufloEpisodicMemory
 from alpha_engine.ruflo.protocol import AgentRole, SwarmMessage, ToolDefinition
@@ -159,6 +161,7 @@ class RufloSupervisorAgent(BaseRufloAgent):
             telemetry.update(kwargs)
 
         try:
+            resp: AISupervisorResponse
             if signal is not None and hasattr(self.ai_supervisor, "evaluate_signal"):
                 resp = await self.ai_supervisor.evaluate_signal(
                     signal=signal,
@@ -234,8 +237,8 @@ class RufloSupervisorAgent(BaseRufloAgent):
             trade_id=trade_id,
             token_address=token_address,
             chain=ChainIdentifier.BASE_MAINNET if "base" in chain.lower() else ChainIdentifier.SOLANA_MAINNET,
-            signal_source=getattr(alpha_engine_signal_source := __import__("alpha_engine.models.enums", fromlist=["SignalSource"]).SignalSource, signal_source.upper(), __import__("alpha_engine.models.enums", fromlist=["SignalSource"]).SignalSource.DEX_SWAP),
-            realized_pnl_usd=__import__("decimal").Decimal(str(realized_pnl_usd)),
+            signal_source=getattr(SignalSource, signal_source.upper(), SignalSource.DEX_SWAP),
+            realized_pnl_usd=Decimal(str(realized_pnl_usd)),
             roi_pct=roi_pct,
             is_win=realized_pnl_usd > 0,
             actual_slippage_bps=actual_slippage_bps,

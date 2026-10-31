@@ -274,6 +274,16 @@ class EngineConfig(BaseSettings):
         default=False,
         description="Enable strict asyncio event loop debugging",
     )
+    dashboard_enabled: bool = Field(
+        default=True,
+        description="Enable Real-Time Institutional Observability Dashboard server",
+    )
+    dashboard_port: int = Field(
+        default=8000,
+        ge=1024,
+        le=65535,
+        description="Port for Observability Dashboard HTTP & WebSocket server",
+    )
 
     # -------------------------------------------------------------------------
     # 4b. Staging Buffer & Wave-2 Dip-Reversal Engine Configuration

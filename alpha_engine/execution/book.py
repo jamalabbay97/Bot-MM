@@ -289,15 +289,74 @@ class PositionBook:
         if cb not in self._capacity_freed_callbacks:
             self._capacity_freed_callbacks.append(cb)
 
-    def _notify_capacity_freed(self) -> None:
+    def _notify_capacity_freed(self, lot_id: str = "", token_address: str = "") -> None:
         """Invoked when an open lot is fully closed or a reserved slot is released."""
         for cb in list(self._capacity_freed_callbacks):
             try:
-                res = cb()
+                import inspect
+                sig = inspect.signature(cb)
+                if len(sig.parameters) >= 2:
+                    res = cb(lot_id, token_address)
+                elif len(sig.parameters) == 1:
+                    res = cb(lot_id)
+                else:
+                    res = cb()
                 if asyncio.iscoroutine(res):
                     asyncio.create_task(res)
             except Exception as exc:
                 logger.warning("Error in capacity freed callback: %s", exc)
+
+    def notify_capacity_freed(self, lot_id: str = "", token_address: str = "") -> None:
+        """Public alias for _notify_capacity_freed."""
+        self._notify_capacity_freed(lot_id=lot_id, token_address=token_address)
+
+    def remove_lot(
+        self,
+        chain: str | ChainIdentifier,
+        token_address: str,
+        lot_id: str,
+    ) -> bool:
+        """
+        Removes a lot from open tracking by chain, token address, and lot_id.
+        Marks lot CLOSED, zeroes tokens_held, appends to _closed_lots, and notifies capacity freed.
+        """
+        chain_val = chain.value if hasattr(chain, "value") else str(chain)
+        t_clean = token_address.strip().lower()
+        for (c, t), lots in list(self._lots.items()):
+            if c == chain_val and t.strip().lower() == t_clean:
+                for i, lot in enumerate(lots):
+                    if lot.lot_id == lot_id:
+                        lot.status = LotStatus.CLOSED
+                        lot.tokens_held = Decimal(0)
+                        lots.pop(i)
+                        self._closed_lots.append(lot)
+                        if len(self._closed_lots) > 100:
+                            self._closed_lots.pop(0)
+                        self.set_token_cooldown(token_address, duration_s=300.0)
+                        self._notify_capacity_freed(lot_id=lot.lot_id, token_address=lot.token_address)
+                        return True
+        return False
+
+    def write_off_lot(self, lot: OpenLot) -> None:
+        """Explicitly write off an open lot (e.g. illiquid market / abandoned curve)."""
+        lot.status = LotStatus.CLOSED
+        lot.tokens_held = Decimal(0)
+        lot.is_illiquid = True
+        lot.unresolved_price = False
+        key = (lot.chain.value, lot.token_address)
+        lots = self._lots.get(key, [])
+        if lot in lots:
+            lots.remove(lot)
+        else:
+            for (c, t), lot_list in list(self._lots.items()):
+                if lot in lot_list or any(l.lot_id == lot.lot_id for l in lot_list):
+                    self._lots[(c, t)] = [l for l in lot_list if l.lot_id != lot.lot_id and l is not lot]
+        self._closed_lots.append(lot)
+        if len(self._closed_lots) > 100:
+            self._closed_lots.pop(0)
+        self.set_token_cooldown(lot.token_address, duration_s=300.0)
+        self._notify_capacity_freed(lot_id=lot.lot_id, token_address=lot.token_address)
+
 
     def effective_active_position_count(self) -> int:
         """Returns the sum of active open position lots plus outstanding reserved execution slots."""
@@ -641,6 +700,7 @@ class PositionBook:
         )
         now_wall_ns = time.time_ns()
         lot = OpenLot(
+            lot_id=getattr(fill, "order_id", "") or str(uuid.uuid4()),
             token_address=fill.token_address,
             chain=fill.chain,
             initial_tokens=fill.tokens_acquired,
@@ -731,7 +791,7 @@ class PositionBook:
                     lot.lot_id[:8],
                     float(pnl),
                 )
-                self._notify_capacity_freed()
+                self._notify_capacity_freed(lot_id=lot.lot_id, token_address=lot.token_address)
             else:
                 pnl = remaining * (sell_price - lot.entry_price)
                 realized_pnl += pnl
@@ -758,10 +818,22 @@ class PositionBook:
         self, chain: ChainIdentifier, token_address: str
     ) -> Decimal:
         key = (chain.value, token_address)
-        return sum(lot.tokens_held for lot in self._lots.get(key, []))
+        return sum(
+            lot.tokens_held for lot in self._lots.get(key, [])
+            if lot.status in (LotStatus.OPEN, LotStatus.PENDING_SELL)
+            and not getattr(lot, "is_illiquid", False)
+        )
 
     def open_position_count(self) -> int:
-        return sum(len(lots) for lots in self._lots.values())
+        return sum(
+            sum(
+                1 for lot in lots
+                if lot.status in (LotStatus.OPEN, LotStatus.PENDING_SELL)
+                and lot.tokens_held > Decimal(0)
+                and not getattr(lot, "is_illiquid", False)
+            )
+            for lots in self._lots.values()
+        )
 
     def unrealized_pnl_native(
         self,
@@ -772,7 +844,8 @@ class PositionBook:
         key = (chain.value, token_address)
         pnl = Decimal(0)
         for lot in self._lots.get(key, []):
-            pnl += lot.tokens_held * (current_price - lot.entry_price)
+            if lot.status in (LotStatus.OPEN, LotStatus.PENDING_SELL) and not getattr(lot, "is_illiquid", False):
+                pnl += lot.tokens_held * (current_price - lot.entry_price)
         return pnl
 
     def get_open_lots(
@@ -787,7 +860,12 @@ class PositionBook:
                 continue
             if token_address is not None and t.lower() != token_address.lower():
                 continue
-            result.extend(lots)
+            result.extend([
+                l for l in lots
+                if l.status in (LotStatus.OPEN, LotStatus.PENDING_SELL)
+                and l.tokens_held > Decimal(0)
+                and not getattr(l, "is_illiquid", False)
+            ])
         return result
 
     def get_all_open_lots(self) -> list[OpenLot]:
@@ -810,7 +888,12 @@ class PositionBook:
         if not token_address:
             return False
         lots = self.get_open_lots(chain=chain, token_address=token_address)
-        return any(lot.tokens_held > Decimal(0) for lot in lots)
+        return any(
+            lot.tokens_held > Decimal(0)
+            and lot.status in (LotStatus.OPEN, LotStatus.PENDING_SELL)
+            and not getattr(lot, "is_illiquid", False)
+            for lot in lots
+        )
 
     def evaluate_lot_exit(
         self,
@@ -2098,10 +2181,14 @@ class PositionBook:
             is_full_close = (getattr(decision, "action", "") == "CLOSE_ALL" or target_lot.tokens_held <= Decimal("1e-18"))
             if is_full_close:
                 target_lot.status = LotStatus.CLOSED
+                target_lot.tokens_held = Decimal(0)
                 if target_lot in lots:
                     lots.remove(target_lot)
-                self._notify_capacity_freed()
+                self._closed_lots.append(target_lot)
+                if len(self._closed_lots) > 100:
+                    self._closed_lots.pop(0)
                 self.set_token_cooldown(target_lot.token_address, duration_s=300.0)
+                self._notify_capacity_freed(lot_id=target_lot.lot_id, token_address=target_lot.token_address)
             else:
                 target_lot.status = LotStatus.OPEN
 
@@ -2146,6 +2233,28 @@ class RunningMetrics:
     circuit_breaker_tripped_at: float = 0.0
     launch_circuit_breaker_tripped_at: float = 0.0
     circuit_breaker_reason: str = ""
+
+    def reset(self, initial_equity_usd: Decimal = Decimal(0)) -> None:
+        """Reset all running performance metrics to initial baseline state."""
+        self.peak_equity_usd = initial_equity_usd
+        self.max_drawdown_pct = 0.0
+        self.gross_profit_usd = Decimal(0)
+        self.gross_loss_usd = Decimal(0)
+        self.total_trades = 0
+        self.winning_trades = 0
+        self.total_gas_usd = Decimal(0)
+        self.cumulative_realized_usd = Decimal(0)
+        self.consecutive_losses = 0
+        self.consecutive_launch_losses = 0
+        self.daily_peak_equity_usd = initial_equity_usd
+        self.daily_start_equity_usd = initial_equity_usd
+        self.daily_drawdown_pct = 0.0
+        self.circuit_breaker_active = False
+        self.launch_circuit_breaker_active = False
+        self.circuit_breaker_tripped_at = 0.0
+        self.launch_circuit_breaker_tripped_at = 0.0
+        self.circuit_breaker_reason = ""
+        logger.info("RunningMetrics performance tracker reset to initial state.")
 
     def is_circuit_breaker_active(self, freeze_duration_s: float = 300.0) -> bool:
         """Check if global circuit breaker is actively freezing BUY executions."""

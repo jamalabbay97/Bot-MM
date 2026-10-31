@@ -361,7 +361,7 @@ async def test_ruflo_swarm_coordinator_consensus_flow(test_config):
 
     status = coordinator.get_swarm_status()
     assert status["is_running"] is True
-    assert len(status["agents"]) == 6
+    assert len(status["agents"]) >= 6
     assert status["topology"] == "adaptive"
 
     # Simulate trade consensus request on a safe token

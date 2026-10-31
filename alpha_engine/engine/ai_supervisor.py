@@ -619,11 +619,14 @@ class AlphaSupervisorAI:
             signal=signal,
             symbol=symbol,
             recent_win_rate=self._outcome_tracker.get_metrics().win_rate_pct or 65.0,
+            ledger=self._ledger,
         )
 
     def set_ledger(self, ledger: Any) -> None:
         """Register the SQLite ledger for structured decision audit trail persistence."""
         self._ledger = ledger
+        if hasattr(self, "_council") and self._council is not None:
+            self._council.ledger = ledger
 
     def set_pattern_store(self, pattern_store: Any) -> None:
         """Register vectorized pattern memory store."""

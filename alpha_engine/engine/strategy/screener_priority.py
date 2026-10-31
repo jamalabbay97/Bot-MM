@@ -840,8 +840,9 @@ class ScreenerPriorityEvaluator:
         if breakout_price is not None and breakout_price > Decimal("0"):
             price_dist_pct = (current_price - breakout_price) / breakout_price
             
-            # If price broke down significantly below breakout price (e.g. > 2% breakdown)
-            if price_dist_pct < Decimal("-0.02"):
+            # If price broke down significantly below breakout price (e.g. > max(2%, 2 * breakout_margin_pct) breakdown)
+            breakdown_limit = -Decimal(str(max(0.02, breakout_margin_pct * 2.0)))
+            if price_dist_pct < breakdown_limit:
                 reason = f"Breakout failed: price fell {float(price_dist_pct * 100):.1f}% below breakout level"
                 self.record_decision(
                     token_address,

@@ -27,6 +27,20 @@ class AgentRole(str, Enum):
     QUANT = "QUANT"                      # Quant Math & Dynamic Risk Sizing
     EXECUTOR = "EXECUTOR"                # Execution & Ledger Journaling
     SUPERVISOR = "SUPERVISOR"            # 24/7 Self-Learning & Reflection Loop
+    LEARNER = "LEARNER"                  # Distillation, Consolidation & Heuristics Tuner
+
+
+class MessageType(str, Enum):
+    """Categorized swarm message interaction types."""
+
+    SIGNAL = "SIGNAL"                    # New candidate alpha signal announcement
+    PROPOSAL = "PROPOSAL"                # Trade proposal for consensus voting
+    VOTE = "VOTE"                        # Agent vote (APPROVE / REJECT / ABSTAIN)
+    REQUEST = "REQUEST"                  # Synchronous or async RPC query to peer agent
+    RESPONSE = "RESPONSE"                # RPC query response
+    RULE_CONSOLIDATION = "RULE_CONSOLIDATION" # Distilled semantic rule update
+    VETO = "VETO"                        # Unconditional circuit-breaker veto
+    HEARTBEAT = "HEARTBEAT"              # Liveness and telemetry heartbeat
 
 
 class SwarmTopology(str, Enum):
@@ -75,6 +89,10 @@ class SwarmMessage:
     content: Optional[str] = None
     payload: dict[str, Any] = field(default_factory=dict)
     correlation_id: Optional[str] = None
+    reply_to: Optional[str] = None
+    status: str = "OK"
+    priority: int = 1                    # 1=Normal, 2=High, 3=Critical/Veto
+    is_request: bool = False
     timestamp_ns: int = field(default_factory=time.time_ns)
 
     def __post_init__(self) -> None:
@@ -84,12 +102,16 @@ class SwarmMessage:
     def to_dict(self) -> dict[str, Any]:
         return {
             "message_id": self.message_id,
-            "sender_role": self.sender_role.value,
-            "target_role": self.target_role.value if self.target_role else "BROADCAST",
+            "sender_role": self.sender_role.value if hasattr(self.sender_role, "value") else str(self.sender_role),
+            "target_role": self.target_role.value if (self.target_role and hasattr(self.target_role, "value")) else ("BROADCAST" if not self.target_role else str(self.target_role)),
             "message_type": self.message_type,
             "content": self.content,
             "payload": self.payload,
             "correlation_id": self.correlation_id,
+            "reply_to": self.reply_to,
+            "status": self.status,
+            "priority": self.priority,
+            "is_request": self.is_request,
             "timestamp_ns": self.timestamp_ns,
         }
 

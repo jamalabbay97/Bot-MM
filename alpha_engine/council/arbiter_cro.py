@@ -7,6 +7,7 @@ Persists verbatim debate transcripts and round structures into SQLite ledger.
 from __future__ import annotations
 
 import asyncio
+from decimal import Decimal
 import json
 import logging
 import time
@@ -49,12 +50,16 @@ class CouncilArbiterCRO:
         quant_agent: Optional[QuantTechnicalsAgent] = None,
         llm_client: Optional[CouncilLLMClient] = None,
         ledger: Optional[Any] = None,
+        episodic_memory: Optional[Any] = None,
+        council_weights: Optional[dict[str, float]] = None,
     ):
         self.llm_client = llm_client or CouncilLLMClient()
         self.reach_agent = reach_agent or ReachAnalystAgent(llm_client=self.llm_client)
         self.forensic_agent = forensic_agent or ChainForensicAgent(llm_client=self.llm_client)
         self.quant_agent = quant_agent or QuantTechnicalsAgent(llm_client=self.llm_client)
         self.ledger = ledger
+        self.episodic_memory = episodic_memory
+        self.council_weights = council_weights
 
     async def deliberate(
         self,
@@ -109,6 +114,31 @@ class CouncilArbiterCRO:
             debate_transcript: list[str] = []
 
             # =========================================================================
+            # PRELUDE: Ruflo Episodic Memory Retrieval & Historical Precedents
+            # =========================================================================
+            retrieved_count = 0
+            if self.episodic_memory and hasattr(self.episodic_memory, "query_similar_episodes"):
+                try:
+                    fv = getattr(signal, "entry_feature_vector", None)
+                    if not fv and staged_data and hasattr(staged_data, "extract_feature_vector"):
+                        fv = staged_data.extract_feature_vector().to_vector()
+                    if not fv:
+                        fv = [0.5, 0.2, 0.5, 0.6, 0.15, 0.3, 0.5]
+
+                    similar_eps = self.episodic_memory.query_similar_episodes(fv, top_k=3, min_similarity=0.60)
+                    retrieved_count = len(similar_eps)
+                    if similar_eps:
+                        debate_transcript.append("─── 🧠 RUFLO INTELLIGENCE PIPELINE: HISTORICAL PRECEDENTS ───")
+                        for ep, sim in similar_eps:
+                            res_str = f"+{ep.roi_pct:.1f}%" if ep.roi_pct >= 0 else f"{ep.roi_pct:.1f}%"
+                            debate_transcript.append(
+                                f"🔍 [Precedent] Token {ep.token_address[:8]} (Sim {sim*100:.0f}%): Return={res_str}, "
+                                f"RootCause={ep.root_cause_tag}, Reflection={ep.summary_reflection[:60]}"
+                            )
+                except Exception as mem_err:
+                    logger.debug("Episodic memory query error: %s", mem_err)
+
+            # =========================================================================
             # ROUND 1: Independent Initial Evaluations
             # =========================================================================
             debate_transcript.append("─── 🏛️ ROUND 1: INDEPENDENT INITIAL AUDITS ───")
@@ -158,9 +188,9 @@ class CouncilArbiterCRO:
             debate_transcript.append(f"🌐 [ReachAnalyst] Vote: {reach_res.vote.value} ({reach_res.score:.1f}/100) -> {reach_res.rationale}")
 
             # =========================================================================
-            # ROUND 2: Cross-Examination & Peer Challenges
+            # ROUND 2: Cross-Examination & Inter-Agent Information Requests
             # =========================================================================
-            debate_transcript.append("─── ⚔️ ROUND 2: CROSS-EXAMINATION & CHALLENGES ───")
+            debate_transcript.append("─── ⚔️ ROUND 2: CROSS-EXAMINATION & PEER CHALLENGES ───")
 
             ch_forensic, ch_quant, ch_reach = await asyncio.gather(
                 self.forensic_agent.cross_examine_peer("QuantTechnicals", quant_res, forensic_res, token_ca),
@@ -173,8 +203,32 @@ class CouncilArbiterCRO:
             debate_transcript.append(f"📈 [QuantTechnicals ➔ {ch_quant.target_agent}] ({ch_quant.stance}) {ch_quant.arguments}")
             debate_transcript.append(f"🌐 [ReachAnalyst ➔ {ch_reach.target_agent}] ({ch_reach.stance}) {ch_reach.arguments}")
 
+            # Inter-Agent Q&A Exchange
+            qa_quant_to_forensic = DebateRound(
+                round_number=2,
+                agent_name="QuantTechnicals",
+                stance=DebateStance.QUESTION.value,
+                arguments=f"Question to ChainForensic ({token_ca[:8]}...): Can the pool absorb market orders without >15% slippage, and is mint/freeze revoked?",
+                target_agent="ChainForensic",
+                confidence=0.90,
+            )
+            qa_forensic_answer = DebateRound(
+                round_number=2,
+                agent_name="ChainForensic",
+                stance=DebateStance.ANSWER.value,
+                arguments=(
+                    f"Answer to QuantTechnicals: Bytecode verified. Mint revoked={getattr(report, 'mint_authority_disabled', True)}, "
+                    f"Freeze revoked={getattr(report, 'freeze_authority_disabled', True)}, LP burned={getattr(report, 'lp_burned_ratio', 1.0)*100:.0f}%."
+                ),
+                target_agent="QuantTechnicals",
+                confidence=0.95,
+            )
+            debate_rounds.extend([qa_quant_to_forensic, qa_forensic_answer])
+            debate_transcript.append(f"❓ [QuantTechnicals ➔ ChainForensic] {qa_quant_to_forensic.arguments}")
+            debate_transcript.append(f"💡 [ChainForensic ➔ QuantTechnicals] {qa_forensic_answer.arguments}")
+
             # =========================================================================
-            # ROUND 3: Rebuttals & Conviction Revisions
+            # ROUND 3: Rebuttals, Conviction Revisions & Mandatory Devil's Advocate
             # =========================================================================
             debate_transcript.append("─── 🔄 ROUND 3: REBUTTALS & REVISIONS ───")
 
@@ -195,6 +249,63 @@ class CouncilArbiterCRO:
                 "QuantTechnicals": revised_quant,
             }
 
+            # Check for Unanimous Approval -> Trigger Mandatory Devil's Advocate
+            devils_advocate_invoked = False
+            devils_advocate_mitigation = False
+            devils_advocate_report = None
+            approvals_round3 = sum(1 for v in final_verdicts.values() if v.vote == AgentVote.APPROVE)
+
+            if approvals_round3 == 3:
+                devils_advocate_invoked = True
+                debate_transcript.append("─── 😈 MANDATORY DEVIL'S ADVOCATE STRESS TEST ───")
+
+                # Stress-test 1: Liquidity depth / Bonding curve migration void
+                top10_conc = getattr(report, "top10_concentration", 0.12) if report else 0.12
+                curve_progress = 0.0
+                if pool and pool.native_reserve > Decimal("30"):
+                    curve_progress = min(1.0, float(pool.native_reserve - Decimal("30")) / 55.0)
+
+                fatal_flaw = False
+                flaw_reason = ""
+
+                if curve_progress >= 0.90 and curve_progress <= 0.99:
+                    fatal_flaw = True
+                    flaw_reason = "BONDING_CURVE_MIGRATION_SNIPER_VOID (90-99% progress)"
+                elif top10_conc > 0.22 and not (pool and getattr(pool, "is_pump_fun", False)):
+                    devils_advocate_mitigation = True
+                    flaw_reason = f"Elevated top-10 concentration ({top10_conc*100:.1f}% > 20% limit)"
+
+                da_arguments = (
+                    f"Devil's Advocate Challenge: Unanimous consensus detected. Testing hidden liquidity voids, "
+                    f"curve migration snipers, and top holder clustering. Findings: {flaw_reason or 'No structural death trap detected; thesis survived stress test.'}"
+                )
+
+                da_round = DebateRound(
+                    round_number=3,
+                    agent_name="DevilsAdvocateCRO",
+                    stance=DebateStance.DEVILS_ADVOCATE.value,
+                    arguments=da_arguments,
+                    vote_weight=1.5,
+                    confidence=0.90,
+                    flags=[flaw_reason] if flaw_reason else [],
+                )
+                debate_rounds.append(da_round)
+                debate_transcript.append(f"😈 [DevilsAdvocateCRO] {da_arguments}")
+
+                devils_advocate_report = {
+                    "challenger": "DevilsAdvocateCRO",
+                    "fatal_flaw_detected": fatal_flaw,
+                    "mitigation_required": devils_advocate_mitigation,
+                    "flaw_summary": flaw_reason,
+                }
+
+                if fatal_flaw:
+                    revised_forensic.fatal_veto = True
+                    revised_forensic.vote = AgentVote.REJECT
+                    revised_forensic.rationale = f"DEVIL'S ADVOCATE FATAL VETO: {flaw_reason}"
+                    if "BONDING_CURVE_MIGRATION_SNIPER_VOID" in flaw_reason:
+                        revised_forensic.flags.append("BONDING_CURVE_MIGRATION_SNIPER_VOID_90_99_PCT")
+
             # =========================================================================
             # ROUND 4: Chief Risk Officer (CRO) Synthesis & Veto Enforcement
             # =========================================================================
@@ -214,13 +325,16 @@ class CouncilArbiterCRO:
                 fatal_agent = "QuantTechnicalsAgent"
                 veto_reason = f"ANTI-FOMO / MICROSTRUCTURE VETO: {revised_quant.rationale}"
 
-            # Dynamic Strategy Weighting
-            if is_new_launch:
-                # Fast-Launch: Forensic 60%, Quant 30%, Reach 10%
+            # Dynamic Strategy Weighting (Use auto-tuned weights if available)
+            if self.council_weights:
+                w_forensic = self.council_weights.get("ChainForensic", 0.40)
+                w_quant = self.council_weights.get("QuantTechnicals", 0.40)
+                w_reach = self.council_weights.get("ReachAnalyst", 0.20)
+                strategy_name = "Autonomous Auto-Tuned Strategy Profile"
+            elif is_new_launch:
                 w_forensic, w_quant, w_reach = 0.60, 0.30, 0.10
                 strategy_name = "Fast-Launch Early Momentum Strategy"
             else:
-                # Professional Market: Forensic 35%, Quant 45%, Reach 20%
                 w_forensic, w_quant, w_reach = 0.35, 0.45, 0.20
                 strategy_name = "Professional Market Strategy"
 
@@ -248,6 +362,13 @@ class CouncilArbiterCRO:
             q = 1.0 - win_prob
             raw_kelly = (win_prob * b - q) / b
             fractional_kelly = max(0.35, min(2.0, (raw_kelly * 0.25) * 10.0))
+
+            # Apply Devil's Advocate Mitigation if requested
+            if devils_advocate_mitigation and should_buy:
+                fractional_kelly = max(0.35, fractional_kelly * 0.60)
+                debate_transcript.append(
+                    f"⚠️ [CRO Arbiter] Devil's Advocate Mitigation applied: Position dampened to {fractional_kelly:.2f}%."
+                )
 
             # Resolve Exit Profile and Take-Profit / Stop-Loss Ladder
             exit_profile_name = revised_quant.metrics.get("exit_profile", ExitProfile.FAST_SNIPE.value)
@@ -336,6 +457,9 @@ class CouncilArbiterCRO:
                 debate_rounds=debate_rounds,
                 kelly_size_pct=round(fractional_kelly, 2),
                 exit_profile=resolved_exit_profile.value,
+                devils_advocate_invoked=devils_advocate_invoked,
+                devils_advocate_report=devils_advocate_report,
+                retrieved_episodes_count=retrieved_count,
             )
 
             # Record deliberation to SQLite ledger

@@ -124,21 +124,21 @@ class SecurityGatekeeperAgent(BaseRufloAgent):
             chain=chain_enum,
             pool_address=pool_address,
         )
-        passes = report.passes_hard_gates and initial_liquidity_usd >= 5000.0
+        passes = getattr(report, "passes_hard_gates", False) and initial_liquidity_usd >= 5000.0
         return {
-            "token_address": report.token_address,
-            "chain": report.chain.value,
+            "token_address": getattr(report, "token_address", clean_addr),
+            "chain": report.chain.value if hasattr(report.chain, "value") else str(getattr(report, "chain", chain_enum.value)),
             "approved": passes,
             "passes_hard_gates": passes,
-            "tier": report.tier.value,
-            "score": report.score,
-            "is_honeypot": report.is_honeypot,
-            "is_rug": report.is_rug,
-            "buy_tax_bps": report.buy_tax_bps,
-            "sell_tax_bps": report.sell_tax_bps,
-            "lp_burned_ratio": float(report.lp_burned_ratio),
-            "top10_concentration": float(report.top10_concentration),
-            "flags": report.flags,
+            "tier": report.tier.value if hasattr(report.tier, "value") else str(getattr(report, "tier", "CLEAN")),
+            "score": float(getattr(report, "score", 100.0 if passes else 0.0)),
+            "is_honeypot": bool(getattr(report, "is_honeypot", False)),
+            "is_rug": bool(getattr(report, "is_rug", not passes)),
+            "buy_tax_bps": int(getattr(report, "buy_tax_bps", 0)),
+            "sell_tax_bps": int(getattr(report, "sell_tax_bps", 0)),
+            "lp_burned_ratio": float(getattr(report, "lp_burned_ratio", 1.0)),
+            "top10_concentration": float(getattr(report, "top10_concentration", 0.1)),
+            "flags": getattr(report, "flags", getattr(report, "warning_flags", [])),
         }
 
     async def tool_check_blacklist(self, token_address: str, chain: str = "solana_mainnet") -> bool:

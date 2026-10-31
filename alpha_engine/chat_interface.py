@@ -458,6 +458,7 @@ class ConversationalSupervisor:
             if not self.supervisor:
                 return "AlphaSupervisorAI is not attached, cannot perform deep web audit."
             result = await self.supervisor.deep_web_audit(query, query)
+            return str(result)
         except Exception as e:
             return f"Deep Research encountered an error: {e}"
 
@@ -510,6 +511,44 @@ class ConversationalSupervisor:
         lines.append("- أقصى تراجع (Max Drawdown) < 8.0%")
         lines.append("- اعتماد أرباح الصفقات الشاذة (Outlier Dependency) <= 60%")
         lines.append("- اجتياز اختبار استقرار المعلمات (Perturbation Test +/-10%)")
+        return "\n".join(lines)
+
+    async def tool_dashboard_summary(self) -> str:
+        """Returns deep-link and high-level vitals of the Observability Hub."""
+        from alpha_engine.dashboard import get_telemetry_aggregator
+        agg = get_telemetry_aggregator()
+        snapshot = await agg.get_full_telemetry_snapshot()
+        sys = snapshot.get("system", {})
+        port = snapshot.get("portfolio", {})
+        conn = snapshot.get("connections", {})
+
+        lines = [
+            "### 🖥️ **AlphaBot Institutional Observability Hub**",
+            "🔗 **Web Dashboard:** `http://localhost:8000/`",
+            "🟢 **Status:** Active WebSocket Streaming",
+            f"⏱️ **Uptime:** {int(sys.get('uptime_seconds', 0)) // 60}m | **RAM:** {sys.get('memory_mb', 0)} MB",
+            f"💼 **Paper Equity:** `${port.get('portfolio_equity_usd', 10000.0):.2f}` (PnL: `${port.get('total_realized_pnl_usd', 0.0):+.2f}`)",
+            f"⚡ **RPC Latency:** Solana `{conn.get('solana_rpc', {}).get('latency_ms', 45)}ms` | Base `{conn.get('base_rpc', {}).get('latency_ms', 60)}ms`",
+            "",
+            "Open your browser at `http://localhost:8000/` to inspect real-time Decision Flow Graphs, 7-Strategy Leaderboards, and verbatim Council debates."
+        ]
+        return "\n".join(lines)
+
+    async def tool_strategies_leaderboard(self) -> str:
+        """Returns live performance metrics for all 7 institutional strategies."""
+        from alpha_engine.dashboard import get_telemetry_aggregator
+        agg = get_telemetry_aggregator()
+        strats = await agg.get_strategy_performance()
+
+        lines = [
+            "### 📊 **Institutional Trading Strategies Leaderboard**\n",
+            "| Strategy | Status | Weight | Win Rate | Sharpe | Sortino | Profit Factor |",
+            "|---|---|---|---|---|---|---|",
+        ]
+        for s in strats:
+            lines.append(
+                f"| **{s['strategy_type']}** | `{s['status']}` | `{s['weight']*100:.1f}%` | `{s['win_rate']*100:.1f}%` | `{s['sharpe_ratio']:.2f}` | `{s['sortino_ratio']:.2f}` | `{s['profit_factor']:.2f}` |"
+            )
         return "\n".join(lines)
 
     async def tool_council_debate(self, token_ca: str) -> str:
@@ -603,7 +642,7 @@ class ConversationalSupervisor:
         }
 
         lines = [
-            f"### 🔍 المسار المؤسسي للعملة (7-Stage Institutional Lifecycle Trace)\n",
+            "### 🔍 المسار المؤسسي للعملة (7-Stage Institutional Lifecycle Trace)\n",
             f"**عنوان العقد:** `{clean_ca}`\n",
             f"**عدد المحطات المسجلة:** {len(events)} محطة\n",
         ]
@@ -659,7 +698,7 @@ class ConversationalSupervisor:
         ]
 
         lines = [
-            f"### 🔬 مخطط تدفق خط الأنابيب المؤسسي (Institutional Pipeline Flow)\n",
+            "### 🔬 مخطط تدفق خط الأنابيب المؤسسي (Institutional Pipeline Flow)\n",
             f"**النافذة الزمنية:** آخر `{lookback_hours:.0f}` ساعة | **المراحل السبع المؤسسية:**\n",
             "```text",
         ]
@@ -689,7 +728,7 @@ class ConversationalSupervisor:
             lines.append(f"[{label.upper()}] ─── ({total:,} tokens)")
             lines.append(f"  ├── ✅ Passed: {passed:,} ({pass_rate:.1f}%)")
             lines.append(f"  └── ❌ Rejected / Filtered: {rejected:,} ({drop_rate:.1f}%)")
-            lines.append(f"        │")
+            lines.append("        │")
 
         lines.append("        ▼")
         lines.append("  [CLOSED-LOOP REINFORCEMENT & SELF-LEARNING]")
@@ -791,6 +830,14 @@ class ConversationalSupervisor:
         """
         q = query.strip()
         lower_q = q.lower()
+
+        # Dashboard deep link & vitals
+        if lower_q in ("/dashboard", "dashboard", "لوحة التحكم", "داشبورد", "لوحة المراقبة"):
+            return await self.tool_dashboard_summary()
+
+        # Strategy leaderboard
+        if lower_q in ("/strategies", "/strategy", "strategies", "الاستراتيجيات", "استراتيجيات"):
+            return await self.tool_strategies_leaderboard()
 
         # Lifecycle trace
         if lower_q.startswith("/trace") or lower_q.startswith("trace ") or lower_q.startswith("تتبع"):

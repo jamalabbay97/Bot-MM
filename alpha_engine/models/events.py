@@ -110,6 +110,7 @@ class SignalEvent(BaseModel):
     market_cap_usd: Optional[Decimal] = Field(default=None, description="Market cap in USD at signal generation")
     strategy_pattern: Optional[str] = Field(default=None, description="Strategy pattern: fast_snipe, wave2_breakout, revival_breakout")
     strategy_type: Optional[StrategyType] = Field(default=None, description="Explicit strategy classification")
+    strategy_name: Optional[str] = Field(default=None, description="Strategy name or pattern associated with signal")
     token_age_hours: Optional[float] = Field(default=None, description="Token age in hours at signal trigger")
     consolidation_length_hours: Optional[float] = Field(default=None, description="Consolidation duration in hours")
     volume_surge_multiplier: Optional[float] = Field(default=None, description="Volume surge over SMA")
@@ -119,6 +120,23 @@ class SignalEvent(BaseModel):
     originating_channel: Optional[str] = Field(default=None, description="Originating channel or DM handle")
     is_direct_dm: bool = Field(default=False, description="Flag indicating signal was directly sent via Telegram DM")
     custom_amount_native: Optional[Decimal] = Field(default=None, description="Custom trade amount in native asset for manual trades")
+
+    @model_validator(mode="before")
+    @classmethod
+    def populate_strategy_name(cls, data: Any) -> Any:
+        if isinstance(data, dict):
+            if not data.get("strategy_name"):
+                strat = (
+                    data.get("strategy_pattern")
+                    or (
+                        data.get("strategy_type").value
+                        if hasattr(data.get("strategy_type"), "value")
+                        else str(data.get("strategy_type") or "")
+                    )
+                    or "default"
+                )
+                data["strategy_name"] = strat
+        return data
 
     @property
     def signal_source(self) -> SignalSource:

@@ -127,6 +127,10 @@ async def test_bootstrap_from_real_database_if_exists():
         pytest.skip("paper_trading.db not available in test environment")
 
     async with SQLiteLedger(real_db) as ledger:
+        closed_trades = await ledger.get_closed_trades_dataset(limit=1)
+        if not closed_trades:
+            pytest.skip("paper_trading.db exists but contains no closed trades to bootstrap")
+
         feedback = AdaptiveFeedbackEngine()
         summary = await feedback.bootstrap_from_ledger(ledger, max_trades=100)
 

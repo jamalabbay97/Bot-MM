@@ -286,6 +286,34 @@ class PaperTradingEngine:
         self._strategy_tournament: StrategyTournamentRegistry = StrategyTournamentRegistry(ledger=None)
         self._strategy_generator: Optional[AutonomousStrategyGenerator] = None
 
+        # Institutional Strategy Manager & Self-Learning Engine
+        from alpha_engine.engine.strategy.strategy_manager import StrategyManager
+        from alpha_engine.engine.self_learning.self_learning_engine import SelfLearningEngine
+        from alpha_engine.dashboard.telemetry import DashboardTelemetryAggregator
+        from alpha_engine.dashboard.server import DashboardServer
+
+        self.strategy_manager = StrategyManager(config=config)
+        self.self_learning_engine = SelfLearningEngine(config=config, ledger=None)
+
+        # Real-Time Observability Hub
+        self.dashboard_telemetry = DashboardTelemetryAggregator(
+            engine_runner=self,
+            strategy_manager=self.strategy_manager,
+            self_learning_engine=self.self_learning_engine,
+            swarm_coordinator=self._swarm_coordinator,
+            position_book=self._position_book,
+            ledger=None,
+            rpc_health_monitor=self._rpc_monitor,
+            supervisor=self._ai_supervisor,
+            staging_buffer=self._wave2_buffer,
+        )
+        dashboard_port = int(getattr(config, "dashboard_port", 8000))
+        self.dashboard_server = DashboardServer(
+            host="0.0.0.0",
+            port=dashboard_port,
+            aggregator=self.dashboard_telemetry,
+        )
+
     @property
     def strategy_tournament(self) -> StrategyTournamentRegistry:
         return self._strategy_tournament
@@ -705,6 +733,7 @@ class PaperTradingEngine:
         now_s = time.time()
         now_ns = time.time_ns()
         for lot in open_lots:
+            logger.info("Force-closing lot %s (chain=%s) at timestamp_ns=%d", lot.lot_id, lot.chain.value, now_ns)
             pool = self._pool_registry.get(lot.token_address) or (self._pool_registry.get(lot.pool_address) if lot.pool_address else None)
             if pool is None or getattr(pool, "last_updated_block", 0) <= 0:
                 pool = PoolState(
@@ -902,7 +931,13 @@ class PaperTradingEngine:
         """Records closed trade in memory and dispatches rich Telegram alert."""
         ep = getattr(lot, "entry_price", Decimal(0))
         xp = getattr(exit_fill, "effective_price", Decimal(0))
-        pct = float((xp - ep) / ep * 100) if ep > 0 else 0.0
+        cost_basis = getattr(lot, "cost_basis_native", Decimal(0))
+        if cost_basis > Decimal(0):
+            pct = float(pnl_native / cost_basis * 100)
+        elif ep > Decimal(0):
+            pct = float((xp - ep) / ep * 100)
+        else:
+            pct = 0.0
         is_win = exit_pnl_usd > 0
         dur_s = max(0.0, (time.time_ns() - lot.open_timestamp_ns) / 1e9) if getattr(lot, "open_timestamp_ns", 0) > 0 else 0.0
 
@@ -915,6 +950,10 @@ class PaperTradingEngine:
         side_str = "SELL (PARTIAL)" if is_partial else "SELL"
         exit_label = f"{decision_reason} (partial)" if is_partial and "partial" not in decision_reason.lower() else decision_reason
 
+        native_price = self._eth_price if lot.chain == ChainIdentifier.BASE_MAINNET else self._sol_price
+        ep_usd = float(ep * native_price) if ep > 0 and native_price > 0 else 0.0
+        xp_usd = float(xp * native_price) if xp > 0 and native_price > 0 else 0.0
+
         self._recent_closed_trades.append({
             "token_address": lot.token_address,
             "chain": lot.chain,
@@ -923,6 +962,8 @@ class PaperTradingEngine:
             "side": side_str,
             "entry_price": ep,
             "exit_price": xp,
+            "entry_price_usd": ep_usd,
+            "exit_price_usd": xp_usd,
             "realized_pnl_usd": exit_pnl_usd,
             "realized_pnl_pct": pct,
             "exit_reason": exit_label,
@@ -930,6 +971,28 @@ class PaperTradingEngine:
             "is_win": is_win,
             "timestamp": time.time(),
         })
+
+        # Self-Learning Engine & Ruflo Swarm post-mortem hook
+        closed_trade_payload = {
+            "trade_id": str(getattr(lot, "lot_id", uuid.uuid4().hex[:8])),
+            "token_address": lot.token_address,
+            "chain": lot.chain.value if hasattr(lot.chain, "value") else str(lot.chain),
+            "strategy_type": getattr(lot, "strategy_type", "MOMENTUM_BREAKOUT"),
+            "realized_pnl_usd": float(exit_pnl_usd),
+            "roi_pct": pct,
+            "actual_slippage_bps": int(getattr(exit_fill, "slippage_bps", 50)),
+            "fill_latency_ms": float(getattr(exit_fill, "fill_latency_ms", 35.0)),
+            "exit_reason": exit_label,
+            "duration_s": dur_s,
+            "is_win": is_win,
+            "timestamp_ns": time.time_ns(),
+        }
+        try:
+            asyncio.create_task(self.self_learning_engine.on_trade_closed(closed_trade_payload))
+            if self._swarm_coordinator:
+                asyncio.create_task(self._swarm_coordinator.on_trade_closed(closed_trade_payload))
+        except Exception as learn_err:
+            logger.debug("Failed triggering post-mortem self-learning hook: %s", learn_err)
 
         d_reason_lower = str(decision_reason).lower()
         if "emergency_drain" in d_reason_lower or "rug_liquidity_drain" in d_reason_lower:
@@ -1235,10 +1298,8 @@ class PaperTradingEngine:
                 passes_hard_gates=True,
             )
 
-        # 2. Get or create pool state
-        pool = self._pool_registry.get(clean_addr)
-        if pool is None:
-            pool = self.get_or_create_initial_pool_state(chain_id, clean_addr, "")
+        # 2. Get or fetch authoritative pool state
+        pool = await self.get_or_fetch_pool_state(chain_id, clean_addr, "")
 
         # 3. Create high-conviction BUY SignalEvent with is_direct_dm=True and custom_amount_native
         mcap = pool.calculate_market_cap_usd(native_price_usd=native_p) if pool else Decimal("10000.0")
@@ -1287,7 +1348,7 @@ class PaperTradingEngine:
         if pool is None and open_lots and open_lots[0].pool_address:
             pool = self._pool_registry.get(open_lots[0].pool_address)
         if pool is None:
-            pool = self.get_or_create_initial_pool_state(chain_id, clean_addr, "")
+            pool = await self.get_or_fetch_pool_state(chain_id, clean_addr, open_lots[0].pool_address if open_lots else "")
 
         current_price = pool.spot_price_native_per_token if pool and pool.spot_price_native_per_token > 0 else open_lots[0].entry_price
         native_price = self._eth_price if chain_id == ChainIdentifier.BASE_MAINNET else self._sol_price
@@ -1624,7 +1685,7 @@ class PaperTradingEngine:
                 )
 
             # 3. Market data & Opportunity Scoring
-            pool = self.get_or_create_initial_pool_state(record.chain, record.token_address)
+            pool = await self.get_or_fetch_pool_state(record.chain, record.token_address)
             score = self._calculate_opportunity_score(pool, report, record.chain)
             record.opportunity_score = score
 
@@ -1724,6 +1785,9 @@ class PaperTradingEngine:
                     record.request_id, TokenRequestState.REJECTED, rejection_reason=record.rejection_reason
                 )
             return
+
+        if pool is None or getattr(pool, "last_updated_block", 0) <= 0:
+            pool = await self.get_or_fetch_pool_state(record.chain, record.token_address)
 
         mcap = pool.calculate_market_cap_usd(native_price_usd=native_p) if pool else Decimal("10000.0")
         signal = SignalEvent(
@@ -1907,7 +1971,7 @@ class PaperTradingEngine:
                 self._waiting_for_capacity.insert(0, candidate)
             return
 
-        pool = self.get_or_create_initial_pool_state(candidate.chain, candidate.token_address)
+        pool = await self.get_or_fetch_pool_state(candidate.chain, candidate.token_address)
         report = None
         if hasattr(self, "_gatekeeper") and self._gatekeeper is not None:
             try:
@@ -1936,6 +2000,7 @@ class PaperTradingEngine:
                 continue
             except asyncio.CancelledError:
                 break
+            logger.debug("Drained user request queue for request_id=%s (token=%s)", record.request_id, record.token_address)
             self._user_request_queue.task_done()
 
     def _extract_gatekeeper_rejection_reason(self, report: SecurityReport) -> str:
@@ -1992,6 +2057,17 @@ class PaperTradingEngine:
             "passed": passed,
             "timestamp": time.time(),
         })
+        if hasattr(self, "dashboard_telemetry") and self.dashboard_telemetry:
+            chain_str = chain.value if hasattr(chain, "value") else str(chain)
+            self.dashboard_telemetry.record_activity(
+                category="SECURITY",
+                title=f"Gatekeeper: {'PASSED' if passed else 'REJECTED'}",
+                details=reason,
+                level="SUCCESS" if passed else "WARNING",
+                component="SecurityGatekeeper",
+                token_address=token_address,
+                metadata={"chain": chain_str, "passed": passed},
+            )
 
     def _calculate_news_sentiment(self, text: str) -> float:
         bullish_words = {"bull", "bullish", "moon", "pump", "surge", "breakout", "listing", "ath", "launch", "rally", "partnership", "buy", "up"}
@@ -2020,6 +2096,191 @@ class PaperTradingEngine:
             "sentiment": sentiment,
             "timestamp": time.time(),
         })
+
+    async def get_or_fetch_pool_state(
+        self,
+        chain: ChainIdentifier,
+        token_address: str,
+        pool_address: str = "",
+        force_refresh: bool = False,
+    ) -> PoolState:
+        """
+        Authoritatively resolves real on-chain DEX pool state, spot price, and reserves.
+        1. Checks local PoolRegistry for a verified, live pool (last_updated_block > 0 and fresh).
+        2. If unverified or missing, queries DexScreener API for live pairs and exact reserves.
+        3. If DexScreener has no data, falls back to GeckoTerminal pool stats.
+        4. Falls back to initial bonding curve pool ONLY if token has no external pair yet.
+        """
+        now = time.time()
+        clean_token = token_address.strip()
+        pool = self._pool_registry.get(clean_token)
+        if pool is None and pool_address:
+            pool = self._pool_registry.get(pool_address)
+
+        if (
+            not force_refresh
+            and pool is not None
+            and (now - getattr(pool, "timestamp_s", 0)) < 15.0
+            and pool.spot_price_native_per_token > Decimal(0)
+        ):
+            return pool
+
+        is_sol = chain == ChainIdentifier.SOLANA_MAINNET
+        from alpha_engine.ingestion.svm import is_valid_solana_pubkey
+        valid_addr = is_valid_solana_pubkey(clean_token) if is_sol else (clean_token.startswith("0x") and len(clean_token) == 42)
+        if not valid_addr:
+            if pool is not None:
+                return pool
+            return self.get_or_create_initial_pool_state(chain, clean_token, pool_address)
+
+        chain_str = "solana" if is_sol else "base"
+        sol_p = Decimal(str(getattr(self._cfg, "sol_price_usd", self._sol_price or Decimal("150.0"))))
+        eth_p = Decimal(str(getattr(self._cfg, "eth_price_usd", self._eth_price or Decimal("3400.0"))))
+        native_price = sol_p if is_sol else eth_p
+
+        # 1. Authoritative lookup on DexScreener
+        owns_session = False
+        session = self._session
+        if session is None or session.closed:
+            session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=5.0))
+            owns_session = True
+
+        try:
+            url = f"https://api.dexscreener.com/latest/dex/tokens/{clean_token}"
+            async with session.get(
+                url,
+                headers={"User-Agent": "Bot-MM-Engine/1.0"},
+                timeout=aiohttp.ClientTimeout(total=4.0),
+            ) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    pairs = data.get("pairs") or []
+                    chain_pairs = [
+                        p for p in pairs
+                        if str(p.get("chainId", "")).lower() == chain_str
+                    ]
+                    if chain_pairs:
+                        selected = None
+                        if pool_address:
+                            selected = next(
+                                (p for p in chain_pairs if str(p.get("pairAddress", "")).lower() == pool_address.lower()),
+                                None,
+                            )
+                        if selected is None:
+                            selected = max(
+                                chain_pairs,
+                                key=lambda x: float((x.get("liquidity") or {}).get("usd") or 0.0),
+                            )
+
+                        price_usd = float(selected.get("priceUsd") or 0.0)
+                        price_native_str = selected.get("priceNative")
+                        liq_dict = selected.get("liquidity") or {}
+                        liq_usd = float(liq_dict.get("usd") or 0.0)
+                        quote_res = liq_dict.get("quote")
+                        base_res = liq_dict.get("base")
+                        pair_addr = str(selected.get("pairAddress") or pool_address or clean_token)
+
+                        if price_usd > 0 or (price_native_str and float(price_native_str) > 0):
+                            if price_native_str and float(price_native_str) > 0:
+                                spot_p = Decimal(str(price_native_str))
+                            else:
+                                spot_p = Decimal(str(price_usd)) / native_price if native_price > Decimal(0) else Decimal("0.000000028")
+
+                            if quote_res is not None and float(quote_res) > 0:
+                                native_res = Decimal(str(quote_res))
+                            elif liq_usd > 0 and native_price > Decimal(0):
+                                native_res = Decimal(str(liq_usd)) / Decimal("2.0") / native_price
+                            else:
+                                native_res = Decimal("30.0")
+
+                            if base_res is not None and float(base_res) > 0:
+                                token_res = Decimal(str(base_res))
+                            elif spot_p > Decimal(0):
+                                token_res = native_res / spot_p
+                            else:
+                                token_res = Decimal("1073000000.0")
+
+                            resolved_pool = PoolState(
+                                pool_address=pair_addr,
+                                chain=chain,
+                                token_address=clean_token,
+                                token_reserve=token_res,
+                                native_reserve=native_res,
+                                fee_numerator=25,
+                                fee_denominator=10000,
+                                last_updated_block=1000,
+                                timestamp_s=now,
+                                token_decimals=6,
+                                native_decimals=9 if chain == ChainIdentifier.SOLANA_MAINNET else 18,
+                            )
+                            self._pool_registry.set(clean_token, resolved_pool)
+                            if pair_addr:
+                                self._pool_registry.set(pair_addr, resolved_pool)
+                            self._metrics_aggregator.record_pool_state(resolved_pool)
+                            if hasattr(self, "_ai_supervisor") and self._ai_supervisor:
+                                self._ai_supervisor.record_price_update(clean_token, spot_p)
+                            logger.info(
+                                "get_or_fetch_pool_state: Authoritative DexScreener pool resolved for %s (%s): price=%s native ($%.6f), reserve=%.2f native, liq=$%.2f",
+                                clean_token[:10],
+                                pair_addr[:10],
+                                spot_p,
+                                price_usd,
+                                float(native_res),
+                                liq_usd,
+                            )
+                            return resolved_pool
+        except Exception as exc:
+            logger.debug("get_or_fetch_pool_state: DexScreener lookup failed for %s: %s", clean_token[:10], exc)
+        finally:
+            if owns_session and not session.closed:
+                await session.close()
+
+        # 2. Query GeckoTerminal fallback
+        try:
+            oracle = self.market_oracle
+            stats = await oracle.get_geckoterminal_pool_stats(chain_str, clean_token)
+            if stats and stats.get("base_token_price_usd", 0) > 0:
+                price_usd = float(stats["base_token_price_usd"])
+                res_usd = float(stats.get("reserve_in_usd", 0.0))
+                spot_p = Decimal(str(price_usd)) / native_price if native_price > Decimal(0) else Decimal("0.000000028")
+                native_res = (Decimal(str(res_usd)) / Decimal("2.0") / native_price) if res_usd > 0 else Decimal("30.0")
+                token_res = (native_res / spot_p) if spot_p > Decimal(0) else Decimal("1073000000.0")
+                pair_addr = str(pool_address or clean_token)
+
+                resolved_pool = PoolState(
+                    pool_address=pair_addr,
+                    chain=chain,
+                    token_address=clean_token,
+                    token_reserve=token_res,
+                    native_reserve=native_res,
+                    fee_numerator=25,
+                    fee_denominator=10000,
+                    last_updated_block=1000,
+                    timestamp_s=now,
+                    token_decimals=6,
+                    native_decimals=9 if chain == ChainIdentifier.SOLANA_MAINNET else 18,
+                )
+                self._pool_registry.set(clean_token, resolved_pool)
+                if pair_addr:
+                    self._pool_registry.set(pair_addr, resolved_pool)
+                self._metrics_aggregator.record_pool_state(resolved_pool)
+                if hasattr(self, "_ai_supervisor") and self._ai_supervisor:
+                    self._ai_supervisor.record_price_update(clean_token, spot_p)
+                logger.info(
+                    "get_or_fetch_pool_state: Authoritative GeckoTerminal pool resolved for %s: price=$%.6f, reserve=%.2f native",
+                    clean_token[:10],
+                    price_usd,
+                    float(native_res),
+                )
+                return resolved_pool
+        except Exception as exc:
+            logger.debug("get_or_fetch_pool_state: GeckoTerminal lookup failed for %s: %s", clean_token[:10], exc)
+
+        # 3. Fallback to existing pool or initial curve pool
+        if pool is not None:
+            return pool
+
+        return self.get_or_create_initial_pool_state(chain, clean_token, pool_address)
 
     def get_or_create_initial_pool_state(
         self,
@@ -2411,7 +2672,7 @@ class PaperTradingEngine:
                 disc_reason = self._extract_gatekeeper_rejection_reason(disc_report)
                 self._record_gatekeeper_eval(token_address, chain, disc_reason, passed=disc_report.passes_hard_gates)
                 if disc_report.passes_hard_gates:
-                    initial_pool = self.get_or_create_initial_pool_state(chain, token_address, pool_address)
+                    initial_pool = self._pool_registry.get(token_address) or self.get_or_create_initial_pool_state(chain, token_address, pool_address)
                     init_price = initial_pool.spot_price_native_per_token if initial_pool else Decimal("0.000000028")
                     if is_pump is None:
                         is_pump = "pump" in token_address.lower() or "pump" in pool_address.lower()
@@ -2453,6 +2714,17 @@ class PaperTradingEngine:
                             report=disc_report,
                             token_creation_timestamp=time.time() - (24 * 3600),
                         )
+                        if hasattr(self, "dashboard_telemetry") and self.dashboard_telemetry:
+                            self.dashboard_telemetry.record_stage_event("staging_promoted", 1)
+                            self.dashboard_telemetry.record_activity(
+                                category="STAGING",
+                                title="Token Added to Wave2 & Revival Watchlist",
+                                details=f"Monitoring breakout: initial price {init_price}",
+                                level="INFO",
+                                component="Wave2StagingBuffer",
+                                token_address=token_address,
+                                metadata={"chain": chain.value if hasattr(chain, "value") else str(chain)},
+                            )
                         logger.info("Auto-discovery registered token %s in Wave-2 and Revival Watchlists", token_address[:10])
             except Exception as exc:  # noqa: BLE001
                 logger.debug("Auto-discovery failed for %s: %s", token_address[:10], exc)
@@ -2474,7 +2746,7 @@ class PaperTradingEngine:
                     passed=reassessed_rep.passes_hard_gates,
                 )
                 if reassessed_rep.passes_hard_gates and not self._pending_launch_buffer.is_staged(token_address):
-                    initial_pool = self.get_or_create_initial_pool_state(chain, token_address, pool_address)
+                    initial_pool = await self.get_or_fetch_pool_state(chain, token_address, pool_address)
                     init_price = initial_pool.spot_price_native_per_token if initial_pool else Decimal("0.000000028")
                     self._pending_launch_buffer.stage_token(
                         token_address=token_address,
@@ -2578,6 +2850,17 @@ class PaperTradingEngine:
                 report=report,
                 t_0=time.time(),
             )
+            if hasattr(self, "dashboard_telemetry") and self.dashboard_telemetry:
+                self.dashboard_telemetry.record_stage_event("staging_promoted", 1)
+                self.dashboard_telemetry.record_activity(
+                    category="STAGING",
+                    title="Token Staged in Launch Buffer",
+                    details=f"Observation window [{self._pending_launch_buffer.min_age_s:.0f}s - {self._pending_launch_buffer.max_age_s:.0f}s]",
+                    level="INFO",
+                    component="PendingLaunchBuffer",
+                    token_address=mint,
+                    metadata={"chain": chain.value if hasattr(chain, "value") else str(chain), "initial_price": str(init_price)},
+                )
             logger.info(
                 "Pump.fun mint [%s] staged in PendingLaunchBuffer (observation window %.0fs-%.0fs, target vol >= %s SOL, >= %d buys, >= %d unique buyers)",
                 mint[:10],
@@ -2619,7 +2902,7 @@ class PaperTradingEngine:
             if pool is None and raw_sig.pool_address:
                 pool = self._pool_registry.get(raw_sig.pool_address)
             if pool is None:
-                pool = self.get_or_create_initial_pool_state(
+                pool = await self.get_or_fetch_pool_state(
                     raw_sig.chain, raw_sig.token_address, raw_sig.pool_address or ""
                 )
 
@@ -2634,6 +2917,17 @@ class PaperTradingEngine:
                     raw_signal=raw_sig,
                     t_0=time.time(),
                 )
+                if hasattr(self, "dashboard_telemetry") and self.dashboard_telemetry:
+                    self.dashboard_telemetry.record_stage_event("staging_promoted", 1)
+                    self.dashboard_telemetry.record_activity(
+                        category="STAGING",
+                        title="Token Staged in Launch Buffer",
+                        details=f"Observation window [{self._pending_launch_buffer.min_age_s:.0f}s - {self._pending_launch_buffer.max_age_s:.0f}s]",
+                        level="INFO",
+                        component="PendingLaunchBuffer",
+                        token_address=raw_sig.token_address,
+                        metadata={"chain": raw_sig.chain.value if hasattr(raw_sig.chain, "value") else str(raw_sig.chain)},
+                    )
                 logger.info(
                     "Pump.fun mint [%s] staged in PendingLaunchBuffer (observation window %.0fs-%.0fs, target vol >= %s SOL, >= %d buys, >= %d unique buyers)",
                     raw_sig.token_address[:10],
@@ -2738,6 +3032,12 @@ class PaperTradingEngine:
                             pnl_estimate_native=lot.tokens_held * (pool.spot_price_native_per_token - lot.entry_price),
                             prioritized=True,
                             action="CLOSE_ALL",
+                        )
+                        logger.warning(
+                            "V2 Emergency Rug Safeguard triggered for lot %s (age=%.1fs, liq_drop=%.1f%%)",
+                            lot.lot_id,
+                            age_seconds,
+                            liquidity_drop * 100.0,
                         )
 
                 if decision is not None and decision.should_exit:
@@ -3039,7 +3339,7 @@ class PaperTradingEngine:
                         )
                         continue
 
-                    pool = self.get_or_create_initial_pool_state(chain, mint)
+                    pool = await self.get_or_fetch_pool_state(chain, mint)
                     social_weight = self._feedback.get_social_weight() if hasattr(self, "_feedback") else 1.0
                     raw_sig = RawSignalEvent(
                         timestamp_ns=int(item.timestamp * 1e9) if item.timestamp else time.time_ns(),
@@ -3082,8 +3382,8 @@ class PaperTradingEngine:
                     continue
 
                 # Ensure pool state is initialized for accurate pricing and market cap checks
-                if signal_item.pool_state is None or signal_item.pool_state.spot_price_native_per_token <= Decimal(0):
-                    signal_item.pool_state = self.get_or_create_initial_pool_state(
+                if signal_item.pool_state is None or signal_item.pool_state.spot_price_native_per_token <= Decimal(0) or getattr(signal_item.pool_state, "last_updated_block", 0) <= 0:
+                    signal_item.pool_state = await self.get_or_fetch_pool_state(
                         chain=signal_item.chain,
                         token_address=signal_item.token_address,
                         pool_address=getattr(signal_item, "pool_address", "") or "",
@@ -3349,8 +3649,8 @@ class PaperTradingEngine:
                     self._position_book.release_position_slot(token_address=signal_item.token_address)
                 continue
 
-            if signal_item.pool_state is None or signal_item.pool_state.spot_price_native_per_token <= Decimal(0):
-                signal_item.pool_state = self.get_or_create_initial_pool_state(
+            if signal_item.pool_state is None or signal_item.pool_state.spot_price_native_per_token <= Decimal(0) or getattr(signal_item.pool_state, "last_updated_block", 0) <= 0:
+                signal_item.pool_state = await self.get_or_fetch_pool_state(
                     chain=signal_item.chain,
                     token_address=signal_item.token_address,
                     pool_address=getattr(signal_item, "pool_address", "") or "",
@@ -3378,6 +3678,8 @@ class PaperTradingEngine:
 
             # Unified Ruflo Multi-Agent Swarm Deliberation & BFT Consensus
             if signal_item.suggested_side == OrderSide.BUY and self._swarm_coordinator:
+                if hasattr(self, "dashboard_telemetry") and self.dashboard_telemetry:
+                    self.dashboard_telemetry.record_stage_event("council_deliberated", 1)
                 try:
                     swarm_result = await self._swarm_coordinator.execute_trade_consensus(
                         token_address=signal_item.token_address,
@@ -3389,7 +3691,19 @@ class PaperTradingEngine:
                         execute_fill=False,
                     )
                     passed = swarm_result.get("approved", False) if isinstance(swarm_result, dict) else getattr(swarm_result, "passed", True)
+                    if passed and hasattr(self, "dashboard_telemetry") and self.dashboard_telemetry:
+                        self.dashboard_telemetry.record_stage_event("council_approved", 1)
                     if swarm_result and not passed:
+                        if hasattr(self, "dashboard_telemetry") and self.dashboard_telemetry:
+                            self.dashboard_telemetry.record_stage_event("council_vetoed", 1)
+                            self.dashboard_telemetry.record_activity(
+                                category="COUNCIL",
+                                title=f"Council VETO: {signal_item.token_address[:10]}",
+                                details=str(swarm_result.get("veto_reason", swarm_result.get("reason", "Veto")) if isinstance(swarm_result, dict) else getattr(swarm_result, "rationale", "Veto")),
+                                level="WARNING",
+                                component="CouncilArbiter",
+                                token_address=signal_item.token_address,
+                            )
                         rationale = swarm_result.get("veto_reason", swarm_result.get("reason", "Veto")) if isinstance(swarm_result, dict) else getattr(swarm_result, "rationale", "Veto")
                         agent_votes = swarm_result.get("votes", {}) if isinstance(swarm_result, dict) else getattr(swarm_result, "agent_votes", {})
                         logger.info(
@@ -3413,6 +3727,8 @@ class PaperTradingEngine:
             ai_action_params: Optional[ActionParameters] = None
             if signal_item.suggested_side == OrderSide.BUY and getattr(self._cfg, "ai_supervisor_enabled", True):
                 try:
+                    if hasattr(self, "dashboard_telemetry") and self.dashboard_telemetry:
+                        self.dashboard_telemetry.record_stage_event("supervisor_audited", 1)
                     ai_audit = await self._ai_supervisor.audit_signal(
                         signal=signal_item,
                         pool_state=signal_item.pool_state,
@@ -3428,6 +3744,17 @@ class PaperTradingEngine:
                         ai_audit.confidence_score,
                         ai_audit.wallet_audit.rationale,
                     )
+                    is_veto = (decision_str == AISupervisorDecisionEnum.PASS.value and getattr(self._cfg, "ai_strict_veto", True))
+                    if hasattr(self, "dashboard_telemetry") and self.dashboard_telemetry:
+                        self.dashboard_telemetry.record_activity(
+                            category="SUPERVISOR",
+                            title=f"Supervisor: {'VETO' if is_veto else 'APPROVED'}",
+                            details=f"Confidence: {ai_audit.confidence_score:.2f} | {ai_audit.wallet_audit.rationale or 'Optimal pre-flight risk profile'}",
+                            level="WARNING" if is_veto else "SUCCESS",
+                            component="AlphaSupervisorAI",
+                            token_address=signal_item.token_address,
+                            metadata={"decision": decision_str, "confidence": float(ai_audit.confidence_score)},
+                        )
                     if decision_str == AISupervisorDecisionEnum.PASS.value and getattr(self._cfg, "ai_strict_veto", True):
                         logger.info(
                             "AlphaSupervisor-AI VETO enforced for %s: %s",
@@ -3487,6 +3814,16 @@ class PaperTradingEngine:
                         "slippage_bps": fill.slippage_bps,
                         "tx_hash": getattr(fill, "tx_hash", None),
                     }
+                    if hasattr(self, "dashboard_telemetry") and self.dashboard_telemetry:
+                        self.dashboard_telemetry.record_stage_event("executed_orders", 1)
+                        self.dashboard_telemetry.record_activity(
+                            category="TRADING",
+                            title=f"Order Executed: {fill.side.value if hasattr(fill.side, 'value') else fill.side} {signal_item.token_address[:10]}",
+                            details=f"Price: {fill.effective_price} | Tokens: {fill.amount_token}",
+                            level="SUCCESS",
+                            component="PaperExecutor",
+                            token_address=signal_item.token_address,
+                        )
 
             realized_pnl_usd: Decimal | None = None
 
@@ -4268,7 +4605,6 @@ class PaperTradingEngine:
         sol_lots = [
             l for l in lots
             if l.chain == ChainIdentifier.SOLANA_MAINNET
-            and not (l.bonding_curve_mode and self._pool_registry.get(l.token_address, expected_token=l.token_address) is not None)
         ]
         evm_lots = [l for l in lots if l.chain == ChainIdentifier.BASE_MAINNET]
 
@@ -4294,7 +4630,7 @@ class PaperTradingEngine:
                                     if base_addr:
                                         pairs_by_mint.setdefault(base_addr, []).append(p)
 
-                            sol_price = Decimal(str(getattr(self.config, "sol_price_usd", self._sol_price or 180.0)))
+                            sol_price = Decimal(str(getattr(self._cfg, "sol_price_usd", self._sol_price or Decimal("150.0"))))
                             for lot in sol_lots:
                                 t_addr = lot.token_address
                                 t_pairs = [p for p in pairs_by_mint.get(t_addr, []) if str(p.get("chainId", "")).lower() == "solana"]
@@ -4354,6 +4690,7 @@ class PaperTradingEngine:
                                             native_decimals=9,
                                         )
                                         self._pool_registry.set(pair_addr, pool)
+                                        self._pool_registry.set(t_addr, pool)
                                         lot.pool_address = pair_addr
                                         lot.unresolved_price = False
                                         lot.stale_price_retries = 0
@@ -4511,19 +4848,18 @@ class PaperTradingEngine:
                     if (
                         l.unresolved_price
                         or (l.pool_address and self._pool_registry.get_pool(l.pool_address) is None)
-                        or (
-                            not (l.bonding_curve_mode and self._pool_registry.get_pool(l.pool_address) is not None)
-                            and (
-                                (l.pool_address and (now_s - getattr(self._pool_registry.get_pool(l.pool_address), "timestamp_s", 0) > 3.0))
-                                or (not l.pool_address and self._pool_registry.get(l.token_address, expected_token=l.token_address) is None)
-                            )
-                        )
+                        or (self._pool_registry.get(l.token_address, expected_token=l.token_address) is None)
+                        or (now_s - getattr(self._pool_registry.get_pool(l.pool_address) or self._pool_registry.get(l.token_address, expected_token=l.token_address), "timestamp_s", 0) > 3.0)
+                        or (getattr(self._pool_registry.get_pool(l.pool_address) or self._pool_registry.get(l.token_address, expected_token=l.token_address), "last_updated_block", 0) <= 0)
                     )
                 ]
                 if lots_needing_price:
                     await self._poll_open_lots_prices(lots_needing_price)
 
                 for lot in open_lots:
+                    if lot.status == LotStatus.CLOSED or getattr(lot, "is_illiquid", False) or lot.tokens_held <= Decimal(0):
+                        continue
+
                     # Idempotent state recovery: check lots in PENDING_SELL
                     if lot.status == LotStatus.PENDING_SELL:
                         if (now_s - lot.pending_exit_timestamp) > 15.0:
@@ -4553,8 +4889,8 @@ class PaperTradingEngine:
                             pool = self._pool_registry.get(lot.token_address, expected_token=lot.token_address)
 
                     dur_s = (now_ns - lot.open_timestamp_ns) / 1e9 if lot.open_timestamp_ns > 0 else 0.0
-                    if pool is None or getattr(pool, "last_updated_block", 0) <= 0 or lot.unresolved_price:
-                        if dur_s > 120.0 or lot.stale_price_retries >= 5:
+                    if pool is None or lot.unresolved_price or pool.spot_price_native_per_token <= Decimal(0) or getattr(pool, "last_updated_block", 0) == 0:
+                        if pool is None and lot.stale_price_retries >= 5 and dur_s > 120.0:
                             native_price = self._eth_price if lot.chain == ChainIdentifier.BASE_MAINNET else self._sol_price
                             logger.error(
                                 "Lot %s (%s) market is genuinely illiquid or unavailable (retries=%d, dur=%.1fs). Safely writing off under ILLIQUID_MARKET without fabricating synthetic market quotes.",
@@ -4563,12 +4899,18 @@ class PaperTradingEngine:
                                 lot.stale_price_retries,
                                 dur_s,
                             )
-                            lot.is_illiquid = True
-                            lot.status = LotStatus.CLOSED
-                            lot.unresolved_price = False
-                            self._position_book.set_token_cooldown(lot.token_address, duration_s=300.0)
+                            loss_usd = -float(lot.cost_basis_native * native_price)
+                            self._position_book.write_off_lot(lot)
+                            new_equity = self._current_equity_usd()
+                            is_launch = (getattr(lot, "exit_profile", None) not in (ExitProfile.REVIVAL_SWING, ExitProfile.EARLY_RALLY_SWING) and 
+                                         getattr(lot, "bonding_curve_mode", False) is True)
+                            self._metrics.record_closed_trade(
+                                realized_pnl_usd=Decimal(str(loss_usd)).quantize(Decimal("0.01")),
+                                gas_cost_usd=Decimal(0),
+                                current_equity_usd=new_equity,
+                                is_new_launch=is_launch,
+                            )
                             if self._ledger:
-                                loss_usd = -float(lot.cost_basis_native * native_price)
                                 await self._ledger.record_lot_transition(
                                     lot_id=lot.lot_id,
                                     token_address=lot.token_address,
@@ -4585,7 +4927,11 @@ class PaperTradingEngine:
                                     exit_reason=TradeExitReason.ILLIQUID_MARKET.value,
                                     pnl_usd=loss_usd,
                                 )
-                            self._position_book._notify_capacity_freed()
+                                await self._ledger.mark_token_closed(
+                                    lot.token_address,
+                                    reason=TradeExitReason.ILLIQUID_MARKET.value,
+                                    pnl_usd=loss_usd,
+                                )
                             continue
                         else:
                             logger.debug(
@@ -4989,6 +5335,23 @@ class PaperTradingEngine:
                 )
                 await self._swarm_coordinator.start()
 
+            # 3. Start Real-Time Institutional Observability Dashboard Hub
+            if getattr(self.config, "dashboard_enabled", True) and hasattr(self, "dashboard_server") and self.dashboard_server:
+                if hasattr(self, "dashboard_telemetry") and self.dashboard_telemetry:
+                    self.dashboard_telemetry.ledger = self._ledger
+                    self.dashboard_telemetry.runner = self
+                    self.dashboard_telemetry.position_book = self._position_book
+                    self.dashboard_telemetry.supervisor = self._ai_supervisor
+                    self.dashboard_telemetry.staging_buffer = self._wave2_buffer
+                    self.dashboard_telemetry.council = getattr(self._ai_supervisor, "_council", None)
+                    self.dashboard_telemetry.swarm = self._swarm_coordinator
+                    self.dashboard_telemetry.self_learning = self._feedback
+                    self.dashboard_telemetry.rpc_monitor = self._rpc_monitor
+                try:
+                    await self.dashboard_server.start()
+                except Exception as exc:
+                    logger.warning("Runner: Could not start dashboard server: %s", exc)
+
             async with coordinator:
                 self._coordinator = coordinator
                 self._telegram = coordinator.telegram_ingester
@@ -4996,6 +5359,17 @@ class PaperTradingEngine:
                     self._telegram.set_market_oracle(self._market_oracle)
 
                 async def _on_wave2_signal(sig: SignalEvent) -> None:
+                    if hasattr(self, "dashboard_telemetry") and self.dashboard_telemetry:
+                        self.dashboard_telemetry.record_stage_event("staging_promoted", 1)
+                        strat_name = getattr(sig, "strategy_name", None) or getattr(sig, "strategy_pattern", None) or "wave2_breakout"
+                        self.dashboard_telemetry.record_activity(
+                            category="STAGING",
+                            title=f"Wave2 Breakout: {sig.token_address[:10]}",
+                            details=f"Strategy: {strat_name} score={sig.alpha_score:.2f}",
+                            level="SUCCESS",
+                            component="Wave2StagingBuffer",
+                            token_address=sig.token_address,
+                        )
                     if not self.is_position_open(sig.token_address, sig.chain):
                         if self._ledger:
                             await self._ledger.record_signal(sig)
@@ -5004,6 +5378,17 @@ class PaperTradingEngine:
                 self._wave2_buffer.register_signal_callback(_on_wave2_signal)
 
                 async def _on_revival_signal(sig: SignalEvent) -> None:
+                    if hasattr(self, "dashboard_telemetry") and self.dashboard_telemetry:
+                        self.dashboard_telemetry.record_stage_event("staging_promoted", 1)
+                        strat_name = getattr(sig, "strategy_name", None) or getattr(sig, "strategy_pattern", None) or "revival_breakout"
+                        self.dashboard_telemetry.record_activity(
+                            category="STAGING",
+                            title=f"Revival Breakout: {sig.token_address[:10]}",
+                            details=f"Strategy: {strat_name} score={sig.alpha_score:.2f}",
+                            level="SUCCESS",
+                            component="RevivalBreakoutBuffer",
+                            token_address=sig.token_address,
+                        )
                     if not self.is_position_open(sig.token_address, sig.chain):
                         if self._ledger:
                             await self._ledger.record_signal(sig)
@@ -5147,6 +5532,13 @@ class PaperTradingEngine:
                     if self._swarm_coordinator:
                         try:
                             await self._swarm_coordinator.stop()
+                        except Exception:
+                            pass
+
+                    # 3c. Stop dashboard server
+                    if hasattr(self, "dashboard_server") and self.dashboard_server:
+                        try:
+                            await self.dashboard_server.stop()
                         except Exception:
                             pass
 

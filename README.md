@@ -33,14 +33,12 @@ A production-grade, event-driven, multi-chain algorithmic trading and alpha anal
 
 ## 🌟 Key System Capabilities
 
-- **Multi-Agent Autonomous Council (`alpha_engine.council`)**: Four specialized AI agents (Reach, Forensic, Quant, and CRO Arbiter) conduct parallel token audits and structured debates to authorize trade entry with fractional Kelly position sizing.
-- **AI Supervisor & Institutional Risk Engine (`AlphaSupervisorAI`)**: Hybrid reasoning layer combining Google Gemini / OpenAI LLM evaluations with instantaneous deterministic heuristics fallbacks, dynamic risk posture switching, and continuous outcome tracking.
-- **Dual-Tier Security Gatekeeper & Smart Probation**: Real-time GoPlus (EVM) and RugCheck (SVM) verification, local `eth_call` honeypot simulation, and a dynamic rejection cache distinguishing fatal scams from soft flags eligible for momentum-driven reassessment.
-- **Dual-Chain WebSocket Ingestion**: Sub-second decoding of Pump.fun bonding curves, Raydium AMM pools (Solana), and Uniswap v2/v3 / Aerodrome pools (Base EVM) with connection-loss auto-recovery and jittered backoff.
-- **Alternative Data Feeds**: Telethon MTProto real-time Telegram channel monitoring, whale address tracking, anti-sybil raid filters, Twitter/X sentiment analysis, and rolling DEX metrics aggregation.
-- **Dynamic Staging Buffers**: Fast-Launch early momentum, Wave-2 consolidation breakout tracking, and dormant token Revival / Community Takeover (CTO) detection.
-- **Institutional Execution Simulation**: Constant Product Market Maker (CPMM) slippage estimation, stochastic network latency, LogNormal MEV burst front-running modeling, and FIFO position book accounting.
-- **Conversational Copilot & Interactive Telegram Bot**: Interactive DM bot featuring persistent 12+ button operational keyboards, inline callback buttons, and RAG-powered natural language decision explanations (`/why`, `/council`, `/status`, `/exit`).
+- **7 Institutional Quantitative Strategies (`alpha_engine.engine.strategy`)**: Momentum Breakout (Volume Profile & OFI), Short-Term Mean Reversion (Z-Score & Bollinger Bands), Liquidity Sweep & Reversal, Whale Accumulation Shadow (Anti-Sybil clustering), Narrative Velocity (Cross-channel virality entropy), Multi-Timeframe Confluence (1m/5m/15m/1h), and Adaptive Regime (Hurst Exponent & Realized Volatility).
+- **Comprehensive Self-Learning Engine (`alpha_engine.engine.self_learning`)**: Continuous tracking of mathematical expectancy, Sharpe, Sortino, max drawdown, online Softmax Exponential Gradient policy reinforcement learning, structured loss attribution, and dynamic hyperparameter tuning for Council weights and slippage bounds.
+- **Multi-Round Council Debate & Devil's Advocate (`alpha_engine.council`)**: Multi-round structured cross-examination between ReachAnalyst, ChainForensic, and QuantTechnicals, featuring episodic memory retrieval and mandatory Devil's Advocate stress-testing on unanimous approvals.
+- **Fully Activated Ruflo Intelligence Swarm (`alpha_engine.ruflo`)**: Adaptive / Mesh / Hierarchical swarm topologies, high-speed lightweight vector store, persistent shared semantic memory, and the 4-stage cognitive intelligence pipeline (Retrieve $\to$ Judge $\to$ Distill $\to$ Consolidate) powered by `RufloLearningAgent`.
+- **Real-Time Observability Dashboard (`alpha_engine.dashboard`)**: Institutional dark glassmorphism dashboard powered by FastAPI and WebSockets, streaming decision flow graphs, live strategy leaderboards, agent arena feeds, RPC connection vitals, and self-healing data inconsistency alerts.
+- **Conversational Copilot & Interactive Telegram Bot**: Interactive DM bot with 12+ button operational keyboards, inline callbacks, RAG-powered decision explanations (`/why`, `/council`, `/status`), and direct observability access (`/dashboard`, `/strategies`, `/flow`).
 
 ---
 

@@ -299,8 +299,10 @@ def main(args: list[str] | None = None) -> int:
         print("✅ Trade Frequency & Pacing Governor successfully reset to 0 trades and 0 cooldown.")
         return 0
 
-    if parsed.close_all:
+    if parsed.close_all or parsed.reset_ledger:
         from alpha_engine.execution.ledger import SQLiteLedger
+
+    if parsed.close_all:
         engine = PaperTradingEngine(config)
         async def _close():
             ledger = SQLiteLedger(config.db_path)
@@ -316,7 +318,6 @@ def main(args: list[str] | None = None) -> int:
         return 0
 
     if parsed.reset_ledger:
-        from alpha_engine.execution.ledger import SQLiteLedger
         engine = PaperTradingEngine(config)
         async def _reset():
             ledger = SQLiteLedger(config.db_path)

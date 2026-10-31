@@ -828,6 +828,7 @@ class Wave2StagingBuffer:
                 dip_depth_pct=round(dip_depth_pct, 2),
                 strategy_pattern="early_rally_breakout",
                 strategy_type=StrategyType.EARLY_RALLY_BREAKOUT,
+                strategy_name="early_rally_breakout",
                 base_market_cap=base_p,
             )
             self._dispatch_signal(signal)
@@ -855,7 +856,12 @@ class Wave2StagingBuffer:
                 if asyncio.iscoroutine(res):
                     try:
                         loop = asyncio.get_running_loop()
-                        loop.create_task(res)
+                        t = loop.create_task(res)
+                        t.add_done_callback(
+                            lambda task: logger.error("Wave2StagingBuffer signal callback error: %s", task.exception())
+                            if not task.cancelled() and task.exception()
+                            else None
+                        )
                     except RuntimeError:
                         pass
             except Exception as exc:
@@ -1475,6 +1481,7 @@ class RevivalBreakoutBuffer:
                 exit_profile=ExitProfile.REVIVAL_SWING,
                 base_market_cap=tok.consolidation_base_mcap,
                 strategy_pattern="revival_breakout",
+                strategy_name="revival_breakout",
                 token_age_hours=token_age_h,
                 consolidation_length_hours=token_age_h,
                 volume_surge_multiplier=surge_mult,
@@ -1506,7 +1513,12 @@ class RevivalBreakoutBuffer:
                 if asyncio.iscoroutine(res):
                     try:
                         loop = asyncio.get_running_loop()
-                        loop.create_task(res)
+                        t = loop.create_task(res)
+                        t.add_done_callback(
+                            lambda task: logger.error("RevivalBreakoutBuffer signal callback error: %s", task.exception())
+                            if not task.cancelled() and task.exception()
+                            else None
+                        )
                     except RuntimeError:
                         pass
             except Exception as exc:

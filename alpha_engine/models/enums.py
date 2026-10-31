@@ -91,6 +91,13 @@ class StrategyType(str, Enum):
     EARLY_RALLY_BREAKOUT = "early_rally_breakout"
     GRADUATED_PRIORITY = "graduated_priority"
     MOVERS_PRIORITY = "movers_priority"
+    MOMENTUM_BREAKOUT = "momentum_breakout"
+    MEAN_REVERSION = "mean_reversion"
+    LIQUIDITY_SWEEP = "liquidity_sweep"
+    WHALE_SHADOW = "whale_shadow"
+    NARRATIVE_VELOCITY = "narrative_velocity"
+    MULTI_TIMEFRAME = "multi_timeframe"
+    ADAPTIVE_REGIME = "adaptive_regime"
 
 
 class ExitProfile(str, Enum):
@@ -99,12 +106,22 @@ class ExitProfile(str, Enum):
     FAST_SNIPE: Short-lived scalps (120s velocity decay, -25% SL, +25%/+50% TP).
     REVIVAL_SWING: Multi-hour/day hold, 35% trailing ATH drawdown, +100%/+200%/+400%/+800% ladder.
     EARLY_RALLY_SWING: Strict -15% hard stop-loss, 50% partial take-profit at +50%/+100%, 25-30% ATH trailing stop on moonbag runner.
+    DYNAMIC_TRAILING: Adaptive trailing stop tracking ATR/peak volatility with multi-target scaling.
+    MEAN_REVERSION_EXIT: Target reversion to statistical mean (Z=0, Z=+2) with tight stop.
+    LIQUIDITY_TARGET: Target key liquidity pools and sweeps with runner trail.
+    WHALE_SHADOW_EXIT: Mirror whale distribution with protective stop and high R:R targets.
+    MOMENTUM_RUNNER: Wide trailing stop designed to capture 5x-20x structural breakouts.
     """
 
     FAST_SNIPE = "FAST_SNIPE"            # Existing 120s velocity decay, -25% SL, +25%/+50% TP
     REVIVAL_SWING = "REVIVAL_SWING"      # Multi-hour/day hold, 35% trailing drawdown, 100%/200% TP ladder
     PEAK_TRAILING = "PEAK_TRAILING"      # Trailing stop from ATH peak, +50%/+60% TP target
     EARLY_RALLY_SWING = "EARLY_RALLY_SWING"  # Strict -15% hard SL, 50% partial TP, 28% ATH trailing stop
+    DYNAMIC_TRAILING = "DYNAMIC_TRAILING"
+    MEAN_REVERSION_EXIT = "MEAN_REVERSION_EXIT"
+    LIQUIDITY_TARGET = "LIQUIDITY_TARGET"
+    WHALE_SHADOW_EXIT = "WHALE_SHADOW_EXIT"
+    MOMENTUM_RUNNER = "MOMENTUM_RUNNER"
 
 
 class SignalSource(str, Enum):
@@ -124,6 +141,13 @@ class SignalSource(str, Enum):
     MEME_RADAR_BURST = "meme_radar_burst"
     SCREENER_GRADUATED = "screener_graduated"
     SCREENER_MOVERS = "screener_movers"
+    MOMENTUM_BREAKOUT = "momentum_breakout"
+    MEAN_REVERSION = "mean_reversion"
+    LIQUIDITY_SWEEP = "liquidity_sweep"
+    WHALE_SHADOW = "whale_shadow"
+    NARRATIVE_VELOCITY = "narrative_velocity"
+    MULTI_TIMEFRAME = "multi_timeframe"
+    ADAPTIVE_REGIME = "adaptive_regime"
 
 
 class LotStatus(str, Enum):

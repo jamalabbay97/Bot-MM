@@ -165,7 +165,7 @@ def patch_dns_resolvers(servers: Sequence[str] | None = None) -> None:
                 upstream_ips = query_upstream_dns(host, servers=effective_servers)
                 if upstream_ips:
                     _RESOLVED_CACHE[host] = upstream_ips
-                    logger.debug("Recovered host %s via upstream DNS query: %s", host, upstream_ips[0])
+                    logger.debug("Recovered host %s via upstream DNS query: %s (gaierror: %s)", host, upstream_ips[0], e)
                     return _ORIG_GETADDRINFO(upstream_ips[0], port, *args, **kwargs)
             raise
 

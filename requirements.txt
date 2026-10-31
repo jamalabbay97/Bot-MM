@@ -26,5 +26,10 @@ telethon>=1.34.0,<2.0.0
 rich>=13.0.0,<16.0.0
 psutil>=5.9.0,<8.0.0
 
+# --- Observability Hub & Real-Time Dashboard (FastAPI + WebSocket) ---
+fastapi>=0.110.0,<1.0.0
+uvicorn>=0.28.0,<1.0.0
+httpx>=0.27.0,<1.0.0
+
 # --- SSL & Security Certificates ---
 certifi>=2024.0.0

@@ -131,15 +131,18 @@ def setup_production_logging(
     )
 
     # 2. Rotating File Handler (20 MB cap, 5 backups)
-    file_handler = RotatingFileHandler(
-        filename=str(log_file_path),
-        maxBytes=max_bytes,
-        backupCount=backup_count,
-        encoding="utf-8",
-    )
-    file_handler.setLevel(numeric_level)
-    file_handler.setFormatter(file_formatter)
-    root_logger.addHandler(file_handler)
+    try:
+        file_handler = RotatingFileHandler(
+            filename=str(log_file_path),
+            maxBytes=max_bytes,
+            backupCount=backup_count,
+            encoding="utf-8",
+        )
+        file_handler.setLevel(numeric_level)
+        file_handler.setFormatter(file_formatter)
+        root_logger.addHandler(file_handler)
+    except (PermissionError, OSError) as log_err:
+        sys.stderr.write(f"Warning: Could not attach RotatingFileHandler to {log_file_path}: {log_err}\n")
 
     # 3. Console Handler (RichHandler with fallback to StreamHandler)
     if RICH_AVAILABLE:

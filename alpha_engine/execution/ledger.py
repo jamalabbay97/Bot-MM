@@ -1599,6 +1599,9 @@ class SQLiteLedger:
               AND t.order_id NOT IN (
                   SELECT lot_id FROM lot_lifecycle WHERE LOWER(status) IN ('closed', 'settled')
               )
+              AND LOWER(t.token_address) NOT IN (
+                  SELECT LOWER(token_address) FROM lot_lifecycle WHERE LOWER(status) IN ('closed', 'settled')
+              )
             ORDER BY t.created_at ASC
         """
         async with conn.execute(query) as cursor:
@@ -1651,20 +1654,50 @@ class SQLiteLedger:
         import uuid
         now_ns = time.time_ns()
         now_s = int(time.time())
-        await conn.execute(
+        # Find all open order_ids for this token
+        async with conn.execute(
             """
-            INSERT INTO lot_lifecycle (lot_id, token_address, chain, status, exit_reason, pnl_usd, timestamp_ns, created_at)
-            VALUES (?, ?, 'solana_mainnet', 'closed', ?, ?, ?, ?)
+            SELECT order_id, chain FROM trades
+            WHERE side = 'buy' AND LOWER(token_address) = LOWER(?)
+              AND order_id NOT IN (
+                  SELECT lot_id FROM lot_lifecycle WHERE LOWER(status) IN ('closed', 'settled')
+              )
             """,
-            (str(uuid.uuid4()), token_address, reason, str(pnl_usd), now_ns, now_s),
-        )
-        await conn.execute(
-            """
-            INSERT INTO lot_lifecycle (lot_id, token_address, chain, status, exit_reason, pnl_usd, timestamp_ns, created_at)
-            VALUES (?, ?, 'solana_mainnet', 'settled', ?, ?, ?, ?)
-            """,
-            (str(uuid.uuid4()), token_address, reason, str(pnl_usd), now_ns + 1, now_s),
-        )
+            (token_address,),
+        ) as cursor:
+            open_orders = await cursor.fetchall()
+
+        if open_orders:
+            for order_id, chain in open_orders:
+                await conn.execute(
+                    """
+                    INSERT INTO lot_lifecycle (lot_id, token_address, chain, status, exit_reason, pnl_usd, timestamp_ns, created_at)
+                    VALUES (?, ?, ?, 'closed', ?, ?, ?, ?)
+                    """,
+                    (order_id, token_address, chain or 'solana_mainnet', reason, str(pnl_usd), now_ns, now_s),
+                )
+                await conn.execute(
+                    """
+                    INSERT INTO lot_lifecycle (lot_id, token_address, chain, status, exit_reason, pnl_usd, timestamp_ns, created_at)
+                    VALUES (?, ?, ?, 'settled', ?, ?, ?, ?)
+                    """,
+                    (order_id, token_address, chain or 'solana_mainnet', reason, str(pnl_usd), now_ns + 1, now_s),
+                )
+        else:
+            await conn.execute(
+                """
+                INSERT INTO lot_lifecycle (lot_id, token_address, chain, status, exit_reason, pnl_usd, timestamp_ns, created_at)
+                VALUES (?, ?, 'solana_mainnet', 'closed', ?, ?, ?, ?)
+                """,
+                (str(uuid.uuid4()), token_address, reason, str(pnl_usd), now_ns, now_s),
+            )
+            await conn.execute(
+                """
+                INSERT INTO lot_lifecycle (lot_id, token_address, chain, status, exit_reason, pnl_usd, timestamp_ns, created_at)
+                VALUES (?, ?, 'solana_mainnet', 'settled', ?, ?, ?, ?)
+                """,
+                (str(uuid.uuid4()), token_address, reason, str(pnl_usd), now_ns + 1, now_s),
+            )
         await conn.commit()
 
     @sqlite_retry(max_retries=5, base_delay=0.1)

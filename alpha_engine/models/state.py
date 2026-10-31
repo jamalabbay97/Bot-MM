@@ -157,7 +157,37 @@ class SecurityReport(BaseModel):
         if isinstance(data, dict):
             if "top10_holder_fraction" in data and "top10_concentration" not in data:
                 data["top10_concentration"] = data["top10_holder_fraction"]
+            if "flags" in data and "warning_flags" not in data:
+                data["warning_flags"] = data["flags"]
         return data
+
+    @property
+    def score(self) -> float:
+        """Overall security score [0.0, 100.0]."""
+        if not self.passes_hard_gates or self.is_honeypot:
+            return 0.0
+        base = 100.0
+        if self.sell_tax_bps > 0:
+            base -= min(50.0, (float(self.sell_tax_bps) / 100.0) * 5.0)
+        if self.buy_tax_bps > 0:
+            base -= min(50.0, (float(self.buy_tax_bps) / 100.0) * 5.0)
+        if not self.mint_authority_disabled:
+            base -= 30.0
+        if not self.freeze_authority_disabled:
+            base -= 20.0
+        if self.top10_concentration > 0.20:
+            base -= min(30.0, (self.top10_concentration - 0.20) * 50.0)
+        return max(0.0, min(100.0, base))
+
+    @property
+    def is_rug(self) -> bool:
+        """True if flagged as honeypot or failed hard gates."""
+        return self.is_honeypot or not self.passes_hard_gates
+
+    @property
+    def flags(self) -> list[str]:
+        """Convenience alias for warning_flags."""
+        return list(self.warning_flags)
 
     @property
     def is_pump_fun(self) -> bool:
@@ -242,6 +272,7 @@ class SecurityReport(BaseModel):
     def is_lp_locked(self) -> bool:
         """True if LP burned/locked ratio >= 90%."""
         return self.lp_burned_ratio >= 0.90
+
 
 
 class PaperFill(BaseModel):

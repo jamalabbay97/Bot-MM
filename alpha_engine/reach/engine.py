@@ -1,4 +1,3 @@
-import asyncio
 import logging
 import urllib.parse
 from dataclasses import dataclass, field
@@ -82,9 +81,10 @@ class ReachEngine:
         text = await self._fetch_text(url)
         mentions = []
         # Basic parsing or mock parsing since parsing DDG HTML properly requires beautifulsoup
+        snippet = text[:200].strip() if text else f"Fallback search result for {query}"
         mentions.append(SocialMention(
             source="X_Fallback",
-            text=f"Fallback search result for {query}",
+            text=snippet,
             url="https://x.com",
             sentiment_score=0.0
         ))
