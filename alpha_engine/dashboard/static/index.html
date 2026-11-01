@@ -706,6 +706,247 @@
         ::-webkit-scrollbar-thumb { background: rgba(255, 255, 255, 0.12); border-radius: 3px; }
         ::-webkit-scrollbar-thumb:hover { background: rgba(255, 255, 255, 0.22); }
 
+        /* Instant Trade Terminal */
+        .trade-terminal {
+            background: linear-gradient(135deg, rgba(15, 23, 42, 0.88) 0%, rgba(30, 27, 75, 0.45) 100%);
+            border: 1px solid rgba(99, 102, 241, 0.35);
+            border-radius: 14px;
+            padding: 20px;
+            margin-bottom: 20px;
+            box-shadow: 0 10px 30px rgba(0, 0, 0, 0.5), inset 0 1px 0 rgba(255, 255, 255, 0.08);
+            position: relative;
+            overflow: hidden;
+        }
+        .trade-terminal::before {
+            content: '';
+            position: absolute;
+            top: 0; left: 0; right: 0; height: 2px;
+            background: linear-gradient(90deg, var(--accent-indigo), var(--accent-cyan), var(--accent-green));
+        }
+        .trade-terminal-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            flex-wrap: wrap;
+            gap: 12px;
+            margin-bottom: 16px;
+            padding-bottom: 12px;
+            border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+        }
+        .trade-side-toggle {
+            display: inline-flex;
+            background: rgba(10, 15, 29, 0.9);
+            border: 1px solid var(--border-subtle);
+            border-radius: 10px;
+            padding: 3px;
+            gap: 4px;
+        }
+        .trade-side-btn {
+            padding: 7px 20px;
+            border-radius: 8px;
+            border: none;
+            font-size: 12px;
+            font-weight: 700;
+            cursor: pointer;
+            font-family: var(--font-mono);
+            color: var(--text-dim);
+            background: transparent;
+            transition: all 0.2s ease;
+        }
+        .trade-side-btn.active-buy {
+            background: linear-gradient(135deg, #059669, #10b981);
+            color: #fff;
+            box-shadow: 0 0 15px rgba(16, 185, 129, 0.4);
+        }
+        .trade-side-btn.active-sell {
+            background: linear-gradient(135deg, #dc2626, #ef4444);
+            color: #fff;
+            box-shadow: 0 0 15px rgba(239, 68, 68, 0.4);
+        }
+        .trade-terminal-grid {
+            display: grid;
+            grid-template-columns: 2.2fr 1fr 1fr auto;
+            gap: 14px;
+            align-items: end;
+        }
+        @media (max-width: 900px) {
+            .trade-terminal-grid {
+                grid-template-columns: 1fr;
+            }
+        }
+        .terminal-input-wrap {
+            display: flex;
+            flex-direction: column;
+            gap: 6px;
+        }
+        .terminal-label {
+            font-size: 11px;
+            font-weight: 600;
+            color: var(--text-muted);
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+        .input-with-badge {
+            position: relative;
+            display: flex;
+            align-items: center;
+            width: 100%;
+        }
+        .input-with-badge .search-input {
+            width: 100%;
+            padding-right: 90px;
+            height: 40px;
+        }
+        .input-embedded-badge {
+            position: absolute;
+            right: 8px;
+            font-size: 10px;
+            font-family: var(--font-mono);
+            font-weight: 700;
+            padding: 4px 8px;
+            border-radius: 6px;
+            background: rgba(99, 102, 241, 0.2);
+            color: var(--accent-indigo);
+            border: 1px solid rgba(99, 102, 241, 0.4);
+            pointer-events: none;
+            letter-spacing: 0.5px;
+        }
+        .chip-container {
+            display: flex;
+            gap: 6px;
+            flex-wrap: wrap;
+            margin-top: 8px;
+        }
+        .chip-btn {
+            background: rgba(255, 255, 255, 0.04);
+            border: 1px solid var(--border-subtle);
+            color: var(--text-muted);
+            font-size: 11px;
+            font-family: var(--font-mono);
+            padding: 4px 10px;
+            border-radius: 6px;
+            cursor: pointer;
+            transition: all 0.15s ease;
+        }
+        .chip-btn:hover, .chip-btn.active {
+            background: rgba(99, 102, 241, 0.25);
+            border-color: var(--accent-indigo);
+            color: #fff;
+        }
+        .btn-execute {
+            padding: 10px 22px;
+            font-size: 13px;
+            font-weight: 700;
+            border-radius: 10px;
+            border: none;
+            cursor: pointer;
+            font-family: var(--font-sans);
+            letter-spacing: 0.3px;
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            gap: 8px;
+            transition: all 0.2s ease;
+            height: 40px;
+            white-space: nowrap;
+        }
+        .btn-execute-buy {
+            background: linear-gradient(135deg, #059669, #10b981);
+            color: #fff;
+            box-shadow: 0 4px 18px rgba(16, 185, 129, 0.35);
+        }
+        .btn-execute-buy:hover {
+            box-shadow: 0 6px 22px rgba(16, 185, 129, 0.55);
+            transform: translateY(-1px);
+        }
+        .btn-execute-sell {
+            background: linear-gradient(135deg, #dc2626, #ef4444);
+            color: #fff;
+            box-shadow: 0 4px 18px rgba(239, 68, 68, 0.35);
+        }
+        .btn-execute-sell:hover {
+            box-shadow: 0 6px 22px rgba(239, 68, 68, 0.55);
+            transform: translateY(-1px);
+        }
+        .execution-result-card {
+            margin-top: 14px;
+            padding: 12px 16px;
+            border-radius: 10px;
+            font-size: 12px;
+            font-family: var(--font-mono);
+            display: none;
+            align-items: center;
+            justify-content: space-between;
+            gap: 12px;
+            animation: fadeIn 0.3s ease;
+        }
+        .execution-result-card.success {
+            background: rgba(16, 185, 129, 0.1);
+            border: 1px solid rgba(16, 185, 129, 0.3);
+            color: var(--accent-green);
+        }
+        .execution-result-card.error {
+            background: rgba(239, 68, 68, 0.1);
+            border: 1px solid rgba(239, 68, 68, 0.3);
+            color: var(--accent-red);
+        }
+
+        /* Switch toggle */
+        .switch {
+            position: relative;
+            display: inline-block;
+            width: 36px;
+            height: 20px;
+        }
+        .switch input {
+            opacity: 0;
+            width: 0;
+            height: 0;
+        }
+        .slider {
+            position: absolute;
+            cursor: pointer;
+            top: 0; left: 0; right: 0; bottom: 0;
+            background-color: rgba(255, 255, 255, 0.12);
+            transition: .25s;
+            border-radius: 20px;
+        }
+        .slider:before {
+            position: absolute;
+            content: "";
+            height: 14px;
+            width: 14px;
+            left: 3px;
+            bottom: 3px;
+            background-color: white;
+            transition: .25s;
+            border-radius: 50%;
+        }
+        input:checked + .slider {
+            background-color: var(--accent-green);
+            box-shadow: 0 0 10px rgba(16, 185, 129, 0.4);
+        }
+        input:checked + .slider:before {
+            transform: translateX(16px);
+        }
+
+        /* Score Progress Bar */
+        .score-bar-bg {
+            width: 100%;
+            height: 6px;
+            background: rgba(255, 255, 255, 0.08);
+            border-radius: 3px;
+            overflow: hidden;
+            margin-top: 4px;
+        }
+        .score-bar-fill {
+            height: 100%;
+            background: linear-gradient(90deg, var(--accent-cyan), var(--accent-green));
+            border-radius: 3px;
+            transition: width 0.4s ease;
+        }
+
         /* Mobile-Friendly Optimizations & Responsive Framework */
         .stage-step-tag {
             font-size: 9px;
@@ -1269,6 +1510,9 @@
         <button class="tab-btn" onclick="switchTab('strategies')">
             📊 Strategy Tournament
         </button>
+        <button class="tab-btn" onclick="switchTab('wallets')">
+            👛 Smart Wallets & Tracker <span class="badge" id="tab-wallets-badge">0</span>
+        </button>
     </nav>
 
     <!-- TAB 1: COCKPIT OVERVIEW -->
@@ -1284,6 +1528,92 @@
             </div>
             <div class="pipeline-flow" id="pipeline-stages">
                 <!-- Dynamically generated stages -->
+            </div>
+        </section>
+
+        <!-- Instant Trade Execution Terminal -->
+        <section class="trade-terminal" id="terminal-section">
+            <div class="trade-terminal-header">
+                <div style="display: flex; align-items: center; gap: 12px;">
+                    <span style="font-size: 22px;">⚡</span>
+                    <div>
+                        <div style="font-size: 16px; font-weight: 700; color: #fff; letter-spacing: -0.3px;">Instant Trade Execution Terminal</div>
+                        <div style="font-size: 11.5px; color: var(--text-muted);">Direct token contract address execution with zero-latency matching engine fill</div>
+                    </div>
+                </div>
+                <div class="trade-side-toggle">
+                    <button class="trade-side-btn active-buy" id="btn-side-buy" onclick="setTradeSide('BUY')">BUY</button>
+                    <button class="trade-side-btn" id="btn-side-sell" onclick="setTradeSide('SELL')">SELL</button>
+                </div>
+            </div>
+
+            <div class="trade-terminal-grid">
+                <div class="terminal-input-wrap">
+                    <label class="terminal-label">
+                        <span>Token Contract Address (CA)</span>
+                        <span id="detected-chain-badge" class="input-embedded-badge" style="display: none;">AUTO</span>
+                    </label>
+                    <div class="input-with-badge">
+                        <input type="text" class="search-input" id="trade-token-ca" placeholder="Paste Solana (base58) or Base (0x...) token address" oninput="onTokenAddressInput(this.value)" autocomplete="off" spellcheck="false">
+                        <span id="trade-chain-tag" class="input-embedded-badge">SOL / EVM</span>
+                    </div>
+                </div>
+
+                <div class="terminal-input-wrap">
+                    <label class="terminal-label">Network Chain</label>
+                    <select class="select-filter" id="trade-chain-select" style="width: 100%; height: 40px;" onchange="onChainSelectChange()">
+                        <option value="AUTO">⚡ Auto-Detect Chain</option>
+                        <option value="SOLANA_MAINNET">🟣 Solana Mainnet</option>
+                        <option value="BASE_MAINNET">🔵 Base Mainnet (EVM)</option>
+                    </select>
+                </div>
+
+                <div class="terminal-input-wrap">
+                    <label class="terminal-label">Order Size (Native Amount)</label>
+                    <input type="number" step="any" min="0" class="search-input" id="trade-amount" placeholder="0.1" style="width: 100%; height: 40px;" value="0.1">
+                </div>
+
+                <div>
+                    <button class="btn-execute btn-execute-buy" id="btn-submit-trade" onclick="submitInstantTrade()">
+                        <span id="btn-trade-icon">⚡</span>
+                        <span id="btn-trade-label">Execute BUY</span>
+                    </button>
+                </div>
+            </div>
+
+            <!-- Quick Preset Chips & Controls -->
+            <div style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 10px; margin-top: 10px;">
+                <div class="chip-container" id="trade-presets-container">
+                    <span style="font-size: 11px; color: var(--text-dim); align-self: center;">Quick Sizes:</span>
+                    <button class="chip-btn active" onclick="setPresetSize(0.1, this)">0.1 SOL</button>
+                    <button class="chip-btn" onclick="setPresetSize(0.25, this)">0.25 SOL</button>
+                    <button class="chip-btn" onclick="setPresetSize(0.5, this)">0.5 SOL</button>
+                    <button class="chip-btn" onclick="setPresetSize(1.0, this)">1.0 SOL</button>
+                    <button class="chip-btn" onclick="setPresetSize(0.02, this, 'ETH')">0.02 ETH</button>
+                    <button class="chip-btn" onclick="setPresetSize(0.05, this, 'ETH')">0.05 ETH</button>
+                    <button class="chip-btn" onclick="setPresetSize(0.1, this, 'ETH')">0.1 ETH</button>
+                </div>
+
+                <div style="display: flex; align-items: center; gap: 14px; font-size: 11px; color: var(--text-muted); font-family: var(--font-mono);">
+                    <label style="display: flex; align-items: center; gap: 5px; cursor: pointer; user-select: none;" title="Bypass gatekeeper & screeners for immediate matching fill">
+                        <input type="checkbox" id="trade-bypass-gatekeeper" style="accent-color: var(--accent-indigo); cursor: pointer;">
+                        <span>Direct Fill (Bypass Gatekeeper)</span>
+                    </label>
+                    <span>Slippage:
+                        <select id="trade-slippage" class="select-filter" style="padding: 3px 8px; font-size: 11px;">
+                            <option value="100">1.0%</option>
+                            <option value="250" selected>2.5%</option>
+                            <option value="500">5.0%</option>
+                        </select>
+                    </span>
+                    <button class="btn" style="font-size: 10px; padding: 4px 10px;" onclick="inspectEnteredToken()">🔍 Inspect CA</button>
+                </div>
+            </div>
+
+            <!-- Trade Execution Result Feedback Card -->
+            <div id="trade-result-card" class="execution-result-card">
+                <div id="trade-result-text" style="display: flex; align-items: center; gap: 8px;"></div>
+                <button class="btn" style="font-size: 10px; padding: 2px 8px;" onclick="document.getElementById('trade-result-card').style.display='none'">Dismiss</button>
             </div>
         </section>
 
@@ -1695,6 +2025,165 @@
         </div>
     </div>
 
+    <!-- TAB 8: SMART WALLET DISCOVERY & MONITORING -->
+    <div id="tab-wallets" class="tab-pane">
+        <!-- KPI Summary Cards -->
+        <div class="grid-4" style="margin-bottom: 20px;">
+            <div class="stat-card">
+                <span class="stat-label">Discovered Alpha Wallets</span>
+                <span class="stat-value" id="wallets-kpi-discovered" style="color: var(--accent-cyan);">0</span>
+                <span class="stat-sub">Screened by SmartMoneyProfiler</span>
+            </div>
+            <div class="stat-card">
+                <span class="stat-label">Monitored / Tracked</span>
+                <span class="stat-value" id="wallets-kpi-tracked" style="color: var(--accent-indigo);">0</span>
+                <span class="stat-sub">Active in copy-trade watchlist</span>
+            </div>
+            <div class="stat-card">
+                <span class="stat-label">Avg Tracked Win Rate</span>
+                <span class="stat-value" id="wallets-kpi-winrate" style="color: var(--accent-green);">0.0%</span>
+                <span class="stat-sub">Historical verified performance</span>
+            </div>
+            <div class="stat-card">
+                <span class="stat-label">Global Copy Trading</span>
+                <div style="display: flex; align-items: center; gap: 10px; margin-top: 6px;">
+                    <label class="switch">
+                        <input type="checkbox" id="master-copy-trade-toggle" onchange="onToggleGlobalCopyTrade(this.checked)">
+                        <span class="slider"></span>
+                    </label>
+                    <span id="master-copy-trade-status" style="font-size: 14px; font-weight: 700; color: var(--accent-green);">ENABLED</span>
+                </div>
+                <span class="stat-sub">Master autonomous copy execution</span>
+            </div>
+        </div>
+
+        <!-- Section: Track Specific Wallet Address Form -->
+        <div class="glass-panel" style="margin-bottom: 20px;">
+            <div class="card-header">
+                <div class="card-title">➕ Add Specific Wallet Address to Track & Monitor</div>
+                <span class="tag tag-indigo">REAL-TIME ONCHAIN WATCHLIST</span>
+            </div>
+            <form id="track-wallet-form" onsubmit="handleTrackWalletSubmit(event)">
+                <div style="display: grid; grid-template-columns: 2fr 1fr 1fr 1fr auto; gap: 12px; align-items: end;">
+                    <div class="terminal-input-wrap">
+                        <label class="terminal-label">Wallet Address</label>
+                        <input type="text" class="search-input" id="input-track-address" placeholder="Solana base58 or Base 0x address" required autocomplete="off" spellcheck="false" style="width: 100%;">
+                    </div>
+                    <div class="terminal-input-wrap">
+                        <label class="terminal-label">Custom Alias / Label</label>
+                        <input type="text" class="search-input" id="input-track-alias" placeholder="e.g. Alpha Whale #1" style="width: 100%;">
+                    </div>
+                    <div class="terminal-input-wrap">
+                        <label class="terminal-label">Blockchain</label>
+                        <select class="select-filter" id="select-track-chain" style="width: 100%; height: 38px;">
+                            <option value="AUTO">Auto-Detect</option>
+                            <option value="SOLANA_MAINNET">Solana</option>
+                            <option value="BASE_MAINNET">Base</option>
+                        </select>
+                    </div>
+                    <div class="terminal-input-wrap">
+                        <label class="terminal-label">Copy Trade Size</label>
+                        <input type="text" class="search-input" id="input-track-copy-size" placeholder="e.g. 0.25 SOL" style="width: 100%;">
+                    </div>
+                    <div>
+                        <button type="submit" class="btn btn-primary" id="btn-submit-track" style="height: 38px; padding: 0 20px; font-weight: 700;">➕ Track Wallet</button>
+                    </div>
+                </div>
+                <div style="display: flex; gap: 20px; align-items: center; margin-top: 12px; font-size: 12px; color: var(--text-muted); flex-wrap: wrap;">
+                    <label style="display: flex; align-items: center; gap: 6px; cursor: pointer;">
+                        <input type="checkbox" id="check-track-copy">
+                        <span>Enable autonomous Copy-Trading for this wallet</span>
+                    </label>
+                    <label style="display: flex; align-items: center; gap: 6px; cursor: pointer;">
+                        <input type="checkbox" id="check-track-alerts" checked>
+                        <span>Enable instant Telegram & UI trade alerts</span>
+                    </label>
+                </div>
+                <div id="track-wallet-feedback" style="display: none; margin-top: 10px; padding: 10px 14px; border-radius: 8px; font-size: 12px; font-family: var(--font-mono);"></div>
+            </form>
+        </div>
+
+        <!-- Section: Monitored Wallets Watchlist Table -->
+        <div class="glass-panel" style="margin-bottom: 20px;">
+            <div class="card-header">
+                <div class="card-title">👛 Monitored Alpha Wallets Watchlist</div>
+                <div class="filter-bar" style="margin-bottom: 0;">
+                    <input type="text" class="search-input" id="search-tracked-wallets" placeholder="Filter tracked wallets..." oninput="filterTrackedWalletsTable()">
+                    <button class="btn" onclick="fetchWalletsData()">🔄 Refresh Wallets</button>
+                </div>
+            </div>
+            <div class="mobile-swipe-hint">⇄ Swipe horizontally to view full table</div>
+            <div class="table-responsive">
+                <table>
+                    <thead>
+                        <tr>
+                            <th>Wallet Address / Alias</th>
+                            <th>Chain</th>
+                            <th>Win Rate %</th>
+                            <th>Total PnL ($)</th>
+                            <th>Detected Strategy</th>
+                            <th>Copy Trading</th>
+                            <th>Copy Size</th>
+                            <th>Alerts</th>
+                            <th>Actions</th>
+                        </tr>
+                    </thead>
+                    <tbody id="tracked-wallets-tbody">
+                        <tr><td colspan="9" style="text-align: center; color: var(--text-dim); padding: 24px;">Loading tracked wallets from SQLite ledger...</td></tr>
+                    </tbody>
+                </table>
+            </div>
+        </div>
+
+        <!-- Section: Smart Money Discovery Scanner -->
+        <div class="glass-panel">
+            <div class="card-header">
+                <div>
+                    <div class="card-title">🔎 Smart Money Discovery Scanner</div>
+                    <div style="font-size: 11px; color: var(--text-muted); margin-top: 2px;">
+                        Curated high-performance alpha wallets identified by behavioral profiling, survivorship bias filter & wash-trade clustering
+                    </div>
+                </div>
+                <div class="filter-bar" style="margin-bottom: 0;">
+                    <select class="select-filter" id="filter-discovery-chain" onchange="filterDiscoveredWalletsTable()">
+                        <option value="ALL">All Chains</option>
+                        <option value="solana">Solana Mainnet</option>
+                        <option value="base">Base Mainnet</option>
+                    </select>
+                    <select class="select-filter" id="filter-discovery-class" onchange="filterDiscoveredWalletsTable()">
+                        <option value="ALL">All Classifications</option>
+                        <option value="SMART_MONEY">Smart Money</option>
+                        <option value="WHALE">Whale</option>
+                        <option value="ALPHA_SNIPER">Alpha Sniper</option>
+                    </select>
+                    <input type="text" class="search-input" id="search-discovered-wallets" placeholder="Search address or cluster..." oninput="filterDiscoveredWalletsTable()">
+                </div>
+            </div>
+            <div class="mobile-swipe-hint">⇄ Swipe horizontally to view full table</div>
+            <div class="table-responsive">
+                <table>
+                    <thead>
+                        <tr>
+                            <th>Discovered Wallet</th>
+                            <th>Chain</th>
+                            <th>Classification</th>
+                            <th>Smart Score</th>
+                            <th>Win Rate %</th>
+                            <th>Trades</th>
+                            <th>Median Hold</th>
+                            <th>Realized PnL ($)</th>
+                            <th>Status</th>
+                            <th>Action</th>
+                        </tr>
+                    </thead>
+                    <tbody id="discovered-wallets-tbody">
+                        <tr><td colspan="10" style="text-align: center; color: var(--text-dim); padding: 24px;">Scanning onchain alpha wallets...</td></tr>
+                    </tbody>
+                </table>
+            </div>
+        </div>
+    </div>
+
     <!-- Slide-over / Modal for Deep Inspection -->
     <div class="modal-overlay" id="detail-modal">
         <div class="modal-card">
@@ -1710,7 +2199,9 @@
         let activeTab = 'cockpit';
         let fullActivityCache = [];
         let fullTradesCache = [];
+        let fullWalletsCache = { tracked: [], discovered: [], stats: {} };
         let doctorRunning = false;
+        let currentTradeSide = 'BUY';
 
         function switchTab(tabId) {
             activeTab = tabId;
@@ -1736,6 +2227,7 @@
             if (tabId === 'decisions') fetchDecisions();
             if (tabId === 'activity') fetchActivityLogs();
             if (tabId === 'council') fetchAgents();
+            if (tabId === 'wallets') fetchWalletsData();
 
             if (window.innerWidth <= 768) {
                 window.scrollTo({ top: 0, behavior: 'smooth' });
@@ -1989,7 +2481,10 @@
                     </td>
                     <td>${Math.floor(p.holding_seconds / 60)}m ${p.holding_seconds % 60}s</td>
                     <td>
-                        <button class="btn" style="font-size: 10px; padding: 3px 8px;" onclick="inspectTokenJourney('${p.token_address}')">Inspect</button>
+                        <div style="display: flex; gap: 4px; align-items: center;">
+                            <button class="btn" style="font-size: 10px; padding: 3px 6px;" onclick="inspectTokenJourney('${p.token_address}')">Inspect</button>
+                            <button class="btn btn-danger" style="font-size: 10px; padding: 3px 6px;" onclick="instantExitPosition('${p.token_address}', '${p.chain}')">⚡ Exit</button>
+                        </div>
                     </td>
                 </tr>
             `).join('');
@@ -2385,6 +2880,557 @@
             }
         }
 
+        // ---------------------------------------------------------------------
+        // Instant Trade Execution Terminal Logic
+        // ---------------------------------------------------------------------
+
+        function setTradeSide(side) {
+            currentTradeSide = side;
+            const buyBtn = document.getElementById('btn-side-buy');
+            const sellBtn = document.getElementById('btn-side-sell');
+            const submitBtn = document.getElementById('btn-submit-trade');
+            const labelEl = document.getElementById('btn-trade-label');
+
+            if (side === 'BUY') {
+                buyBtn.className = 'trade-side-btn active-buy';
+                sellBtn.className = 'trade-side-btn';
+                submitBtn.className = 'btn-execute btn-execute-buy';
+                labelEl.innerText = 'Execute BUY';
+            } else {
+                buyBtn.className = 'trade-side-btn';
+                sellBtn.className = 'trade-side-btn active-sell';
+                submitBtn.className = 'btn-execute btn-execute-sell';
+                labelEl.innerText = 'Execute SELL';
+            }
+        }
+
+        function onTokenAddressInput(val) {
+            const clean = (val || '').trim();
+            const tag = document.getElementById('trade-chain-tag');
+            const select = document.getElementById('trade-chain-select');
+            const badge = document.getElementById('detected-chain-badge');
+
+            if (!clean) {
+                tag.innerText = 'SOL / EVM';
+                tag.style.color = 'var(--accent-indigo)';
+                badge.style.display = 'none';
+                return;
+            }
+
+            if (clean.startsWith('0x') && clean.length === 42) {
+                tag.innerText = 'BASE EVM';
+                tag.style.color = 'var(--accent-indigo)';
+                badge.innerText = 'BASE EVM';
+                badge.style.display = 'inline-block';
+                if (select.value === 'AUTO') {
+                    select.value = 'BASE_MAINNET';
+                }
+            } else if (clean.length >= 32 && clean.length <= 44 && !clean.startsWith('0x')) {
+                tag.innerText = 'SOLANA';
+                tag.style.color = 'var(--accent-cyan)';
+                badge.innerText = 'SOLANA';
+                badge.style.display = 'inline-block';
+                if (select.value === 'AUTO') {
+                    select.value = 'SOLANA_MAINNET';
+                }
+            } else {
+                tag.innerText = 'UNKNOWN';
+                tag.style.color = 'var(--accent-amber)';
+                badge.style.display = 'none';
+            }
+        }
+
+        function onChainSelectChange() {
+            const select = document.getElementById('trade-chain-select');
+            const tag = document.getElementById('trade-chain-tag');
+            if (select.value === 'SOLANA_MAINNET') {
+                tag.innerText = 'SOLANA';
+                tag.style.color = 'var(--accent-cyan)';
+            } else if (select.value === 'BASE_MAINNET') {
+                tag.innerText = 'BASE EVM';
+                tag.style.color = 'var(--accent-indigo)';
+            } else {
+                onTokenAddressInput(document.getElementById('trade-token-ca').value);
+            }
+        }
+
+        function setPresetSize(amt, btnEl, unit = 'SOL') {
+            document.querySelectorAll('#trade-presets-container .chip-btn').forEach(b => b.classList.remove('active'));
+            if (btnEl) btnEl.classList.add('active');
+            const input = document.getElementById('trade-amount');
+            if (input) input.value = amt;
+        }
+
+        function inspectEnteredToken() {
+            const ca = document.getElementById('trade-token-ca').value.trim();
+            if (!ca) {
+                alert('Please enter or paste a token contract address first.');
+                return;
+            }
+            inspectTokenJourney(ca);
+        }
+
+        async function submitInstantTrade() {
+            const caInput = document.getElementById('trade-token-ca');
+            const chainSelect = document.getElementById('trade-chain-select');
+            const amountInput = document.getElementById('trade-amount');
+            const slippageSelect = document.getElementById('trade-slippage');
+            const submitBtn = document.getElementById('btn-submit-trade');
+            const resultCard = document.getElementById('trade-result-card');
+            const resultText = document.getElementById('trade-result-text');
+
+            const tokenAddress = (caInput.value || '').trim();
+            if (!tokenAddress) {
+                resultCard.className = 'execution-result-card error';
+                resultCard.style.display = 'flex';
+                resultText.innerHTML = '<span>⚠️ Error: Please input a valid token contract address.</span>';
+                caInput.focus();
+                return;
+            }
+
+            const amountNative = parseFloat(amountInput.value) || 0.1;
+            const chain = chainSelect.value;
+            const slippageBps = parseInt(slippageSelect.value, 10) || 250;
+            const side = currentTradeSide;
+            const bypassGatekeeper = document.getElementById('trade-bypass-gatekeeper')?.checked || false;
+
+            // Loading state
+            submitBtn.disabled = true;
+            submitBtn.style.opacity = '0.7';
+            resultCard.className = 'execution-result-card';
+            resultCard.style.display = 'flex';
+            resultCard.style.background = 'rgba(99, 102, 241, 0.15)';
+            resultCard.style.color = '#fff';
+            resultText.innerHTML = `<span>⏳ Submitting instant ${side} order to matching engine...</span>`;
+
+            try {
+                const res = await fetch('/api/action/trade/execute', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        token_address: tokenAddress,
+                        side: side,
+                        chain: chain,
+                        amount_native: amountNative,
+                        slippage_bps: slippageBps,
+                        bypass_consensus: bypassGatekeeper,
+                    }),
+                });
+                const data = await res.json();
+
+                if (res.ok && data.status === 'SUCCESS') {
+                    resultCard.className = 'execution-result-card success';
+                    resultCard.style.background = 'rgba(16, 185, 129, 0.12)';
+                    resultCard.style.color = 'var(--accent-green)';
+                    resultText.innerHTML = `
+                        <span>✓ <strong>${side} Executed:</strong> ${data.message} | Size: ${data.amount_native} | Price: $${data.execution_price_usd ? data.execution_price_usd.toFixed(2) : '--'} | Latency: ${data.latency_ms}ms</span>
+                        <a href="javascript:void(0)" onclick="inspectTokenJourney('${tokenAddress}')" style="color: var(--accent-cyan); text-decoration: underline; margin-left: 8px;">View Journey</a>
+                    `;
+                    fetchSnapshot();
+                    fetchTrades();
+                    setTimeout(() => {
+                        fetchSnapshot();
+                        fetchTrades();
+                    }, 350);
+                } else {
+                    resultCard.className = 'execution-result-card error';
+                    resultCard.style.background = 'rgba(239, 68, 68, 0.12)';
+                    resultCard.style.color = 'var(--accent-red)';
+                    resultText.innerHTML = `<span>✕ <strong>Execution Rejected:</strong> ${data.message || 'Engine veto or failed sanity check.'}</span>`;
+                }
+            } catch (err) {
+                resultCard.className = 'execution-result-card error';
+                resultCard.style.background = 'rgba(239, 68, 68, 0.12)';
+                resultCard.style.color = 'var(--accent-red)';
+                resultText.innerHTML = `<span>✕ Network/Server Error: ${err.message}</span>`;
+            } finally {
+                submitBtn.disabled = false;
+                submitBtn.style.opacity = '1';
+            }
+        }
+
+        async function instantExitPosition(tokenAddress, chain) {
+            if (!confirm(`Are you sure you want to instantly exit/sell position for ${tokenAddress.slice(0, 10)}...?`)) {
+                return;
+            }
+
+            try {
+                const res = await fetch('/api/action/trade/execute', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        token_address: tokenAddress,
+                        side: 'SELL',
+                        chain: chain || 'AUTO',
+                    }),
+                });
+                const data = await res.json();
+                if (res.ok && data.status === 'SUCCESS') {
+                    alert(`Exit Order Filled: ${data.message}`);
+                    fetchSnapshot();
+                    fetchTrades();
+                } else {
+                    alert(`Exit Failed: ${data.message}`);
+                }
+            } catch (err) {
+                alert(`Exit Network Error: ${err.message}`);
+            }
+        }
+
+        // ---------------------------------------------------------------------
+        // Smart Wallet Discovery & Monitoring Logic
+        // ---------------------------------------------------------------------
+
+        async function fetchWalletsData() {
+            try {
+                const res = await fetch('/api/wallets');
+                const data = await res.json();
+                fullWalletsCache = data;
+                renderWalletsTab(data);
+            } catch (err) {
+                console.error('Failed fetching wallets data', err);
+            }
+        }
+
+        function renderWalletsTab(data) {
+            if (!data) return;
+
+            // 1. KPI Badges
+            const stats = data.stats || {};
+            const discEl = document.getElementById('wallets-kpi-discovered');
+            if (discEl) discEl.innerText = stats.total_discovered || (data.discovered ? data.discovered.length : 0);
+
+            const trackEl = document.getElementById('wallets-kpi-tracked');
+            if (trackEl) trackEl.innerText = stats.total_tracked || (data.tracked ? data.tracked.length : 0);
+
+            const tabBadge = document.getElementById('tab-wallets-badge');
+            if (tabBadge) tabBadge.innerText = stats.total_tracked || (data.tracked ? data.tracked.length : 0);
+            const dockBadge = document.getElementById('dock-wallets-badge');
+            if (dockBadge) dockBadge.innerText = stats.total_tracked || (data.tracked ? data.tracked.length : 0);
+
+            const wrEl = document.getElementById('wallets-kpi-winrate');
+            if (wrEl) wrEl.innerText = `${stats.avg_win_rate_pct !== undefined ? stats.avg_win_rate_pct : 75.0}%`;
+
+            const masterToggle = document.getElementById('master-copy-trade-toggle');
+            const masterStatus = document.getElementById('master-copy-trade-status');
+            if (masterToggle && masterStatus) {
+                masterToggle.checked = stats.global_copy_trading !== false;
+                masterStatus.innerText = masterToggle.checked ? 'ENABLED' : 'DISABLED';
+                masterStatus.style.color = masterToggle.checked ? 'var(--accent-green)' : 'var(--accent-red)';
+            }
+
+            // 2. Render Tracked Wallets Table
+            renderTrackedWalletsTable(data.tracked || []);
+
+            // 3. Render Discovered Wallets Table
+            renderDiscoveredWalletsTable(data.discovered || []);
+        }
+
+        function renderTrackedWalletsTable(wallets) {
+            const tbody = document.getElementById('tracked-wallets-tbody');
+            if (!tbody) return;
+
+            if (!wallets || wallets.length === 0) {
+                tbody.innerHTML = `<tr><td colspan="9" style="text-align: center; color: var(--text-dim); padding: 24px;">No wallets currently tracked. Use the form above or the Discovery Scanner below to add wallets.</td></tr>`;
+                return;
+            }
+
+            tbody.innerHTML = wallets.map(w => {
+                const addr = w.wallet_address || w.address || '';
+                const shortAddr = addr.length > 12 ? `${addr.slice(0, 6)}...${addr.slice(-4)}` : addr;
+                const chainName = (w.chain || 'solana_mainnet').replace('_mainnet', '').toUpperCase();
+                const copyActive = Boolean(w.copy_trade_enabled || w.copy_trading_enabled);
+                const winRate = parseFloat(w.win_rate_pct || 0);
+                const pnl = parseFloat(w.total_pnl_usd || 0);
+
+                return `
+                    <tr>
+                        <td>
+                            <div style="font-weight: 700; color: #fff;">${w.alias || 'Alpha Trader'}</div>
+                            <div style="display: flex; align-items: center; gap: 6px; font-family: var(--font-mono); font-size: 11px; color: var(--text-dim); margin-top: 2px;">
+                                <span>${shortAddr}</span>
+                                <button class="btn" style="padding: 1px 5px; font-size: 9px;" onclick="copyToClipboard('${addr}')" title="Copy full address">📋</button>
+                            </div>
+                        </td>
+                        <td><span class="tag ${chainName === 'SOLANA' ? 'tag-cyan' : 'tag-indigo'}">${chainName}</span></td>
+                        <td style="color: ${winRate >= 65 ? 'var(--accent-green)' : 'var(--accent-amber)'}; font-weight: 700; font-family: var(--font-mono);">
+                            ${winRate.toFixed(1)}%
+                        </td>
+                        <td style="color: ${pnl >= 0 ? 'var(--accent-green)' : 'var(--accent-red)'}; font-weight: 700; font-family: var(--font-mono);">
+                            ${pnl >= 0 ? '+' : ''}$${pnl.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+                        </td>
+                        <td style="color: var(--text-muted); font-size: 11.5px;">${w.detected_strategy || 'Organic Alpha'}</td>
+                        <td>
+                            <label class="switch" title="Toggle Copy Trading for this wallet">
+                                <input type="checkbox" ${copyActive ? 'checked' : ''} onchange="toggleWalletCopy('${addr}', ${copyActive})">
+                                <span class="slider"></span>
+                            </label>
+                        </td>
+                        <td style="font-family: var(--font-mono); font-size: 11px; color: var(--accent-cyan);">
+                            ${w.copy_trade_size_native || 'Default (0.1)'}
+                        </td>
+                        <td>
+                            <span class="tag ${w.alerts_enabled !== false ? 'tag-green' : 'tag-amber'}">${w.alerts_enabled !== false ? 'ACTIVE' : 'MUTED'}</span>
+                        </td>
+                        <td>
+                            <div style="display: flex; gap: 6px; align-items: center;">
+                                <button class="btn" style="font-size: 10px; padding: 3px 8px;" onclick="inspectWallet('${addr}')">Inspect</button>
+                                <button class="btn btn-danger" style="font-size: 10px; padding: 3px 8px;" onclick="untrackWallet('${addr}')">❌ Untrack</button>
+                            </div>
+                        </td>
+                    </tr>
+                `;
+            }).join('');
+        }
+
+        function renderDiscoveredWalletsTable(wallets) {
+            const tbody = document.getElementById('discovered-wallets-tbody');
+            if (!tbody) return;
+
+            if (!wallets || wallets.length === 0) {
+                tbody.innerHTML = `<tr><td colspan="10" style="text-align: center; color: var(--text-dim); padding: 24px;">No discovered alpha wallets match current filters.</td></tr>`;
+                return;
+            }
+
+            tbody.innerHTML = wallets.map(w => {
+                const addr = w.wallet_address || '';
+                const shortAddr = addr.length > 12 ? `${addr.slice(0, 6)}...${addr.slice(-4)}` : addr;
+                const chainName = (w.chain || 'solana_mainnet').replace('_mainnet', '').toUpperCase();
+                const score = Math.round(parseFloat(w.smart_money_score || 85));
+                const winRate = parseFloat(w.win_rate_pct || 0);
+                const pnl = parseFloat(w.total_pnl_usd || 0);
+                const isTracked = Boolean(w.is_tracked);
+
+                return `
+                    <tr>
+                        <td>
+                            <div style="font-family: var(--font-mono); font-weight: 600; color: #fff;">${shortAddr}</div>
+                            <div style="font-size: 10px; color: var(--text-dim); margin-top: 2px;">
+                                ${w.cluster_tag || 'ORGANIC_ALPHA'}
+                                <button class="btn" style="padding: 0 4px; font-size: 8px; margin-left: 4px;" onclick="copyToClipboard('${addr}')">📋</button>
+                            </div>
+                        </td>
+                        <td><span class="tag ${chainName === 'SOLANA' ? 'tag-cyan' : 'tag-indigo'}">${chainName}</span></td>
+                        <td><span class="tag tag-indigo">${(w.classification || 'SMART_MONEY').toUpperCase()}</span></td>
+                        <td style="min-width: 110px;">
+                            <div style="display: flex; justify-content: space-between; font-size: 10.5px; font-family: var(--font-mono);">
+                                <span style="color: var(--accent-cyan); font-weight: 700;">${score}/100</span>
+                                <span style="color: var(--text-dim);">Score</span>
+                            </div>
+                            <div class="score-bar-bg">
+                                <div class="score-bar-fill" style="width: ${score}%;"></div>
+                            </div>
+                        </td>
+                        <td style="color: ${winRate >= 65 ? 'var(--accent-green)' : 'var(--accent-amber)'}; font-weight: 700; font-family: var(--font-mono);">
+                            ${winRate.toFixed(1)}%
+                        </td>
+                        <td style="font-family: var(--font-mono);">${w.total_trades || 0}</td>
+                        <td style="font-size: 11px; color: var(--text-muted);">${w.median_holding_time_s ? Math.round(w.median_holding_time_s) + 's' : 'N/A'}</td>
+                        <td style="color: ${pnl >= 0 ? 'var(--accent-green)' : 'var(--accent-red)'}; font-weight: 700; font-family: var(--font-mono);">
+                            ${pnl >= 0 ? '+' : ''}$${pnl.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+                        </td>
+                        <td><span class="tag tag-green">${(w.status || 'ACTIVE').toUpperCase()}</span></td>
+                        <td>
+                            <div style="display: flex; gap: 6px; align-items: center;">
+                                ${isTracked 
+                                    ? `<span class="tag tag-green" style="font-size: 10px;">✓ TRACKED</span>`
+                                    : `<button class="btn btn-primary" style="font-size: 10px; padding: 3px 8px;" onclick="quickTrackDiscovered('${addr}', '${w.chain}', '${w.classification || 'Smart Whale'}')">➕ Track</button>`
+                                }
+                                <button class="btn" style="font-size: 10px; padding: 3px 6px;" onclick="inspectWallet('${addr}')">👁️</button>
+                            </div>
+                        </td>
+                    </tr>
+                `;
+            }).join('');
+        }
+
+        function filterTrackedWalletsTable() {
+            const q = (document.getElementById('search-tracked-wallets').value || '').toLowerCase().trim();
+            if (!fullWalletsCache.tracked) return;
+            const filtered = fullWalletsCache.tracked.filter(w => {
+                const addr = (w.wallet_address || w.address || '').toLowerCase();
+                const alias = (w.alias || '').toLowerCase();
+                const strat = (w.detected_strategy || '').toLowerCase();
+                return addr.includes(q) || alias.includes(q) || strat.includes(q);
+            });
+            renderTrackedWalletsTable(filtered);
+        }
+
+        function filterDiscoveredWalletsTable() {
+            const chain = document.getElementById('filter-discovery-chain').value;
+            const cls = document.getElementById('filter-discovery-class').value;
+            const q = (document.getElementById('search-discovered-wallets').value || '').toLowerCase().trim();
+            if (!fullWalletsCache.discovered) return;
+
+            const filtered = fullWalletsCache.discovered.filter(w => {
+                const addr = (w.wallet_address || '').toLowerCase();
+                const cluster = (w.cluster_tag || '').toLowerCase();
+                const wChain = (w.chain || '').toLowerCase();
+                const wClass = (w.classification || '').toUpperCase();
+
+                const matchChain = (chain === 'ALL') || wChain.includes(chain);
+                const matchClass = (cls === 'ALL') || wClass.includes(cls);
+                const matchQ = !q || addr.includes(q) || cluster.includes(q);
+
+                return matchChain && matchClass && matchQ;
+            });
+            renderDiscoveredWalletsTable(filtered);
+        }
+
+        async function handleTrackWalletSubmit(event) {
+            event.preventDefault();
+            const addrInput = document.getElementById('input-track-address');
+            const aliasInput = document.getElementById('input-track-alias');
+            const chainSelect = document.getElementById('select-track-chain');
+            const copySizeInput = document.getElementById('input-track-copy-size');
+            const copyCheck = document.getElementById('check-track-copy');
+            const alertsCheck = document.getElementById('check-track-alerts');
+            const feedbackEl = document.getElementById('track-wallet-feedback');
+            const submitBtn = document.getElementById('btn-submit-track');
+
+            const addr = addrInput.value.trim();
+            if (!addr) {
+                feedbackEl.style.display = 'block';
+                feedbackEl.style.background = 'rgba(239, 68, 68, 0.12)';
+                feedbackEl.style.color = 'var(--accent-red)';
+                feedbackEl.innerText = 'Please input a valid wallet address.';
+                return;
+            }
+
+            submitBtn.disabled = true;
+            feedbackEl.style.display = 'block';
+            feedbackEl.style.background = 'rgba(99, 102, 241, 0.15)';
+            feedbackEl.style.color = '#fff';
+            feedbackEl.innerText = 'Registering wallet in onchain tracking database...';
+
+            try {
+                const res = await fetch('/api/wallets/track', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        wallet_address: addr,
+                        alias: aliasInput.value.trim(),
+                        chain: chainSelect.value,
+                        copy_trade_enabled: copyCheck.checked,
+                        copy_trade_size_native: copySizeInput.value.trim() || null,
+                        alerts_enabled: alertsCheck.checked,
+                    }),
+                });
+                const data = await res.json();
+
+                if (res.ok && data.status === 'SUCCESS') {
+                    feedbackEl.style.background = 'rgba(16, 185, 129, 0.12)';
+                    feedbackEl.style.color = 'var(--accent-green)';
+                    feedbackEl.innerText = `✓ ${data.message}`;
+                    addrInput.value = '';
+                    aliasInput.value = '';
+                    copySizeInput.value = '';
+                    fetchWalletsData();
+                } else {
+                    feedbackEl.style.background = 'rgba(239, 68, 68, 0.12)';
+                    feedbackEl.style.color = 'var(--accent-red)';
+                    feedbackEl.innerText = `✕ Error: ${data.message || 'Failed to track wallet'}`;
+                }
+            } catch (err) {
+                feedbackEl.style.background = 'rgba(239, 68, 68, 0.12)';
+                feedbackEl.style.color = 'var(--accent-red)';
+                feedbackEl.innerText = `✕ Network error: ${err.message}`;
+            } finally {
+                submitBtn.disabled = false;
+            }
+        }
+
+        async function untrackWallet(walletAddress) {
+            if (!confirm(`Untrack wallet ${walletAddress.slice(0, 10)}...?`)) return;
+            try {
+                const res = await fetch('/api/wallets/untrack', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ wallet_address: walletAddress }),
+                });
+                const data = await res.json();
+                if (res.ok && data.status === 'SUCCESS') {
+                    fetchWalletsData();
+                } else {
+                    alert(`Failed to untrack: ${data.message}`);
+                }
+            } catch (err) {
+                alert(`Network error: ${err.message}`);
+            }
+        }
+
+        async function toggleWalletCopy(walletAddress, currentVal) {
+            try {
+                const res = await fetch('/api/wallets/toggle_copy', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        wallet_address: walletAddress,
+                        enabled: !currentVal,
+                    }),
+                });
+                fetchWalletsData();
+            } catch (err) {
+                console.error('Error toggling copy trade for wallet', err);
+            }
+        }
+
+        async function onToggleGlobalCopyTrade(enabled) {
+            try {
+                const res = await fetch('/api/wallets/toggle_copy', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ enabled: enabled }),
+                });
+                const data = await res.json();
+                const statusEl = document.getElementById('master-copy-trade-status');
+                if (statusEl) {
+                    statusEl.innerText = enabled ? 'ENABLED' : 'DISABLED';
+                    statusEl.style.color = enabled ? 'var(--accent-green)' : 'var(--accent-red)';
+                }
+            } catch (err) {
+                console.error('Error toggling master copy trade switch', err);
+            }
+        }
+
+        async function quickTrackDiscovered(walletAddress, chain, alias) {
+            try {
+                const res = await fetch('/api/wallets/track', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        wallet_address: walletAddress,
+                        chain: chain,
+                        alias: alias || 'Discovered Alpha',
+                        copy_trade_enabled: false,
+                        alerts_enabled: true,
+                    }),
+                });
+                fetchWalletsData();
+            } catch (err) {
+                console.error('Quick track failed', err);
+            }
+        }
+
+        function inspectWallet(walletAddress) {
+            const all = (fullWalletsCache.tracked || []).concat(fullWalletsCache.discovered || []);
+            const found = all.find(w => (w.wallet_address || w.address || '').toLowerCase() === walletAddress.toLowerCase());
+            openInspectionModal(`👛 Wallet Inspection: ${walletAddress.slice(0, 10)}...`, found || { wallet_address: walletAddress });
+        }
+
+        function copyToClipboard(text) {
+            navigator.clipboard.writeText(text).then(() => {
+                const active = document.activeElement;
+                if (active) {
+                    const prev = active.innerText;
+                    active.innerText = '✓';
+                    setTimeout(() => { active.innerText = prev; }, 1000);
+                }
+            }).catch(e => {
+                prompt('Copy address to clipboard:', text);
+            });
+        }
+
         async function confirmResetLedger() {
             if (!confirm("Are you sure you want to reset the paper trading ledger? This will clear closed trades history and restore initial equity to $8,300 USD.")) return;
             try {
@@ -2404,6 +3450,7 @@
             fetchDecisions();
             fetchActivityLogs();
             fetchAgents();
+            fetchWalletsData();
         }
 
         function openInspectionModal(title, obj) {
@@ -2425,6 +3472,7 @@
         window.addEventListener('DOMContentLoaded', () => {
             fetchSnapshot();
             fetchActivityLogs();
+            fetchWalletsData();
             connectWebSocket();
         });
     </script>
@@ -2438,6 +3486,11 @@
             <span class="dock-icon">💼</span>
             <span class="dock-text">Trades</span>
             <span class="dock-badge" id="dock-trades-badge">0</span>
+        </button>
+        <button class="dock-btn" onclick="switchTab('wallets')" title="Wallets">
+            <span class="dock-icon">👛</span>
+            <span class="dock-text">Wallets</span>
+            <span class="dock-badge" id="dock-wallets-badge">0</span>
         </button>
         <button class="dock-btn" onclick="switchTab('council')" title="Council">
             <span class="dock-icon">🏛️</span>

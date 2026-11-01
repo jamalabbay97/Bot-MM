@@ -83,6 +83,7 @@ from alpha_engine.models.events import (
 from alpha_engine.models.news import NewsEvent, NewsSignalEvent
 from alpha_engine.models.state import (
     ExitDecision,
+    PaperFill,
     PoolState,
     PortfolioSnapshot,
     SecurityReport,
@@ -293,7 +294,35 @@ class PaperTradingEngine:
         from alpha_engine.dashboard.server import DashboardServer
 
         self.strategy_manager = StrategyManager(config=config)
-        self.self_learning_engine = SelfLearningEngine(config=config, ledger=None)
+        self.self_learning_engine = SelfLearningEngine(
+            strategy_registry=self.strategy_manager.registry,
+            council_arbiter=getattr(self._ai_supervisor, "_council", None),
+            config=config,
+            ledger=None,
+        )
+
+        def _on_champion_promoted(champ: Any, rationale: str) -> None:
+            self.active_strategy = champ.strategy_name
+            self.hard_stop_loss_pct = champ.parameters.hard_stop_loss_pct
+            self.custom_take_profit_pct = champ.parameters.take_profit_pct
+            self.trailing_stop_from_peak_pct = champ.parameters.trailing_stop_from_peak_pct
+            logger.info(
+                "Runner: Applied newly promoted Champion strategy [%s] to live trade execution. SL=%.1f%%, TP=%.1f%%, Trail=%.1f%%",
+                champ.strategy_name,
+                champ.parameters.hard_stop_loss_pct * 100,
+                (champ.parameters.take_profit_pct or 0.5) * 100,
+                (champ.parameters.trailing_stop_from_peak_pct or 0.25) * 100,
+            )
+            if hasattr(self, "dashboard_telemetry") and self.dashboard_telemetry:
+                self.dashboard_telemetry.record_activity(
+                    category="STRATEGY",
+                    title=f"🏆 New Champion: {champ.strategy_name}",
+                    details=f"Promoted to live execution. {rationale}",
+                    level="SUCCESS",
+                    component="AutonomousEvolution",
+                )
+
+        self._strategy_tournament.register_on_promotion_callback(_on_champion_promoted)
 
         # Real-Time Observability Hub
         self.dashboard_telemetry = DashboardTelemetryAggregator(
@@ -991,6 +1020,14 @@ class PaperTradingEngine:
             asyncio.create_task(self.self_learning_engine.on_trade_closed(closed_trade_payload))
             if self._swarm_coordinator:
                 asyncio.create_task(self._swarm_coordinator.on_trade_closed(closed_trade_payload))
+            if hasattr(self, "_strategy_tournament") and self._strategy_tournament:
+                self._strategy_tournament.record_live_trade_outcome(
+                    strategy_name=str(getattr(lot, "strategy_name", getattr(lot, "strategy_type", "default"))),
+                    pnl_usd=float(exit_pnl_usd),
+                    is_win=is_win,
+                    roi_pct=pct,
+                    hold_time_s=dur_s,
+                )
         except Exception as learn_err:
             logger.debug("Failed triggering post-mortem self-learning hook: %s", learn_err)
 
@@ -1223,10 +1260,12 @@ class PaperTradingEngine:
         chain: Optional[ChainIdentifier] = None,
         amount_native: Optional[Decimal] = None,
         originating_channel: Optional[str] = None,
+        bypass_consensus: bool = False,
     ) -> tuple[bool, str, Optional[Any]]:
         """
-        Manually triggers entry into a token position (via Telegram /buy or token page button).
-        Bypasses market cap and screener filters while verifying security gates, balance, and exposure.
+        Manually triggers direct execution and opens a position for a token.
+        Bypasses market cap and screener filters, verifies security gates and balance,
+        then directly executes the fill and registers the lot in the position book.
         """
         clean_addr = token_address.strip()
         chain_id = chain or (
@@ -1253,6 +1292,9 @@ class PaperTradingEngine:
             if available_cash < (req_amount + fee_est):
                 return False, f"رصيد غير كافٍ ({available_cash:.4f} {unit} المتاح < {req_amount + fee_est:.4f} {unit} المطلوب)", None
 
+        if req_amount is None or req_amount <= Decimal(0):
+            req_amount = Decimal("0.05") if chain_id == ChainIdentifier.SOLANA_MAINNET else Decimal("0.01")
+
         # Pre-check position capacity atomically
         can_open, reject_reason = self._position_book.can_open_position(
             token_address=clean_addr,
@@ -1269,7 +1311,7 @@ class PaperTradingEngine:
 
         # 1. Evaluate security gates via gatekeeper
         report = None
-        if hasattr(self, "_gatekeeper") and self._gatekeeper is not None:
+        if not bypass_consensus and hasattr(self, "_gatekeeper") and self._gatekeeper is not None:
             try:
                 report = await self._gatekeeper.evaluate_token(
                     token_address=clean_addr,
@@ -1278,7 +1320,7 @@ class PaperTradingEngine:
             except Exception as exc:
                 logger.warning("Manual buy gatekeeper error for %s: %s", clean_addr[:10], exc)
 
-        if report is not None and not getattr(report, "passes_hard_gates", True):
+        if report is not None and not getattr(report, "passes_hard_gates", True) and not bypass_consensus:
             self._position_book.release_position_slot(token_address=clean_addr)
             reason = self._extract_gatekeeper_rejection_reason(report)
             return False, f"فشل الفحص الأمني للعملة (Security Veto): {reason}", None
@@ -1300,8 +1342,15 @@ class PaperTradingEngine:
 
         # 2. Get or fetch authoritative pool state
         pool = await self.get_or_fetch_pool_state(chain_id, clean_addr, "")
+        if pool is None or pool.spot_price_native_per_token <= Decimal(0):
+            from alpha_engine.math.cpmm import get_initial_bonding_curve_pool
+            pool = get_initial_bonding_curve_pool(
+                token_address=clean_addr,
+                chain=chain_id,
+                pool_address="",
+            )
 
-        # 3. Create high-conviction BUY SignalEvent with is_direct_dm=True and custom_amount_native
+        # 3. Create high-conviction BUY SignalEvent
         mcap = pool.calculate_market_cap_usd(native_price_usd=native_p) if pool else Decimal("10000.0")
 
         signal = SignalEvent(
@@ -1313,17 +1362,118 @@ class PaperTradingEngine:
             pool_state=pool,
             security_report=report,
             strength=SignalStrength.STRONG,
-            alpha_score=0.95,
+            alpha_score=0.99,
             source=SignalSource.TELEGRAM_SCRAPER,
-            originating_channel=originating_channel or "DM:ManualBuy",
+            originating_channel=originating_channel or "Dashboard:InstantExecution",
             is_direct_dm=True,
             market_cap_usd=mcap,
-            custom_amount_native=amount_native,
+            custom_amount_native=req_amount,
         )
 
-        # 4. Enqueue into signal queue
-        await self._signal_q.put(signal)
-        return True, "تم إرسال أمر الشراء بنجاح إلى محرك التنفيذ (Trade signal queued)", signal
+        # 4. Directly execute fill via executor or pool spot price
+        fill: Optional[PaperFill] = None
+        if hasattr(self, "_executor") and self._executor is not None:
+            try:
+                fill = await self._executor.execute_signal(
+                    signal,
+                    portfolio_equity_usd=self._current_equity_usd(),
+                    is_new_launch=self._is_new_launch_signal(signal),
+                    fixed_trade_amount_native=req_amount,
+                )
+            except Exception as exc:
+                logger.warning("Error executing manual buy signal via executor: %s", exc)
+
+        eff_price = getattr(fill, "effective_price", None)
+        is_valid_fill = (
+            fill is not None
+            and isinstance(eff_price, (Decimal, int, float))
+            and Decimal(str(eff_price)) > Decimal(0)
+        )
+        if not is_valid_fill:
+            spot_native = pool.spot_price_native_per_token if (pool and pool.spot_price_native_per_token > Decimal(0)) else Decimal("0.00000003")
+            tokens_acq = req_amount / spot_native if spot_native > Decimal(0) else Decimal("1000000")
+            fill = PaperFill(
+                order_id=str(uuid.uuid4()),
+                token_address=clean_addr,
+                pool_address=pool.pool_address if pool else ("0x" + "0" * 40),
+                chain=chain_id,
+                side=OrderSide.BUY,
+                simulated_native_spent=req_amount,
+                tokens_acquired=tokens_acq,
+                effective_price=spot_native,
+                price_impact_bps=25,
+                simulated_gas_cost_usd=Decimal("0.02") if chain_id == ChainIdentifier.SOLANA_MAINNET else Decimal("0.05"),
+                fill_latency_ms=45,
+                portfolio_equity_usd=self._current_equity_usd(),
+                platform="Pump.fun" if clean_addr.lower().endswith("pump") else "DexScan",
+            )
+
+        # 5. Open lot in position book
+        initial_reserve = pool.native_reserve if pool else Decimal(0)
+        platform_name = getattr(fill, "platform", None) or ("Pump.fun" if clean_addr.lower().endswith("pump") else "DexScan")
+        is_pump = clean_addr.lower().endswith("pump") or platform_name.lower() == "pump.fun"
+
+        lot = self._position_book.open_lot(
+            fill,
+            signal.signal_id,
+            initial_pool_reserve_native=initial_reserve,
+            pool_address=getattr(signal, "pool_address", "") or "",
+            bonding_curve_mode=is_pump,
+            platform=platform_name,
+            strategy_name=getattr(self, "active_strategy", "MANUAL_INSTANT"),
+            hard_stop_loss_pct=getattr(self, "hard_stop_loss_pct", getattr(self._cfg, "hard_stop_loss_pct", 0.20)),
+            custom_take_profit_pct=getattr(self, "custom_take_profit_pct", getattr(self._cfg, "custom_take_profit_pct", 0.50)),
+            trailing_stop_from_peak_pct=getattr(self, "trailing_stop_from_peak_pct", getattr(self._cfg, "trailing_stop_from_peak_pct", 0.15)),
+        )
+
+        # 6. Commit reserved slot and register pool
+        self._position_book.commit_slot_to_lot_by_token(clean_addr, lot.lot_id)
+        if pool is not None and lot.pool_address:
+            self._pool_registry.set(lot.pool_address, pool)
+
+        # 7. Deduct cash balance and track gas
+        gas_val = getattr(fill, "simulated_gas_cost_usd", None)
+        gas_usd = Decimal(str(gas_val)) if isinstance(gas_val, (Decimal, int, float)) else Decimal("0.02")
+        gas_native = (gas_usd / native_p).quantize(Decimal("1e-18")) if native_p > Decimal(0) else Decimal("0.0005")
+        spent_val = getattr(fill, "simulated_native_spent", None)
+        spent_native = Decimal(str(spent_val)) if isinstance(spent_val, (Decimal, int, float)) else req_amount
+
+        if chain_id == ChainIdentifier.BASE_MAINNET:
+            self._cash_eth -= (spent_native + gas_native)
+        else:
+            self._cash_sol -= (spent_native + gas_native)
+
+        if hasattr(self, "_metrics") and self._metrics is not None and hasattr(self._metrics, "total_gas_usd"):
+            self._metrics.total_gas_usd += gas_usd
+        lot.cost_basis_native = spent_native + gas_native
+
+        # 8. Record in persistent ledger
+        if self._ledger:
+            await self._ledger.record_lot_transition(
+                lot_id=lot.lot_id,
+                token_address=lot.token_address,
+                chain=lot.chain.value,
+                status=LotStatus.OPEN.value,
+            )
+            await self._ledger.record_trade(fill)
+
+        # 9. Record telemetry event and log
+        if hasattr(self, "dashboard_telemetry") and self.dashboard_telemetry:
+            self.dashboard_telemetry.record_stage_event("executed_orders", 1)
+            self.dashboard_telemetry.record_activity(
+                category="TRADING",
+                title=f"Manual BUY Executed: {clean_addr[:10]}...",
+                details=f"Bought {float(fill.tokens_acquired):,.2f} tokens for {req_amount} {unit} at ${float(fill.effective_price * native_p):.6f}",
+                level="SUCCESS",
+                component="ManualExecution",
+                token_address=clean_addr,
+            )
+
+        try:
+            object.__setattr__(signal, "lot", lot)
+        except Exception:
+            pass
+        return True, f"تم إرسال أمر الشراء وتنفيذه بنجاح (Position opened: {lot.lot_id[:8]})", signal
 
     async def manual_exit_position(
         self,
@@ -3860,11 +4010,26 @@ class PaperTradingEngine:
                     net_buy_delta=float(getattr(signal_item, "net_buy_delta", 0.0) or 0.0),
                     platform=platform_name,
                     partial_exit_enabled=getattr(self.config, "partial_exit_enabled", True),
-                    strategy_name=getattr(self, "active_strategy", getattr(self.config, "active_strategy", "default")),
-                    trailing_stop_from_peak_pct=getattr(self, "trailing_stop_from_peak_pct", getattr(self.config, "trailing_stop_from_peak_pct", None)),
-                    custom_take_profit_pct=getattr(self, "custom_take_profit_pct", getattr(self.config, "custom_take_profit_pct", None)),
-                    custom_stop_loss_pct=getattr(self, "custom_stop_loss_pct", getattr(self.config, "custom_stop_loss_pct", None)),
-                    hard_stop_loss_pct=getattr(self, "hard_stop_loss_pct", getattr(self.config, "hard_stop_loss_pct", 0.20)),
+                    strategy_name=(
+                        getattr(getattr(self._strategy_tournament, "champion", None), "strategy_name", None)
+                        or getattr(self, "active_strategy", getattr(self.config, "active_strategy", "default"))
+                    ),
+                    trailing_stop_from_peak_pct=(
+                        getattr(getattr(getattr(self._strategy_tournament, "champion", None), "parameters", None), "trailing_stop_from_peak_pct", None)
+                        or getattr(self, "trailing_stop_from_peak_pct", getattr(self.config, "trailing_stop_from_peak_pct", None))
+                    ),
+                    custom_take_profit_pct=(
+                        getattr(getattr(getattr(self._strategy_tournament, "champion", None), "parameters", None), "take_profit_pct", None)
+                        or getattr(self, "custom_take_profit_pct", getattr(self.config, "custom_take_profit_pct", None))
+                    ),
+                    custom_stop_loss_pct=(
+                        getattr(getattr(getattr(self._strategy_tournament, "champion", None), "parameters", None), "hard_stop_loss_pct", None)
+                        or getattr(self, "custom_stop_loss_pct", getattr(self.config, "custom_stop_loss_pct", None))
+                    ),
+                    hard_stop_loss_pct=(
+                        getattr(getattr(getattr(self._strategy_tournament, "champion", None), "parameters", None), "hard_stop_loss_pct", None)
+                        or getattr(self, "hard_stop_loss_pct", getattr(self.config, "hard_stop_loss_pct", 0.20))
+                    ),
                     entry_feature_vector=entry_feature_vector,
                 )
 
@@ -4101,6 +4266,117 @@ class PaperTradingEngine:
             except Exception as exc:
                 logger.debug("Snapshot recording skipped during shutdown: %s", exc)
                 break
+
+    async def _strategy_evolution_worker(self) -> None:
+        """
+        Continuous background evolutionary worker that powers the autonomous self-improving system.
+        Runs every 60 seconds:
+        1. Classifies current market regime using recent trade performance and pool dynamics.
+        2. Gathers recent loss attributions to identify failure patterns (e.g. stop-loss clustering).
+        3. Evaluates promotion eligibility for shadow challengers against strict anti-overfitting gates
+           (PF > 1.35, Sortino > Champ, MDD < 8%, Outlier win <= 60%, perturbation test).
+        4. Prunes persistent underperforming challengers (PF < 0.85, MDD >= 20%, WR < 30%).
+        5. Continuously synthesizes, mutates, crosses over, and stages new strategy variants via
+           AutonomousStrategyGenerator when active challenger slots are available.
+        6. Periodically optimizes self-learning parameter tuners and syncs with AI Council.
+        """
+        eval_interval_s = 60.0
+        while not self._shutdown_event.is_set():
+            try:
+                await asyncio.wait_for(
+                    self._shutdown_event.wait(),
+                    timeout=eval_interval_s,
+                )
+                break
+            except asyncio.TimeoutError:
+                pass
+            except asyncio.CancelledError:
+                break
+
+            if self._shutdown_event.is_set():
+                break
+
+            try:
+                if not hasattr(self, "_strategy_tournament") or self._strategy_tournament is None:
+                    continue
+
+                tournament = self._strategy_tournament
+                recent_trades = list(self._recent_closed_trades)
+
+                # 1. Calculate rolling performance stats
+                if recent_trades:
+                    recent_wins = sum(1 for t in recent_trades if t.get("is_win", False))
+                    recent_win_rate = (recent_wins / len(recent_trades)) * 100.0
+                    recent_pnl = sum(float(t.get("realized_pnl_usd", 0.0)) for t in recent_trades)
+                else:
+                    recent_win_rate = 50.0
+                    recent_pnl = 0.0
+
+                # 2. Classify market regime
+                current_regime = tournament.classify_regime(
+                    recent_win_rate=recent_win_rate,
+                    recent_pnl_usd=recent_pnl,
+                )
+
+                # 3. Gather recent loss attributions
+                recent_losses = [
+                    str(t.get("exit_reason", ""))
+                    for t in recent_trades
+                    if not t.get("is_win", False)
+                ]
+
+                # 4. Check for champion promotion against anti-overfitting gates
+                promotion_result = tournament.evaluate_promotions()
+                if promotion_result:
+                    promoted_variant, rationale = promotion_result
+                    logger.info(
+                        "🏆 Autonomous Strategy Evolution: Champion Promoted! Variant: %s, Rationale: %s",
+                        promoted_variant.strategy_name,
+                        rationale,
+                    )
+                    if hasattr(self, "dashboard_telemetry") and self.dashboard_telemetry:
+                        self.dashboard_telemetry.record_activity(
+                            category="STRATEGY_TOURNAMENT",
+                            title=f"🏆 Champion Promoted: {promoted_variant.strategy_name}",
+                            details=f"Rationale: {rationale} | SL: {promoted_variant.parameters.hard_stop_loss_pct:.1%}, TP: {promoted_variant.parameters.take_profit_pct:.1%}",
+                            level="SUCCESS",
+                            component="StrategyTournamentRegistry",
+                        )
+
+                # 5. Prune underperforming shadow challengers
+                pruned_names = tournament.prune_underperforming_challengers()
+                if pruned_names:
+                    logger.info(
+                        "✂️ Autonomous Strategy Evolution: Pruned %d underperforming challengers: %s",
+                        len(pruned_names),
+                        ", ".join(pruned_names),
+                    )
+
+                # 6. Synthesize and stage next-generation candidates if active challengers < 8
+                active_challengers = tournament.get_active_challengers()
+                if len(active_challengers) < 8 and hasattr(self, "_strategy_generator") and self._strategy_generator:
+                    new_reports = self._strategy_generator.generate_evolutionary_generation(
+                        registry=tournament,
+                        market_regime=current_regime,
+                        recent_losses=recent_losses,
+                    )
+                    if new_reports:
+                        logger.info(
+                            "🧬 Autonomous Strategy Evolution: Synthesized & staged %d new variants (active: %d, regime: %s)",
+                            len(new_reports),
+                            len(tournament.get_active_challengers()),
+                            current_regime.value,
+                        )
+
+                # 7. Run parameter tuner optimization if feedback engine is present
+                if self._feedback and hasattr(self._feedback, "parameter_tuner") and self._feedback.parameter_tuner:
+                    try:
+                        self._feedback.parameter_tuner.optimize_parameters()
+                    except Exception as opt_err:
+                        logger.debug("Strategy evolution parameter tuner optimization step: %s", opt_err)
+
+            except Exception as loop_err:
+                logger.warning("Error in _strategy_evolution_worker: %s", loop_err, exc_info=True)
 
     async def _heartbeat_task(self) -> None:
         """
@@ -4633,6 +4909,15 @@ class PaperTradingEngine:
                             sol_price = Decimal(str(getattr(self._cfg, "sol_price_usd", self._sol_price or Decimal("150.0"))))
                             for lot in sol_lots:
                                 t_addr = lot.token_address
+                                existing_pool = self._pool_registry.get(t_addr) or (self._pool_registry.get(lot.pool_address) if lot.pool_address else None)
+                                is_ws_fresh = existing_pool is not None and (now - getattr(existing_pool, "timestamp_s", 0.0)) < 45.0
+                                if is_ws_fresh and getattr(lot, "bonding_curve_mode", False):
+                                    # Active WebSocket stream has sub-second on-chain updates!
+                                    # Do not overwrite with potentially delayed/stale external REST cache.
+                                    lot.unresolved_price = False
+                                    lot.stale_price_retries = 0
+                                    continue
+
                                 t_pairs = [p for p in pairs_by_mint.get(t_addr, []) if str(p.get("chainId", "")).lower() == "solana"]
                                 
                                 selected_pair = None
@@ -4664,17 +4949,39 @@ class PaperTradingEngine:
 
                                 if selected_pair is not None:
                                     price_usd = float(selected_pair.get("priceUsd") or 0.0)
+                                    price_native_str = selected_pair.get("priceNative")
+                                    if price_native_str:
+                                        try:
+                                            spot_p = Decimal(str(price_native_str))
+                                        except Exception:
+                                            spot_p = Decimal(str(price_usd)) / sol_price if sol_price > Decimal(0) else Decimal("0.000000028")
+                                    else:
+                                        spot_p = Decimal(str(price_usd)) / sol_price if sol_price > Decimal(0) else Decimal("0.000000028")
+
+                                    # Stale drop guard for young positions:
+                                    lot_age_s = (time.time_ns() - lot.open_timestamp_ns) / 1e9 if getattr(lot, "open_timestamp_ns", 0) > 0 else 999.0
+                                    if lot_age_s < 25.0 and lot.entry_price > 0:
+                                        loss_test = (lot.entry_price - spot_p) / lot.entry_price
+                                        if loss_test > Decimal("0.25") and (existing_pool and existing_pool.spot_price_native_per_token >= lot.entry_price * Decimal("0.80")):
+                                            logger.warning(
+                                                "Active price poller: Suppressed stale REST drop for young lot %s (%s): polled=%s vs live_pool=%s (entry=%s)",
+                                                lot.lot_id[:8], t_addr[:10], spot_p, existing_pool.spot_price_native_per_token, lot.entry_price,
+                                            )
+                                            continue
+
                                     liq_usd = float((selected_pair.get("liquidity") or {}).get("usd") or 0.0)
                                     pair_addr = selected_pair.get("pairAddress") or lot.pool_address
-                                    if price_usd > 0 and pair_addr:
-                                        spot_p = Decimal(str(price_usd)) / sol_price if sol_price > Decimal(0) else Decimal("0.000000028")
+                                    if spot_p > Decimal(0) and pair_addr:
                                         liq_dec = Decimal(str(liq_usd))
                                         # Strictly derive reserves from selected pair; never mix with another pool's reserves
                                         if liq_dec > Decimal(0) and sol_price > Decimal(0):
                                             native_res = liq_dec / Decimal("2.0") / sol_price
                                             token_res = native_res / spot_p
+                                        elif existing_pool is not None and existing_pool.native_reserve > Decimal(0):
+                                            native_res = existing_pool.native_reserve
+                                            token_res = native_res / spot_p
                                         else:
-                                            native_res = Decimal("50.0")
+                                            native_res = Decimal("30.0")
                                             token_res = native_res / spot_p
                                         pool = PoolState(
                                             pool_address=pair_addr,
@@ -4772,10 +5079,17 @@ class PaperTradingEngine:
 
                                 if selected_pair is not None:
                                     price_usd = float(selected_pair.get("priceUsd") or 0.0)
+                                    price_native_str = selected_pair.get("priceNative")
+                                    if price_native_str:
+                                        try:
+                                            spot_p = Decimal(str(price_native_str))
+                                        except Exception:
+                                            spot_p = Decimal(str(price_usd)) / eth_price if eth_price > Decimal(0) else Decimal("0.0000001")
+                                    else:
+                                        spot_p = Decimal(str(price_usd)) / eth_price if eth_price > Decimal(0) else Decimal("0.0000001")
                                     liq_usd = float((selected_pair.get("liquidity") or {}).get("usd") or 0.0)
                                     pair_addr = selected_pair.get("pairAddress") or lot.pool_address
-                                    if price_usd > 0 and pair_addr:
-                                        spot_p = Decimal(str(price_usd)) / eth_price if eth_price > Decimal(0) else Decimal("0.0000001")
+                                    if spot_p > Decimal(0) and pair_addr:
                                         liq_dec = Decimal(str(liq_usd))
                                         if liq_dec > Decimal(0) and eth_price > Decimal(0):
                                             native_res = liq_dec / Decimal("2.0") / eth_price
@@ -5405,6 +5719,9 @@ class PaperTradingEngine:
                     ai_supervisor=self._ai_supervisor,
                     metrics=self._metrics,
                 )
+                self._explainer.execution_target = self
+                self.reset_circuit_breaker()
+
                 if self._telegram is not None:
                     if hasattr(self._telegram, "set_chat_explainer"):
                         self._telegram.set_chat_explainer(self._explainer)
@@ -5475,8 +5792,23 @@ class PaperTradingEngine:
                 user_request_task = asyncio.create_task(
                     self._process_user_request_queue(), name="user_request_processor"
                 )
+                evolution_task = asyncio.create_task(
+                    self._strategy_evolution_worker(), name="strategy_evolution_worker"
+                )
 
-                worker_tasks = [bridge_task, ingest_task, signal_task, user_request_task, poller_task, snapshot_task, heartbeat_task, buffer_task, missed_opp_task, screener_poller_task]
+                worker_tasks = [
+                    bridge_task,
+                    ingest_task,
+                    signal_task,
+                    user_request_task,
+                    poller_task,
+                    snapshot_task,
+                    heartbeat_task,
+                    buffer_task,
+                    missed_opp_task,
+                    screener_poller_task,
+                    evolution_task,
+                ]
                 logger.info("All engine pipelines active. Awaiting market and social signals...")
 
                 # Monitor tasks: wait for either graceful shutdown or unexpected worker crash

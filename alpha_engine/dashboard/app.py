@@ -14,7 +14,7 @@ import os
 from pathlib import Path
 from typing import Any, Optional
 
-from fastapi import FastAPI, Query, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, Query, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
@@ -189,6 +189,88 @@ def create_app(aggregator: Optional[DashboardTelemetryAggregator] = None) -> Fas
             )
             return JSONResponse(status_code=200, content={"status": "SUCCESS", "closed_count": closed})
         return JSONResponse(status_code=503, content={"status": "ERROR", "message": "Engine runner not bound."})
+
+    @app.post("/api/action/trade/execute")
+    async def action_execute_trade(request: Request) -> JSONResponse:
+        """Action: Execute instant buy/sell order for a specific token contract address."""
+        try:
+            payload = await request.json()
+        except Exception:
+            payload = {}
+
+        agg = get_telemetry_aggregator()
+        res = await agg.execute_instant_trade(
+            token_address=payload.get("token_address", ""),
+            side=payload.get("side", "BUY"),
+            chain=payload.get("chain"),
+            amount_native=payload.get("amount_native"),
+            amount_usd=payload.get("amount_usd"),
+            slippage_bps=int(payload.get("slippage_bps", 100)),
+            bypass_consensus=bool(payload.get("bypass_consensus", False)),
+        )
+        status_code = 200 if res.get("status") == "SUCCESS" else 400
+        return JSONResponse(status_code=status_code, content=res)
+
+    @app.get("/api/wallets")
+    async def get_wallets(user_id: Optional[str] = Query(None)) -> JSONResponse:
+        """Smart Wallet Hub: list discovered alpha wallets, user tracked wallets, and copy-trade state."""
+        agg = get_telemetry_aggregator()
+        data = await agg.get_wallets_overview(user_id=user_id)
+        return JSONResponse(status_code=200, content=data)
+
+    @app.post("/api/wallets/track")
+    async def track_wallet_endpoint(request: Request) -> JSONResponse:
+        """Track a specific wallet address for monitoring and optional copy-trading."""
+        try:
+            payload = await request.json()
+        except Exception:
+            payload = {}
+
+        agg = get_telemetry_aggregator()
+        res = await agg.track_wallet(
+            wallet_address=payload.get("wallet_address", ""),
+            chain=payload.get("chain"),
+            alias=payload.get("alias", ""),
+            copy_trade_enabled=bool(payload.get("copy_trade_enabled", False)),
+            copy_trade_size_native=payload.get("copy_trade_size_native"),
+            alerts_enabled=bool(payload.get("alerts_enabled", True)),
+            user_id=payload.get("user_id"),
+        )
+        status_code = 200 if res.get("status") == "SUCCESS" else 400
+        return JSONResponse(status_code=status_code, content=res)
+
+    @app.post("/api/wallets/untrack")
+    async def untrack_wallet_endpoint(request: Request) -> JSONResponse:
+        """Remove a wallet address from active monitoring."""
+        try:
+            payload = await request.json()
+        except Exception:
+            payload = {}
+
+        agg = get_telemetry_aggregator()
+        res = await agg.untrack_wallet(
+            wallet_address=payload.get("wallet_address", ""),
+            user_id=payload.get("user_id"),
+        )
+        status_code = 200 if res.get("status") == "SUCCESS" else 400
+        return JSONResponse(status_code=status_code, content=res)
+
+    @app.post("/api/wallets/toggle_copy")
+    async def toggle_copy_trading_endpoint(request: Request) -> JSONResponse:
+        """Toggle copy-trading state globally or per wallet."""
+        try:
+            payload = await request.json()
+        except Exception:
+            payload = {}
+
+        agg = get_telemetry_aggregator()
+        res = await agg.toggle_wallet_copy_trade(
+            wallet_address=payload.get("wallet_address"),
+            enabled=payload.get("enabled"),
+            size_native=payload.get("size_native"),
+            user_id=payload.get("user_id"),
+        )
+        return JSONResponse(status_code=200, content=res)
 
     @app.websocket("/ws/telemetry")
     async def websocket_telemetry_stream(websocket: WebSocket) -> None:

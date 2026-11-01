@@ -1469,7 +1469,7 @@ class TelegramIngester:
             else:
                 resp = "🌊 قائمة ستيجينغ غير متاحة حالياً."
             await self._safe_reply(event, resp)
-        elif first_token in ("🏆 strategies",):
+        elif first_token in ("🏆 strategies", "🎯 strategies", "/strategies", "/tournament", "/experiments", "strategies", "tournament", "استراتيجيات", "بطولة_الاستراتيجيات"):
             if self._chat_explainer and hasattr(self._chat_explainer, "tool_experiments"):
                 resp = await self._chat_explainer.tool_experiments()
             else:

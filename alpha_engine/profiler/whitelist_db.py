@@ -80,6 +80,13 @@ class WhitelistDatabase:
             ON wallet_whitelist(chain, status);
             """
         )
+        try:
+            await self._conn.execute(
+                "ALTER TABLE wallet_whitelist ADD COLUMN smart_money_score REAL NOT NULL DEFAULT 0.0;"
+            )
+        except Exception:
+            # Column already exists or table freshly created
+            pass
 
     @sqlite_retry(max_retries=5, base_delay=0.1)
     async def upsert_wallet(

@@ -408,6 +408,7 @@ class StrategyTournamentRegistry:
     def __init__(self, ledger: Optional[Any] = None) -> None:
         self.ledger = ledger
         self.current_regime: MarketRegime = MarketRegime.NEUTRAL
+        self.on_promotion_callbacks: list[Callable[[StrategyVariant, str], Any]] = []
 
         # Initialize default Champion
         champ_params = StrategyParameters(
@@ -523,6 +524,97 @@ class StrategyTournamentRegistry:
             except Exception as exc:
                 logger.debug("Failed to record new challenger to ledger: %s", exc)
 
+    def register_on_promotion_callback(self, callback: Callable[[StrategyVariant, str], Any]) -> None:
+        """Register a callback triggered whenever a Challenger is promoted to Champion."""
+        if callback not in self.on_promotion_callbacks:
+            self.on_promotion_callbacks.append(callback)
+
+    def prune_underperforming_challengers(
+        self,
+        min_trades: int = 15,
+        max_dd_pct: float = 20.0,
+        min_pf: float = 0.85,
+    ) -> list[str]:
+        """
+        Retire persistently failing or high-drawdown strategy variants.
+        Frees up tournament slots for novel autonomous mutations.
+        """
+        pruned = []
+        for name, chal in list(self.challengers.items()):
+            if chal.status != ExperimentStatus.SHADOW:
+                continue
+            m = chal.metrics
+            if m.trades_count >= min_trades:
+                if m.profit_factor < min_pf or m.max_drawdown_pct >= max_dd_pct or m.win_rate < 30.0:
+                    chal.status = ExperimentStatus.RETIRED
+                    pruned.append(name)
+                    logger.info(
+                        "StrategyTournamentRegistry: Retired underperforming challenger %s (N=%d, PF=%.2f, DD=%.1f%%, WR=%.1f%%)",
+                        name, m.trades_count, m.profit_factor, m.max_drawdown_pct, m.win_rate,
+                    )
+        return pruned
+
+    def record_live_trade_outcome(
+        self,
+        strategy_name: str,
+        pnl_usd: float,
+        is_win: bool,
+        roi_pct: float,
+        hold_time_s: float = 0.0,
+    ) -> None:
+        """
+        Feed real-world settled live trades back into the Champion strategy's metrics,
+        ensuring the live tournament continuously reflects genuine live market performance.
+        """
+        target = None
+        if self.champion and self.champion.strategy_name == strategy_name:
+            target = self.champion
+        elif strategy_name in self.challengers:
+            target = self.challengers[strategy_name]
+
+        if target is not None:
+            now = time.time()
+            entry_ts = (now - hold_time_s) if hold_time_s > 0 else now
+            outcome_label = "WIN" if is_win else "LOSS"
+
+            # Align PnL sign with outcome if non-zero
+            adjusted_pnl = Decimal(str(pnl_usd))
+            if is_win and adjusted_pnl < Decimal(0):
+                adjusted_pnl = abs(adjusted_pnl)
+            elif not is_win and adjusted_pnl > Decimal(0):
+                adjusted_pnl = -abs(adjusted_pnl)
+
+            sim_lot = ShadowLot(
+                lot_id=f"live_{uuid.uuid4().hex[:8]}",
+                strategy_id=target.experiment_id,
+                token_address="LIVE_SETTLED_TRADE",
+                chain=ChainIdentifier.SOLANA_MAINNET,
+                entry_price=Decimal("1.0"),
+                entry_timestamp=entry_ts,
+                tokens_acquired=Decimal("1.0"),
+                simulated_native_spent=Decimal("1.0"),
+                cost_basis_usd=Decimal("100.0"),
+                gas_drag_usd=Decimal("0.0"),
+                cpmm_slippage_bps=0,
+                latency_ms=0.0,
+                mev_drag_usd=Decimal("0.0"),
+                highest_price=Decimal("1.0"),
+                is_closed=True,
+                status=LotStatus.CLOSED,
+                exit_price=Decimal("1.0") * Decimal(str(max(0.0001, 1.0 + roi_pct / 100.0))),
+                exit_timestamp=now,
+                exit_reason=f"LIVE_SETTLED_TRADE_{outcome_label}",
+                realized_pnl_usd=adjusted_pnl,
+                roi_pct=roi_pct,
+            )
+            target.closed_lots.append(sim_lot)
+            m = target.recompute_metrics()
+
+            logger.info(
+                "StrategyTournamentRegistry: Recorded live %s trade for %s -> PnL=$%.2f, ROI=%.2f%%, HoldTime=%.1fs (Trades=%d, WinRate=%.1f%%, PF=%.2f, Sortino=%.2f)",
+                outcome_label, strategy_name, pnl_usd, roi_pct, hold_time_s, m.trades_count, m.win_rate, m.profit_factor, m.sortino_ratio,
+            )
+
     def get_active_challengers(self) -> list[StrategyVariant]:
         """Return list of active challenger variants in shadow mode."""
         return [c for c in self.challengers.values() if c.status == ExperimentStatus.SHADOW]
@@ -547,11 +639,11 @@ class StrategyTournamentRegistry:
         - Risk-Off Drawdown: sharp negative PnL (< -$100), low win rate (< 40%)
         - Revival Rotation: moderate win rate, elevated aging token breakouts
         """
-        if recent_pnl_usd < -100.0 or recent_win_rate < 40.0:
+        if recent_pnl_usd < -100.0 or recent_win_rate < 40.0 or (sol_volatility >= 0.10 and recent_pnl_usd < -20.0):
             regime = MarketRegime.RISK_OFF_DRAWDOWN
-        elif graduation_velocity >= 2.0 and recent_win_rate >= 60.0:
+        elif (graduation_velocity >= 2.0 or sol_volatility >= 0.08) and recent_win_rate >= 60.0:
             regime = MarketRegime.HIGH_VOL_MEME_MANIA
-        elif recent_win_rate < 48.0:
+        elif recent_win_rate < 48.0 or (sol_volatility < 0.025 and recent_win_rate < 52.0):
             regime = MarketRegime.LOW_LIQUIDITY_CHOP
         else:
             regime = MarketRegime.REVIVAL_ROTATION
@@ -728,6 +820,13 @@ class StrategyTournamentRegistry:
             best_candidate.status = ExperimentStatus.CHAMPION
             del self.challengers[best_candidate.strategy_name]
             self.champion = best_candidate
+
+            # Notify registered live engine callbacks
+            for cb in self.on_promotion_callbacks:
+                try:
+                    cb(best_candidate, promotion_rationale)
+                except Exception as cb_err:
+                    logger.warning("Error in on_promotion_callback: %s", cb_err)
 
             logger.info(
                 "🏆 STRATEGY PROMOTION: %s promoted to CHAMPION! Reason: %s",
@@ -1089,4 +1188,99 @@ class AutonomousStrategyGenerator:
             deployed_reports.append(report)
 
         return deployed_reports
+
+    def crossover_strategies(
+        self,
+        parent_a: StrategyParameters,
+        parent_b: StrategyParameters,
+    ) -> StrategyParameters:
+        """
+        Recombine genetic parameters from two high-performing strategy parents:
+        Takes entry filtering from parent_a and exit profile from parent_b.
+        """
+        self._generation_counter += 1
+        name = f"cross_{parent_a.strategy_name[:6]}_{parent_b.strategy_name[:6]}_gen{self._generation_counter}"
+        sl = round((parent_a.hard_stop_loss_pct * 0.6 + parent_b.hard_stop_loss_pct * 0.4), 3)
+        tp = round(((parent_a.take_profit_pct or 0.5) * 0.4 + (parent_b.take_profit_pct or 0.5) * 0.6), 3)
+        trail = round(((parent_a.trailing_stop_from_peak_pct or 0.25) * 0.5 + (parent_b.trailing_stop_from_peak_pct or 0.25) * 0.5), 3)
+        time_exit = parent_a.time_exit_s or parent_b.time_exit_s
+        min_score = max(parent_a.min_entry_score, parent_b.min_entry_score)
+
+        merged_extra = dict(parent_b.extra_params)
+        merged_extra.update(parent_a.extra_params)
+
+        return StrategyParameters(
+            strategy_name=name,
+            hard_stop_loss_pct=sl,
+            take_profit_pct=tp,
+            trailing_stop_from_peak_pct=trail,
+            time_exit_s=time_exit,
+            min_entry_score=min_score,
+            partial_tp_ratio=parent_b.partial_tp_ratio,
+            regime_affinity=parent_a.regime_affinity or parent_b.regime_affinity,
+            allowed_sources=parent_a.allowed_sources or parent_b.allowed_sources,
+            extra_params=merged_extra,
+        )
+
+    def generate_evolutionary_generation(
+        self,
+        registry: StrategyTournamentRegistry,
+        market_regime: MarketRegime,
+        recent_losses: Optional[list[str]] = None,
+        backtester: Optional[Any] = None,
+    ) -> list[dict[str, Any]]:
+        """
+        Continuously synthesize, mutate, cross-breed, and backtest the next generation
+        of autonomous strategies. Adapts exploration space based on recent loss attributions.
+        """
+        active_challengers = registry.get_active_challengers()
+        champion = registry.champion
+
+        reports = []
+
+        # 1. Adaptive mutation rate based on recent loss attributions
+        mutation_rate = 0.10
+        if recent_losses:
+            hard_stops = sum(1 for l in recent_losses if "sl_hard" in l.lower() or "stop_loss" in l.lower())
+            if hard_stops > len(recent_losses) * 0.5:
+                mutation_rate = 0.15
+
+        # 2. Mutate Champion to explore local optimum
+        if champion:
+            champ_child = self.mutate_strategy(champion.parameters, mutation_rate=mutation_rate)
+            if recent_losses and any("sl_hard" in l.lower() for l in recent_losses[-5:]):
+                champ_child.hard_stop_loss_pct = min(0.25, champ_child.hard_stop_loss_pct * 1.15)
+                champ_child.min_entry_score = min(85.0, champ_child.min_entry_score + 5.0)
+            rep = self.evaluate_and_stage_candidate(champ_child, registry, backtester)
+            reports.append(rep)
+
+        # 3. Cross-over best challengers
+        if len(active_challengers) >= 2:
+            sorted_challengers = sorted(
+                active_challengers,
+                key=lambda c: c.metrics.profit_factor * c.metrics.sortino_ratio,
+                reverse=True,
+            )
+            cross_child = self.crossover_strategies(sorted_challengers[0].parameters, sorted_challengers[1].parameters)
+            rep = self.evaluate_and_stage_candidate(cross_child, registry, backtester)
+            reports.append(rep)
+
+        # 4. Fill open slots with regime-specific archetype variants
+        archetype_map = {
+            MarketRegime.HIGH_VOL_MEME_MANIA: StrategyArchetype.FAST_LAUNCH_MOMENTUM,
+            MarketRegime.LOW_LIQUIDITY_CHOP: StrategyArchetype.WAVE2_ACCUMULATION,
+            MarketRegime.REVIVAL_ROTATION: StrategyArchetype.REVIVAL_CTO_SWING,
+            MarketRegime.RISK_OFF_DRAWDOWN: StrategyArchetype.SMART_MONEY_FOLLOW,
+            MarketRegime.NEUTRAL: StrategyArchetype.NARRATIVE_BREAKOUT,
+        }
+        target_archetype = archetype_map.get(market_regime, StrategyArchetype.FAST_LAUNCH_MOMENTUM)
+        new_variant = self.generate_strategy_variant(target_archetype)
+        rep = self.evaluate_and_stage_candidate(new_variant, registry, backtester)
+        reports.append(rep)
+
+        logger.info(
+            "AutonomousStrategyGenerator: Discovered and evaluated %d new evolutionary candidates for regime %s",
+            len(reports), market_regime.value,
+        )
+        return reports
 

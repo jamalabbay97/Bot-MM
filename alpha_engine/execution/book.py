@@ -1096,10 +1096,14 @@ class PositionBook:
 
         loss_from_entry = (lot.entry_price - current_price) / lot.entry_price if lot.entry_price > 0 else Decimal(0)
 
-        # Narrow grace period: Only suppresses hard stop if loss is < 20% and not early_rally
+        # Grace period protection: In the first 15 seconds, suppress hard stop-loss triggers
+        # UNLESS liquidity reserves have actually been drained/dumped (reserve_dump_confirmed)
+        # or pool reserves collapsed below viable floor (< 5.0 SOL).
         can_trigger_hard_stop = True
         if in_grace_period:
-            if loss_from_entry < Decimal("0.20") and not is_early_rally_strategy:
+            if not reserve_dump_confirmed and (current_pool_reserve_native is None or current_pool_reserve_native >= Decimal("5.0")):
+                can_trigger_hard_stop = False
+            elif loss_from_entry < Decimal("0.20") and not is_early_rally_strategy:
                 can_trigger_hard_stop = False
 
         if entry_sl_threshold is not None and loss_from_entry >= entry_sl_threshold and can_trigger_hard_stop:
