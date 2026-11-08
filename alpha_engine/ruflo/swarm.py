@@ -179,6 +179,14 @@ class RufloSwarmCoordinator:
         if position_book is not None:
             self.execution_agent.position_book = position_book
 
+    async def _safe_record_agent_deliberation(self, deliberation: dict[str, Any]) -> None:
+        """Safely record multi-agent deliberation without allowing database errors to crash consensus."""
+        if self._ledger and hasattr(self._ledger, "record_agent_deliberation"):
+            try:
+                await self._ledger.record_agent_deliberation(deliberation)
+            except Exception as exc:
+                logger.warning("Failed to record agent deliberation in ledger: %s", exc)
+
     async def start(self) -> None:
         """Start all specialized swarm agents, memory stores, and reflection loops."""
         if self._is_running:
@@ -417,18 +425,17 @@ class RufloSwarmCoordinator:
                         "votes": votes,
                         "episodic_matches": episodic_matches,
                     }
-                    if self._ledger and hasattr(self._ledger, "record_agent_deliberation"):
-                        await self._ledger.record_agent_deliberation({
-                            "deliberation_id": str(uuid.uuid4()),
-                            "signal_id": sig_id,
-                            "token_address": token_address,
-                            "agent_votes_json": json.dumps(votes),
-                            "episodic_memory_matches_json": json.dumps(episodic_matches),
-                            "selected_strategy_id": getattr(signal, "strategy_name", "champion_peak_trailing_50"),
-                            "final_decision": "REJECT",
-                            "rationale": rejection["veto_reason"],
-                            "timestamp_ns": time.time_ns(),
-                        })
+                    await self._safe_record_agent_deliberation({
+                        "deliberation_id": str(uuid.uuid4()),
+                        "signal_id": sig_id,
+                        "token_address": token_address,
+                        "agent_votes_json": json.dumps(votes),
+                        "episodic_memory_matches_json": json.dumps(episodic_matches),
+                        "selected_strategy_id": getattr(signal, "strategy_name", "champion_peak_trailing_50"),
+                        "final_decision": "REJECT",
+                        "rationale": rejection["veto_reason"],
+                        "timestamp_ns": time.time_ns(),
+                    })
                     return rejection
 
             # 2. Security Check
@@ -448,18 +455,17 @@ class RufloSwarmCoordinator:
                     "votes": votes,
                     "episodic_matches": episodic_matches,
                 }
-                if self._ledger and hasattr(self._ledger, "record_agent_deliberation"):
-                    await self._ledger.record_agent_deliberation({
-                        "deliberation_id": str(uuid.uuid4()),
-                        "signal_id": sig_id,
-                        "token_address": token_address,
-                        "agent_votes_json": json.dumps(votes),
-                        "episodic_memory_matches_json": json.dumps(episodic_matches),
-                        "selected_strategy_id": getattr(signal, "strategy_name", "champion_peak_trailing_50"),
-                        "final_decision": "REJECT",
-                        "rationale": rejection["veto_reason"],
-                        "timestamp_ns": time.time_ns(),
-                    })
+                await self._safe_record_agent_deliberation({
+                    "deliberation_id": str(uuid.uuid4()),
+                    "signal_id": sig_id,
+                    "token_address": token_address,
+                    "agent_votes_json": json.dumps(votes),
+                    "episodic_memory_matches_json": json.dumps(episodic_matches),
+                    "selected_strategy_id": getattr(signal, "strategy_name", "champion_peak_trailing_50"),
+                    "final_decision": "REJECT",
+                    "rationale": rejection["veto_reason"],
+                    "timestamp_ns": time.time_ns(),
+                })
                 return rejection
 
             sec_result = await self.gatekeeper_agent.tool_evaluate_token(
@@ -480,18 +486,17 @@ class RufloSwarmCoordinator:
                     "votes": votes,
                     "episodic_matches": episodic_matches,
                 }
-                if self._ledger and hasattr(self._ledger, "record_agent_deliberation"):
-                    await self._ledger.record_agent_deliberation({
-                        "deliberation_id": str(uuid.uuid4()),
-                        "signal_id": sig_id,
-                        "token_address": token_address,
-                        "agent_votes_json": json.dumps(votes),
-                        "episodic_memory_matches_json": json.dumps(episodic_matches),
-                        "selected_strategy_id": getattr(signal, "strategy_name", "champion_peak_trailing_50"),
-                        "final_decision": "REJECT",
-                        "rationale": rejection["veto_reason"],
-                        "timestamp_ns": time.time_ns(),
-                    })
+                await self._safe_record_agent_deliberation({
+                    "deliberation_id": str(uuid.uuid4()),
+                    "signal_id": sig_id,
+                    "token_address": token_address,
+                    "agent_votes_json": json.dumps(votes),
+                    "episodic_memory_matches_json": json.dumps(episodic_matches),
+                    "selected_strategy_id": getattr(signal, "strategy_name", "champion_peak_trailing_50"),
+                    "final_decision": "REJECT",
+                    "rationale": rejection["veto_reason"],
+                    "timestamp_ns": time.time_ns(),
+                })
                 return rejection
 
             # 3. Capacity Check
@@ -511,18 +516,17 @@ class RufloSwarmCoordinator:
                     "votes": votes,
                     "episodic_matches": episodic_matches,
                 }
-                if self._ledger and hasattr(self._ledger, "record_agent_deliberation"):
-                    await self._ledger.record_agent_deliberation({
-                        "deliberation_id": str(uuid.uuid4()),
-                        "signal_id": sig_id,
-                        "token_address": token_address,
-                        "agent_votes_json": json.dumps(votes),
-                        "episodic_memory_matches_json": json.dumps(episodic_matches),
-                        "selected_strategy_id": getattr(signal, "strategy_name", "champion_peak_trailing_50"),
-                        "final_decision": "REJECT",
-                        "rationale": rejection["veto_reason"],
-                        "timestamp_ns": time.time_ns(),
-                    })
+                await self._safe_record_agent_deliberation({
+                    "deliberation_id": str(uuid.uuid4()),
+                    "signal_id": sig_id,
+                    "token_address": token_address,
+                    "agent_votes_json": json.dumps(votes),
+                    "episodic_memory_matches_json": json.dumps(episodic_matches),
+                    "selected_strategy_id": getattr(signal, "strategy_name", "champion_peak_trailing_50"),
+                    "final_decision": "REJECT",
+                    "rationale": rejection["veto_reason"],
+                    "timestamp_ns": time.time_ns(),
+                })
                 return rejection
 
             # 4. Quant Sizing Check
@@ -545,18 +549,17 @@ class RufloSwarmCoordinator:
                     "votes": votes,
                     "episodic_matches": episodic_matches,
                 }
-                if self._ledger and hasattr(self._ledger, "record_agent_deliberation"):
-                    await self._ledger.record_agent_deliberation({
-                        "deliberation_id": str(uuid.uuid4()),
-                        "signal_id": sig_id,
-                        "token_address": token_address,
-                        "agent_votes_json": json.dumps(votes),
-                        "episodic_memory_matches_json": json.dumps(episodic_matches),
-                        "selected_strategy_id": getattr(signal, "strategy_name", "champion_peak_trailing_50"),
-                        "final_decision": "REJECT",
-                        "rationale": rejection["veto_reason"],
-                        "timestamp_ns": time.time_ns(),
-                    })
+                await self._safe_record_agent_deliberation({
+                    "deliberation_id": str(uuid.uuid4()),
+                    "signal_id": sig_id,
+                    "token_address": token_address,
+                    "agent_votes_json": json.dumps(votes),
+                    "episodic_memory_matches_json": json.dumps(episodic_matches),
+                    "selected_strategy_id": getattr(signal, "strategy_name", "champion_peak_trailing_50"),
+                    "final_decision": "REJECT",
+                    "rationale": rejection["veto_reason"],
+                    "timestamp_ns": time.time_ns(),
+                })
                 return rejection
 
             # 5. Council Arbiter CRO Cross-Specialist Deliberation (Reach, Forensic, Quant, CRO)
@@ -609,18 +612,17 @@ class RufloSwarmCoordinator:
                     "episodic_matches": episodic_matches,
                     "debate": council_debate,
                 }
-                if self._ledger and hasattr(self._ledger, "record_agent_deliberation"):
-                    await self._ledger.record_agent_deliberation({
-                        "deliberation_id": str(uuid.uuid4()),
-                        "signal_id": sig_id,
-                        "token_address": token_address,
-                        "agent_votes_json": json.dumps(votes),
-                        "episodic_memory_matches_json": json.dumps(episodic_matches),
-                        "selected_strategy_id": getattr(signal, "strategy_name", "champion_peak_trailing_50"),
-                        "final_decision": "REJECT",
-                        "rationale": rejection["veto_reason"],
-                        "timestamp_ns": time.time_ns(),
-                    })
+                await self._safe_record_agent_deliberation({
+                    "deliberation_id": str(uuid.uuid4()),
+                    "signal_id": sig_id,
+                    "token_address": token_address,
+                    "agent_votes_json": json.dumps(votes),
+                    "episodic_memory_matches_json": json.dumps(episodic_matches),
+                    "selected_strategy_id": getattr(signal, "strategy_name", "champion_peak_trailing_50"),
+                    "final_decision": "REJECT",
+                    "rationale": rejection["veto_reason"],
+                    "timestamp_ns": time.time_ns(),
+                })
                 return rejection
 
             # 6. Supervisor Audit
@@ -655,18 +657,17 @@ class RufloSwarmCoordinator:
                     "votes": votes,
                     "episodic_matches": episodic_matches,
                 }
-                if self._ledger and hasattr(self._ledger, "record_agent_deliberation"):
-                    await self._ledger.record_agent_deliberation({
-                        "deliberation_id": str(uuid.uuid4()),
-                        "signal_id": sig_id,
-                        "token_address": token_address,
-                        "agent_votes_json": json.dumps(votes),
-                        "episodic_memory_matches_json": json.dumps(episodic_matches),
-                        "selected_strategy_id": getattr(signal, "strategy_name", "champion_peak_trailing_50"),
-                        "final_decision": "REJECT",
-                        "rationale": rejection["veto_reason"],
-                        "timestamp_ns": time.time_ns(),
-                    })
+                await self._safe_record_agent_deliberation({
+                    "deliberation_id": str(uuid.uuid4()),
+                    "signal_id": sig_id,
+                    "token_address": token_address,
+                    "agent_votes_json": json.dumps(votes),
+                    "episodic_memory_matches_json": json.dumps(episodic_matches),
+                    "selected_strategy_id": getattr(signal, "strategy_name", "champion_peak_trailing_50"),
+                    "final_decision": "REJECT",
+                    "rationale": rejection["veto_reason"],
+                    "timestamp_ns": time.time_ns(),
+                })
                 return rejection
 
             # 7. Consensus Approved: Compute dynamic sizing with pipeline multiplier and optionally execute paper fill
@@ -716,18 +717,17 @@ class RufloSwarmCoordinator:
                 f"⚖️ [RufloSwarm] {self.consensus.value.upper()} Consensus Reached: APPROVED [topology={active_topology.value}].",
             ]
 
-            if self._ledger and hasattr(self._ledger, "record_agent_deliberation"):
-                await self._ledger.record_agent_deliberation({
-                    "deliberation_id": str(uuid.uuid4()),
-                    "signal_id": sig_id,
-                    "token_address": token_address,
-                    "agent_votes_json": json.dumps(votes),
-                    "episodic_memory_matches_json": json.dumps(episodic_matches),
-                    "selected_strategy_id": getattr(signal, "strategy_name", "champion_peak_trailing_50"),
-                    "final_decision": "APPROVE",
-                    "rationale": "Multi-agent consensus approved; all 9 agent checks passed.",
-                    "timestamp_ns": time.time_ns(),
-                })
+            await self._safe_record_agent_deliberation({
+                "deliberation_id": str(uuid.uuid4()),
+                "signal_id": sig_id,
+                "token_address": token_address,
+                "agent_votes_json": json.dumps(votes),
+                "episodic_memory_matches_json": json.dumps(episodic_matches),
+                "selected_strategy_id": getattr(signal, "strategy_name", "champion_peak_trailing_50"),
+                "final_decision": "APPROVE",
+                "rationale": "Multi-agent consensus approved; all 9 agent checks passed.",
+                "timestamp_ns": time.time_ns(),
+            })
 
             return {
                 "approved": True,

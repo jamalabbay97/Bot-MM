@@ -13,7 +13,7 @@ import asyncio
 from decimal import Decimal
 import time
 from typing import Any
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
@@ -320,29 +320,43 @@ async def test_manual_enter_and_exit_position_integration(tmp_path):
 
     # 7. Test custom amount_native sizing in manual_enter_position and Telegram /buy command
     custom_tok = "9ZNTfG4Nyftzy2gcvZwoNoNoW54gWkWv3r7nm2cqpump"
-    ok_amt, msg_amt, sig_amt = await engine.manual_enter_position(
-        custom_tok,
-        amount_native=Decimal("0.25"),
-        originating_channel="DM:12345",
+    custom_pool = PoolState(
+        chain=ChainIdentifier.SOLANA_MAINNET,
+        pool_address="PoolCustom1111111111111111111111111111111",
+        token_reserve=Decimal("1000000000.0"),
+        native_reserve=Decimal("50.0"),
+        fee_numerator=100,
+        fee_denominator=10000,
+        last_updated_block=1234,
+        token_address=custom_tok,
+        timestamp_s=time.time(),
+        price_source="DexScreener:Mock",
+        data_age_s=0.2,
     )
-    assert ok_amt is True
-    assert sig_amt is not None
-    assert sig_amt.custom_amount_native == Decimal("0.25")
+    with patch.object(engine, "get_or_fetch_pool_state", new=AsyncMock(return_value=custom_pool)):
+        ok_amt, msg_amt, sig_amt = await engine.manual_enter_position(
+            custom_tok,
+            amount_native=Decimal("0.25"),
+            originating_channel="DM:12345",
+        )
+        assert ok_amt is True
+        assert sig_amt is not None
+        assert sig_amt.custom_amount_native == Decimal("0.25")
 
-    # Test insufficient balance rejection in manual_enter_position
-    ok_excess, msg_excess, _ = await engine.manual_enter_position(
-        "8ZNTfG4Nyftzy2gcvZwoNoNoW54gWkWv3r7nm2cqpump",
-        amount_native=Decimal("99999.0"),
-        originating_channel="DM:12345",
-    )
-    assert ok_excess is False
-    assert "رصيد غير كافٍ" in msg_excess
+        # Test insufficient balance rejection in manual_enter_position
+        ok_excess, msg_excess, _ = await engine.manual_enter_position(
+            "8ZNTfG4Nyftzy2gcvZwoNoNoW54gWkWv3r7nm2cqpump",
+            amount_native=Decimal("99999.0"),
+            originating_channel="DM:12345",
+        )
+        assert ok_excess is False
+        assert "رصيد غير كافٍ" in msg_excess
 
-    # Test Telegram /buy with custom amount
-    buy_event = DummyEvent(f"/buy {custom_tok}2 0.35", sender_id=12345)
-    await ingester._handle_dm_message(buy_event)
-    assert len(buy_event.replies) >= 2
-    reply_text = "\n".join(r["text"] for r in buy_event.replies)
-    assert "0.35" in reply_text
+        # Test Telegram /buy with custom amount
+        buy_event = DummyEvent(f"/buy {custom_tok}2 0.35", sender_id=12345)
+        await ingester._handle_dm_message(buy_event)
+        assert len(buy_event.replies) >= 2
+        reply_text = "\n".join(r["text"] for r in buy_event.replies)
+        assert "0.35" in reply_text
 
 

@@ -67,6 +67,8 @@ class PoolState(BaseModel):
     native_decimals: Annotated[int, Field(ge=0, le=18)] = 18
     token_address: Optional[str] = None
     timestamp_s: Optional[float] = Field(default_factory=time.time)
+    price_source: Optional[str] = None
+    data_age_s: Optional[float] = None
 
     @model_validator(mode="after")
     def fee_fraction_sane(self) -> "PoolState":
@@ -76,6 +78,15 @@ class PoolState(BaseModel):
                 f"Fee fraction {fee} >= 0.5; this is almost certainly wrong."
             )
         return self
+
+    @property
+    def effective_data_age_s(self) -> float:
+        """Returns the data age in seconds or computed from timestamp_s, defaulting to 999.0."""
+        if self.data_age_s is not None:
+            return float(self.data_age_s)
+        if self.timestamp_s is not None:
+            return float(max(0.0, time.time() - self.timestamp_s))
+        return 999.0
 
     @property
     def fee_gamma(self) -> Decimal:

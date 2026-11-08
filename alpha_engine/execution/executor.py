@@ -95,11 +95,27 @@ class PaperExecutor:
         side = signal.suggested_side
         pool = getattr(signal, "pool_state", None)
         if pool is None or pool.token_reserve <= Decimal(0) or pool.native_reserve <= Decimal(0):
-            pool = get_initial_bonding_curve_pool(
-                token_address=signal.token_address,
-                chain=signal.chain,
-                pool_address=signal.pool_address,
+            if is_new_launch:
+                pool = get_initial_bonding_curve_pool(
+                    token_address=signal.token_address,
+                    chain=signal.chain,
+                    pool_address=signal.pool_address,
+                )
+            else:
+                logger.warning(
+                    "execute_signal: No valid pool_state for %s; refusing fill without real-time price.",
+                    signal.token_address[:10],
+                )
+                return None
+
+        pool_age = time.time() - getattr(pool, "timestamp_s", 0.0) if pool else 999.0
+        if not is_new_launch and pool_age > 4.0:
+            logger.warning(
+                "execute_signal: pool_state for %s is stale (age=%.2fs > 4.0s); rejecting fill.",
+                signal.token_address[:10],
+                pool_age,
             )
+            return None
 
         latency_result = simulate_latency(
             pool=pool,

@@ -7,6 +7,7 @@ Python 3.11+ | aiohttp + web3.py
 
 from __future__ import annotations
 
+import asyncio
 from decimal import Decimal
 import logging
 from typing import Any, Optional
@@ -379,6 +380,7 @@ class SecurityGatekeeper:
         )
         self._positive_cache: dict[tuple[str, str], tuple[float, SecurityReport]] = {}
         self._positive_cache_ttl: float = 300.0
+        self._in_flight_screens: dict[tuple[str, str], asyncio.Future[SecurityReport]] = {}
 
     @property
     def negative_cache(self) -> NegativeRejectionCache:
@@ -570,7 +572,46 @@ class SecurityGatekeeper:
         pool_address: str = "",
         token_age_s: float | None = None,
     ) -> SecurityReport:
-        """Run the full dual-tier screening pipeline for a token with negative cache lookup."""
+        """Run the full dual-tier screening pipeline for a token with negative cache lookup and in-flight coalescing."""
+        chain_str = chain.value if hasattr(chain, "value") else str(chain)
+        flight_key = (token_address.lower().strip(), chain_str)
+        if flight_key in self._in_flight_screens:
+            return await self._in_flight_screens[flight_key]
+
+        fut: asyncio.Future[SecurityReport] | None = None
+        try:
+            loop = asyncio.get_running_loop()
+            fut = loop.create_future()
+            self._in_flight_screens[flight_key] = fut
+        except RuntimeError:
+            fut = None
+
+        try:
+            report = await self._screen_token_impl(
+                token_address=token_address,
+                chain=chain,
+                pool_address=pool_address,
+                token_age_s=token_age_s,
+            )
+            if fut is not None and not fut.done():
+                fut.set_result(report)
+            return report
+        except Exception as exc:
+            if fut is not None and not fut.done():
+                fut.set_exception(exc)
+            raise
+        finally:
+            if fut is not None:
+                self._in_flight_screens.pop(flight_key, None)
+
+    async def _screen_token_impl(
+        self,
+        token_address: str,
+        chain: ChainIdentifier,
+        pool_address: str = "",
+        token_age_s: float | None = None,
+    ) -> SecurityReport:
+        """Internal execution of the dual-tier screening pipeline."""
         chain_str = chain.value if hasattr(chain, "value") else str(chain)
         async with tracer.span(
             token_address,

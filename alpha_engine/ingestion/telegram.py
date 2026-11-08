@@ -2856,7 +2856,7 @@ class TelegramIngester:
                 loop = asyncio.get_running_loop()
                 async def _save_db():
                     try:
-                        async with aiosqlite.connect(self._db_path) as db:
+                        async with _connect_aiosqlite(self._db_path) as db:
                             await db.execute(
                                 "CREATE TABLE IF NOT EXISTS bot_settings (key TEXT PRIMARY KEY, value TEXT, updated_at REAL)"
                             )
@@ -3141,7 +3141,7 @@ class TelegramIngester:
                 amt_str = f"\n• المبلغ المخصص: `{custom_amount}`" if custom_amount is not None else ""
                 await self._safe_reply(
                     event,
-                    f"🟢 **تم إرسال أمر الشراء بنجاح!**\n• العملة: `{clean_ca}`{amt_str}\n• الحالة: تم التمرير إلى محرك التنفيذ الفوري واستثناء شرط القيمة السوقية.\nاستخدم أمر `/trades` لمتابعة المركز المفتوح.",
+                    f"🟢 **تم إرسال أمر الشراء الفوري بنجاح!**\n• العملة: `{clean_ca}`{amt_str}\n• تفاصيل التنفيذ: {reason}\nاستخدم أمر `/trades` لمتابعة المركز المفتوح.",
                 )
             else:
                 await self._safe_reply(event, f"❌ **تعذر تنفيذ الشراء:**\n{reason}")
@@ -3429,11 +3429,8 @@ class TelegramIngester:
                 ))
                 ep_raw = t.get("entry_price", 0)
                 cp_raw = t.get("current_price", 0)
-                unit = "ETH" if "base" in chain_str.lower() else "SOL"
-                eng = getattr(self, "_execution_target", None)
-                native_rate = float(getattr(eng, "_sol_price", 150.0) or 150.0) if unit == "SOL" else float(getattr(eng, "_eth_price", 3400.0) or 3400.0)
-                entry_p = self._format_price_clean(ep_raw, native_rate, unit)
-                curr_p = self._format_price_clean(cp_raw, native_rate, unit)
+                entry_p = self._format_price_clean(ep_raw)
+                curr_p = self._format_price_clean(cp_raw)
 
                 # Dynamic PnL recalculation
                 pnl_f = float(t.get("unrealized_pnl_usd", 0.0))
@@ -3502,11 +3499,8 @@ class TelegramIngester:
                 ))
                 ep_raw = ct.get("entry_price", 0)
                 xp_raw = ct.get("exit_price", 0)
-                unit = "ETH" if "base" in chain_str.lower() else "SOL"
-                eng = getattr(self, "_execution_target", None)
-                native_rate = float(getattr(eng, "_sol_price", 150.0) or 150.0) if unit == "SOL" else float(getattr(eng, "_eth_price", 3400.0) or 3400.0)
-                entry_p = self._format_price_clean(ep_raw, native_rate, unit)
-                exit_p = self._format_price_clean(xp_raw, native_rate, unit)
+                entry_p = self._format_price_clean(ep_raw)
+                exit_p = self._format_price_clean(xp_raw)
                 pnl_f = float(ct.get("realized_pnl_usd", 0.0))
                 pnl_pct = float(ct.get("realized_pnl_pct", 0.0))
                 is_win = ct.get("is_win", pnl_f > 0)

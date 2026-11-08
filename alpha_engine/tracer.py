@@ -41,9 +41,23 @@ class LifecycleTracer:
         while True:
             try:
                 event = await self._queue.get()
+                events = [event]
+                while not self._queue.empty() and len(events) < 50:
+                    try:
+                        events.append(self._queue.get_nowait())
+                    except Exception:
+                        break
                 if self.ledger:
-                    await self.ledger.record_trace_event(event)
-                self._queue.task_done()
+                    try:
+                        if hasattr(self.ledger, "record_trace_events_batch"):
+                            await self.ledger.record_trace_events_batch(events)
+                        else:
+                            for ev in events:
+                                await self.ledger.record_trace_event(ev)
+                    except Exception as err:
+                        logger.debug("Tracer flush batch error: %s", err)
+                for _ in events:
+                    self._queue.task_done()
             except asyncio.CancelledError:
                 break
             except Exception as e:
@@ -51,14 +65,22 @@ class LifecycleTracer:
 
     async def flush(self) -> None:
         """Drain currently queued traces directly into the ledger."""
+        events: list[LifecycleEvent] = []
         while not self._queue.empty():
             try:
-                event = self._queue.get_nowait()
-                if self.ledger:
-                    await self.ledger.record_trace_event(event)
+                events.append(self._queue.get_nowait())
                 self._queue.task_done()
             except Exception:
                 break
+        if events and self.ledger:
+            try:
+                if hasattr(self.ledger, "record_trace_events_batch"):
+                    await self.ledger.record_trace_events_batch(events)
+                else:
+                    for ev in events:
+                        await self.ledger.record_trace_event(ev)
+            except Exception as err:
+                logger.debug("Tracer direct flush error: %s", err)
 
     async def stop_worker(self) -> None:
         """Gracefully drain remaining traces and cancel the background worker task."""

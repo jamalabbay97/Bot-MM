@@ -577,7 +577,13 @@ class DashboardTelemetryAggregator:
                     SELECT t.trade_id, t.order_id, t.signal_id, t.chain, t.token_address,
                            t.side, t.native_spent, t.tokens_delta, t.effective_price,
                            t.price_impact_bps, t.gas_cost_usd, t.fill_latency_ms,
-                           t.realized_pnl_usd, t.created_at, t.strategy_name,
+                           t.realized_pnl_usd, t.created_at,
+                           COALESCE(NULLIF(t.strategy_name, ''), (
+                               SELECT d.strategy_pattern 
+                               FROM decision_audit_log d 
+                               WHERE d.token_address = t.token_address 
+                               ORDER BY d.timestamp_ns DESC LIMIT 1
+                           ), 'DYNAMIC_ADAPTIVE') AS strategy_name,
                            (
                                SELECT l.exit_reason 
                                FROM lot_lifecycle l 
@@ -1180,12 +1186,35 @@ class DashboardTelemetryAggregator:
             try:
                 results = []
                 champ = tournament.champion
+                challengers = tournament.get_active_challengers()
+
+                # Calculate true dynamic SoftMax weights based on risk-adjusted performance
+                import math
+                all_variants = [champ] + list(challengers)
+                scores = []
+                for v in all_variants:
+                    m = v.metrics
+                    pf = max(0.1, float(m.profit_factor))
+                    sortino = max(-3.0, min(8.0, float(m.sortino_ratio)))
+                    wr = float(m.win_rate) / 100.0
+                    base_s = (sortino + 2.5) * 0.4 + pf * 0.4 + wr * 0.2
+                    status_val = str(getattr(getattr(v, "status", None), "value", getattr(v, "status", ""))).lower()
+                    if status_val == "champion" or v == champ:
+                        base_s += 0.8  # Incumbency edge
+                    scores.append(base_s)
+
+                temp = 1.0
+                max_s = max(scores) if scores else 0.0
+                exp_scores = [math.exp((s - max_s) / temp) for s in scores]
+                sum_exp = sum(exp_scores) if sum(exp_scores) > 0 else 1.0
+                dynamic_weights = [round(s / sum_exp, 3) for s in exp_scores]
+
                 cm = champ.metrics
                 trades_c = max(1, cm.trades_count)
                 results.append({
                     "strategy_type": f"🏆 {champ.strategy_name}",
                     "status": "CHAMPION",
-                    "weight": 0.65,
+                    "weight": dynamic_weights[0],
                     "total_trades": cm.trades_count,
                     "win_rate": round(cm.win_rate / 100.0, 3),
                     "profit_factor": round(float(cm.profit_factor), 2),
@@ -1195,15 +1224,13 @@ class DashboardTelemetryAggregator:
                     "expectancy_usd": round(float(cm.net_pnl_usd / trades_c), 2),
                 })
 
-                challengers = tournament.get_active_challengers()
-                chal_weight = round(0.35 / max(1, len(challengers)), 3)
-                for chal in challengers:
+                for idx, chal in enumerate(challengers):
                     m = chal.metrics
                     c_trades = max(1, m.trades_count)
                     results.append({
                         "strategy_type": f"🔬 {chal.strategy_name}",
                         "status": "CHALLENGER",
-                        "weight": chal_weight,
+                        "weight": dynamic_weights[idx + 1],
                         "total_trades": m.trades_count,
                         "win_rate": round(m.win_rate / 100.0, 3),
                         "profit_factor": round(float(m.profit_factor), 2),

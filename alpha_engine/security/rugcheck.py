@@ -18,6 +18,7 @@ import aiohttp
 
 from alpha_engine.models.enums import ChainIdentifier, SecurityTier
 from alpha_engine.models.state import SecurityReport
+from alpha_engine.rate_limiter.bucket import AsyncTokenBucket
 from alpha_engine.rate_limiter.registry import RateLimiterRegistry
 from alpha_engine.security.constants import (
     _API_TIMEOUT_S,
@@ -37,6 +38,16 @@ logger = logging.getLogger(__name__)
 
 # Retry backoff delays for server errors (400ms, 800ms, 1200ms)
 _RUGCHECK_RETRY_DELAYS_S: tuple[float, ...] = (0.4, 0.8, 1.2)
+
+# Rate limiter dedicated to RugCheck API (capacity 5, 2.0 req/s refill)
+_RUGCHECK_LIMITER = AsyncTokenBucket(
+    capacity=5.0,
+    refill_rate=2.0,
+    name="rugcheck_api",
+)
+
+# In-flight request deduplication map to prevent multiple concurrent requests for same mint
+_IN_FLIGHT_RUGCHECK: dict[str, asyncio.Future[dict[str, Any] | None]] = {}
 
 
 class UnindexedMintLRUCache:
@@ -88,6 +99,46 @@ async def _verify_solana_mint_on_chain(
 
 
 async def _fetch_rugcheck_report(
+    session: aiohttp.ClientSession,
+    mint_address: str,
+    limiter: RateLimiterRegistry,
+    rpc_url: str = "",
+    token_age_s: float | None = None,
+    pool_address: str = "",
+) -> dict[str, Any] | None:
+    """
+    Single-flight coalesced wrapper around RugCheck report fetching.
+    Prevents duplicate concurrent network requests for the exact same token mint.
+    """
+    mint_key = mint_address.lower().strip()
+    if mint_key in _IN_FLIGHT_RUGCHECK:
+        return await _IN_FLIGHT_RUGCHECK[mint_key]
+
+    loop = asyncio.get_running_loop()
+    fut: asyncio.Future[dict[str, Any] | None] = loop.create_future()
+    _IN_FLIGHT_RUGCHECK[mint_key] = fut
+
+    try:
+        res = await _fetch_rugcheck_report_impl(
+            session=session,
+            mint_address=mint_address,
+            limiter=limiter,
+            rpc_url=rpc_url,
+            token_age_s=token_age_s,
+            pool_address=pool_address,
+        )
+        if not fut.done():
+            fut.set_result(res)
+        return res
+    except Exception as exc:
+        if not fut.done():
+            fut.set_exception(exc)
+        raise
+    finally:
+        _IN_FLIGHT_RUGCHECK.pop(mint_key, None)
+
+
+async def _fetch_rugcheck_report_impl(
     session: aiohttp.ClientSession,
     mint_address: str,
     limiter: RateLimiterRegistry,
@@ -148,6 +199,7 @@ async def _fetch_rugcheck_report(
     max_attempts = len(_RUGCHECK_RETRY_DELAYS_S) + 1
 
     for attempt in range(max_attempts):
+        await _RUGCHECK_LIMITER.acquire(cost=1.0)
         await limiter.helius.acquire(cost=1.0)
         try:
             async with session.get(
@@ -188,19 +240,22 @@ async def _fetch_rugcheck_report(
                     if attempt < len(_RUGCHECK_RETRY_DELAYS_S):
                         await asyncio.sleep(_RUGCHECK_RETRY_DELAYS_S[attempt])
                         continue
+                    UNINDEXED_MINT_CACHE.put(mint_address)
                     return None
 
         except (aiohttp.ClientError, TimeoutError, OSError) as exc:
+            err_msg = str(exc) or type(exc).__name__
             logger.warning(
                 "RugCheck request failed for %s (attempt %d/%d): %s",
                 mint_address[:10],
                 attempt + 1,
                 max_attempts,
-                exc,
+                err_msg,
             )
             if attempt < len(_RUGCHECK_RETRY_DELAYS_S):
                 await asyncio.sleep(_RUGCHECK_RETRY_DELAYS_S[attempt])
                 continue
+            UNINDEXED_MINT_CACHE.put(mint_address)
             return None
 
     # Fallback to local RPC account validation before declaring token invalid
@@ -219,6 +274,7 @@ async def _fetch_rugcheck_report(
             return on_chain_info
 
     logger.debug("RugCheck unavailable or unindexed for token mint %s", mint_address[:10])
+    UNINDEXED_MINT_CACHE.put(mint_address)
     return None
 
 

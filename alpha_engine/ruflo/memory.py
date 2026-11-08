@@ -77,10 +77,12 @@ class RufloEpisodicMemory:
             if self._initialized:
                 return
             try:
-                self._conn = await aiosqlite.connect(self.db_path, timeout=30.0)
+                self._conn = await aiosqlite.connect(self.db_path, timeout=60.0)
                 self._conn.row_factory = aiosqlite.Row
                 await self._conn.execute("PRAGMA journal_mode = WAL;")
+                await self._conn.execute("PRAGMA busy_timeout = 60000;")
                 await self._conn.execute("PRAGMA synchronous = NORMAL;")
+                await self._conn.execute("PRAGMA cache_size = -64000;")
                 await self._conn.execute(
                     """
                     CREATE TABLE IF NOT EXISTS ruflo_episodic_memory (
@@ -165,36 +167,36 @@ class RufloEpisodicMemory:
             if len(self._episodes) > self._max_episodes:
                 self._episodes.pop(0)
 
-        if self._conn is not None:
-            try:
-                await self._conn.execute(
-                    """
-                    INSERT OR REPLACE INTO ruflo_episodic_memory (
-                        episode_id, token_address, chain, decision_type, signal_source,
-                        confidence_score, feature_vector, realized_pnl_usd, roi_pct,
-                        actual_slippage_bps, fill_latency_ms, root_cause_tag, summary_reflection, timestamp_ns
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
-                    """,
-                    (
-                        episode.episode_id,
-                        episode.token_address,
-                        episode.chain,
-                        episode.decision_type,
-                        episode.signal_source,
-                        episode.confidence_score,
-                        json.dumps(episode.feature_vector),
-                        episode.realized_pnl_usd,
-                        episode.roi_pct,
-                        episode.actual_slippage_bps,
-                        episode.fill_latency_ms,
-                        episode.root_cause_tag,
-                        episode.summary_reflection,
-                        episode.timestamp_ns,
-                    ),
-                )
-                await self._conn.commit()
-            except Exception as exc:
-                logger.debug("Failed to persist Ruflo episode to SQLite: %s", exc)
+            if self._conn is not None:
+                try:
+                    await self._conn.execute(
+                        """
+                        INSERT OR REPLACE INTO ruflo_episodic_memory (
+                            episode_id, token_address, chain, decision_type, signal_source,
+                            confidence_score, feature_vector, realized_pnl_usd, roi_pct,
+                            actual_slippage_bps, fill_latency_ms, root_cause_tag, summary_reflection, timestamp_ns
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+                        """,
+                        (
+                            episode.episode_id,
+                            episode.token_address,
+                            episode.chain,
+                            episode.decision_type,
+                            episode.signal_source,
+                            episode.confidence_score,
+                            json.dumps(episode.feature_vector),
+                            episode.realized_pnl_usd,
+                            episode.roi_pct,
+                            episode.actual_slippage_bps,
+                            episode.fill_latency_ms,
+                            episode.root_cause_tag,
+                            episode.summary_reflection,
+                            episode.timestamp_ns,
+                        ),
+                    )
+                    await self._conn.commit()
+                except Exception as exc:
+                    logger.debug("Failed to persist Ruflo episode to SQLite: %s", exc)
 
     def query_similar_episodes(
         self,
@@ -491,9 +493,12 @@ class RufloSemanticMemory:
             if self._initialized:
                 return
             try:
-                self._conn = await aiosqlite.connect(self.db_path, timeout=30.0)
+                self._conn = await aiosqlite.connect(self.db_path, timeout=60.0)
                 self._conn.row_factory = aiosqlite.Row
                 await self._conn.execute("PRAGMA journal_mode = WAL;")
+                await self._conn.execute("PRAGMA busy_timeout = 60000;")
+                await self._conn.execute("PRAGMA synchronous = NORMAL;")
+                await self._conn.execute("PRAGMA cache_size = -64000;")
                 await self._conn.execute(
                     """
                     CREATE TABLE IF NOT EXISTS ruflo_semantic_memory (
@@ -554,33 +559,33 @@ class RufloSemanticMemory:
             rule.updated_at_ns = time.time_ns()
             self._rules[rule.rule_id] = rule
 
-        if self._conn is not None:
-            try:
-                await self._conn.execute(
-                    """
-                    INSERT OR REPLACE INTO ruflo_semantic_memory (
-                        rule_id, category, condition, action, parameters_json,
-                        confidence, sample_size, evidence_episodes_json,
-                        is_active, created_at_ns, updated_at_ns
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
-                    """,
-                    (
-                        rule.rule_id,
-                        rule.category,
-                        rule.condition,
-                        rule.action,
-                        json.dumps(rule.parameters),
-                        rule.confidence,
-                        rule.sample_size,
-                        json.dumps(rule.evidence_episodes),
-                        1 if rule.is_active else 0,
-                        rule.created_at_ns,
-                        rule.updated_at_ns,
-                    ),
-                )
-                await self._conn.commit()
-            except Exception as exc:
-                logger.debug("Failed persisting SemanticRule to SQLite: %s", exc)
+            if self._conn is not None:
+                try:
+                    await self._conn.execute(
+                        """
+                        INSERT OR REPLACE INTO ruflo_semantic_memory (
+                            rule_id, category, condition, action, parameters_json,
+                            confidence, sample_size, evidence_episodes_json,
+                            is_active, created_at_ns, updated_at_ns
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+                        """,
+                        (
+                            rule.rule_id,
+                            rule.category,
+                            rule.condition,
+                            rule.action,
+                            json.dumps(rule.parameters),
+                            rule.confidence,
+                            rule.sample_size,
+                            json.dumps(rule.evidence_episodes),
+                            1 if rule.is_active else 0,
+                            rule.created_at_ns,
+                            rule.updated_at_ns,
+                        ),
+                    )
+                    await self._conn.commit()
+                except Exception as exc:
+                    logger.debug("Failed persisting SemanticRule to SQLite: %s", exc)
 
     def query_rules(
         self,

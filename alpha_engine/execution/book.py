@@ -105,6 +105,9 @@ class OpenLot:
     price_unresolved_since_s: float = 0.0
     is_illiquid: bool = False
     entry_feature_vector: list[float] = field(default_factory=list)
+    exit_price_source: str = "DEX"
+    exit_data_age_s: float = 0.0
+    exit_mcap_usd: Decimal = Decimal(0)
 
     def record_tick(
         self,
@@ -910,6 +913,8 @@ class PositionBook:
         security_report: Any | None = None,
         partial_exit_fraction: Decimal | None = None,
         hard_stop_loss_pct: Optional[float | Decimal] = None,
+        current_pool_address: Optional[str] = None,
+        **kwargs: Any,
     ) -> ExitDecision | None:
         """
         Evaluate adaptive dynamic exit rules for an open lot:
@@ -1003,6 +1008,14 @@ class PositionBook:
             lot.peak_pnl = current_pnl
 
         # Track pool reserves and check for dumps
+        # Check if pool address changed (e.g. migration from pump curve to Raydium/AMM pool, or venue shift)
+        if current_pool_address and lot.pool_address and current_pool_address.lower() != lot.pool_address.lower():
+            lot.pool_address = current_pool_address
+            if current_pool_reserve_native is not None and current_pool_reserve_native > 0:
+                lot.initial_pool_reserve_native = current_pool_reserve_native
+                lot.peak_pool_reserve_native = current_pool_reserve_native
+                lot.last_pool_reserve_native = current_pool_reserve_native
+
         reserve_dump_confirmed = False
         if current_pool_reserve_native is not None and current_pool_reserve_native > 0:
             if lot.initial_pool_reserve_native <= 0:
@@ -1100,10 +1113,10 @@ class PositionBook:
         # UNLESS liquidity reserves have actually been drained/dumped (reserve_dump_confirmed)
         # or pool reserves collapsed below viable floor (< 5.0 SOL).
         can_trigger_hard_stop = True
-        if in_grace_period:
+        if in_grace_period and not is_early_rally_strategy:
             if not reserve_dump_confirmed and (current_pool_reserve_native is None or current_pool_reserve_native >= Decimal("5.0")):
                 can_trigger_hard_stop = False
-            elif loss_from_entry < Decimal("0.20") and not is_early_rally_strategy:
+            elif loss_from_entry < Decimal("0.20"):
                 can_trigger_hard_stop = False
 
         if entry_sl_threshold is not None and loss_from_entry >= entry_sl_threshold and can_trigger_hard_stop:

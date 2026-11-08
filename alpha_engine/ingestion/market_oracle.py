@@ -331,15 +331,23 @@ class MarketOracle:
                         vol_24h = float(attrs.get("volume_usd", {}).get("h24") or 0.0)
                         name = attrs.get("name", "")
 
+                        pool_addr = str(attrs.get("address") or (top_pool.get("id", "").split("_")[-1] if "_" in top_pool.get("id", "") else top_pool.get("id", "")))
+                        headers = getattr(resp, "headers", {}) or {}
+                        age_hdr = headers.get("Age", "0") if hasattr(headers, "get") else "0"
+                        age_s = float(age_hdr) if str(age_hdr).isdigit() else 0.0
+                        req_dur = time.time() - now
                         stats = {
                             "pool_name": name,
                             "dex": dex_id,
+                            "pool_address": pool_addr,
                             "base_token_price_usd": price_usd,
                             "reserve_in_usd": reserve_usd,
                             "fdv_usd": fdv,
                             "volume_usd_24h": vol_24h,
                             "network": net,
                             "token_address": tok,
+                            "fetched_at": now,
+                            "data_age_s": req_dur + age_s,
                         }
                         self._pool_stats_cached[cache_key] = (stats, now + GECKOTERMINAL_TTL_S)
                         return stats

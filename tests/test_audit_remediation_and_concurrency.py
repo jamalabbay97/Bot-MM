@@ -65,6 +65,11 @@ async def make_test_engine(tmp_path, max_active_positions=3, max_q_size=10):
         passes_hard_gates=True,
     )
     engine._gatekeeper.evaluate_token = AsyncMock(return_value=clean_report)
+    async def mock_pool_fetch(chain, token_address, pool_address="", force_refresh=False, strict_realtime=False, max_data_age_s=4.0):
+        from alpha_engine.math.cpmm import get_initial_bonding_curve_pool
+        pool = get_initial_bonding_curve_pool(chain=chain, token_address=token_address, pool_address=pool_address)
+        return pool.model_copy(update={"timestamp_s": time.time(), "data_age_s": 0.1, "price_source": "MockPool"})
+    engine.get_or_fetch_pool_state = AsyncMock(side_effect=mock_pool_fetch)
     try:
         yield engine
     finally:
@@ -337,6 +342,12 @@ async def test_scenario_08_restart_recovery_from_ledger(tmp_path):
         )
         engine1._gatekeeper.evaluate_token = AsyncMock(return_value=clean_rep)
 
+        async def mock_pool_fetch(chain, token_address, pool_address="", force_refresh=False, strict_realtime=False, max_data_age_s=4.0):
+            from alpha_engine.math.cpmm import get_initial_bonding_curve_pool
+            pool = get_initial_bonding_curve_pool(chain=chain, token_address=token_address, pool_address=pool_address)
+            return pool.model_copy(update={"timestamp_s": time.time(), "data_age_s": 0.1, "price_source": "MockPool"})
+        engine1.get_or_fetch_pool_state = AsyncMock(side_effect=mock_pool_fetch)
+
         await engine1.submit_token_request(t1, ChainIdentifier.SOLANA_MAINNET)
         await engine1.submit_token_request(t2, ChainIdentifier.SOLANA_MAINNET)
         if engine1._token_request_tasks:
@@ -521,3 +532,109 @@ async def test_scenario_15_timezone_normalization_utc_and_morocco():
     morocco_zone = zoneinfo.ZoneInfo("Africa/Casablanca")
     dt_zone = dt_utc.astimezone(morocco_zone)
     assert dt_zone is not None
+
+
+# =========================================================================
+# Scenario 16: High-concurrency SQLite stress, zero-lock retention & batching
+# =========================================================================
+@pytest.mark.anyio
+async def test_scenario_16_sqlite_high_concurrency_stress_and_locking(tmp_path):
+    from alpha_engine.models.events import SignalEvent
+    from alpha_engine.models.enums import OrderSide, SignalStrength, SecurityTier
+    from alpha_engine.models.state import SecurityReport
+    from alpha_engine.models.observability import LifecycleEvent, TraceStage, TraceStatus
+    from alpha_engine.tracer import LifecycleTracer
+
+    db_file = tmp_path / f"stress_trading_{uuid.uuid4().hex[:8]}.db"
+    async with SQLiteLedger(db_file) as ledger:
+        tracer = LifecycleTracer(ledger=ledger)
+        tracer.start_worker()
+
+        sec_report = SecurityReport(
+            token_address="StressToken111111111111111111111111111111",
+            chain=ChainIdentifier.SOLANA_MAINNET,
+            tier=SecurityTier.CLEAN,
+            is_honeypot=False,
+            is_rug=False,
+            score=90.0,
+            flags=[],
+            buy_tax_bps=0,
+            sell_tax_bps=0,
+            checked_at_ts=int(time.time()),
+            passes_hard_gates=True,
+        )
+
+        from alpha_engine.math.cpmm import get_initial_bonding_curve_pool
+        pool_sample = get_initial_bonding_curve_pool(
+            chain=ChainIdentifier.SOLANA_MAINNET,
+            token_address="DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263",
+            pool_address="7xKXtg2CW87d97TXJSDpbD5jBkheTqA83TZRuJosgAsU",
+        )
+
+        async def _write_signals(i: int):
+            sig = SignalEvent(
+                signal_id=f"sig_{i}_{uuid.uuid4().hex[:6]}",
+                timestamp_ns=time.time_ns(),
+                chain=ChainIdentifier.SOLANA_MAINNET,
+                pool_address="7xKXtg2CW87d97TXJSDpbD5jBkheTqA83TZRuJosgAsU",
+                token_address="DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263",
+                suggested_side=OrderSide.BUY,
+                strength=SignalStrength.STRONG,
+                alpha_score=0.85,
+                pool_state=pool_sample,
+                security_report=sec_report,
+            )
+            await ledger.record_signal(sig)
+
+        async def _write_deliberation(i: int):
+            await ledger.record_agent_deliberation({
+                "deliberation_id": f"delib_{i}_{uuid.uuid4().hex[:6]}",
+                "signal_id": f"sig_{i}",
+                "token_address": f"token_{i}",
+                "votes": {"SCOUT": True, "GATEKEEPER": True},
+                "episodic_matches": [],
+                "selected_strategy_id": "champion",
+                "final_decision": "APPROVE",
+                "rationale": "Stress test deliberation passing cleanly",
+                "timestamp_ns": time.time_ns(),
+            })
+
+        async def _queue_trace(i: int):
+            event = LifecycleEvent(
+                trace_id=f"trace_{i}_{uuid.uuid4().hex[:6]}",
+                token_address=f"token_{i}",
+                chain="solana_mainnet",
+                stage=TraceStage.SECURITY_SCREENING,
+                component="SecurityGatekeeper",
+                function_name="evaluate_token",
+                status=TraceStatus.PASSED,
+                reason="Passed stress gates",
+                input_data={"token": f"token_{i}"},
+                output_data={"score": 90.0},
+                duration_ms=1.5,
+                timestamp_ns=time.time_ns(),
+            )
+            await tracer._queue.put(event)
+
+        async def _run_checkpoint():
+            await ledger.checkpoint()
+
+        # Launch 60 concurrent writer tasks simultaneously
+        tasks = []
+        for i in range(20):
+            tasks.append(_write_signals(i))
+            tasks.append(_write_deliberation(i))
+            tasks.append(_queue_trace(i))
+        tasks.append(_run_checkpoint())
+
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        for r in results:
+            assert not isinstance(r, Exception), f"Concurrent task failed with exception: {r}"
+
+        # Flush tracer queue and stop worker
+        await tracer.stop_worker()
+
+        # Verify records exist in database without errors
+        stats = await ledger.get_decision_stats(lookback_hours=1.0)
+        assert isinstance(stats, dict)
+

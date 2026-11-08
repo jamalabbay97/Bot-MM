@@ -34,29 +34,79 @@ _SNAPSHOT_INTERVAL_S = 60.0
 F = TypeVar("F", bound=Callable[..., Coroutine[Any, Any, Any]])
 
 
-def sqlite_retry(max_retries: int = 5, base_delay: float = 0.1) -> Callable[[F], F]:
+class AsyncRLock:
+    """
+    Re-entrant asyncio lock tied to the active asyncio.Task.
+    Allows nested re-entrant acquisitions by the same task without deadlocking.
+    """
+
+    def __init__(self) -> None:
+        self._lock = asyncio.Lock()
+        self._owner: Optional[asyncio.Task[Any]] = None
+        self._count: int = 0
+
+    async def acquire(self) -> None:
+        current_task = asyncio.current_task()
+        if self._owner is not None and self._owner == current_task:
+            self._count += 1
+            return
+        await self._lock.acquire()
+        self._owner = current_task
+        self._count = 1
+
+    def release(self) -> None:
+        current_task = asyncio.current_task()
+        if self._owner != current_task:
+            raise RuntimeError(f"Cannot release un-acquired lock: owner={self._owner}, current={current_task}")
+        self._count -= 1
+        if self._count == 0:
+            self._owner = None
+            self._lock.release()
+
+    async def __aenter__(self) -> "AsyncRLock":
+        await self.acquire()
+        return self
+
+    async def __aexit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
+        self.release()
+
+
+def sqlite_retry(max_retries: int = 10, base_delay: float = 0.15, max_delay: float = 3.0) -> Callable[[F], F]:
     """
     Async retry decorator with exponential backoff and jitter
     specifically catching sqlite3.OperationalError when the database is locked or busy.
+    Coordinates with instance-level _lock (AsyncRLock) if present to serialize operations.
     """
+    eff_retries = max(max_retries, 10)
+    eff_delay = max(base_delay, 0.15)
+
     def decorator(func: F) -> F:
         @functools.wraps(func)
         async def wrapper(*args: Any, **kwargs: Any) -> Any:
+            lock: Optional[Any] = None
+            if args and hasattr(args[0], "_lock") and hasattr(args[0]._lock, "acquire"):
+                lock = args[0]._lock
+
             last_exc = None
-            for attempt in range(max_retries + 1):
+            for attempt in range(eff_retries + 1):
                 try:
-                    return await func(*args, **kwargs)
+                    if lock is not None:
+                        async with lock:
+                            return await func(*args, **kwargs)
+                    else:
+                        return await func(*args, **kwargs)
                 except sqlite3.OperationalError as exc:
                     err_msg = str(exc).lower()
-                    if ("locked" in err_msg or "busy" in err_msg) and attempt < max_retries:
+                    if ("locked" in err_msg or "busy" in err_msg) and attempt < eff_retries:
                         last_exc = exc
-                        jitter = random.uniform(0.5, 1.5)
-                        delay = base_delay * (2 ** attempt) * jitter
+                        jitter = random.uniform(0.8, 1.2)
+                        delay = min(max_delay, eff_delay * (2 ** min(attempt, 6)) * jitter)
                         logger.warning(
                             "SQLite busy/locked in %s (attempt %d/%d), retrying in %.3fs: %s",
                             getattr(func, "__name__", str(func)),
                             attempt + 1,
-                            max_retries,
+                            eff_retries,
+                            delay,
                             exc,
                         )
                         await asyncio.sleep(delay)
@@ -284,10 +334,11 @@ class SQLiteLedger:
         self._db_path = str(db_path)
         self._jsonl_path = Path(jsonl_path) if jsonl_path else Path(self._db_path).with_suffix(".jsonl")
         self._conn: aiosqlite.Connection | None = None
+        self._lock = AsyncRLock()
 
     async def __aenter__(self) -> "SQLiteLedger":
         self._conn = await asyncio.wait_for(
-            aiosqlite.connect(self._db_path, timeout=30.0),
+            aiosqlite.connect(self._db_path, timeout=60.0),
             timeout=_DB_INIT_TIMEOUT_S,
         )
         await self._initialise()
@@ -297,22 +348,29 @@ class SQLiteLedger:
         """Explicitly open connection and initialize database schema and PRAGMAs."""
         return await self.__aenter__()
 
-    @sqlite_retry(max_retries=5, base_delay=0.1)
-    async def checkpoint(self) -> None:
+    @sqlite_retry(max_retries=10, base_delay=0.15)
+    async def checkpoint(self, mode: str = "PASSIVE") -> None:
         """
         Explicitly checkpoint the Write-Ahead Log (WAL) into the main database.
+        Defaults to PASSIVE mode to avoid locking out concurrent writers or readers.
         """
         if self._conn:
             try:
-                await self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE);")
-                await self._conn.commit()
-                logger.info("SQLite WAL checkpoint (TRUNCATE) successfully executed.")
+                await self._conn.execute(f"PRAGMA wal_checkpoint({mode});")
+                logger.info("SQLite WAL checkpoint (%s) successfully executed.", mode)
             except Exception as exc:
+                if mode != "PASSIVE":
+                    try:
+                        await self._conn.execute("PRAGMA wal_checkpoint(PASSIVE);")
+                        logger.info("SQLite WAL checkpoint fallback (PASSIVE) executed.")
+                        return
+                    except Exception:
+                        pass
                 logger.warning("WAL checkpoint failed: %s", exc)
 
     async def __aexit__(self, *_: object) -> None:
         if self._conn:
-            await self.checkpoint()
+            await self.checkpoint(mode="PASSIVE")
             await self._conn.close()
             self._conn = None
 
@@ -320,12 +378,12 @@ class SQLiteLedger:
         """Explicitly checkpoint and close connection."""
         await self.__aexit__(None, None, None)
 
-    @sqlite_retry(max_retries=5, base_delay=0.1)
+    @sqlite_retry(max_retries=10, base_delay=0.15)
     async def _initialise(self) -> None:
         conn = self._conn
         assert conn is not None, "Database not connected."
         await conn.execute("PRAGMA journal_mode = WAL;")
-        await conn.execute("PRAGMA busy_timeout = 30000;")
+        await conn.execute("PRAGMA busy_timeout = 60000;")
         await conn.execute("PRAGMA synchronous = NORMAL;")
         await conn.execute("PRAGMA cache_size = -64000;")
         await conn.execute("PRAGMA temp_store = MEMORY;")
@@ -1187,44 +1245,45 @@ class SQLiteLedger:
                 logger.debug("Error parsing PatternFeatureVector: %s", exc)
         return results
 
-    @sqlite_retry(max_retries=5, base_delay=0.1)
-    async def record_trace_event(self, event: Any) -> None:
-        """Persist a token lifecycle trace event asynchronously to SQLite."""
+    @sqlite_retry(max_retries=10, base_delay=0.15)
+    async def record_trace_events_batch(self, events: list[Any]) -> None:
+        """Persist a batch of token lifecycle trace events asynchronously to SQLite in a single transaction."""
         conn = self._conn
-        if conn is None:
+        if conn is None or not events:
             return
-        if isinstance(event, dict):
-            stg = event.get("stage")
-            stage_val = stg.value if hasattr(stg, "value") else str(stg)
-            stat = event.get("status")
-            status_val = stat.value if hasattr(stat, "value") else str(stat)
-            trace_id = event.get("trace_id")
-            token_address = event.get("token_address")
-            chain_val = event.get("chain")
-            component = event.get("component")
-            function_name = event.get("function_name")
-            reason = event.get("reason")
-            input_data = event.get("input_data", {})
-            output_data = event.get("output_data", {})
-            duration_ms = float(event.get("duration_ms", 0.0))
-            timestamp_ns = int(event.get("timestamp_ns", time.time_ns()))
-        else:
-            stage_val = event.stage.value if hasattr(event.stage, "value") else str(event.stage)
-            status_val = event.status.value if hasattr(event.status, "value") else str(event.status)
-            trace_id = event.trace_id
-            token_address = event.token_address
-            chain_val = event.chain
-            component = event.component
-            function_name = event.function_name
-            reason = event.reason
-            input_data = event.input_data
-            output_data = event.output_data
-            duration_ms = event.duration_ms
-            timestamp_ns = event.timestamp_ns
 
-        await conn.execute(
-            """INSERT INTO token_lifecycle_trace VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
-            (
+        rows = []
+        for event in events:
+            if isinstance(event, dict):
+                stg = event.get("stage")
+                stage_val = stg.value if hasattr(stg, "value") else str(stg)
+                stat = event.get("status")
+                status_val = stat.value if hasattr(stat, "value") else str(stat)
+                trace_id = event.get("trace_id")
+                token_address = event.get("token_address")
+                chain_val = event.get("chain")
+                component = event.get("component")
+                function_name = event.get("function_name")
+                reason = event.get("reason")
+                input_data = event.get("input_data", {})
+                output_data = event.get("output_data", {})
+                duration_ms = float(event.get("duration_ms", 0.0))
+                timestamp_ns = int(event.get("timestamp_ns", time.time_ns()))
+            else:
+                stage_val = event.stage.value if hasattr(event.stage, "value") else str(event.stage)
+                status_val = event.status.value if hasattr(event.status, "value") else str(event.status)
+                trace_id = event.trace_id
+                token_address = event.token_address
+                chain_val = event.chain
+                component = event.component
+                function_name = event.function_name
+                reason = event.reason
+                input_data = event.input_data
+                output_data = event.output_data
+                duration_ms = event.duration_ms
+                timestamp_ns = event.timestamp_ns
+
+            rows.append((
                 trace_id,
                 token_address,
                 chain_val,
@@ -1237,9 +1296,18 @@ class SQLiteLedger:
                 json.dumps(output_data, default=str),
                 duration_ms,
                 timestamp_ns,
-            ),
+            ))
+
+        await conn.executemany(
+            """INSERT INTO token_lifecycle_trace VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+            rows,
         )
         await conn.commit()
+
+    @sqlite_retry(max_retries=10, base_delay=0.15)
+    async def record_trace_event(self, event: Any) -> None:
+        """Persist a token lifecycle trace event asynchronously to SQLite."""
+        await self.record_trace_events_batch([event])
 
     @sqlite_retry(max_retries=5, base_delay=0.1)
     async def get_recent_assets(self, limit: int = 50) -> list[str]:

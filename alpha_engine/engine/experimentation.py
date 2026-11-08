@@ -759,16 +759,30 @@ class StrategyTournamentRegistry:
 
         return closed_all
 
+    def get_open_tokens(self) -> set[str]:
+        """Return the set of token addresses actively held in shadow lots."""
+        tokens: set[str] = set()
+        if self.champion:
+            tokens.update(lot.token_address for lot in self.champion.open_lots.values())
+        for c in self.challengers.values():
+            tokens.update(lot.token_address for lot in c.open_lots.values())
+        return tokens
+
     def evaluate_promotions(self) -> Optional[Tuple[StrategyVariant, str]]:
         """
         Anti-Overfitting & Promotion/Demotion Governance:
-        1. Minimum Sample Size: N >= 30 completed trades in shadow mode
+        1. Minimum Sample Size: N >= min_promotion_trades (default 8 if champion underperforming, 15 otherwise)
         2. Out-of-Sample Consistency: Sortino > Champion + 0.1 and Profit Factor > 1.35
         3. Max Drawdown < 8.0%
         4. Outlier Win Dependency: <= 60% of total profits from a single trade
         5. Parameter Perturbation: Must pass cliff stability check
         """
         champ_metrics = self.champion.metrics
+        is_champ_underperforming = (
+            champ_metrics.trades_count >= 5
+            and (champ_metrics.win_rate < 35.0 or champ_metrics.net_pnl_usd < -10.0 or champ_metrics.sortino_ratio < -0.5)
+        )
+        min_trades = getattr(self, "min_promotion_trades", 8 if is_champ_underperforming else 15)
 
         best_candidate: Optional[StrategyVariant] = None
         best_score: float = -999.0
@@ -778,15 +792,20 @@ class StrategyTournamentRegistry:
             m = chal.metrics
 
             # 1. Sample size gate
-            if m.trades_count < 30:
+            if m.trades_count < min_trades:
                 continue
 
-            # 2. Risk-adjusted metrics gate (Sortino > Champion and Profit Factor > 1.35)
-            if m.profit_factor < 1.35 or m.sortino_ratio <= (champ_metrics.sortino_ratio + 0.1):
-                continue
+            # 2. Risk-adjusted metrics gate
+            if is_champ_underperforming:
+                # If champion is bleeding, any demonstrably superior challenger with positive metrics qualifies
+                if m.win_rate < 40.0 or m.sortino_ratio <= champ_metrics.sortino_ratio:
+                    continue
+            else:
+                if m.profit_factor < 1.35 or m.sortino_ratio <= (champ_metrics.sortino_ratio + 0.1):
+                    continue
 
             # 3. Maximum Drawdown gate
-            if m.max_drawdown_pct >= 8.0:
+            if m.max_drawdown_pct >= 12.0 if is_champ_underperforming else 8.0:
                 continue
 
             # 4. Outlier Win Dependency gate (prevent survivorship bias)
@@ -801,13 +820,13 @@ class StrategyTournamentRegistry:
             if not chal.check_perturbation_stability(perturbation_pct=0.10):
                 continue
 
-            composite_score = m.sortino_ratio * m.profit_factor
+            composite_score = m.sortino_ratio * max(0.1, m.profit_factor)
             if composite_score > best_score:
                 best_score = composite_score
                 best_candidate = chal
                 promotion_rationale = (
                     f"Outperformed Champion: Sortino {m.sortino_ratio:.2f} > {champ_metrics.sortino_ratio:.2f}, "
-                    f"PF {m.profit_factor:.2f} > 1.35, MDD {m.max_drawdown_pct:.1f}% < 8%, "
+                    f"PF {m.profit_factor:.2f}, MDD {m.max_drawdown_pct:.1f}%, "
                     f"OutlierDep {m.outlier_win_ratio*100:.1f}% <= 60% across N={m.trades_count} shadow trades."
                 )
 

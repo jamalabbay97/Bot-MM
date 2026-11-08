@@ -77,7 +77,7 @@ async def test_fetch_rugcheck_report_network_error_returns_none():
         session=session,
         mint_address="7cEMq8uRd43dFnaj6xf73QLxKMfLf5Es8FjiszMqpump",
         limiter=limiter,
-        rpc_url="https://api.mainnet-beta.solana.com",
+        rpc_url="https://api.mainnet-beta.solanUnexpected keyword argument `current_pool_address` in function `alpha_engine.execution.book.PositionBook.evaluate_lot_exit`a.com",
         token_age_s=15.0,  # fresh token
     )
     # Must return None so Gatekeeper marks as TIER1_WARN, NOT {"invalid_mint": True}
@@ -177,3 +177,68 @@ def test_negative_rejection_cache_transient_and_pump_not_fatal():
         ChainIdentifier.SOLANA_MAINNET,
         sol_amount=Decimal("5.0"),
     ) is False
+
+
+def test_safe_getaddrinfo_intercepts_cisco_umbrella_sinkhole():
+    """Verify that if system resolver returns a Cisco Umbrella sinkhole IP, _safe_getaddrinfo intercepts it."""
+    from alpha_engine.dns_resolver import patch_dns_resolvers, _RESOLVED_CACHE
+    patch_dns_resolvers(servers=["1.1.1.1", "8.8.8.8"])
+
+    with patch("alpha_engine.dns_resolver._ORIG_GETADDRINFO") as mock_orig, \
+         patch("alpha_engine.dns_resolver.query_upstream_dns") as mock_upstream:
+        # First call returns Cisco Umbrella sinkhole IP (146.112.61.106)
+        mock_orig.side_effect = [
+            [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("146.112.61.106", 443))],
+            [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("174.138.15.144", 443))],
+        ]
+        mock_upstream.return_value = ["174.138.15.144"]
+
+        # Evict from resolved cache if present
+        _RESOLVED_CACHE.pop("sinkholed-domain.com", None)
+
+        res = socket.getaddrinfo("sinkholed-domain.com", 443)
+        assert res is not None
+        assert res[0][4][0] == "174.138.15.144"
+        mock_upstream.assert_called_once_with("sinkholed-domain.com", servers=("1.1.1.1", "8.8.8.8"))
+
+
+@pytest.mark.anyio
+async def test_rugcheck_singleflight_coalescing():
+    """Verify concurrent requests for the exact same mint share a single in-flight fetch."""
+    from alpha_engine.security.rugcheck import _fetch_rugcheck_report
+
+    class MockGetCM:
+        async def __aenter__(self):
+            await asyncio.sleep(0.02)
+            resp = MagicMock()
+            resp.status = 200
+            resp.json = AsyncMock(return_value={"mint": "SameMint111111", "tokenMeta": {}})
+            return resp
+
+        async def __aexit__(self, exc_type, exc_val, exc_tb):
+            return None
+
+    mock_session = MagicMock()
+    mock_session.get = MagicMock(side_effect=lambda *args, **kwargs: MockGetCM())
+
+
+    mock_limiter = MagicMock()
+    mock_limiter.helius.acquire = AsyncMock()
+
+    mint = "SameMint11111111111111111111111111111111111"
+
+    # Launch 5 concurrent calls for the exact same mint
+    tasks = [
+        _fetch_rugcheck_report(mock_session, mint, mock_limiter)
+        for _ in range(5)
+    ]
+    results = await asyncio.gather(*tasks)
+
+    assert len(results) == 5
+    for r in results:
+        assert r == {"mint": "SameMint111111", "tokenMeta": {}}
+
+    # Verify session.get was invoked only ONCE across all 5 concurrent calls
+    assert mock_session.get.call_count == 1
+
+
