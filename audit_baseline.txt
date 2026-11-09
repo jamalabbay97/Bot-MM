@@ -1,0 +1,1298 @@
+================================================================================
+BOT-MM STATIC CODE AUDIT BASELINE REPORT
+================================================================================
+
+--- [native_price_literals] (Findings: 33) ---
+alpha_engine/config.py:799: Pydantic Field default for sol_price_usd hardcoded: Decimal('150.0')
+alpha_engine/config.py:800: Hardcoded native price constant: Decimal('150.0')
+alpha_engine/config.py:804: Pydantic Field default for eth_price_usd hardcoded: Decimal('3400.0')
+alpha_engine/config.py:805: Hardcoded native price constant: Decimal('3400.0')
+alpha_engine/engine/runner.py:2434: getattr with hardcoded native price default: getattr(..., 'sol_price_usd', self._sol_price or Decimal('150.0'))
+alpha_engine/engine/runner.py:2434: Hardcoded native price constant: Decimal('150.0')
+alpha_engine/engine/runner.py:2435: getattr with hardcoded native price default: getattr(..., 'eth_price_usd', self._eth_price or Decimal('3400.0'))
+alpha_engine/engine/runner.py:2435: Hardcoded native price constant: Decimal('3400.0')
+alpha_engine/engine/runner.py:2549: getattr with hardcoded native price default: getattr(..., 'sol_price_usd', self._sol_price or Decimal('150.0'))
+alpha_engine/engine/runner.py:2549: Hardcoded native price constant: Decimal('150.0')
+alpha_engine/engine/runner.py:2550: getattr with hardcoded native price default: getattr(..., 'eth_price_usd', self._eth_price or Decimal('3400.0'))
+alpha_engine/engine/runner.py:2550: Hardcoded native price constant: Decimal('3400.0')
+alpha_engine/engine/runner.py:2747: getattr with hardcoded native price default: getattr(..., 'sol_price_usd', self._sol_price or Decimal('150.0'))
+alpha_engine/engine/runner.py:2747: Hardcoded native price constant: Decimal('150.0')
+alpha_engine/engine/runner.py:2748: getattr with hardcoded native price default: getattr(..., 'eth_price_usd', self._eth_price or Decimal('3400.0'))
+alpha_engine/engine/runner.py:2748: Hardcoded native price constant: Decimal('3400.0')
+alpha_engine/engine/runner.py:5260: getattr with hardcoded native price default: getattr(..., 'sol_price_usd', self._sol_price or 150.0)
+alpha_engine/engine/runner.py:5421: getattr with hardcoded native price default: getattr(..., 'sol_price_usd', self._sol_price or Decimal('150.0'))
+alpha_engine/engine/runner.py:5421: Hardcoded native price constant: Decimal('150.0')
+alpha_engine/engine/runner.py:5564: getattr with hardcoded native price default: getattr(..., 'eth_price_usd', self._eth_price or 2500.0)
+alpha_engine/engine/signals.py:721: getattr with hardcoded native price default: getattr(..., 'sol_price_usd', Decimal('150.0'))
+alpha_engine/engine/signals.py:721: Hardcoded native price constant: Decimal('150.0')
+alpha_engine/engine/signals.py:768: getattr with hardcoded native price default: getattr(..., 'sol_price_usd', Decimal('150.0'))
+alpha_engine/engine/signals.py:768: Hardcoded native price constant: Decimal('150.0')
+alpha_engine/engine/strategy/screener_priority.py:278: getattr with hardcoded native price default: getattr(..., 'sol_price_usd', 150.0)
+alpha_engine/engine/strategy/screener_priority.py:436: getattr with hardcoded native price default: getattr(..., 'sol_price_usd', Decimal('150.0'))
+alpha_engine/engine/strategy/screener_priority.py:436: Hardcoded native price constant: Decimal('150.0')
+alpha_engine/ingestion/dex_metrics.py:311: Hardcoded native price constant: Decimal('150.0')
+alpha_engine/ingestion/dex_metrics.py:367: Hardcoded native price constant: Decimal('150.0')
+alpha_engine/ingestion/dex_metrics.py:445: Hardcoded native price constant: Decimal('150.0')
+alpha_engine/ingestion/telegram.py:2767: dict.get with hardcoded native price default: .get('sol_price_usd', '150.0')
+alpha_engine/ingestion/telegram.py:2903: Assignment to sol_price with hardcoded native price literal: literal number 150.0
+alpha_engine/ruflo/agents/execution_agent.py:58: Hardcoded native price constant: Decimal('150.0')
+
+--- [task_awaitables] (Findings: 2) ---
+alpha_engine/engine/runner.py:1083: create_task target resolves to synchronous def 'on_trade_closed' in the codebase
+alpha_engine/security/preflight.py:144: await target resolves to synchronous def 'inspect_bytecode_for_delayed_taxes' in the codebase
+
+--- [model_getattr_defaults] (Findings: 896) ---
+alpha_engine/chat_interface.py:255: getattr(..., 'peak_price', getattr(lot, 'highest_price_observed', lot.entry_price)) [EXISTS on model(s): AuditedTokenOutcome, OpenPositionLot]
+alpha_engine/chat_interface.py:255: getattr(..., 'highest_price_observed', lot.entry_price) [EXISTS on model(s): OpenPositionLot]
+alpha_engine/chat_interface.py:257: getattr(..., 'platform', 'DexScan') [EXISTS on model(s): OpenPositionLot, PaperFill, TradeRecord]
+alpha_engine/chat_interface.py:258: getattr(..., 'exit_stage', getattr(lot, 'current_stage', None)) [EXISTS on model(s): TradeRecord]
+alpha_engine/chat_interface.py:258: getattr(..., 'current_stage', None) [EXISTS on model(s): OpenPositionLot]
+alpha_engine/chat_interface.py:260: getattr(..., 'trailing_stop_price', getattr(lot, 'trailing_sl_price', Decimal(0))) [NOT FOUND on any known pydantic model]
+alpha_engine/chat_interface.py:260: getattr(..., 'trailing_sl_price', Decimal(0)) [EXISTS on model(s): OpenPositionLot]
+alpha_engine/chat_interface.py:261: getattr(..., 'scaled_out_50_pct', getattr(lot, 'tp1_sold', False)) [NOT FOUND on any known pydantic model]
+alpha_engine/chat_interface.py:261: getattr(..., 'tp1_sold', False) [EXISTS on model(s): OpenPositionLot]
+alpha_engine/chat_interface.py:262: getattr(..., 'ai_tp2_sold', getattr(lot, 'tp2_sold', False)) [NOT FOUND on any known pydantic model]
+alpha_engine/chat_interface.py:262: getattr(..., 'tp2_sold', False) [EXISTS on model(s): OpenPositionLot]
+alpha_engine/chat_interface.py:494: getattr(..., 'execution_target', None) [NOT FOUND on any known pydantic model]
+alpha_engine/chat_interface.py:495: getattr(..., 'strategy_tournament', None) [NOT FOUND on any known pydantic model]
+alpha_engine/chat_interface.py:762: getattr(..., 'execution_target', None) [NOT FOUND on any known pydantic model]
+alpha_engine/chat_interface.py:763: getattr(..., 'strategy_tournament', None) [NOT FOUND on any known pydantic model]
+alpha_engine/council/arbiter_cro.py:92: getattr(..., 'exit_profile', None) [EXISTS on model(s): OpenPositionLot, SignalEvent]
+alpha_engine/council/arbiter_cro.py:93: getattr(..., 'token_age_s', None) [NOT FOUND on any known pydantic model]
+alpha_engine/council/arbiter_cro.py:94: getattr(..., 'token_age_hours', None) [EXISTS on model(s): RevivalPatternFeatureVector, SignalEvent]
+alpha_engine/council/arbiter_cro.py:95: getattr(..., 'source', None) [EXISTS on model(s): RawSignalEvent, SignalEvent]
+alpha_engine/council/arbiter_cro.py:96: getattr(..., 'value', str(sig_source)) [NOT FOUND on any known pydantic model]
+alpha_engine/council/arbiter_cro.py:122: getattr(..., 'entry_feature_vector', None) [NOT FOUND on any known pydantic model]
+alpha_engine/council/arbiter_cro.py:220: getattr(..., 'mint_authority_disabled', True) [EXISTS on model(s): SecurityReport]
+alpha_engine/council/arbiter_cro.py:221: getattr(..., 'freeze_authority_disabled', True) [EXISTS on model(s): SecurityReport]
+alpha_engine/council/arbiter_cro.py:221: getattr(..., 'lp_burned_ratio', 1.0) [EXISTS on model(s): SecurityReport]
+alpha_engine/council/arbiter_cro.py:263: getattr(..., 'top10_concentration', 0.12) [EXISTS on model(s): PatternFeatureVector, SecurityReport]
+alpha_engine/council/arbiter_cro.py:274: getattr(..., 'is_pump_fun', False) [NOT FOUND on any known pydantic model]
+alpha_engine/council/arbiter_cro.py:468: getattr(..., 'signal_id', f'council-{uuid.uuid4().hex[:8]}') [EXISTS on model(s): DecisionRecord, DecisionSignal, NewsSignalEvent, RawSignalEvent (+3 more)]
+alpha_engine/council/arbiter_cro.py:469: getattr(..., 'strategy_name', strategy_name) [EXISTS on model(s): SignalEvent, TradeRecord]
+alpha_engine/council/forensic_agent.py:42: getattr(..., 'pool_address', '') [EXISTS on model(s): DecisionSignal, ExitOrder, OpenPositionLot, PaperFill (+7 more)]
+alpha_engine/council/forensic_agent.py:46: getattr(..., 'mint_authority_disabled', True) [EXISTS on model(s): SecurityReport]
+alpha_engine/council/forensic_agent.py:46: getattr(..., 'freeze_authority_disabled', True) [EXISTS on model(s): SecurityReport]
+alpha_engine/council/forensic_agent.py:51: getattr(..., 'is_honeypot', False) [EXISTS on model(s): SecurityReport]
+alpha_engine/council/forensic_agent.py:53: getattr(..., 'buy_tax_bps', 0) [EXISTS on model(s): SecurityReport]
+alpha_engine/council/forensic_agent.py:53: getattr(..., 'sell_tax_bps', 0) [EXISTS on model(s): SecurityReport]
+alpha_engine/council/forensic_agent.py:57: getattr(..., 'lp_burned_ratio', 1.0) [EXISTS on model(s): SecurityReport]
+alpha_engine/council/forensic_agent.py:61: getattr(..., 'top10_concentration', 0.15) [EXISTS on model(s): PatternFeatureVector, SecurityReport]
+alpha_engine/council/forensic_agent.py:67: getattr(..., 'top1_holder_pct', 0.0) [NOT FOUND on any known pydantic model]
+alpha_engine/council/forensic_agent.py:72: getattr(..., 'native_reserve', Decimal('1.0')) [EXISTS on model(s): PoolState]
+alpha_engine/council/quant_agent.py:37: getattr(..., 'volume_surge_multiplier', 0.0) [EXISTS on model(s): PatternFeatureVector, RevivalPatternFeatureVector, ScreenerDiscoveryEvent, SignalEvent]
+alpha_engine/council/quant_agent.py:38: getattr(..., 'net_buy_delta', 0.5) [EXISTS on model(s): PatternFeatureVector, SignalEvent]
+alpha_engine/council/quant_agent.py:39: getattr(..., 'alpha_score', 0.5) [EXISTS on model(s): DecisionSignal, SignalEvent]
+alpha_engine/council/quant_agent.py:42: getattr(..., 'base_market_cap', 0.0) [EXISTS on model(s): OpenPositionLot, SignalEvent]
+alpha_engine/council/quant_agent.py:44: getattr(..., 'market_cap_usd', 0.0) [EXISTS on model(s): DecisionRecord, ScreenerDiscoveryEvent, SignalEvent]
+alpha_engine/council/quant_agent.py:45: getattr(..., 'market_cap_usd', 0.0) [EXISTS on model(s): DecisionRecord, ScreenerDiscoveryEvent, SignalEvent]
+alpha_engine/council/quant_agent.py:46: getattr(..., 'market_cap_usd', 0.0) [EXISTS on model(s): DecisionRecord, ScreenerDiscoveryEvent, SignalEvent]
+alpha_engine/council/quant_agent.py:54: getattr(..., 'rsi_5m', 50.0) [NOT FOUND on any known pydantic model]
+alpha_engine/council/quant_agent.py:61: getattr(..., 'token_age_s', 0) [NOT FOUND on any known pydantic model]
+alpha_engine/council/quant_agent.py:62: getattr(..., 'source', None) [EXISTS on model(s): RawSignalEvent, SignalEvent]
+alpha_engine/council/quant_agent.py:62: getattr(..., 'value', str(signal.source)) [NOT FOUND on any known pydantic model]
+alpha_engine/council/quant_agent.py:69: getattr(..., 'exit_profile', None) [EXISTS on model(s): OpenPositionLot, SignalEvent]
+alpha_engine/council/quant_agent.py:71: getattr(..., 'exit_profile', None) [EXISTS on model(s): OpenPositionLot, SignalEvent]
+alpha_engine/council/quant_agent.py:80: getattr(..., 'unique_buyers', set()) [NOT FOUND on any known pydantic model]
+alpha_engine/council/quant_agent.py:81: getattr(..., 'unique_buyers', set()) [NOT FOUND on any known pydantic model]
+alpha_engine/dashboard/telemetry.py:255: getattr(..., '_client', None) [NOT FOUND on any known pydantic model]
+alpha_engine/dashboard/telemetry.py:256: getattr(..., 'is_connected', lambda: True) [NOT FOUND on any known pydantic model]
+alpha_engine/dashboard/telemetry.py:368: getattr(..., '_ai_supervisor', None) [NOT FOUND on any known pydantic model]
+alpha_engine/dashboard/telemetry.py:370: getattr(..., '_total_audits', 0) [NOT FOUND on any known pydantic model]
+alpha_engine/dashboard/telemetry.py:371: getattr(..., '_buy_approval_count', 0) [NOT FOUND on any known pydantic model]
+alpha_engine/dashboard/telemetry.py:461: getattr(..., '_position_book', None) [NOT FOUND on any known pydantic model]
+alpha_engine/dashboard/telemetry.py:472: getattr(..., '_sol_price', 150.0) [NOT FOUND on any known pydantic model]
+alpha_engine/dashboard/telemetry.py:473: getattr(..., '_eth_price', 3400.0) [NOT FOUND on any known pydantic model]
+alpha_engine/dashboard/telemetry.py:479: getattr(..., 'entry_price', 0.0) [EXISTS on model(s): OpenPositionLot]
+alpha_engine/dashboard/telemetry.py:480: getattr(..., 'entry_price_usd', 0.0) [EXISTS on model(s): WalletTradeRecord]
+alpha_engine/dashboard/telemetry.py:493: getattr(..., 'last_price', 0.0) [NOT FOUND on any known pydantic model]
+alpha_engine/dashboard/telemetry.py:493: getattr(..., 'peak_price', 0.0) [EXISTS on model(s): AuditedTokenOutcome, OpenPositionLot]
+alpha_engine/dashboard/telemetry.py:495: getattr(..., 'last_price_usd', 0.0) [NOT FOUND on any known pydantic model]
+alpha_engine/dashboard/telemetry.py:496: getattr(..., 'tokens_held', 0.0) [NOT FOUND on any known pydantic model]
+alpha_engine/dashboard/telemetry.py:496: getattr(..., 'amount_tokens', 0.0) [NOT FOUND on any known pydantic model]
+alpha_engine/dashboard/telemetry.py:498: getattr(..., 'cost_basis_native', 0.0) [NOT FOUND on any known pydantic model]
+alpha_engine/dashboard/telemetry.py:509: getattr(..., 'open_timestamp_ns', getattr(lot, 'entry_timestamp_ns', time.time_ns())) [NOT FOUND on any known pydantic model]
+alpha_engine/dashboard/telemetry.py:509: getattr(..., 'entry_timestamp_ns', time.time_ns()) [EXISTS on model(s): OpenPositionLot]
+alpha_engine/dashboard/telemetry.py:512: getattr(..., 'lot_id', '') [EXISTS on model(s): ExitOrder, OpenPositionLot, TokenRequestRecord]
+alpha_engine/dashboard/telemetry.py:513: getattr(..., 'token_address', 'Unknown') [EXISTS on model(s): AuditedTokenOutcome, DecisionRecord, DecisionSignal, ExitOrder (+14 more)]
+alpha_engine/dashboard/telemetry.py:514: getattr(..., 'symbol', getattr(lot, 'token_address', 'TOKEN')[:6].upper()) [NOT FOUND on any known pydantic model]
+alpha_engine/dashboard/telemetry.py:514: getattr(..., 'token_address', 'TOKEN') [EXISTS on model(s): AuditedTokenOutcome, DecisionRecord, DecisionSignal, ExitOrder (+14 more)]
+alpha_engine/dashboard/telemetry.py:524: getattr(..., 'strategy_name', getattr(lot, 'strategy_type', 'MOMENTUM_BREAKOUT')) [EXISTS on model(s): SignalEvent, TradeRecord]
+alpha_engine/dashboard/telemetry.py:524: getattr(..., 'strategy_type', 'MOMENTUM_BREAKOUT') [EXISTS on model(s): SignalEvent]
+alpha_engine/dashboard/telemetry.py:526: getattr(..., 'peak_price', 0.0) [EXISTS on model(s): AuditedTokenOutcome, OpenPositionLot]
+alpha_engine/dashboard/telemetry.py:527: getattr(..., 'trailing_stop_price', 0.0) [NOT FOUND on any known pydantic model]
+alpha_engine/dashboard/telemetry.py:539: getattr(..., 'peak_equity_usd', '8300.00') [NOT FOUND on any known pydantic model]
+alpha_engine/dashboard/telemetry.py:540: getattr(..., 'cumulative_realized_usd', '0.00') [NOT FOUND on any known pydantic model]
+alpha_engine/dashboard/telemetry.py:573: getattr(..., '_sol_price', 150.0) [NOT FOUND on any known pydantic model]
+alpha_engine/dashboard/telemetry.py:574: getattr(..., '_eth_price', 3400.0) [NOT FOUND on any known pydantic model]
+alpha_engine/dashboard/telemetry.py:704: getattr(..., '_ai_supervisor', None) [NOT FOUND on any known pydantic model]
+alpha_engine/dashboard/telemetry.py:898: getattr(..., 'value', str(raw_mode)) [NOT FOUND on any known pydantic model]
+alpha_engine/dashboard/telemetry.py:901: getattr(..., 'max_drawdown_pct', 0.0) [EXISTS on model(s): AuditedTokenOutcome, PortfolioSnapshot]
+alpha_engine/dashboard/telemetry.py:902: getattr(..., 'consecutive_losses', 0) [NOT FOUND on any known pydantic model]
+alpha_engine/dashboard/telemetry.py:903: getattr(..., 'circuit_breaker_active', False) [NOT FOUND on any known pydantic model]
+alpha_engine/dashboard/telemetry.py:904: getattr(..., 'circuit_breaker_reason', '') [NOT FOUND on any known pydantic model]
+alpha_engine/dashboard/telemetry.py:905: getattr(..., 'circuit_breaker_tripped_at', 0.0) [NOT FOUND on any known pydantic model]
+alpha_engine/dashboard/telemetry.py:1181: getattr(..., 'strategy_tournament', None) [NOT FOUND on any known pydantic model]
+alpha_engine/dashboard/telemetry.py:1201: getattr(..., 'value', getattr(v, 'status', '')) [NOT FOUND on any known pydantic model]
+alpha_engine/dashboard/telemetry.py:1201: getattr(..., 'status', None) [EXISTS on model(s): LifecycleEvent, NewsSignalEvent, RawSignalEvent, WhitelistRecord]
+alpha_engine/dashboard/telemetry.py:1201: getattr(..., 'status', '') [EXISTS on model(s): LifecycleEvent, NewsSignalEvent, RawSignalEvent, WhitelistRecord]
+alpha_engine/dashboard/telemetry.py:1387: getattr(..., 'circuit_breaker_active', False) [NOT FOUND on any known pydantic model]
+alpha_engine/dashboard/telemetry.py:1391: getattr(..., 'circuit_breaker_reason', 'Loss threshold exceeded') [NOT FOUND on any known pydantic model]
+alpha_engine/dashboard/telemetry.py:1462: getattr(..., '_db_path', 'paper_trading.db') [NOT FOUND on any known pydantic model]
+alpha_engine/dashboard/telemetry.py:1472: getattr(..., '_db_path', 'paper_trading.db') [NOT FOUND on any known pydantic model]
+alpha_engine/dashboard/telemetry.py:1520: getattr(..., '_sol_price', 150.0) [NOT FOUND on any known pydantic model]
+alpha_engine/dashboard/telemetry.py:1521: getattr(..., '_eth_price', 3400.0) [NOT FOUND on any known pydantic model]
+alpha_engine/dashboard/telemetry.py:1585: getattr(..., 'lot', None) [NOT FOUND on any known pydantic model]
+alpha_engine/dashboard/telemetry.py:1586: getattr(..., 'lot_id', None) [EXISTS on model(s): ExitOrder, OpenPositionLot, TokenRequestRecord]
+alpha_engine/dashboard/telemetry.py:1661: getattr(..., 'tokens_held', Decimal('0')) [NOT FOUND on any known pydantic model]
+alpha_engine/dashboard/telemetry.py:1668: getattr(..., 'entry_price', Decimal('0.00000003')) [EXISTS on model(s): OpenPositionLot]
+alpha_engine/engine/ai_supervisor.py:471: getattr(..., 'ai_supervisor_enabled', True) [EXISTS on model(s): EngineConfig]
+alpha_engine/engine/ai_supervisor.py:472: getattr(..., 'ai_provider', 'gemini') [EXISTS on model(s): EngineConfig]
+alpha_engine/engine/ai_supervisor.py:473: getattr(..., 'ai_fallback_provider', None) [EXISTS on model(s): EngineConfig]
+alpha_engine/engine/ai_supervisor.py:476: getattr(..., 'ai_base_url', None) [EXISTS on model(s): EngineConfig]
+alpha_engine/engine/ai_supervisor.py:480: getattr(..., 'gemini_api_key', None) [EXISTS on model(s): EngineConfig]
+alpha_engine/engine/ai_supervisor.py:481: getattr(..., 'openai_api_key', None) [EXISTS on model(s): EngineConfig]
+alpha_engine/engine/ai_supervisor.py:482: getattr(..., 'anthropic_api_key', None) [EXISTS on model(s): EngineConfig]
+alpha_engine/engine/ai_supervisor.py:483: getattr(..., 'groq_api_key', None) [EXISTS on model(s): EngineConfig]
+alpha_engine/engine/ai_supervisor.py:484: getattr(..., 'deepseek_api_key', None) [EXISTS on model(s): EngineConfig]
+alpha_engine/engine/ai_supervisor.py:485: getattr(..., 'ai_api_key', None) [EXISTS on model(s): EngineConfig]
+alpha_engine/engine/ai_supervisor.py:490: getattr(..., 'ai_model', '') [EXISTS on model(s): EngineConfig]
+alpha_engine/engine/ai_supervisor.py:492: getattr(..., 'ai_timeout_s', 4.0) [EXISTS on model(s): EngineConfig]
+alpha_engine/engine/ai_supervisor.py:493: getattr(..., 'ai_strict_veto', True) [EXISTS on model(s): EngineConfig]
+alpha_engine/engine/ai_supervisor.py:521: getattr(..., 'anthropic_api_key', None) [EXISTS on model(s): EngineConfig]
+alpha_engine/engine/ai_supervisor.py:523: getattr(..., 'openai_api_key', None) [EXISTS on model(s): EngineConfig]
+alpha_engine/engine/ai_supervisor.py:525: getattr(..., 'groq_api_key', None) [EXISTS on model(s): EngineConfig]
+alpha_engine/engine/ai_supervisor.py:525: getattr(..., 'openai_api_key', None) [EXISTS on model(s): EngineConfig]
+alpha_engine/engine/ai_supervisor.py:527: getattr(..., 'deepseek_api_key', None) [EXISTS on model(s): EngineConfig]
+alpha_engine/engine/ai_supervisor.py:527: getattr(..., 'openai_api_key', None) [EXISTS on model(s): EngineConfig]
+alpha_engine/engine/ai_supervisor.py:529: getattr(..., 'gemini_api_key', None) [EXISTS on model(s): EngineConfig]
+alpha_engine/engine/ai_supervisor.py:531: getattr(..., 'ai_api_key', 'ollama') [EXISTS on model(s): EngineConfig]
+alpha_engine/engine/ai_supervisor.py:532: getattr(..., 'ai_api_key', None) [EXISTS on model(s): EngineConfig]
+alpha_engine/engine/ai_supervisor.py:1058: getattr(..., 'exit_profile', None) [EXISTS on model(s): OpenPositionLot, SignalEvent]
+alpha_engine/engine/ai_supervisor.py:1058: getattr(..., 'is_cto', False) [NOT FOUND on any known pydantic model]
+alpha_engine/engine/ai_supervisor.py:1059: getattr(..., 'volume_surge_multiplier', 1.0) [EXISTS on model(s): PatternFeatureVector, RevivalPatternFeatureVector, ScreenerDiscoveryEvent, SignalEvent]
+alpha_engine/engine/ai_supervisor.py:1060: getattr(..., 'dev_exit_confirmed', False) [NOT FOUND on any known pydantic model]
+alpha_engine/engine/ai_supervisor.py:1060: getattr(..., 'dev_balance_zero', False) [NOT FOUND on any known pydantic model]
+alpha_engine/engine/ai_supervisor.py:1115: getattr(..., 'spot_price', None) [NOT FOUND on any known pydantic model]
+alpha_engine/engine/ai_supervisor.py:1146: getattr(..., 'security_report', None) [EXISTS on model(s): SignalEvent]
+alpha_engine/engine/ai_supervisor.py:1157: getattr(..., 'top10_concentration', 0.15) [EXISTS on model(s): PatternFeatureVector, SecurityReport]
+alpha_engine/engine/ai_supervisor.py:1287: getattr(..., 'pool_state', None) [EXISTS on model(s): DecisionSignal, SignalEvent]
+alpha_engine/engine/ai_supervisor.py:1288: getattr(..., 'security_report', None) [EXISTS on model(s): SignalEvent]
+alpha_engine/engine/ai_supervisor.py:1289: getattr(..., 'trigger_swap', None) [EXISTS on model(s): SignalEvent]
+alpha_engine/engine/ai_supervisor.py:1293: getattr(..., 'pool_address', '') [EXISTS on model(s): DecisionSignal, ExitOrder, OpenPositionLot, PaperFill (+7 more)]
+alpha_engine/engine/ai_supervisor.py:1301: getattr(..., 'wallet_address', '') [EXISTS on model(s): WalletProfile, WhitelistRecord]
+alpha_engine/engine/ai_supervisor.py:1336: getattr(..., 'signal_source', '') [NOT FOUND on any known pydantic model]
+alpha_engine/engine/ai_supervisor.py:1346: getattr(..., 'freeze_authority_disabled', True) [EXISTS on model(s): SecurityReport]
+alpha_engine/engine/ai_supervisor.py:1347: getattr(..., 'is_clean_bytecode', True) [NOT FOUND on any known pydantic model]
+alpha_engine/engine/ai_supervisor.py:1348: getattr(..., 'rejection_reasons', []) [EXISTS on model(s): WalletProfile, WhitelistRecord]
+alpha_engine/engine/ai_supervisor.py:1353: getattr(..., 'total_trades', getattr(wallet_profile, 'total_closed_trades', 0)) [EXISTS on model(s): WalletProfile, WhitelistRecord]
+alpha_engine/engine/ai_supervisor.py:1353: getattr(..., 'total_closed_trades', 0) [NOT FOUND on any known pydantic model]
+alpha_engine/engine/ai_supervisor.py:1354: getattr(..., 'win_rate_pct', recent_win_rate) [EXISTS on model(s): OutcomeTrackerMetrics, PortfolioSnapshot, WalletProfile, WhitelistRecord]
+alpha_engine/engine/ai_supervisor.py:1355: getattr(..., 'profit_factor', getattr(wallet_profile, 'custom_metadata', {}).get('profit_factor', recent_profit_factor) if getattr(wallet_profile, 'custom_metadata', None) else recent_profit_factor) [EXISTS on model(s): PortfolioSnapshot]
+alpha_engine/engine/ai_supervisor.py:1355: getattr(..., 'custom_metadata', None) [EXISTS on model(s): FundingHop, InitialTxRecord, WalletProfile, WalletTradeRecord (+1 more)]
+alpha_engine/engine/ai_supervisor.py:1355: getattr(..., 'custom_metadata', {}) [EXISTS on model(s): FundingHop, InitialTxRecord, WalletProfile, WalletTradeRecord (+1 more)]
+alpha_engine/engine/ai_supervisor.py:1356: getattr(..., 'sortino_ratio', getattr(wallet_profile, 'custom_metadata', {}).get('sortino_ratio', 2.1) if getattr(wallet_profile, 'custom_metadata', None) else 2.1) [NOT FOUND on any known pydantic model]
+alpha_engine/engine/ai_supervisor.py:1356: getattr(..., 'custom_metadata', None) [EXISTS on model(s): FundingHop, InitialTxRecord, WalletProfile, WalletTradeRecord (+1 more)]
+alpha_engine/engine/ai_supervisor.py:1356: getattr(..., 'custom_metadata', {}) [EXISTS on model(s): FundingHop, InitialTxRecord, WalletProfile, WalletTradeRecord (+1 more)]
+alpha_engine/engine/ai_supervisor.py:1357: getattr(..., 'max_drawdown_pct', getattr(wallet_profile, 'custom_metadata', {}).get('max_drawdown_pct', 18.0) if getattr(wallet_profile, 'custom_metadata', None) else 18.0) [EXISTS on model(s): AuditedTokenOutcome, PortfolioSnapshot]
+alpha_engine/engine/ai_supervisor.py:1357: getattr(..., 'custom_metadata', None) [EXISTS on model(s): FundingHop, InitialTxRecord, WalletProfile, WalletTradeRecord (+1 more)]
+alpha_engine/engine/ai_supervisor.py:1357: getattr(..., 'custom_metadata', {}) [EXISTS on model(s): FundingHop, InitialTxRecord, WalletProfile, WalletTradeRecord (+1 more)]
+alpha_engine/engine/ai_supervisor.py:1358: getattr(..., 'median_holding_time_seconds', getattr(wallet_profile, 'median_holding_time_s', 280.0)) [EXISTS on model(s): WalletProfile]
+alpha_engine/engine/ai_supervisor.py:1358: getattr(..., 'median_holding_time_s', 280.0) [EXISTS on model(s): WhitelistRecord]
+alpha_engine/engine/ai_supervisor.py:1359: getattr(..., 'outlier_pnl_ratio', 0.22) [EXISTS on model(s): WalletProfile]
+alpha_engine/engine/ai_supervisor.py:1360: getattr(..., 'is_disperse_funded', getattr(wallet_profile, 'custom_metadata', {}).get('is_disperse_funded', False) if getattr(wallet_profile, 'custom_metadata', None) else False) [NOT FOUND on any known pydantic model]
+alpha_engine/engine/ai_supervisor.py:1360: getattr(..., 'custom_metadata', None) [EXISTS on model(s): FundingHop, InitialTxRecord, WalletProfile, WalletTradeRecord (+1 more)]
+alpha_engine/engine/ai_supervisor.py:1360: getattr(..., 'custom_metadata', {}) [EXISTS on model(s): FundingHop, InitialTxRecord, WalletProfile, WalletTradeRecord (+1 more)]
+alpha_engine/engine/ai_supervisor.py:1361: getattr(..., 'is_block0_snipe', getattr(wallet_profile, 'custom_metadata', {}).get('is_block0_snipe', False) if getattr(wallet_profile, 'custom_metadata', None) else False) [NOT FOUND on any known pydantic model]
+alpha_engine/engine/ai_supervisor.py:1361: getattr(..., 'custom_metadata', None) [EXISTS on model(s): FundingHop, InitialTxRecord, WalletProfile, WalletTradeRecord (+1 more)]
+alpha_engine/engine/ai_supervisor.py:1361: getattr(..., 'custom_metadata', {}) [EXISTS on model(s): FundingHop, InitialTxRecord, WalletProfile, WalletTradeRecord (+1 more)]
+alpha_engine/engine/ai_supervisor.py:1362: getattr(..., 'is_mev_bot', getattr(wallet_profile, 'custom_metadata', {}).get('is_mev_bot', False) if getattr(wallet_profile, 'custom_metadata', None) else False) [NOT FOUND on any known pydantic model]
+alpha_engine/engine/ai_supervisor.py:1362: getattr(..., 'custom_metadata', None) [EXISTS on model(s): FundingHop, InitialTxRecord, WalletProfile, WalletTradeRecord (+1 more)]
+alpha_engine/engine/ai_supervisor.py:1362: getattr(..., 'custom_metadata', {}) [EXISTS on model(s): FundingHop, InitialTxRecord, WalletProfile, WalletTradeRecord (+1 more)]
+alpha_engine/engine/ai_supervisor.py:1369: getattr(..., 'duplicate_count', 0) [NOT FOUND on any known pydantic model]
+alpha_engine/engine/ai_supervisor.py:1372: getattr(..., 'exit_profile', None) [EXISTS on model(s): OpenPositionLot, SignalEvent]
+alpha_engine/engine/ai_supervisor.py:1372: getattr(..., 'strategy_pattern', '') [EXISTS on model(s): DecisionRecord, SignalEvent]
+alpha_engine/engine/ai_supervisor.py:1373: getattr(..., 'base_market_cap', 0.0) [EXISTS on model(s): OpenPositionLot, SignalEvent]
+alpha_engine/engine/ai_supervisor.py:1374: getattr(..., 'base_market_cap', 0.0) [EXISTS on model(s): OpenPositionLot, SignalEvent]
+alpha_engine/engine/ai_supervisor.py:1375: getattr(..., 'market_cap_usd', 0.0) [EXISTS on model(s): DecisionRecord, ScreenerDiscoveryEvent, SignalEvent]
+alpha_engine/engine/ai_supervisor.py:1375: getattr(..., 'spot_price', None) [NOT FOUND on any known pydantic model]
+alpha_engine/engine/ai_supervisor.py:1375: getattr(..., 'spot_price', 0.0) [NOT FOUND on any known pydantic model]
+alpha_engine/engine/ai_supervisor.py:1375: getattr(..., 'token_reserve', 1000000000.0) [EXISTS on model(s): PoolState]
+alpha_engine/engine/ai_supervisor.py:1376: getattr(..., 'token_age_hours', 0.0) [EXISTS on model(s): RevivalPatternFeatureVector, SignalEvent]
+alpha_engine/engine/ai_supervisor.py:1377: getattr(..., 'consolidation_length_hours', 0.0) [EXISTS on model(s): RevivalPatternFeatureVector, SignalEvent]
+alpha_engine/engine/ai_supervisor.py:1378: getattr(..., 'volume_surge_multiplier', 0.0) [EXISTS on model(s): PatternFeatureVector, RevivalPatternFeatureVector, ScreenerDiscoveryEvent, SignalEvent]
+alpha_engine/engine/ai_supervisor.py:1379: getattr(..., 'net_buy_delta', 0.0) [EXISTS on model(s): PatternFeatureVector, SignalEvent]
+alpha_engine/engine/ai_supervisor.py:1387: getattr(..., 'alpha_score', 0.0) [EXISTS on model(s): DecisionSignal, SignalEvent]
+alpha_engine/engine/ai_supervisor.py:1805: getattr(..., 'token_address', 'N/A') [EXISTS on model(s): AuditedTokenOutcome, DecisionRecord, DecisionSignal, ExitOrder (+14 more)]
+alpha_engine/engine/ai_supervisor.py:1806: getattr(..., 'actual_slippage_bps', 0) [NOT FOUND on any known pydantic model]
+alpha_engine/engine/ai_supervisor.py:1807: getattr(..., 'expected_slippage_bps', 150) [NOT FOUND on any known pydantic model]
+alpha_engine/engine/ai_supervisor.py:1808: getattr(..., 'is_win', False) [NOT FOUND on any known pydantic model]
+alpha_engine/engine/ai_supervisor.py:1809: getattr(..., 'roi_pct', 0.0) [EXISTS on model(s): WalletTradeRecord]
+alpha_engine/engine/ai_supervisor.py:1824: getattr(..., 'time_to_fill_ms', 0.0) [NOT FOUND on any known pydantic model]
+alpha_engine/engine/ai_supervisor.py:1853: getattr(..., 'trade_id', token) [EXISTS on model(s): TradeRecord]
+alpha_engine/engine/ai_supervisor.py:1855: getattr(..., 'chain', 'solana_mainnet') [EXISTS on model(s): AuditedTokenOutcome, DecisionRecord, DecisionSignal, ExitOrder (+18 more)]
+alpha_engine/engine/ai_supervisor.py:1857: getattr(..., 'signal_source', 'DEX_SWAP') [NOT FOUND on any known pydantic model]
+alpha_engine/engine/ai_supervisor.py:1861: getattr(..., 'entry_feature_vector', None) [NOT FOUND on any known pydantic model]
+alpha_engine/engine/ai_supervisor.py:1864: getattr(..., 'realized_pnl_usd', 0.0) [EXISTS on model(s): PortfolioSnapshot, TokenRequestRecord, TradeRecord, WalletTradeRecord]
+alpha_engine/engine/ai_supervisor.py:1867: getattr(..., 'time_to_fill_ms', 50.0) [NOT FOUND on any known pydantic model]
+alpha_engine/engine/experimentation.py:702: getattr(..., 'pool_address', '') [EXISTS on model(s): DecisionSignal, ExitOrder, OpenPositionLot, PaperFill (+7 more)]
+alpha_engine/engine/experimentation.py:707: getattr(..., 'alpha_score', 0.5) [EXISTS on model(s): DecisionSignal, SignalEvent]
+alpha_engine/engine/experimentation.py:737: getattr(..., 'pool_address', '') [EXISTS on model(s): DecisionSignal, ExitOrder, OpenPositionLot, PaperFill (+7 more)]
+alpha_engine/engine/experimentation.py:785: getattr(..., 'min_promotion_trades', 8 if is_champ_underperforming else 15) [NOT FOUND on any known pydantic model]
+alpha_engine/engine/experimentation.py:1111: getattr(..., 'db_path', 'paper_trading.db') [EXISTS on model(s): EngineConfig]
+alpha_engine/engine/feedback.py:286: getattr(..., 'value', str(reflection.chain)) [NOT FOUND on any known pydantic model]
+alpha_engine/engine/feedback.py:297: getattr(..., 'exit_reason', '') [EXISTS on model(s): TradeRecord]
+alpha_engine/engine/feedback.py:383: getattr(..., 'episodic_memory', None) [NOT FOUND on any known pydantic model]
+alpha_engine/engine/feedback.py:429: getattr(..., 'entry_feature_vector', None) [NOT FOUND on any known pydantic model]
+alpha_engine/engine/feedback.py:669: getattr(..., 'buy_tax_bps', 0) [EXISTS on model(s): SecurityReport]
+alpha_engine/engine/feedback.py:670: getattr(..., 'sell_tax_bps', 0) [EXISTS on model(s): SecurityReport]
+alpha_engine/engine/feedback.py:671: getattr(..., 'is_honeypot', False) [EXISTS on model(s): SecurityReport]
+alpha_engine/engine/feedback.py:672: getattr(..., 'freeze_authority_disabled', True) [EXISTS on model(s): SecurityReport]
+alpha_engine/engine/feedback.py:673: getattr(..., 'mint_authority_disabled', True) [EXISTS on model(s): SecurityReport]
+alpha_engine/engine/feedback.py:727: getattr(..., '_last_analysis', {}) [NOT FOUND on any known pydantic model]
+alpha_engine/engine/feedback.py:1026: getattr(..., 'decision', '') [EXISTS on model(s): AISupervisorResponse, AuditedTokenOutcome]
+alpha_engine/engine/feedback.py:1029: getattr(..., 'flags', []) [EXISTS on model(s): AuditedTokenOutcome, SecurityAssessment]
+alpha_engine/engine/feedback.py:1032: getattr(..., 'dropped', False) [NOT FOUND on any known pydantic model]
+alpha_engine/engine/feedback.py:1034: getattr(..., 'drop_reason', '') [NOT FOUND on any known pydantic model]
+alpha_engine/engine/registry.py:28: getattr(..., 'mint', None) [EXISTS on model(s): PumpMintEvent, ScreenerDiscoveryEvent]
+alpha_engine/engine/registry.py:42: getattr(..., 'has_authoritative_reserves', False) [NOT FOUND on any known pydantic model]
+alpha_engine/engine/registry.py:43: getattr(..., 'virtual_sol_reserves', Decimal(0)) [EXISTS on model(s): PumpMintEvent]
+alpha_engine/engine/registry.py:44: getattr(..., 'virtual_token_reserves', Decimal(0)) [EXISTS on model(s): PumpMintEvent]
+alpha_engine/engine/registry.py:100: getattr(..., 'token_address', None) [EXISTS on model(s): AuditedTokenOutcome, DecisionRecord, DecisionSignal, ExitOrder (+14 more)]
+alpha_engine/engine/registry.py:110: getattr(..., 'token_address', None) [EXISTS on model(s): AuditedTokenOutcome, DecisionRecord, DecisionSignal, ExitOrder (+14 more)]
+alpha_engine/engine/registry.py:118: getattr(..., 'token_address', None) [EXISTS on model(s): AuditedTokenOutcome, DecisionRecord, DecisionSignal, ExitOrder (+14 more)]
+alpha_engine/engine/registry.py:123: getattr(..., 'token_address', None) [EXISTS on model(s): AuditedTokenOutcome, DecisionRecord, DecisionSignal, ExitOrder (+14 more)]
+alpha_engine/engine/registry.py:147: getattr(..., 'token_address', None) [EXISTS on model(s): AuditedTokenOutcome, DecisionRecord, DecisionSignal, ExitOrder (+14 more)]
+alpha_engine/engine/registry.py:159: getattr(..., 'token_address', None) [EXISTS on model(s): AuditedTokenOutcome, DecisionRecord, DecisionSignal, ExitOrder (+14 more)]
+alpha_engine/engine/registry.py:271: getattr(..., 'name', str(agent)) [EXISTS on model(s): ToolDefinition]
+alpha_engine/engine/registry.py:272: getattr(..., 'role', None) [NOT FOUND on any known pydantic model]
+alpha_engine/engine/runner.py:121: getattr(..., 'asyncio_debug', False) [EXISTS on model(s): EngineConfig]
+alpha_engine/engine/runner.py:141: getattr(..., 'max_queue_size', 100) [EXISTS on model(s): EngineConfig]
+alpha_engine/engine/runner.py:150: getattr(..., 'max_user_request_queue_size', 200) [EXISTS on model(s): EngineConfig]
+alpha_engine/engine/runner.py:152: getattr(..., 'max_concurrent_analyses', 5) [EXISTS on model(s): EngineConfig]
+alpha_engine/engine/runner.py:164: getattr(..., 'dns_doh_servers', None) [EXISTS on model(s): EngineConfig]
+alpha_engine/engine/runner.py:166: getattr(..., 'buffer_min_unique_buyers', getattr(config, 'min_unique_buyers', 2)) [EXISTS on model(s): EngineConfig]
+alpha_engine/engine/runner.py:166: getattr(..., 'min_unique_buyers', 2) [NOT FOUND on any known pydantic model]
+alpha_engine/engine/runner.py:167: getattr(..., 'slot_bundle_threshold', 0.6) [EXISTS on model(s): EngineConfig]
+alpha_engine/engine/runner.py:169: getattr(..., 'observation_window_min_sec', 30.0) [EXISTS on model(s): EngineConfig]
+alpha_engine/engine/runner.py:170: getattr(..., 'observation_window_max_sec', 90.0) [EXISTS on model(s): EngineConfig]
+alpha_engine/engine/runner.py:171: getattr(..., 'buffer_min_buys', 3) [EXISTS on model(s): EngineConfig]
+alpha_engine/engine/runner.py:172: getattr(..., 'buffer_target_volume_sol', Decimal('0.8')) [EXISTS on model(s): EngineConfig]
+alpha_engine/engine/runner.py:211: getattr(..., 'active_strategy', 'peak_trailing_50') [EXISTS on model(s): EngineConfig]
+alpha_engine/engine/runner.py:212: getattr(..., 'trailing_stop_from_peak_pct', 0.5) [EXISTS on model(s): EngineConfig, TradeRecord]
+alpha_engine/engine/runner.py:213: getattr(..., 'custom_take_profit_pct', 0.5) [EXISTS on model(s): EngineConfig, TradeRecord]
+alpha_engine/engine/runner.py:214: getattr(..., 'custom_stop_loss_pct', 0.5) [EXISTS on model(s): EngineConfig, TradeRecord]
+alpha_engine/engine/runner.py:215: getattr(..., 'hard_stop_loss_pct', 0.2) [EXISTS on model(s): ActionParameters, EngineConfig, TradeRecord]
+alpha_engine/engine/runner.py:217: getattr(..., 'early_rally_min_market_cap_usd', 3500.0) [EXISTS on model(s): EngineConfig]
+alpha_engine/engine/runner.py:219: getattr(..., 'auto_trade_enabled', True) [EXISTS on model(s): EngineConfig]
+alpha_engine/engine/runner.py:220: getattr(..., 'screener_exclusive_focus', False) [EXISTS on model(s): EngineConfig]
+alpha_engine/engine/runner.py:221: getattr(..., 'screener_poll_interval_s', 25.0) [EXISTS on model(s): EngineConfig]
+alpha_engine/engine/runner.py:223: getattr(..., 'manual_trade_amount', None) [EXISTS on model(s): EngineConfig]
+alpha_engine/engine/runner.py:225: getattr(..., 'manual_trade_currency', 'SOL') [EXISTS on model(s): EngineConfig]
+alpha_engine/engine/runner.py:247: getattr(..., 'base_fallback_rpcs', []) [EXISTS on model(s): EngineConfig]
+alpha_engine/engine/runner.py:248: getattr(..., 'solana_fallback_rpcs', []) [EXISTS on model(s): EngineConfig]
+alpha_engine/engine/runner.py:258: getattr(..., 'ruflo_enabled', True) [EXISTS on model(s): EngineConfig]
+alpha_engine/engine/runner.py:259: getattr(..., 'ruflo_topology', 'hierarchical') [EXISTS on model(s): EngineConfig]
+alpha_engine/engine/runner.py:260: getattr(..., 'ruflo_consensus', 'bft') [EXISTS on model(s): EngineConfig]
+alpha_engine/engine/runner.py:301: getattr(..., '_council', None) [NOT FOUND on any known pydantic model]
+alpha_engine/engine/runner.py:341: getattr(..., 'dashboard_port', 8000) [EXISTS on model(s): EngineConfig]
+alpha_engine/engine/runner.py:397: getattr(..., 'pacing_governor_enabled', False) [EXISTS on model(s): EngineConfig]
+alpha_engine/engine/runner.py:423: getattr(..., 'pacing_governor_enabled', False) [EXISTS on model(s): EngineConfig]
+alpha_engine/engine/runner.py:428: getattr(..., 'pacing_max_initial_trades', 10) [EXISTS on model(s): EngineConfig]
+alpha_engine/engine/runner.py:429: getattr(..., 'pacing_cooldown_hours', 4.0) [EXISTS on model(s): EngineConfig]
+alpha_engine/engine/runner.py:430: getattr(..., 'pacing_interval_hours', 3.0) [EXISTS on model(s): EngineConfig]
+alpha_engine/engine/runner.py:459: getattr(..., 'active_strategy', getattr(self._cfg, 'active_strategy', 'peak_trailing_50')) [EXISTS on model(s): EngineConfig]
+alpha_engine/engine/runner.py:459: getattr(..., 'active_strategy', 'peak_trailing_50') [EXISTS on model(s): EngineConfig]
+alpha_engine/engine/runner.py:460: getattr(..., 'trailing_stop_from_peak_pct', getattr(self._cfg, 'trailing_stop_from_peak_pct', 0.5)) [EXISTS on model(s): EngineConfig, TradeRecord]
+alpha_engine/engine/runner.py:460: getattr(..., 'trailing_stop_from_peak_pct', 0.5) [EXISTS on model(s): EngineConfig, TradeRecord]
+alpha_engine/engine/runner.py:461: getattr(..., 'custom_take_profit_pct', getattr(self._cfg, 'custom_take_profit_pct', 0.5)) [EXISTS on model(s): EngineConfig, TradeRecord]
+alpha_engine/engine/runner.py:461: getattr(..., 'custom_take_profit_pct', 0.5) [EXISTS on model(s): EngineConfig, TradeRecord]
+alpha_engine/engine/runner.py:462: getattr(..., 'custom_stop_loss_pct', getattr(self._cfg, 'custom_stop_loss_pct', 0.5)) [EXISTS on model(s): EngineConfig, TradeRecord]
+alpha_engine/engine/runner.py:462: getattr(..., 'custom_stop_loss_pct', 0.5) [EXISTS on model(s): EngineConfig, TradeRecord]
+alpha_engine/engine/runner.py:463: getattr(..., 'hard_stop_loss_pct', getattr(self._cfg, 'hard_stop_loss_pct', 0.2)) [EXISTS on model(s): ActionParameters, EngineConfig, TradeRecord]
+alpha_engine/engine/runner.py:463: getattr(..., 'hard_stop_loss_pct', 0.2) [EXISTS on model(s): ActionParameters, EngineConfig, TradeRecord]
+alpha_engine/engine/runner.py:464: getattr(..., 'auto_trade_enabled', getattr(self._cfg, 'auto_trade_enabled', True)) [EXISTS on model(s): EngineConfig]
+alpha_engine/engine/runner.py:464: getattr(..., 'auto_trade_enabled', True) [EXISTS on model(s): EngineConfig]
+alpha_engine/engine/runner.py:465: getattr(..., 'screener_exclusive_focus', getattr(self._cfg, 'screener_exclusive_focus', False)) [EXISTS on model(s): EngineConfig]
+alpha_engine/engine/runner.py:465: getattr(..., 'screener_exclusive_focus', False) [EXISTS on model(s): EngineConfig]
+alpha_engine/engine/runner.py:466: getattr(..., 'screener_poll_interval_s', getattr(self._cfg, 'screener_poll_interval_s', 25.0)) [EXISTS on model(s): EngineConfig]
+alpha_engine/engine/runner.py:466: getattr(..., 'screener_poll_interval_s', 25.0) [EXISTS on model(s): EngineConfig]
+alpha_engine/engine/runner.py:467: getattr(..., 'min_market_cap_usd', getattr(self._cfg, 'min_market_cap_usd', 10000.0)) [EXISTS on model(s): EngineConfig]
+alpha_engine/engine/runner.py:467: getattr(..., 'min_market_cap_usd', 10000.0) [EXISTS on model(s): EngineConfig]
+alpha_engine/engine/runner.py:468: getattr(..., 'early_rally_min_market_cap_usd', getattr(self._cfg, 'early_rally_min_market_cap_usd', 3500.0)) [EXISTS on model(s): EngineConfig]
+alpha_engine/engine/runner.py:468: getattr(..., 'early_rally_min_market_cap_usd', 3500.0) [EXISTS on model(s): EngineConfig]
+alpha_engine/engine/runner.py:485: getattr(..., '_strategy_tournament', None) [NOT FOUND on any known pydantic model]
+alpha_engine/engine/runner.py:488: getattr(..., 'active_strategy', 'default') [EXISTS on model(s): EngineConfig]
+alpha_engine/engine/runner.py:489: getattr(..., 'hard_stop_loss_pct', 0.2) [EXISTS on model(s): ActionParameters, EngineConfig, TradeRecord]
+alpha_engine/engine/runner.py:490: getattr(..., 'custom_take_profit_pct', 0.5) [EXISTS on model(s): EngineConfig, TradeRecord]
+alpha_engine/engine/runner.py:491: getattr(..., 'trailing_stop_from_peak_pct', 0.15) [EXISTS on model(s): EngineConfig, TradeRecord]
+alpha_engine/engine/runner.py:501: getattr(..., 'tournament_exploration_rate', 0.25) [NOT FOUND on any known pydantic model]
+alpha_engine/engine/runner.py:508: getattr(..., 'current_regime', MarketRegime.NEUTRAL) [NOT FOUND on any known pydantic model]
+alpha_engine/engine/runner.py:509: getattr(..., 'regime', None) [NOT FOUND on any known pydantic model]
+alpha_engine/engine/runner.py:509: getattr(..., 'regime_affinity', None) [NOT FOUND on any known pydantic model]
+alpha_engine/engine/runner.py:534: getattr(..., 'db_path', 'paper_trading.db') [EXISTS on model(s): EngineConfig]
+alpha_engine/engine/runner.py:785: getattr(..., 'min_market_cap_usd', getattr(self._cfg, 'min_market_cap_usd', 10000.0)) [EXISTS on model(s): EngineConfig]
+alpha_engine/engine/runner.py:785: getattr(..., 'min_market_cap_usd', 10000.0) [EXISTS on model(s): EngineConfig]
+alpha_engine/engine/runner.py:828: getattr(..., 'last_updated_block', 0) [EXISTS on model(s): PoolState]
+alpha_engine/engine/runner.py:866: getattr(..., 'platform', None) [EXISTS on model(s): OpenPositionLot, PaperFill, TradeRecord]
+alpha_engine/engine/runner.py:884: getattr(..., 'is_new_launch', False) [EXISTS on model(s): OpenPositionLot, PaperFill, TradeRecord]
+alpha_engine/engine/runner.py:909: getattr(..., 'strategy_name', None) [EXISTS on model(s): SignalEvent, TradeRecord]
+alpha_engine/engine/runner.py:945: getattr(..., 'exit_profile', None) [EXISTS on model(s): OpenPositionLot, SignalEvent]
+alpha_engine/engine/runner.py:948: getattr(..., 'source', None) [EXISTS on model(s): RawSignalEvent, SignalEvent]
+alpha_engine/engine/runner.py:951: getattr(..., 'source', None) [EXISTS on model(s): RawSignalEvent, SignalEvent]
+alpha_engine/engine/runner.py:953: getattr(..., 'pattern', None) [NOT FOUND on any known pydantic model]
+alpha_engine/engine/runner.py:955: getattr(..., 'token_age_hours', 0.0) [EXISTS on model(s): RevivalPatternFeatureVector, SignalEvent]
+alpha_engine/engine/runner.py:957: getattr(..., 'token_age_s', 0.0) [NOT FOUND on any known pydantic model]
+alpha_engine/engine/runner.py:961: getattr(..., 'token_address', '') [EXISTS on model(s): AuditedTokenOutcome, DecisionRecord, DecisionSignal, ExitOrder (+14 more)]
+alpha_engine/engine/runner.py:962: getattr(..., 'source', None) [EXISTS on model(s): RawSignalEvent, SignalEvent]
+alpha_engine/engine/runner.py:1023: getattr(..., 'entry_price', Decimal(0)) [EXISTS on model(s): OpenPositionLot]
+alpha_engine/engine/runner.py:1024: getattr(..., 'effective_price', Decimal(0)) [EXISTS on model(s): PaperFill, TradeRecord]
+alpha_engine/engine/runner.py:1025: getattr(..., 'cost_basis_native', Decimal(0)) [NOT FOUND on any known pydantic model]
+alpha_engine/engine/runner.py:1033: getattr(..., 'open_timestamp_ns', 0) [NOT FOUND on any known pydantic model]
+alpha_engine/engine/runner.py:1035: getattr(..., 'platform', None) [EXISTS on model(s): OpenPositionLot, PaperFill, TradeRecord]
+alpha_engine/engine/runner.py:1040: getattr(..., 'status', None) [EXISTS on model(s): LifecycleEvent, NewsSignalEvent, RawSignalEvent, WhitelistRecord]
+alpha_engine/engine/runner.py:1052: getattr(..., 'is_new_launch', False) [EXISTS on model(s): OpenPositionLot, PaperFill, TradeRecord]
+alpha_engine/engine/runner.py:1067: getattr(..., 'strategy_name', None) [EXISTS on model(s): SignalEvent, TradeRecord]
+alpha_engine/engine/runner.py:1067: getattr(..., 'strategy_type', 'DYNAMIC_ADAPTIVE') [EXISTS on model(s): SignalEvent]
+alpha_engine/engine/runner.py:1069: getattr(..., 'lot_id', uuid.uuid4().hex[:8]) [EXISTS on model(s): ExitOrder, OpenPositionLot, TokenRequestRecord]
+alpha_engine/engine/runner.py:1075: getattr(..., 'slippage_bps', 50) [NOT FOUND on any known pydantic model]
+alpha_engine/engine/runner.py:1076: getattr(..., 'fill_latency_ms', 35.0) [EXISTS on model(s): PaperFill, TradeRecord]
+alpha_engine/engine/runner.py:1088: getattr(..., 'strategy_name', getattr(lot, 'strategy_type', 'default')) [EXISTS on model(s): SignalEvent, TradeRecord]
+alpha_engine/engine/runner.py:1088: getattr(..., 'strategy_type', 'default') [EXISTS on model(s): SignalEvent]
+alpha_engine/engine/runner.py:1126: getattr(..., 'exit_profile', None) [EXISTS on model(s): OpenPositionLot, SignalEvent]
+alpha_engine/engine/runner.py:1127: getattr(..., 'strategy_name', '') [EXISTS on model(s): SignalEvent, TradeRecord]
+alpha_engine/engine/runner.py:1145: getattr(..., 'exit_price_source', None) [NOT FOUND on any known pydantic model]
+alpha_engine/engine/runner.py:1146: getattr(..., 'exit_data_age_s', 0.0) [NOT FOUND on any known pydantic model]
+alpha_engine/engine/runner.py:1147: getattr(..., 'exit_mcap_usd', Decimal(0)) [NOT FOUND on any known pydantic model]
+alpha_engine/engine/runner.py:1151: getattr(..., 'peak_price', ep) [EXISTS on model(s): AuditedTokenOutcome, OpenPositionLot]
+alpha_engine/engine/runner.py:1169: getattr(..., 'peak_price', ep) [EXISTS on model(s): AuditedTokenOutcome, OpenPositionLot]
+alpha_engine/engine/runner.py:1173: getattr(..., 'token_age_hours', 0.0) [EXISTS on model(s): RevivalPatternFeatureVector, SignalEvent]
+alpha_engine/engine/runner.py:1174: getattr(..., 'consolidation_length_hours', 0.0) [EXISTS on model(s): RevivalPatternFeatureVector, SignalEvent]
+alpha_engine/engine/runner.py:1175: getattr(..., 'base_market_cap', 0.0) [EXISTS on model(s): OpenPositionLot, SignalEvent]
+alpha_engine/engine/runner.py:1176: getattr(..., 'volume_surge_multiplier', 3.0) [EXISTS on model(s): PatternFeatureVector, RevivalPatternFeatureVector, ScreenerDiscoveryEvent, SignalEvent]
+alpha_engine/engine/runner.py:1177: getattr(..., 'net_buy_delta', 0.7) [EXISTS on model(s): PatternFeatureVector, SignalEvent]
+alpha_engine/engine/runner.py:1216: getattr(..., 'order_id', '') [EXISTS on model(s): ExitOrder, OpenPositionLot, PaperFill, TokenRequestRecord (+1 more)]
+alpha_engine/engine/runner.py:1224: getattr(..., 'fill_latency_ms', 50.0) [EXISTS on model(s): PaperFill, TradeRecord]
+alpha_engine/engine/runner.py:1225: getattr(..., 'entry_feature_vector', []) [NOT FOUND on any known pydantic model]
+alpha_engine/engine/runner.py:1232: getattr(..., 'order_id', '') [EXISTS on model(s): ExitOrder, OpenPositionLot, PaperFill, TokenRequestRecord (+1 more)]
+alpha_engine/engine/runner.py:1237: getattr(..., 'entry_feature_vector', None) [NOT FOUND on any known pydantic model]
+alpha_engine/engine/runner.py:1250: getattr(..., 'wave2_surge_k', None) [NOT FOUND on any known pydantic model]
+alpha_engine/engine/runner.py:1251: getattr(..., 'wave2_net_buy_delta_pct', None) [NOT FOUND on any known pydantic model]
+alpha_engine/engine/runner.py:1255: getattr(..., 'wave2_surge_k', None) [NOT FOUND on any known pydantic model]
+alpha_engine/engine/runner.py:1256: getattr(..., 'wave2_net_buy_delta_pct', None) [NOT FOUND on any known pydantic model]
+alpha_engine/engine/runner.py:1259: getattr(..., 'hard_stop_loss_pct', None) [EXISTS on model(s): ActionParameters, EngineConfig, TradeRecord]
+alpha_engine/engine/runner.py:1297: getattr(..., 'max_queue_size', 100) [EXISTS on model(s): EngineConfig]
+alpha_engine/engine/runner.py:1315: getattr(..., 'last_updated_block', 0) [EXISTS on model(s): PoolState]
+alpha_engine/engine/runner.py:1397: getattr(..., 'passes_hard_gates', True) [NOT FOUND on any known pydantic model]
+alpha_engine/engine/runner.py:1475: getattr(..., 'effective_price', None) [EXISTS on model(s): PaperFill, TradeRecord]
+alpha_engine/engine/runner.py:1502: getattr(..., '_is_pump_curve', False) [NOT FOUND on any known pydantic model]
+alpha_engine/engine/runner.py:1502: getattr(..., '_bonding_curve_complete', False) [NOT FOUND on any known pydantic model]
+alpha_engine/engine/runner.py:1506: getattr(..., 'price_source', None) [EXISTS on model(s): PoolState]
+alpha_engine/engine/runner.py:1508: getattr(..., 'platform', None) [EXISTS on model(s): OpenPositionLot, PaperFill, TradeRecord]
+alpha_engine/engine/runner.py:1514: getattr(..., 'pool_address', '') [EXISTS on model(s): DecisionSignal, ExitOrder, OpenPositionLot, PaperFill (+7 more)]
+alpha_engine/engine/runner.py:1517: getattr(..., 'active_strategy', 'MANUAL_INSTANT') [EXISTS on model(s): EngineConfig]
+alpha_engine/engine/runner.py:1518: getattr(..., 'hard_stop_loss_pct', getattr(self._cfg, 'hard_stop_loss_pct', 0.2)) [EXISTS on model(s): ActionParameters, EngineConfig, TradeRecord]
+alpha_engine/engine/runner.py:1518: getattr(..., 'hard_stop_loss_pct', 0.2) [EXISTS on model(s): ActionParameters, EngineConfig, TradeRecord]
+alpha_engine/engine/runner.py:1519: getattr(..., 'custom_take_profit_pct', getattr(self._cfg, 'custom_take_profit_pct', 0.5)) [EXISTS on model(s): EngineConfig, TradeRecord]
+alpha_engine/engine/runner.py:1519: getattr(..., 'custom_take_profit_pct', 0.5) [EXISTS on model(s): EngineConfig, TradeRecord]
+alpha_engine/engine/runner.py:1520: getattr(..., 'trailing_stop_from_peak_pct', getattr(self._cfg, 'trailing_stop_from_peak_pct', 0.15)) [EXISTS on model(s): EngineConfig, TradeRecord]
+alpha_engine/engine/runner.py:1520: getattr(..., 'trailing_stop_from_peak_pct', 0.15) [EXISTS on model(s): EngineConfig, TradeRecord]
+alpha_engine/engine/runner.py:1529: getattr(..., 'simulated_gas_cost_usd', None) [EXISTS on model(s): PaperFill]
+alpha_engine/engine/runner.py:1532: getattr(..., 'simulated_native_spent', None) [EXISTS on model(s): PaperFill]
+alpha_engine/engine/runner.py:1613: getattr(..., 'price_source', None) [EXISTS on model(s): PoolState]
+alpha_engine/engine/runner.py:1614: getattr(..., 'data_age_s', None) [EXISTS on model(s): PoolState]
+alpha_engine/engine/runner.py:1659: getattr(..., 'platform', None) [EXISTS on model(s): OpenPositionLot, PaperFill, TradeRecord]
+alpha_engine/engine/runner.py:1684: getattr(..., 'is_new_launch', False) [EXISTS on model(s): OpenPositionLot, PaperFill, TradeRecord]
+alpha_engine/engine/runner.py:1691: getattr(..., 'signal_id', '') [EXISTS on model(s): DecisionRecord, DecisionSignal, NewsSignalEvent, RawSignalEvent (+3 more)]
+alpha_engine/engine/runner.py:1694: getattr(..., 'strategy_name', 'MANUAL_INSTANT') [EXISTS on model(s): SignalEvent, TradeRecord]
+alpha_engine/engine/runner.py:1739: getattr(..., 'passes_hard_gates', False) [NOT FOUND on any known pydantic model]
+alpha_engine/engine/runner.py:1740: getattr(..., 'score', 80.0) [NOT FOUND on any known pydantic model]
+alpha_engine/engine/runner.py:1925: getattr(..., 'passes_hard_gates', True) [NOT FOUND on any known pydantic model]
+alpha_engine/engine/runner.py:2069: getattr(..., 'timestamp_s', 0.0) [EXISTS on model(s): PoolState]
+alpha_engine/engine/runner.py:2070: getattr(..., 'data_age_s', None) [EXISTS on model(s): PoolState]
+alpha_engine/engine/runner.py:2075: getattr(..., 'last_updated_block', 0) [EXISTS on model(s): PoolState]
+alpha_engine/engine/runner.py:2135: getattr(..., 'platform', None) [EXISTS on model(s): OpenPositionLot, PaperFill, TradeRecord]
+alpha_engine/engine/runner.py:2139: getattr(..., 'execution_venue', None) [EXISTS on model(s): DecisionSignal, SignalEvent]
+alpha_engine/engine/runner.py:2140: getattr(..., 'pool_address', '') [EXISTS on model(s): DecisionSignal, ExitOrder, OpenPositionLot, PaperFill (+7 more)]
+alpha_engine/engine/runner.py:2142: getattr(..., 'active_strategy', getattr(self.config, 'active_strategy', 'default')) [EXISTS on model(s): EngineConfig]
+alpha_engine/engine/runner.py:2142: getattr(..., 'active_strategy', 'default') [EXISTS on model(s): EngineConfig]
+alpha_engine/engine/runner.py:2143: getattr(..., 'trailing_stop_from_peak_pct', getattr(self.config, 'trailing_stop_from_peak_pct', None)) [EXISTS on model(s): EngineConfig, TradeRecord]
+alpha_engine/engine/runner.py:2143: getattr(..., 'trailing_stop_from_peak_pct', None) [EXISTS on model(s): EngineConfig, TradeRecord]
+alpha_engine/engine/runner.py:2144: getattr(..., 'custom_take_profit_pct', getattr(self.config, 'custom_take_profit_pct', None)) [EXISTS on model(s): EngineConfig, TradeRecord]
+alpha_engine/engine/runner.py:2144: getattr(..., 'custom_take_profit_pct', None) [EXISTS on model(s): EngineConfig, TradeRecord]
+alpha_engine/engine/runner.py:2145: getattr(..., 'custom_stop_loss_pct', getattr(self.config, 'custom_stop_loss_pct', None)) [EXISTS on model(s): EngineConfig, TradeRecord]
+alpha_engine/engine/runner.py:2145: getattr(..., 'custom_stop_loss_pct', None) [EXISTS on model(s): EngineConfig, TradeRecord]
+alpha_engine/engine/runner.py:2146: getattr(..., 'hard_stop_loss_pct', getattr(self.config, 'hard_stop_loss_pct', 0.2)) [EXISTS on model(s): ActionParameters, EngineConfig, TradeRecord]
+alpha_engine/engine/runner.py:2146: getattr(..., 'hard_stop_loss_pct', 0.2) [EXISTS on model(s): ActionParameters, EngineConfig, TradeRecord]
+alpha_engine/engine/runner.py:2152: getattr(..., 'pool_address', '') [EXISTS on model(s): DecisionSignal, ExitOrder, OpenPositionLot, PaperFill (+7 more)]
+alpha_engine/engine/runner.py:2216: getattr(..., 'price_source', None) [EXISTS on model(s): PoolState]
+alpha_engine/engine/runner.py:2217: getattr(..., 'data_age_s', None) [EXISTS on model(s): PoolState]
+alpha_engine/engine/runner.py:2218: getattr(..., 'timestamp_s', time.time()) [EXISTS on model(s): PoolState]
+alpha_engine/engine/runner.py:2332: getattr(..., 'passes_hard_gates', False) [NOT FOUND on any known pydantic model]
+alpha_engine/engine/runner.py:2335: getattr(..., 'is_honeypot', False) [EXISTS on model(s): SecurityReport]
+alpha_engine/engine/runner.py:2340: getattr(..., 'buy_tax_pct', 0.0) [NOT FOUND on any known pydantic model]
+alpha_engine/engine/runner.py:2345: getattr(..., 'sell_tax_pct', 0.0) [NOT FOUND on any known pydantic model]
+alpha_engine/engine/runner.py:2349: getattr(..., 'mint_authority_disabled', None) [EXISTS on model(s): SecurityReport]
+alpha_engine/engine/runner.py:2351: getattr(..., 'mint_disabled', True) [NOT FOUND on any known pydantic model]
+alpha_engine/engine/runner.py:2354: getattr(..., 'top10_concentration', 0.0) [EXISTS on model(s): PatternFeatureVector, SecurityReport]
+alpha_engine/engine/runner.py:2355: getattr(..., 'is_pump_fun', False) [NOT FOUND on any known pydantic model]
+alpha_engine/engine/runner.py:2366: getattr(..., 'lp_burned_ratio', 1.0) [EXISTS on model(s): SecurityReport]
+alpha_engine/engine/runner.py:2434: getattr(..., 'sol_price_usd', self._sol_price or Decimal('150.0')) [EXISTS on model(s): EngineConfig]
+alpha_engine/engine/runner.py:2435: getattr(..., 'eth_price_usd', self._eth_price or Decimal('3400.0')) [EXISTS on model(s): EngineConfig]
+alpha_engine/engine/runner.py:2549: getattr(..., 'sol_price_usd', self._sol_price or Decimal('150.0')) [EXISTS on model(s): EngineConfig]
+alpha_engine/engine/runner.py:2550: getattr(..., 'eth_price_usd', self._eth_price or Decimal('3400.0')) [EXISTS on model(s): EngineConfig]
+alpha_engine/engine/runner.py:2611: getattr(..., 'solana_rpc_http', '') [EXISTS on model(s): EngineConfig]
+alpha_engine/engine/runner.py:2731: getattr(..., 'timestamp_s', 0) [EXISTS on model(s): PoolState]
+alpha_engine/engine/runner.py:2747: getattr(..., 'sol_price_usd', self._sol_price or Decimal('150.0')) [EXISTS on model(s): EngineConfig]
+alpha_engine/engine/runner.py:2748: getattr(..., 'eth_price_usd', self._eth_price or Decimal('3400.0')) [EXISTS on model(s): EngineConfig]
+alpha_engine/engine/runner.py:2789: getattr(..., '_is_pump_curve', False) [NOT FOUND on any known pydantic model]
+alpha_engine/engine/runner.py:2790: getattr(..., '_bonding_curve_complete', False) [NOT FOUND on any known pydantic model]
+alpha_engine/engine/runner.py:2798: getattr(..., '_reserve_usd', 0.0) [NOT FOUND on any known pydantic model]
+alpha_engine/engine/runner.py:2898: getattr(..., 'signal_id', '') [EXISTS on model(s): DecisionRecord, DecisionSignal, NewsSignalEvent, RawSignalEvent (+3 more)]
+alpha_engine/engine/runner.py:3054: getattr(..., 'buyer', '') [NOT FOUND on any known pydantic model]
+alpha_engine/engine/runner.py:3054: getattr(..., 'sender', '') [EXISTS on model(s): SwapEvent]
+alpha_engine/engine/runner.py:3055: getattr(..., 'slot', 0) [EXISTS on model(s): PumpMintEvent]
+alpha_engine/engine/runner.py:3055: getattr(..., 'block_number', 0) [EXISTS on model(s): InitialTxRecord, SwapEvent]
+alpha_engine/engine/runner.py:3139: getattr(..., 'token_age_hours', 0.0) [EXISTS on model(s): RevivalPatternFeatureVector, SignalEvent]
+alpha_engine/engine/runner.py:3245: getattr(..., 'value', signal_event.execution_venue) [NOT FOUND on any known pydantic model]
+alpha_engine/engine/runner.py:3396: getattr(..., 'narrative_cluster', None) [EXISTS on model(s): NewsEvent, NewsSignalEvent, RawSignalEvent, SignalEvent]
+alpha_engine/engine/runner.py:3405: getattr(..., 'narrative_cluster', None) [EXISTS on model(s): NewsEvent, NewsSignalEvent, RawSignalEvent, SignalEvent]
+alpha_engine/engine/runner.py:3568: getattr(..., 'narrative_cluster', None) [EXISTS on model(s): NewsEvent, NewsSignalEvent, RawSignalEvent, SignalEvent]
+alpha_engine/engine/runner.py:3570: getattr(..., 'is_direct_dm', False) [EXISTS on model(s): RawSignalEvent, SignalEvent]
+alpha_engine/engine/runner.py:3572: getattr(..., 'originating_channel', None) [EXISTS on model(s): NewsSignalEvent, RawSignalEvent, SignalEvent, TokenRequestRecord]
+alpha_engine/engine/runner.py:3602: getattr(..., 'exit_grace_period_sec', 15.0) [EXISTS on model(s): EngineConfig]
+alpha_engine/engine/runner.py:3627: getattr(..., 'entry_timestamp_s', None) [NOT FOUND on any known pydantic model]
+alpha_engine/engine/runner.py:3664: getattr(..., 'platform', None) [EXISTS on model(s): OpenPositionLot, PaperFill, TradeRecord]
+alpha_engine/engine/runner.py:3683: getattr(..., 'exit_profile', None) [EXISTS on model(s): OpenPositionLot, SignalEvent]
+alpha_engine/engine/runner.py:3684: getattr(..., 'bonding_curve_mode', False) [NOT FOUND on any known pydantic model]
+alpha_engine/engine/runner.py:3695: getattr(..., 'platform', None) [EXISTS on model(s): OpenPositionLot, PaperFill, TradeRecord]
+alpha_engine/engine/runner.py:3698: getattr(..., 'pool_address', '') [EXISTS on model(s): DecisionSignal, ExitOrder, OpenPositionLot, PaperFill (+7 more)]
+alpha_engine/engine/runner.py:3715: getattr(..., 'strategy_name', None) [EXISTS on model(s): SignalEvent, TradeRecord]
+alpha_engine/engine/runner.py:3725: getattr(..., 'token_symbol', 'UNKNOWN') [EXISTS on model(s): DecisionRecord]
+alpha_engine/engine/runner.py:3743: getattr(..., 'cumulative_realized_usd', getattr(self._metrics, 'total_realized_pnl_usd', 0.0)) [NOT FOUND on any known pydantic model]
+alpha_engine/engine/runner.py:3744: getattr(..., 'total_realized_pnl_usd', 0.0) [NOT FOUND on any known pydantic model]
+alpha_engine/engine/runner.py:3763: getattr(..., 'entry_feature_vector', []) [NOT FOUND on any known pydantic model]
+alpha_engine/engine/runner.py:3786: getattr(..., 'min_signal_strength', None) [EXISTS on model(s): EngineConfig]
+alpha_engine/engine/runner.py:3991: getattr(..., 'is_direct_dm', False) [EXISTS on model(s): RawSignalEvent, SignalEvent]
+alpha_engine/engine/runner.py:3992: getattr(..., 'originating_channel', '') [EXISTS on model(s): NewsSignalEvent, RawSignalEvent, SignalEvent, TokenRequestRecord]
+alpha_engine/engine/runner.py:3993: getattr(..., 'originating_channel', '') [EXISTS on model(s): NewsSignalEvent, RawSignalEvent, SignalEvent, TokenRequestRecord]
+alpha_engine/engine/runner.py:3997: getattr(..., 'auto_trade_enabled', True) [EXISTS on model(s): EngineConfig]
+alpha_engine/engine/runner.py:4003: getattr(..., 'timestamp_s', 0.0) [EXISTS on model(s): PoolState]
+alpha_engine/engine/runner.py:4004: getattr(..., 'data_age_s', None) [EXISTS on model(s): PoolState]
+alpha_engine/engine/runner.py:4010: getattr(..., 'last_updated_block', 0) [EXISTS on model(s): PoolState]
+alpha_engine/engine/runner.py:4015: getattr(..., 'pool_address', '') [EXISTS on model(s): DecisionSignal, ExitOrder, OpenPositionLot, PaperFill (+7 more)]
+alpha_engine/engine/runner.py:4032: getattr(..., 'pool_address', '') [EXISTS on model(s): DecisionSignal, ExitOrder, OpenPositionLot, PaperFill (+7 more)]
+alpha_engine/engine/runner.py:4038: getattr(..., 'screener_exclusive_focus', False) [EXISTS on model(s): EngineConfig]
+alpha_engine/engine/runner.py:4044: getattr(..., 'pattern', None) [NOT FOUND on any known pydantic model]
+alpha_engine/engine/runner.py:4044: getattr(..., 'strategy_pattern', None) [EXISTS on model(s): DecisionRecord, SignalEvent]
+alpha_engine/engine/runner.py:4050: getattr(..., 'is_graduated', False) [NOT FOUND on any known pydantic model]
+alpha_engine/engine/runner.py:4051: getattr(..., 'strategy_pattern', None) [EXISTS on model(s): DecisionRecord, SignalEvent]
+alpha_engine/engine/runner.py:4052: getattr(..., 'execution_venue', None) [EXISTS on model(s): DecisionSignal, SignalEvent]
+alpha_engine/engine/runner.py:4059: getattr(..., 'exit_profile', None) [EXISTS on model(s): OpenPositionLot, SignalEvent]
+alpha_engine/engine/runner.py:4060: getattr(..., 'strategy_pattern', '') [EXISTS on model(s): DecisionRecord, SignalEvent]
+alpha_engine/engine/runner.py:4069: getattr(..., 'execution_venue', 'unknown') [EXISTS on model(s): DecisionSignal, SignalEvent]
+alpha_engine/engine/runner.py:4076: getattr(..., 'source', None) [EXISTS on model(s): RawSignalEvent, SignalEvent]
+alpha_engine/engine/runner.py:4084: getattr(..., 'exit_profile', None) [EXISTS on model(s): OpenPositionLot, SignalEvent]
+alpha_engine/engine/runner.py:4090: getattr(..., 'strategy_pattern', '') [EXISTS on model(s): DecisionRecord, SignalEvent]
+alpha_engine/engine/runner.py:4091: getattr(..., 'active_strategy', '') [EXISTS on model(s): EngineConfig]
+alpha_engine/engine/runner.py:4094: getattr(..., 'early_rally_min_market_cap_usd', getattr(self._cfg, 'early_rally_min_market_cap_usd', 3500.0)) [EXISTS on model(s): EngineConfig]
+alpha_engine/engine/runner.py:4094: getattr(..., 'early_rally_min_market_cap_usd', 3500.0) [EXISTS on model(s): EngineConfig]
+alpha_engine/engine/runner.py:4096: getattr(..., 'min_market_cap_usd', getattr(self._cfg, 'min_market_cap_usd', 10000.0)) [EXISTS on model(s): EngineConfig]
+alpha_engine/engine/runner.py:4096: getattr(..., 'min_market_cap_usd', 10000.0) [EXISTS on model(s): EngineConfig]
+alpha_engine/engine/runner.py:4097: getattr(..., 'market_cap_usd', None) [EXISTS on model(s): DecisionRecord, ScreenerDiscoveryEvent, SignalEvent]
+alpha_engine/engine/runner.py:4144: getattr(..., 'min_entry_score', 50.0) [EXISTS on model(s): EngineConfig]
+alpha_engine/engine/runner.py:4163: getattr(..., 'circuit_breaker_freeze_duration_s', 3600.0) [EXISTS on model(s): EngineConfig]
+alpha_engine/engine/runner.py:4188: getattr(..., 'custom_amount_native', None) [EXISTS on model(s): RawSignalEvent, SignalEvent, TokenRequestRecord]
+alpha_engine/engine/runner.py:4204: getattr(..., 'daily_drawdown_pct', 0.0) [NOT FOUND on any known pydantic model]
+alpha_engine/engine/runner.py:4263: getattr(..., 'pool_address', '') [EXISTS on model(s): DecisionSignal, ExitOrder, OpenPositionLot, PaperFill (+7 more)]
+alpha_engine/engine/runner.py:4264: getattr(..., 'narrative_cluster', None) [EXISTS on model(s): NewsEvent, NewsSignalEvent, RawSignalEvent, SignalEvent]
+alpha_engine/engine/runner.py:4290: getattr(..., 'token_address', '') [EXISTS on model(s): AuditedTokenOutcome, DecisionRecord, DecisionSignal, ExitOrder (+14 more)]
+alpha_engine/engine/runner.py:4291: getattr(..., 'strength', None) [EXISTS on model(s): SignalEvent]
+alpha_engine/engine/runner.py:4298: getattr(..., 'timestamp_s', 0.0) [EXISTS on model(s): PoolState]
+alpha_engine/engine/runner.py:4299: getattr(..., 'data_age_s', None) [EXISTS on model(s): PoolState]
+alpha_engine/engine/runner.py:4305: getattr(..., 'last_updated_block', 0) [EXISTS on model(s): PoolState]
+alpha_engine/engine/runner.py:4310: getattr(..., 'pool_address', '') [EXISTS on model(s): DecisionSignal, ExitOrder, OpenPositionLot, PaperFill (+7 more)]
+alpha_engine/engine/runner.py:4325: getattr(..., 'last_updated_block', 0) [EXISTS on model(s): PoolState]
+alpha_engine/engine/runner.py:4329: getattr(..., 'pool_address', '') [EXISTS on model(s): DecisionSignal, ExitOrder, OpenPositionLot, PaperFill (+7 more)]
+alpha_engine/engine/runner.py:4337: getattr(..., 'security_report', None) [EXISTS on model(s): SignalEvent]
+alpha_engine/engine/runner.py:4338: getattr(..., 'wallet_profile', None) [NOT FOUND on any known pydantic model]
+alpha_engine/engine/runner.py:4365: getattr(..., 'security_report', None) [EXISTS on model(s): SignalEvent]
+alpha_engine/engine/runner.py:4368: getattr(..., 'passed', True) [NOT FOUND on any known pydantic model]
+alpha_engine/engine/runner.py:4377: getattr(..., 'rationale', 'Veto') [EXISTS on model(s): WalletAudit]
+alpha_engine/engine/runner.py:4382: getattr(..., 'rationale', 'Veto') [EXISTS on model(s): WalletAudit]
+alpha_engine/engine/runner.py:4383: getattr(..., 'agent_votes', {}) [NOT FOUND on any known pydantic model]
+alpha_engine/engine/runner.py:4403: getattr(..., 'ai_supervisor_enabled', True) [EXISTS on model(s): EngineConfig]
+alpha_engine/engine/runner.py:4410: getattr(..., 'security_report', None) [EXISTS on model(s): SignalEvent]
+alpha_engine/engine/runner.py:4422: getattr(..., 'ai_strict_veto', True) [EXISTS on model(s): EngineConfig]
+alpha_engine/engine/runner.py:4433: getattr(..., 'ai_strict_veto', True) [EXISTS on model(s): EngineConfig]
+alpha_engine/engine/runner.py:4490: getattr(..., 'tx_hash', None) [EXISTS on model(s): FundingHop, InitialTxRecord, PumpMintEvent, SwapEvent]
+alpha_engine/engine/runner.py:4513: getattr(..., 'platform', None) [EXISTS on model(s): OpenPositionLot, PaperFill, TradeRecord]
+alpha_engine/engine/runner.py:4516: getattr(..., 'source', None) [EXISTS on model(s): RawSignalEvent, SignalEvent]
+alpha_engine/engine/runner.py:4517: getattr(..., 'execution_venue', None) [EXISTS on model(s): DecisionSignal, SignalEvent]
+alpha_engine/engine/runner.py:4518: getattr(..., 'pool_address', '') [EXISTS on model(s): DecisionSignal, ExitOrder, OpenPositionLot, PaperFill (+7 more)]
+alpha_engine/engine/runner.py:4525: getattr(..., 'pool_address', '') [EXISTS on model(s): DecisionSignal, ExitOrder, OpenPositionLot, PaperFill (+7 more)]
+alpha_engine/engine/runner.py:4530: getattr(..., 'narrative_cluster', None) [EXISTS on model(s): NewsEvent, NewsSignalEvent, RawSignalEvent, SignalEvent]
+alpha_engine/engine/runner.py:4531: getattr(..., 'exit_profile', ExitProfile.FAST_SNIPE) [EXISTS on model(s): OpenPositionLot, SignalEvent]
+alpha_engine/engine/runner.py:4532: getattr(..., 'base_market_cap', 0.0) [EXISTS on model(s): OpenPositionLot, SignalEvent]
+alpha_engine/engine/runner.py:4533: getattr(..., 'token_age_hours', 0.0) [EXISTS on model(s): RevivalPatternFeatureVector, SignalEvent]
+alpha_engine/engine/runner.py:4534: getattr(..., 'consolidation_length_hours', 0.0) [EXISTS on model(s): RevivalPatternFeatureVector, SignalEvent]
+alpha_engine/engine/runner.py:4535: getattr(..., 'volume_surge_multiplier', 0.0) [EXISTS on model(s): PatternFeatureVector, RevivalPatternFeatureVector, ScreenerDiscoveryEvent, SignalEvent]
+alpha_engine/engine/runner.py:4536: getattr(..., 'net_buy_delta', 0.0) [EXISTS on model(s): PatternFeatureVector, SignalEvent]
+alpha_engine/engine/runner.py:4538: getattr(..., 'partial_exit_enabled', True) [EXISTS on model(s): EngineConfig]
+alpha_engine/engine/runner.py:4588: getattr(..., 'exit_profile', None) [EXISTS on model(s): OpenPositionLot, SignalEvent]
+alpha_engine/engine/runner.py:4588: getattr(..., 'source', None) [EXISTS on model(s): RawSignalEvent, SignalEvent]
+alpha_engine/engine/runner.py:4599: getattr(..., 'volume_surge_multiplier', 0.0) [EXISTS on model(s): PatternFeatureVector, RevivalPatternFeatureVector, ScreenerDiscoveryEvent, SignalEvent]
+alpha_engine/engine/runner.py:4599: getattr(..., 'net_buy_delta', 0.0) [EXISTS on model(s): PatternFeatureVector, SignalEvent]
+alpha_engine/engine/runner.py:4603: getattr(..., 'exit_profile', None) [EXISTS on model(s): OpenPositionLot, SignalEvent]
+alpha_engine/engine/runner.py:4613: getattr(..., 'token_age_hours', 0.0) [EXISTS on model(s): RevivalPatternFeatureVector, SignalEvent]
+alpha_engine/engine/runner.py:4614: getattr(..., 'base_market_cap', 0.0) [EXISTS on model(s): OpenPositionLot, SignalEvent]
+alpha_engine/engine/runner.py:4615: getattr(..., 'volume_surge_multiplier', 0.0) [EXISTS on model(s): PatternFeatureVector, RevivalPatternFeatureVector, ScreenerDiscoveryEvent, SignalEvent]
+alpha_engine/engine/runner.py:4615: getattr(..., 'net_buy_delta', 0.0) [EXISTS on model(s): PatternFeatureVector, SignalEvent]
+alpha_engine/engine/runner.py:4661: getattr(..., 'platform', None) [EXISTS on model(s): OpenPositionLot, PaperFill, TradeRecord]
+alpha_engine/engine/runner.py:4664: getattr(..., 'source', None) [EXISTS on model(s): RawSignalEvent, SignalEvent]
+alpha_engine/engine/runner.py:4697: getattr(..., 'is_new_launch', False) [EXISTS on model(s): OpenPositionLot, PaperFill, TradeRecord]
+alpha_engine/engine/runner.py:4729: getattr(..., 'strategy_name', None) [EXISTS on model(s): SignalEvent, TradeRecord]
+alpha_engine/engine/runner.py:5042: getattr(..., 'initial_price', Decimal('0')) [EXISTS on model(s): AuditedTokenOutcome]
+alpha_engine/engine/runner.py:5043: getattr(..., 'highest_price', getattr(staged, 'peak_price', getattr(staged, 'latest_price', Decimal('0')))) [NOT FOUND on any known pydantic model]
+alpha_engine/engine/runner.py:5043: getattr(..., 'peak_price', getattr(staged, 'latest_price', Decimal('0'))) [EXISTS on model(s): AuditedTokenOutcome, OpenPositionLot]
+alpha_engine/engine/runner.py:5043: getattr(..., 'latest_price', Decimal('0')) [EXISTS on model(s): AuditedTokenOutcome]
+alpha_engine/engine/runner.py:5051: getattr(..., 'token_address', '') [EXISTS on model(s): AuditedTokenOutcome, DecisionRecord, DecisionSignal, ExitOrder (+14 more)]
+alpha_engine/engine/runner.py:5054: getattr(..., 'volume_surge_multiplier', 2.0) [EXISTS on model(s): PatternFeatureVector, RevivalPatternFeatureVector, ScreenerDiscoveryEvent, SignalEvent]
+alpha_engine/engine/runner.py:5055: getattr(..., 'net_buy_delta', 0.6) [EXISTS on model(s): PatternFeatureVector, SignalEvent]
+alpha_engine/engine/runner.py:5056: getattr(..., 'top10_concentration', 0.2) [EXISTS on model(s): PatternFeatureVector, SecurityReport]
+alpha_engine/engine/runner.py:5107: getattr(..., '_outcome_tracker', {}) [NOT FOUND on any known pydantic model]
+alpha_engine/engine/runner.py:5109: getattr(..., '_negative_cache', {}) [NOT FOUND on any known pydantic model]
+alpha_engine/engine/runner.py:5137: getattr(..., 'screener_poll_interval_s', getattr(self._cfg, 'screener_poll_interval_s', 25.0)) [EXISTS on model(s): EngineConfig]
+alpha_engine/engine/runner.py:5137: getattr(..., 'screener_poll_interval_s', 25.0) [EXISTS on model(s): EngineConfig]
+alpha_engine/engine/runner.py:5163: getattr(..., 'min_market_cap_usd', getattr(self._cfg, 'min_market_cap_usd', 10000.0)) [EXISTS on model(s): EngineConfig]
+alpha_engine/engine/runner.py:5163: getattr(..., 'min_market_cap_usd', 10000.0) [EXISTS on model(s): EngineConfig]
+alpha_engine/engine/runner.py:5260: getattr(..., 'sol_price_usd', self._sol_price or 150.0) [EXISTS on model(s): EngineConfig]
+alpha_engine/engine/runner.py:5322: getattr(..., 'last_updated_block', 0) [EXISTS on model(s): PoolState]
+alpha_engine/engine/runner.py:5342: getattr(..., 'platform', None) [EXISTS on model(s): OpenPositionLot, PaperFill, TradeRecord]
+alpha_engine/engine/runner.py:5353: getattr(..., 'is_new_launch', False) [EXISTS on model(s): OpenPositionLot, PaperFill, TradeRecord]
+alpha_engine/engine/runner.py:5421: getattr(..., 'sol_price_usd', self._sol_price or Decimal('150.0')) [EXISTS on model(s): EngineConfig]
+alpha_engine/engine/runner.py:5425: getattr(..., 'timestamp_s', 0.0) [EXISTS on model(s): PoolState]
+alpha_engine/engine/runner.py:5426: getattr(..., 'bonding_curve_mode', False) [NOT FOUND on any known pydantic model]
+alpha_engine/engine/runner.py:5474: getattr(..., 'open_timestamp_ns', 0) [NOT FOUND on any known pydantic model]
+alpha_engine/engine/runner.py:5564: getattr(..., 'eth_price_usd', self._eth_price or 2500.0) [EXISTS on model(s): EngineConfig]
+alpha_engine/engine/runner.py:5682: getattr(..., 'timestamp_s', 0) [EXISTS on model(s): PoolState]
+alpha_engine/engine/runner.py:5683: getattr(..., 'last_updated_block', 0) [EXISTS on model(s): PoolState]
+alpha_engine/engine/runner.py:5690: getattr(..., 'is_illiquid', False) [NOT FOUND on any known pydantic model]
+alpha_engine/engine/runner.py:5714: getattr(..., 'timestamp_s', 0.0) [EXISTS on model(s): PoolState]
+alpha_engine/engine/runner.py:5715: getattr(..., 'data_age_s', None) [EXISTS on model(s): PoolState]
+alpha_engine/engine/runner.py:5730: getattr(..., 'last_updated_block', 0) [EXISTS on model(s): PoolState]
+alpha_engine/engine/runner.py:5744: getattr(..., 'exit_profile', None) [EXISTS on model(s): OpenPositionLot, SignalEvent]
+alpha_engine/engine/runner.py:5745: getattr(..., 'bonding_curve_mode', False) [NOT FOUND on any known pydantic model]
+alpha_engine/engine/runner.py:5785: getattr(..., 'price_source', None) [EXISTS on model(s): PoolState]
+alpha_engine/engine/runner.py:5786: getattr(..., 'data_age_s', 0.0) [EXISTS on model(s): PoolState]
+alpha_engine/engine/runner.py:5786: getattr(..., 'timestamp_s', now_s) [EXISTS on model(s): PoolState]
+alpha_engine/engine/runner.py:5801: getattr(..., 'timestamp_s', None) [EXISTS on model(s): PoolState]
+alpha_engine/engine/runner.py:5802: getattr(..., 'exit_grace_period_sec', 15.0) [EXISTS on model(s): EngineConfig]
+alpha_engine/engine/runner.py:5805: getattr(..., 'pool_address', None) [EXISTS on model(s): DecisionSignal, ExitOrder, OpenPositionLot, PaperFill (+7 more)]
+alpha_engine/engine/runner.py:5821: getattr(..., 'hard_stop_loss_pct', 0.2) [EXISTS on model(s): ActionParameters, EngineConfig, TradeRecord]
+alpha_engine/engine/runner.py:5844: getattr(..., 'platform', None) [EXISTS on model(s): OpenPositionLot, PaperFill, TradeRecord]
+alpha_engine/engine/runner.py:5863: getattr(..., 'exit_profile', None) [EXISTS on model(s): OpenPositionLot, SignalEvent]
+alpha_engine/engine/runner.py:5864: getattr(..., 'bonding_curve_mode', False) [NOT FOUND on any known pydantic model]
+alpha_engine/engine/runner.py:5911: getattr(..., 'platform', None) [EXISTS on model(s): OpenPositionLot, PaperFill, TradeRecord]
+alpha_engine/engine/runner.py:5912: getattr(..., 'strategy_name', None) [EXISTS on model(s): SignalEvent, TradeRecord]
+alpha_engine/engine/runner.py:5921: getattr(..., 'token_symbol', 'UNKNOWN') [EXISTS on model(s): DecisionRecord]
+alpha_engine/engine/runner.py:5939: getattr(..., 'cumulative_realized_usd', getattr(self._metrics, 'total_realized_pnl_usd', 0.0)) [NOT FOUND on any known pydantic model]
+alpha_engine/engine/runner.py:5940: getattr(..., 'total_realized_pnl_usd', 0.0) [NOT FOUND on any known pydantic model]
+alpha_engine/engine/runner.py:5959: getattr(..., 'entry_feature_vector', []) [NOT FOUND on any known pydantic model]
+alpha_engine/engine/runner.py:5969: getattr(..., 'platform', None) [EXISTS on model(s): OpenPositionLot, PaperFill, TradeRecord]
+alpha_engine/engine/runner.py:6087: getattr(..., 'max_open_lot_age_s', 43200.0) [NOT FOUND on any known pydantic model]
+alpha_engine/engine/runner.py:6135: getattr(..., 'gatekeeper_negative_cache_ttl_s', 300.0) [EXISTS on model(s): EngineConfig]
+alpha_engine/engine/runner.py:6136: getattr(..., 'gatekeeper_negative_cache_maxsize', 5000) [EXISTS on model(s): EngineConfig]
+alpha_engine/engine/runner.py:6147: getattr(..., 'solana_fallback_rpcs', []) [EXISTS on model(s): EngineConfig]
+alpha_engine/engine/runner.py:6167: getattr(..., 'telegram_session_string', None) [EXISTS on model(s): EngineConfig]
+alpha_engine/engine/runner.py:6213: getattr(..., 'dashboard_enabled', True) [EXISTS on model(s): EngineConfig]
+alpha_engine/engine/runner.py:6220: getattr(..., '_council', None) [NOT FOUND on any known pydantic model]
+alpha_engine/engine/runner.py:6238: getattr(..., 'strategy_name', None) [EXISTS on model(s): SignalEvent, TradeRecord]
+alpha_engine/engine/runner.py:6238: getattr(..., 'strategy_pattern', None) [EXISTS on model(s): DecisionRecord, SignalEvent]
+alpha_engine/engine/runner.py:6257: getattr(..., 'strategy_name', None) [EXISTS on model(s): SignalEvent, TradeRecord]
+alpha_engine/engine/runner.py:6257: getattr(..., 'strategy_pattern', None) [EXISTS on model(s): DecisionRecord, SignalEvent]
+alpha_engine/engine/self_learning/hyperparameter_tuner.py:104: getattr(..., 'vote', '') [NOT FOUND on any known pydantic model]
+alpha_engine/engine/signals.py:662: getattr(..., 'token_address', '') [EXISTS on model(s): AuditedTokenOutcome, DecisionRecord, DecisionSignal, ExitOrder (+14 more)]
+alpha_engine/engine/signals.py:669: getattr(..., 'source', SignalSource.X_SENTIMENT) [EXISTS on model(s): RawSignalEvent, SignalEvent]
+alpha_engine/engine/signals.py:672: getattr(..., 'timestamp_ns', time.time_ns()) [EXISTS on model(s): DecisionRecord, DecisionSignal, ExitOrder, LifecycleEvent (+10 more)]
+alpha_engine/engine/signals.py:682: getattr(..., 'originating_channel', None) [EXISTS on model(s): NewsSignalEvent, RawSignalEvent, SignalEvent, TokenRequestRecord]
+alpha_engine/engine/signals.py:683: getattr(..., 'is_direct_dm', False) [EXISTS on model(s): RawSignalEvent, SignalEvent]
+alpha_engine/engine/signals.py:684: getattr(..., 'custom_amount_native', None) [EXISTS on model(s): RawSignalEvent, SignalEvent, TokenRequestRecord]
+alpha_engine/engine/signals.py:721: getattr(..., 'sol_price_usd', Decimal('150.0')) [EXISTS on model(s): EngineConfig]
+alpha_engine/engine/signals.py:736: getattr(..., 'graduated', True) [NOT FOUND on any known pydantic model]
+alpha_engine/engine/signals.py:768: getattr(..., 'sol_price_usd', Decimal('150.0')) [EXISTS on model(s): EngineConfig]
+alpha_engine/engine/signals.py:863: getattr(..., 'pool_type', '') [NOT FOUND on any known pydantic model]
+alpha_engine/engine/signals.py:865: getattr(..., 'pool_type', '') [NOT FOUND on any known pydantic model]
+alpha_engine/engine/signals.py:867: getattr(..., 'dex', '') [NOT FOUND on any known pydantic model]
+alpha_engine/engine/signals.py:872: getattr(..., 'is_v3', False) [NOT FOUND on any known pydantic model]
+alpha_engine/engine/signals.py:872: getattr(..., 'fee_numerator', 0) [EXISTS on model(s): PoolState]
+alpha_engine/engine/signals.py:960: getattr(..., 'smart_money_wallets', []) [NOT FOUND on any known pydantic model]
+alpha_engine/engine/signals.py:961: getattr(..., 'whale_cluster_detected', False) [NOT FOUND on any known pydantic model]
+alpha_engine/engine/signals.py:1022: getattr(..., 'slot_or_block', 1000) [NOT FOUND on any known pydantic model]
+alpha_engine/engine/staging.py:980: getattr(..., 'revival_min_token_age_s', self.min_token_age_s) [EXISTS on model(s): EngineConfig]
+alpha_engine/engine/staging.py:981: getattr(..., 'revival_max_dev_balance_pct', self.max_dev_balance_pct) [EXISTS on model(s): EngineConfig]
+alpha_engine/engine/staging.py:982: getattr(..., 'revival_max_top10_concentration_pct', self.max_top10_concentration_pct) [EXISTS on model(s): EngineConfig]
+alpha_engine/engine/staging.py:983: getattr(..., 'revival_volume_surge_multiplier_k', self.volume_surge_multiplier_k) [EXISTS on model(s): EngineConfig]
+alpha_engine/engine/staging.py:984: getattr(..., 'revival_min_net_buy_delta', self.min_net_buy_delta) [EXISTS on model(s): EngineConfig]
+alpha_engine/engine/staging.py:985: getattr(..., 'revival_min_accumulation_score', self.min_accumulation_score) [EXISTS on model(s): EngineConfig]
+alpha_engine/engine/strategy/adaptive_regime.py:151: getattr(..., 'recent_swaps', []) [NOT FOUND on any known pydantic model]
+alpha_engine/engine/strategy/adaptive_regime.py:219: getattr(..., 'native_reserves', Decimal('1')) [NOT FOUND on any known pydantic model]
+alpha_engine/engine/strategy/adaptive_regime.py:228: getattr(..., 'indicators', {}) [NOT FOUND on any known pydantic model]
+alpha_engine/engine/strategy/liquidity_sweep.py:141: getattr(..., 'native_reserves', Decimal('1')) [NOT FOUND on any known pydantic model]
+alpha_engine/engine/strategy/liquidity_sweep.py:146: getattr(..., 'five_min_candles', []) [NOT FOUND on any known pydantic model]
+alpha_engine/engine/strategy/liquidity_sweep.py:149: getattr(..., 'volume_buckets', []) [NOT FOUND on any known pydantic model]
+alpha_engine/engine/strategy/liquidity_sweep.py:165: getattr(..., 'trough_price', Decimal('0')) [NOT FOUND on any known pydantic model]
+alpha_engine/engine/strategy/liquidity_sweep.py:166: getattr(..., 'initial_price', Decimal('0')) [EXISTS on model(s): AuditedTokenOutcome]
+alpha_engine/engine/strategy/liquidity_sweep.py:172: getattr(..., 'peak_price', initial_p * Decimal('1.5')) [EXISTS on model(s): AuditedTokenOutcome, OpenPositionLot]
+alpha_engine/engine/strategy/liquidity_sweep.py:178: getattr(..., 'net_buy_delta', m_data.get('net_buy_delta', 0.5)) [EXISTS on model(s): PatternFeatureVector, SignalEvent]
+alpha_engine/engine/strategy/liquidity_sweep.py:228: getattr(..., 'liquidity_usd', 0.0) [EXISTS on model(s): DecisionRecord, ScreenerDiscoveryEvent, SecurityReport]
+alpha_engine/engine/strategy/liquidity_sweep.py:241: getattr(..., 'entry_price', Decimal('0')) [EXISTS on model(s): OpenPositionLot]
+alpha_engine/engine/strategy/liquidity_sweep.py:253: getattr(..., 'native_reserves', Decimal('1')) [NOT FOUND on any known pydantic model]
+alpha_engine/engine/strategy/liquidity_sweep.py:262: getattr(..., 'stop_loss_pct', hard_stop) [EXISTS on model(s): EngineConfig]
+alpha_engine/engine/strategy/liquidity_sweep.py:285: getattr(..., 'exit_stage', 0) [EXISTS on model(s): TradeRecord]
+alpha_engine/engine/strategy/mean_reversion.py:120: getattr(..., 'native_reserves', Decimal('1')) [NOT FOUND on any known pydantic model]
+alpha_engine/engine/strategy/mean_reversion.py:128: getattr(..., 'recent_swaps', []) [NOT FOUND on any known pydantic model]
+alpha_engine/engine/strategy/mean_reversion.py:147: getattr(..., 'net_buy_delta', m_data.get('net_buy_delta', 0.5)) [EXISTS on model(s): PatternFeatureVector, SignalEvent]
+alpha_engine/engine/strategy/mean_reversion.py:198: getattr(..., 'liquidity_usd', 0.0) [EXISTS on model(s): DecisionRecord, ScreenerDiscoveryEvent, SecurityReport]
+alpha_engine/engine/strategy/mean_reversion.py:211: getattr(..., 'entry_price', Decimal('0')) [EXISTS on model(s): OpenPositionLot]
+alpha_engine/engine/strategy/mean_reversion.py:221: getattr(..., 'native_reserves', Decimal('1')) [NOT FOUND on any known pydantic model]
+alpha_engine/engine/strategy/mean_reversion.py:251: getattr(..., 'exit_stage', 0) [EXISTS on model(s): TradeRecord]
+alpha_engine/engine/strategy/mean_reversion.py:252: getattr(..., 'indicators', {}) [NOT FOUND on any known pydantic model]
+alpha_engine/engine/strategy/momentum_breakout.py:163: getattr(..., 'freeze_authority_disabled', True) [EXISTS on model(s): SecurityReport]
+alpha_engine/engine/strategy/momentum_breakout.py:169: getattr(..., 'native_reserves', Decimal('1')) [NOT FOUND on any known pydantic model]
+alpha_engine/engine/strategy/momentum_breakout.py:174: getattr(..., 'recent_swaps', []) [NOT FOUND on any known pydantic model]
+alpha_engine/engine/strategy/momentum_breakout.py:175: getattr(..., 'volume_surge_multiplier', m_data.get('volume_surge_multiplier', 1.0)) [EXISTS on model(s): PatternFeatureVector, RevivalPatternFeatureVector, ScreenerDiscoveryEvent, SignalEvent]
+alpha_engine/engine/strategy/momentum_breakout.py:176: getattr(..., 'net_buy_delta', m_data.get('net_buy_delta', 0.5)) [EXISTS on model(s): PatternFeatureVector, SignalEvent]
+alpha_engine/engine/strategy/momentum_breakout.py:194: getattr(..., 'peak_price', Decimal('0')) [EXISTS on model(s): AuditedTokenOutcome, OpenPositionLot]
+alpha_engine/engine/strategy/momentum_breakout.py:248: getattr(..., 'liquidity_usd', 0.0) [EXISTS on model(s): DecisionRecord, ScreenerDiscoveryEvent, SecurityReport]
+alpha_engine/engine/strategy/momentum_breakout.py:261: getattr(..., 'entry_price', Decimal('0')) [EXISTS on model(s): OpenPositionLot]
+alpha_engine/engine/strategy/momentum_breakout.py:273: getattr(..., 'native_reserves', Decimal('1')) [NOT FOUND on any known pydantic model]
+alpha_engine/engine/strategy/momentum_breakout.py:304: getattr(..., 'exit_stage', 0) [EXISTS on model(s): TradeRecord]
+alpha_engine/engine/strategy/multi_timeframe.py:85: getattr(..., 'net_buy_delta', market_data.get('net_buy_delta', 0.5)) [EXISTS on model(s): PatternFeatureVector, SignalEvent]
+alpha_engine/engine/strategy/multi_timeframe.py:96: getattr(..., 'volume_surge_multiplier', market_data.get('volume_surge_multiplier', 1.0)) [EXISTS on model(s): PatternFeatureVector, RevivalPatternFeatureVector, ScreenerDiscoveryEvent, SignalEvent]
+alpha_engine/engine/strategy/multi_timeframe.py:97: getattr(..., 'rsi_5m', market_data.get('rsi_5m', 50.0)) [NOT FOUND on any known pydantic model]
+alpha_engine/engine/strategy/multi_timeframe.py:116: getattr(..., 'token_age_hours', market_data.get('token_age_hours', 1.0)) [EXISTS on model(s): RevivalPatternFeatureVector, SignalEvent]
+alpha_engine/engine/strategy/multi_timeframe.py:117: getattr(..., 'one_hour_volume', market_data.get('one_hour_volume', 10.0)) [NOT FOUND on any known pydantic model]
+alpha_engine/engine/strategy/multi_timeframe.py:145: getattr(..., 'freeze_authority_disabled', True) [EXISTS on model(s): SecurityReport]
+alpha_engine/engine/strategy/multi_timeframe.py:152: getattr(..., 'native_reserves', Decimal('1')) [NOT FOUND on any known pydantic model]
+alpha_engine/engine/strategy/multi_timeframe.py:154: getattr(..., 'liquidity_usd', 0.0) [EXISTS on model(s): DecisionRecord, ScreenerDiscoveryEvent, SecurityReport]
+alpha_engine/engine/strategy/multi_timeframe.py:161: getattr(..., 'initial_price', current_price) [EXISTS on model(s): AuditedTokenOutcome]
+alpha_engine/engine/strategy/multi_timeframe.py:216: getattr(..., 'entry_price', Decimal('0')) [EXISTS on model(s): OpenPositionLot]
+alpha_engine/engine/strategy/multi_timeframe.py:228: getattr(..., 'native_reserves', Decimal('1')) [NOT FOUND on any known pydantic model]
+alpha_engine/engine/strategy/multi_timeframe.py:237: getattr(..., 'indicators', {}) [NOT FOUND on any known pydantic model]
+alpha_engine/engine/strategy/multi_timeframe.py:269: getattr(..., 'exit_stage', 0) [EXISTS on model(s): TradeRecord]
+alpha_engine/engine/strategy/narrative_velocity.py:97: getattr(..., 'freeze_authority_disabled', True) [EXISTS on model(s): SecurityReport]
+alpha_engine/engine/strategy/narrative_velocity.py:102: getattr(..., 'reach_verdict', None) [NOT FOUND on any known pydantic model]
+alpha_engine/engine/strategy/narrative_velocity.py:103: getattr(..., 'score', getattr(staged_data, 'reach_score', m_data.get('reach_score', 0.0))) [NOT FOUND on any known pydantic model]
+alpha_engine/engine/strategy/narrative_velocity.py:103: getattr(..., 'reach_score', m_data.get('reach_score', 0.0)) [NOT FOUND on any known pydantic model]
+alpha_engine/engine/strategy/narrative_velocity.py:104: getattr(..., 'flags', getattr(staged_data, 'reach_flags', m_data.get('reach_flags', []))) [EXISTS on model(s): AuditedTokenOutcome, SecurityAssessment]
+alpha_engine/engine/strategy/narrative_velocity.py:104: getattr(..., 'reach_flags', m_data.get('reach_flags', [])) [NOT FOUND on any known pydantic model]
+alpha_engine/engine/strategy/narrative_velocity.py:129: getattr(..., 'market_cap_usd', 0.0) [EXISTS on model(s): DecisionRecord, ScreenerDiscoveryEvent, SignalEvent]
+alpha_engine/engine/strategy/narrative_velocity.py:187: getattr(..., 'entry_price', Decimal('0')) [EXISTS on model(s): OpenPositionLot]
+alpha_engine/engine/strategy/narrative_velocity.py:199: getattr(..., 'native_reserves', Decimal('1')) [NOT FOUND on any known pydantic model]
+alpha_engine/engine/strategy/narrative_velocity.py:208: getattr(..., 'indicators', {}) [NOT FOUND on any known pydantic model]
+alpha_engine/engine/strategy/narrative_velocity.py:240: getattr(..., 'exit_stage', 0) [EXISTS on model(s): TradeRecord]
+alpha_engine/engine/strategy/scoring.py:25: getattr(..., 'is_honeypot', False) [EXISTS on model(s): SecurityReport]
+alpha_engine/engine/strategy/scoring.py:29: getattr(..., 'buy_tax_bps', 0) [EXISTS on model(s): SecurityReport]
+alpha_engine/engine/strategy/scoring.py:30: getattr(..., 'sell_tax_bps', 0) [EXISTS on model(s): SecurityReport]
+alpha_engine/engine/strategy/scoring.py:37: getattr(..., 'lp_burned_ratio', 0.0) [EXISTS on model(s): SecurityReport]
+alpha_engine/engine/strategy/scoring.py:38: getattr(..., 'is_pump_fun', False) [NOT FOUND on any known pydantic model]
+alpha_engine/engine/strategy/scoring.py:42: getattr(..., 'top10_concentration', 0.1) [EXISTS on model(s): PatternFeatureVector, SecurityReport]
+alpha_engine/engine/strategy/scoring.py:80: getattr(..., 'raw_signal', None) [NOT FOUND on any known pydantic model]
+alpha_engine/engine/strategy/scoring.py:82: getattr(..., 'smart_money_score', 0.0) [EXISTS on model(s): WalletProfile, WhitelistRecord]
+alpha_engine/engine/strategy/scoring.py:94: getattr(..., 'raw_signal', None) [NOT FOUND on any known pydantic model]
+alpha_engine/engine/strategy/screener_priority.py:159: getattr(..., 'graduated_max_price_extension_pct', 1.5) [NOT FOUND on any known pydantic model]
+alpha_engine/engine/strategy/screener_priority.py:163: getattr(..., 'min_market_cap_usd', Decimal('10000.0')) [EXISTS on model(s): EngineConfig]
+alpha_engine/engine/strategy/screener_priority.py:164: getattr(..., 'screener_min_volume_usd', Decimal('5000.0')) [EXISTS on model(s): EngineConfig]
+alpha_engine/engine/strategy/screener_priority.py:165: getattr(..., 'screener_volume_window_sec', 120.0) [EXISTS on model(s): EngineConfig]
+alpha_engine/engine/strategy/screener_priority.py:166: getattr(..., 'graduated_min_liquidity_usd', Decimal('10000.0')) [EXISTS on model(s): EngineConfig]
+alpha_engine/engine/strategy/screener_priority.py:167: getattr(..., 'graduated_max_price_impact_pct', 0.05) [EXISTS on model(s): EngineConfig]
+alpha_engine/engine/strategy/screener_priority.py:169: getattr(..., 'breakout_margin_pct', 0.01) [EXISTS on model(s): EngineConfig]
+alpha_engine/engine/strategy/screener_priority.py:170: getattr(..., 'retest_tolerance_pct', 0.01) [EXISTS on model(s): EngineConfig]
+alpha_engine/engine/strategy/screener_priority.py:171: getattr(..., 'breakout_volume_multiplier', 1.5) [EXISTS on model(s): EngineConfig]
+alpha_engine/engine/strategy/screener_priority.py:172: getattr(..., 'range_formation_window_sec', 300.0) [EXISTS on model(s): EngineConfig]
+alpha_engine/engine/strategy/screener_priority.py:173: getattr(..., 'allow_continuation_without_retest', False) [EXISTS on model(s): EngineConfig]
+alpha_engine/engine/strategy/screener_priority.py:174: getattr(..., 'verify_genuine_activity', True) [EXISTS on model(s): EngineConfig]
+alpha_engine/engine/strategy/screener_priority.py:175: getattr(..., 'min_independent_wallets', 5) [EXISTS on model(s): EngineConfig]
+alpha_engine/engine/strategy/screener_priority.py:176: getattr(..., 'max_single_wallet_volume_share', 0.5) [EXISTS on model(s): EngineConfig]
+alpha_engine/engine/strategy/screener_priority.py:182: getattr(..., 'movers_max_extension_pct', 1.5) [EXISTS on model(s): EngineConfig]
+alpha_engine/engine/strategy/screener_priority.py:186: getattr(..., 'min_market_cap_usd', Decimal('10000.0')) [EXISTS on model(s): EngineConfig]
+alpha_engine/engine/strategy/screener_priority.py:187: getattr(..., 'screener_min_volume_usd', Decimal('5000.0')) [EXISTS on model(s): EngineConfig]
+alpha_engine/engine/strategy/screener_priority.py:188: getattr(..., 'screener_volume_window_sec', 120.0) [EXISTS on model(s): EngineConfig]
+alpha_engine/engine/strategy/screener_priority.py:189: getattr(..., 'movers_min_liquidity_usd', Decimal('10000.0')) [EXISTS on model(s): EngineConfig]
+alpha_engine/engine/strategy/screener_priority.py:190: getattr(..., 'movers_min_buy_pressure_ratio', 0.55) [EXISTS on model(s): EngineConfig]
+alpha_engine/engine/strategy/screener_priority.py:192: getattr(..., 'graduated_max_price_impact_pct', 0.05) [EXISTS on model(s): EngineConfig]
+alpha_engine/engine/strategy/screener_priority.py:193: getattr(..., 'breakout_margin_pct', 0.01) [EXISTS on model(s): EngineConfig]
+alpha_engine/engine/strategy/screener_priority.py:194: getattr(..., 'retest_tolerance_pct', 0.01) [EXISTS on model(s): EngineConfig]
+alpha_engine/engine/strategy/screener_priority.py:195: getattr(..., 'breakout_volume_multiplier', 1.5) [EXISTS on model(s): EngineConfig]
+alpha_engine/engine/strategy/screener_priority.py:196: getattr(..., 'range_formation_window_sec', 300.0) [EXISTS on model(s): EngineConfig]
+alpha_engine/engine/strategy/screener_priority.py:197: getattr(..., 'allow_continuation_without_retest', False) [EXISTS on model(s): EngineConfig]
+alpha_engine/engine/strategy/screener_priority.py:198: getattr(..., 'verify_genuine_activity', True) [EXISTS on model(s): EngineConfig]
+alpha_engine/engine/strategy/screener_priority.py:199: getattr(..., 'min_independent_wallets', 5) [EXISTS on model(s): EngineConfig]
+alpha_engine/engine/strategy/screener_priority.py:200: getattr(..., 'max_single_wallet_volume_share', 0.5) [EXISTS on model(s): EngineConfig]
+alpha_engine/engine/strategy/screener_priority.py:204: getattr(..., 'screener_concurrency_limit', 10) [EXISTS on model(s): EngineConfig]
+alpha_engine/engine/strategy/screener_priority.py:271: getattr(..., 'market_cap_usd', None) [EXISTS on model(s): DecisionRecord, ScreenerDiscoveryEvent, SignalEvent]
+alpha_engine/engine/strategy/screener_priority.py:278: getattr(..., 'sol_price_usd', 150.0) [EXISTS on model(s): EngineConfig]
+alpha_engine/engine/strategy/screener_priority.py:299: getattr(..., 'volume_surge_multiplier', None) [EXISTS on model(s): PatternFeatureVector, RevivalPatternFeatureVector, ScreenerDiscoveryEvent, SignalEvent]
+alpha_engine/engine/strategy/screener_priority.py:301: getattr(..., 'failed_breakout', None) [EXISTS on model(s): ScreenerDiscoveryEvent]
+alpha_engine/engine/strategy/screener_priority.py:303: getattr(..., 'retest_confirmed', None) [EXISTS on model(s): ScreenerDiscoveryEvent]
+alpha_engine/engine/strategy/screener_priority.py:305: getattr(..., 'needs_retest', None) [EXISTS on model(s): ScreenerDiscoveryEvent]
+alpha_engine/engine/strategy/screener_priority.py:436: getattr(..., 'sol_price_usd', Decimal('150.0')) [EXISTS on model(s): EngineConfig]
+alpha_engine/engine/strategy/screener_priority.py:440: getattr(..., 'screener_market_data_max_staleness_s', 30.0) [EXISTS on model(s): EngineConfig]
+alpha_engine/engine/strategy/screener_priority.py:495: getattr(..., 'min_market_cap_usd', Decimal('10000.0')) [EXISTS on model(s): EngineConfig]
+alpha_engine/engine/strategy/screener_priority.py:587: getattr(..., 'verify_genuine_activity', None) [EXISTS on model(s): EngineConfig]
+alpha_engine/engine/strategy/screener_priority.py:589: getattr(..., 'verify_genuine_activity', False) [EXISTS on model(s): EngineConfig]
+alpha_engine/engine/strategy/screener_priority.py:590: getattr(..., 'min_independent_wallets', 5) [EXISTS on model(s): EngineConfig]
+alpha_engine/engine/strategy/screener_priority.py:591: getattr(..., 'max_single_wallet_volume_share', 0.5) [EXISTS on model(s): EngineConfig]
+alpha_engine/engine/strategy/screener_priority.py:596: getattr(..., 'volume_window_sec', 120.0) [NOT FOUND on any known pydantic model]
+alpha_engine/engine/strategy/screener_priority.py:733: getattr(..., 'max_top10_concentration', 0.4) [EXISTS on model(s): EngineConfig]
+alpha_engine/engine/strategy/screener_priority.py:757: getattr(..., 'breakout_margin_pct', 0.01) [EXISTS on model(s): EngineConfig]
+alpha_engine/engine/strategy/screener_priority.py:758: getattr(..., 'retest_tolerance_pct', 0.01) [EXISTS on model(s): EngineConfig]
+alpha_engine/engine/strategy/screener_priority.py:760: getattr(..., 'breakout_volume_multiplier', 1.5) [EXISTS on model(s): EngineConfig]
+alpha_engine/engine/strategy/screener_priority.py:762: getattr(..., 'breakout_volume_multiplier', 1.5) [EXISTS on model(s): EngineConfig]
+alpha_engine/engine/strategy/screener_priority.py:764: getattr(..., 'allow_continuation_without_retest', False) [EXISTS on model(s): EngineConfig]
+alpha_engine/engine/strategy/screener_priority.py:892: getattr(..., 'allow_continuation_without_retest', False) [EXISTS on model(s): EngineConfig]
+alpha_engine/engine/strategy/screener_priority.py:893: getattr(..., 'allow_continuation', False) [NOT FOUND on any known pydantic model]
+alpha_engine/engine/strategy/screener_priority.py:894: getattr(..., 'allow_continuation_without_retest', False) [EXISTS on model(s): EngineConfig]
+alpha_engine/engine/strategy/screener_priority.py:895: getattr(..., 'allow_continuation', False) [NOT FOUND on any known pydantic model]
+alpha_engine/engine/strategy/strategy_manager.py:150: getattr(..., 'strategy_type', None) [EXISTS on model(s): SignalEvent]
+alpha_engine/engine/strategy/whale_shadow.py:93: getattr(..., 'freeze_authority_disabled', True) [EXISTS on model(s): SecurityReport]
+alpha_engine/engine/strategy/whale_shadow.py:95: getattr(..., 'is_pump_fun', False) [NOT FOUND on any known pydantic model]
+alpha_engine/engine/strategy/whale_shadow.py:99: getattr(..., 'dev_balance_pct', 0.0) [NOT FOUND on any known pydantic model]
+alpha_engine/engine/strategy/whale_shadow.py:104: getattr(..., 'whale_cluster_detected', False) [NOT FOUND on any known pydantic model]
+alpha_engine/engine/strategy/whale_shadow.py:115: getattr(..., 'unique_buyers', set()) [NOT FOUND on any known pydantic model]
+alpha_engine/engine/strategy/whale_shadow.py:116: getattr(..., 'total_volume_native', Decimal('0')) [NOT FOUND on any known pydantic model]
+alpha_engine/engine/strategy/whale_shadow.py:128: getattr(..., 'initial_price', current_price) [EXISTS on model(s): AuditedTokenOutcome]
+alpha_engine/engine/strategy/whale_shadow.py:188: getattr(..., 'entry_price', Decimal('0')) [EXISTS on model(s): OpenPositionLot]
+alpha_engine/engine/strategy/whale_shadow.py:200: getattr(..., 'native_reserves', Decimal('1')) [NOT FOUND on any known pydantic model]
+alpha_engine/engine/strategy/whale_shadow.py:209: getattr(..., 'indicators', {}) [NOT FOUND on any known pydantic model]
+alpha_engine/engine/strategy/whale_shadow.py:241: getattr(..., 'exit_stage', 0) [EXISTS on model(s): TradeRecord]
+alpha_engine/execution/book.py:698: getattr(..., 'platform', None) [EXISTS on model(s): OpenPositionLot, PaperFill, TradeRecord]
+alpha_engine/execution/book.py:706: getattr(..., 'order_id', '') [EXISTS on model(s): ExitOrder, OpenPositionLot, PaperFill, TokenRequestRecord (+1 more)]
+alpha_engine/execution/book.py:739: getattr(..., 'is_new_launch', False) [EXISTS on model(s): OpenPositionLot, PaperFill, TradeRecord]
+alpha_engine/execution/book.py:827: getattr(..., 'is_illiquid', False) [NOT FOUND on any known pydantic model]
+alpha_engine/execution/book.py:836: getattr(..., 'is_illiquid', False) [NOT FOUND on any known pydantic model]
+alpha_engine/execution/book.py:850: getattr(..., 'is_illiquid', False) [NOT FOUND on any known pydantic model]
+alpha_engine/execution/book.py:870: getattr(..., 'is_illiquid', False) [NOT FOUND on any known pydantic model]
+alpha_engine/execution/book.py:897: getattr(..., 'is_illiquid', False) [NOT FOUND on any known pydantic model]
+alpha_engine/execution/book.py:939: getattr(..., 'buy_tax_bps', 0) [EXISTS on model(s): SecurityReport]
+alpha_engine/execution/book.py:940: getattr(..., 'sell_tax_bps', 0) [EXISTS on model(s): SecurityReport]
+alpha_engine/execution/book.py:941: getattr(..., 'is_honeypot', False) [EXISTS on model(s): SecurityReport]
+alpha_engine/execution/book.py:942: getattr(..., 'freeze_authority_disabled', True) [EXISTS on model(s): SecurityReport]
+alpha_engine/execution/book.py:943: getattr(..., 'mint_authority_disabled', True) [EXISTS on model(s): SecurityReport]
+alpha_engine/execution/book.py:2198: getattr(..., 'action', '') [NOT FOUND on any known pydantic model]
+alpha_engine/execution/executor.py:96: getattr(..., 'pool_state', None) [EXISTS on model(s): DecisionSignal, SignalEvent]
+alpha_engine/execution/executor.py:111: getattr(..., 'timestamp_s', 0.0) [EXISTS on model(s): PoolState]
+alpha_engine/execution/executor.py:233: getattr(..., 'source', None) [EXISTS on model(s): RawSignalEvent, SignalEvent]
+alpha_engine/execution/executor.py:234: getattr(..., 'execution_venue', None) [EXISTS on model(s): DecisionSignal, SignalEvent]
+alpha_engine/execution/executor.py:235: getattr(..., 'pool_address', '') [EXISTS on model(s): DecisionSignal, ExitOrder, OpenPositionLot, PaperFill (+7 more)]
+alpha_engine/execution/executor.py:457: getattr(..., 'pool_state', None) [EXISTS on model(s): DecisionSignal, SignalEvent]
+alpha_engine/execution/ledger.py:106: getattr(..., '__name__', str(func)) [NOT FOUND on any known pydantic model]
+alpha_engine/execution/ledger.py:487: getattr(..., 'platform', 'DexScan') [EXISTS on model(s): OpenPositionLot, PaperFill, TradeRecord]
+alpha_engine/execution/ledger.py:488: getattr(..., 'is_new_launch', False) [EXISTS on model(s): OpenPositionLot, PaperFill, TradeRecord]
+alpha_engine/execution/ledger.py:489: getattr(..., 'hard_stop_loss_pct', None) [EXISTS on model(s): ActionParameters, EngineConfig, TradeRecord]
+alpha_engine/execution/ledger.py:490: getattr(..., 'custom_stop_loss_pct', None) [EXISTS on model(s): EngineConfig, TradeRecord]
+alpha_engine/execution/ledger.py:491: getattr(..., 'custom_take_profit_pct', None) [EXISTS on model(s): EngineConfig, TradeRecord]
+alpha_engine/execution/ledger.py:492: getattr(..., 'trailing_stop_from_peak_pct', None) [EXISTS on model(s): EngineConfig, TradeRecord]
+alpha_engine/execution/ledger.py:493: getattr(..., 'strategy_name', None) [EXISTS on model(s): SignalEvent, TradeRecord]
+alpha_engine/execution/ledger.py:497: getattr(..., 'platform', 'DexScan') [EXISTS on model(s): OpenPositionLot, PaperFill, TradeRecord]
+alpha_engine/ingestion/coordinator.py:189: getattr(..., '_signal_queue', None) [NOT FOUND on any known pydantic model]
+alpha_engine/ingestion/coordinator.py:368: getattr(..., 'is_rejected', None) [NOT FOUND on any known pydantic model]
+alpha_engine/ingestion/coordinator.py:438: getattr(..., 'passes_hard_gates', True) [NOT FOUND on any known pydantic model]
+alpha_engine/ingestion/coordinator.py:494: getattr(..., 'is_rejected', None) [NOT FOUND on any known pydantic model]
+alpha_engine/ingestion/coordinator.py:529: getattr(..., 'is_rejected', None) [NOT FOUND on any known pydantic model]
+alpha_engine/ingestion/market_oracle.py:335: getattr(..., 'headers', {}) [NOT FOUND on any known pydantic model]
+alpha_engine/ingestion/svm.py:358: getattr(..., 'code', None) [NOT FOUND on any known pydantic model]
+alpha_engine/ingestion/telegram.py:56: getattr(..., 'data', b'') [NOT FOUND on any known pydantic model]
+alpha_engine/ingestion/telegram.py:56: getattr(..., 'type', None) [NOT FOUND on any known pydantic model]
+alpha_engine/ingestion/telegram.py:89: getattr(..., '_conn', None) [NOT FOUND on any known pydantic model]
+alpha_engine/ingestion/telegram.py:105: getattr(..., '_conn', None) [NOT FOUND on any known pydantic model]
+alpha_engine/ingestion/telegram.py:445: getattr(..., '_execution_target', None) [NOT FOUND on any known pydantic model]
+alpha_engine/ingestion/telegram.py:448: getattr(..., '__self__', None) [NOT FOUND on any known pydantic model]
+alpha_engine/ingestion/telegram.py:597: getattr(..., 'raw_text', None) [EXISTS on model(s): NewsEvent, NewsSignalEvent, RawSignalEvent]
+alpha_engine/ingestion/telegram.py:599: getattr(..., 'message', None) [NOT FOUND on any known pydantic model]
+alpha_engine/ingestion/telegram.py:601: getattr(..., 'message', getattr(message_obj, 'text', '')) [NOT FOUND on any known pydantic model]
+alpha_engine/ingestion/telegram.py:601: getattr(..., 'text', '') [EXISTS on model(s): TelegramMessage]
+alpha_engine/ingestion/telegram.py:603: getattr(..., 'text', '') [EXISTS on model(s): TelegramMessage]
+alpha_engine/ingestion/telegram.py:605: getattr(..., 'chat_id', None) [NOT FOUND on any known pydantic model]
+alpha_engine/ingestion/telegram.py:607: getattr(..., 'chat', None) [NOT FOUND on any known pydantic model]
+alpha_engine/ingestion/telegram.py:608: getattr(..., 'id', 0) [NOT FOUND on any known pydantic model]
+alpha_engine/ingestion/telegram.py:610: getattr(..., 'id', None) [NOT FOUND on any known pydantic model]
+alpha_engine/ingestion/telegram.py:612: getattr(..., 'message', None) [NOT FOUND on any known pydantic model]
+alpha_engine/ingestion/telegram.py:613: getattr(..., 'id', 0) [NOT FOUND on any known pydantic model]
+alpha_engine/ingestion/telegram.py:616: getattr(..., 'chat', None) [NOT FOUND on any known pydantic model]
+alpha_engine/ingestion/telegram.py:618: getattr(..., 'title', str(chat_id)) [NOT FOUND on any known pydantic model]
+alpha_engine/ingestion/telegram.py:785: getattr(..., '_asset_map', {}) [NOT FOUND on any known pydantic model]
+alpha_engine/ingestion/telegram.py:923: getattr(..., 'sender_id', None) [NOT FOUND on any known pydantic model]
+alpha_engine/ingestion/telegram.py:937: getattr(..., 'sender_id', None) [NOT FOUND on any known pydantic model]
+alpha_engine/ingestion/telegram.py:985: getattr(..., 'sender_id', None) [NOT FOUND on any known pydantic model]
+alpha_engine/ingestion/telegram.py:987: getattr(..., 'sender', None) [EXISTS on model(s): SwapEvent]
+alpha_engine/ingestion/telegram.py:988: getattr(..., 'id', None) [NOT FOUND on any known pydantic model]
+alpha_engine/ingestion/telegram.py:1000: getattr(..., 'data', b'') [NOT FOUND on any known pydantic model]
+alpha_engine/ingestion/telegram.py:1137: getattr(..., 'is_private', False) [NOT FOUND on any known pydantic model]
+alpha_engine/ingestion/telegram.py:1257: getattr(..., 'is_private', False) [NOT FOUND on any known pydantic model]
+alpha_engine/ingestion/telegram.py:1306: getattr(..., 'is_private', False) [NOT FOUND on any known pydantic model]
+alpha_engine/ingestion/telegram.py:1309: getattr(..., 'out', False) [NOT FOUND on any known pydantic model]
+alpha_engine/ingestion/telegram.py:1312: getattr(..., 'sender_id', None) [NOT FOUND on any known pydantic model]
+alpha_engine/ingestion/telegram.py:1314: getattr(..., 'sender', None) [EXISTS on model(s): SwapEvent]
+alpha_engine/ingestion/telegram.py:1315: getattr(..., 'id', None) [NOT FOUND on any known pydantic model]
+alpha_engine/ingestion/telegram.py:1330: getattr(..., 'raw_text', getattr(event, 'text', '')) [EXISTS on model(s): NewsEvent, NewsSignalEvent, RawSignalEvent]
+alpha_engine/ingestion/telegram.py:1330: getattr(..., 'text', '') [EXISTS on model(s): TelegramMessage]
+alpha_engine/ingestion/telegram.py:1793: getattr(..., 'maxsize', 100) [NOT FOUND on any known pydantic model]
+alpha_engine/ingestion/telegram.py:1843: getattr(..., '_execution_target', None) [NOT FOUND on any known pydantic model]
+alpha_engine/ingestion/telegram.py:1850: getattr(..., 'id', 0) [NOT FOUND on any known pydantic model]
+alpha_engine/ingestion/telegram.py:1862: getattr(..., 'id', 0) [NOT FOUND on any known pydantic model]
+alpha_engine/ingestion/telegram.py:1900: getattr(..., '_execution_target', None) [NOT FOUND on any known pydantic model]
+alpha_engine/ingestion/telegram.py:1907: getattr(..., 'id', 0) [NOT FOUND on any known pydantic model]
+alpha_engine/ingestion/telegram.py:1919: getattr(..., 'id', 0) [NOT FOUND on any known pydantic model]
+alpha_engine/ingestion/telegram.py:2490: getattr(..., 'active_strategy', 'peak_trailing_50') [EXISTS on model(s): EngineConfig]
+alpha_engine/ingestion/telegram.py:2491: getattr(..., 'trailing_stop_from_peak_pct', 0.5) [EXISTS on model(s): EngineConfig, TradeRecord]
+alpha_engine/ingestion/telegram.py:2492: getattr(..., 'custom_take_profit_pct', 0.5) [EXISTS on model(s): EngineConfig, TradeRecord]
+alpha_engine/ingestion/telegram.py:2493: getattr(..., 'custom_stop_loss_pct', 0.5) [EXISTS on model(s): EngineConfig, TradeRecord]
+alpha_engine/ingestion/telegram.py:2494: getattr(..., 'auto_trade_enabled', True) [EXISTS on model(s): EngineConfig]
+alpha_engine/ingestion/telegram.py:2495: getattr(..., 'screener_exclusive_focus', False) [EXISTS on model(s): EngineConfig]
+alpha_engine/ingestion/telegram.py:2496: getattr(..., 'min_market_cap_usd', 10000.0) [EXISTS on model(s): EngineConfig]
+alpha_engine/ingestion/telegram.py:2952: getattr(..., '_execution_target', None) [NOT FOUND on any known pydantic model]
+alpha_engine/ingestion/telegram.py:3097: getattr(..., '_execution_target', None) [NOT FOUND on any known pydantic model]
+alpha_engine/ingestion/telegram.py:3127: getattr(..., '_execution_target', None) [NOT FOUND on any known pydantic model]
+alpha_engine/ingestion/telegram.py:3158: getattr(..., '_execution_target', None) [NOT FOUND on any known pydantic model]
+alpha_engine/ingestion/telegram.py:3646: getattr(..., 'seconds', backoff) [NOT FOUND on any known pydantic model]
+alpha_engine/ingestion/telegram.py:3688: getattr(..., 'seconds', '?') [NOT FOUND on any known pydantic model]
+alpha_engine/ingestion/telegram.py:3720: getattr(..., 'is_private', False) [NOT FOUND on any known pydantic model]
+alpha_engine/ingestion/telegram.py:3842: getattr(..., 'seconds', 60) [NOT FOUND on any known pydantic model]
+alpha_engine/ingestion/x_stream.py:231: getattr(..., 'created_at_timestamp', time.time()) [NOT FOUND on any known pydantic model]
+alpha_engine/models/ai.py:201: getattr(..., 'rationale', None) [EXISTS on model(s): WalletAudit]
+alpha_engine/models/ai.py:203: getattr(..., 'flags', None) [EXISTS on model(s): AuditedTokenOutcome, SecurityAssessment]
+alpha_engine/models/ai.py:205: getattr(..., 'insights_learned', None) [EXISTS on model(s): FeedbackTuning]
+alpha_engine/models/ai.py:212: getattr(..., 'is_secure', True) [EXISTS on model(s): SecurityAssessment]
+alpha_engine/models/decisions.py:88: getattr(..., 'token_address', str(signal)) [EXISTS on model(s): AuditedTokenOutcome, DecisionRecord, DecisionSignal, ExitOrder (+14 more)]
+alpha_engine/models/decisions.py:89: getattr(..., 'top10_concentration', 0.15) [EXISTS on model(s): PatternFeatureVector, SecurityReport]
+alpha_engine/models/decisions.py:97: getattr(..., 'total_pnl_usd', 10.0) [EXISTS on model(s): WalletProfile, WhitelistRecord]
+alpha_engine/models/decisions.py:101: getattr(..., 'consolidation_duration_s', None) [EXISTS on model(s): PatternFeatureVector]
+alpha_engine/models/decisions.py:103: getattr(..., 'consolidation_length_hours', None) [EXISTS on model(s): RevivalPatternFeatureVector, SignalEvent]
+alpha_engine/models/decisions.py:105: getattr(..., 'dip_depth_pct', None) [EXISTS on model(s): PatternFeatureVector, SignalEvent]
+alpha_engine/models/decisions.py:108: getattr(..., 'volume_surge_multiplier', None) [EXISTS on model(s): PatternFeatureVector, RevivalPatternFeatureVector, ScreenerDiscoveryEvent, SignalEvent]
+alpha_engine/models/decisions.py:111: getattr(..., 'net_buy_delta', None) [EXISTS on model(s): PatternFeatureVector, SignalEvent]
+alpha_engine/models/decisions.py:114: getattr(..., 'liquidity_to_mc_ratio', None) [EXISTS on model(s): PatternFeatureVector]
+alpha_engine/models/decisions.py:117: getattr(..., 'peak_gain_multiplier', None) [EXISTS on model(s): PatternFeatureVector]
+alpha_engine/models/enums.py:283: getattr(..., 'value', chain or '') [NOT FOUND on any known pydantic model]
+alpha_engine/models/enums.py:297: getattr(..., 'value', chain or '') [NOT FOUND on any known pydantic model]
+alpha_engine/models/enums.py:303: getattr(..., 'value', execution_venue) [NOT FOUND on any known pydantic model]
+alpha_engine/models/enums.py:311: getattr(..., 'value', source) [NOT FOUND on any known pydantic model]
+alpha_engine/models/state.py:410: getattr(..., 'platform', None) [EXISTS on model(s): OpenPositionLot, PaperFill, TradeRecord]
+alpha_engine/models/state.py:418: getattr(..., 'signal_id', '') [EXISTS on model(s): DecisionRecord, DecisionSignal, NewsSignalEvent, RawSignalEvent (+3 more)]
+alpha_engine/models/state.py:435: getattr(..., 'is_new_launch', False) [EXISTS on model(s): OpenPositionLot, PaperFill, TradeRecord]
+alpha_engine/models/state.py:436: getattr(..., 'hard_stop_loss_pct', None) [EXISTS on model(s): ActionParameters, EngineConfig, TradeRecord]
+alpha_engine/models/state.py:437: getattr(..., 'custom_stop_loss_pct', None) [EXISTS on model(s): EngineConfig, TradeRecord]
+alpha_engine/models/state.py:438: getattr(..., 'custom_take_profit_pct', None) [EXISTS on model(s): EngineConfig, TradeRecord]
+alpha_engine/models/state.py:439: getattr(..., 'trailing_stop_from_peak_pct', None) [EXISTS on model(s): EngineConfig, TradeRecord]
+alpha_engine/models/state.py:440: getattr(..., 'strategy_name', None) [EXISTS on model(s): SignalEvent, TradeRecord]
+alpha_engine/ruflo/agents/gatekeeper_agent.py:127: getattr(..., 'passes_hard_gates', False) [NOT FOUND on any known pydantic model]
+alpha_engine/ruflo/agents/gatekeeper_agent.py:129: getattr(..., 'token_address', clean_addr) [EXISTS on model(s): AuditedTokenOutcome, DecisionRecord, DecisionSignal, ExitOrder (+14 more)]
+alpha_engine/ruflo/agents/gatekeeper_agent.py:130: getattr(..., 'chain', chain_enum.value) [EXISTS on model(s): AuditedTokenOutcome, DecisionRecord, DecisionSignal, ExitOrder (+18 more)]
+alpha_engine/ruflo/agents/gatekeeper_agent.py:133: getattr(..., 'tier', 'CLEAN') [EXISTS on model(s): SecurityReport]
+alpha_engine/ruflo/agents/gatekeeper_agent.py:134: getattr(..., 'score', 100.0 if passes else 0.0) [NOT FOUND on any known pydantic model]
+alpha_engine/ruflo/agents/gatekeeper_agent.py:135: getattr(..., 'is_honeypot', False) [EXISTS on model(s): SecurityReport]
+alpha_engine/ruflo/agents/gatekeeper_agent.py:136: getattr(..., 'is_rug', not passes) [NOT FOUND on any known pydantic model]
+alpha_engine/ruflo/agents/gatekeeper_agent.py:137: getattr(..., 'buy_tax_bps', 0) [EXISTS on model(s): SecurityReport]
+alpha_engine/ruflo/agents/gatekeeper_agent.py:138: getattr(..., 'sell_tax_bps', 0) [EXISTS on model(s): SecurityReport]
+alpha_engine/ruflo/agents/gatekeeper_agent.py:139: getattr(..., 'lp_burned_ratio', 1.0) [EXISTS on model(s): SecurityReport]
+alpha_engine/ruflo/agents/gatekeeper_agent.py:140: getattr(..., 'top10_concentration', 0.1) [EXISTS on model(s): PatternFeatureVector, SecurityReport]
+alpha_engine/ruflo/agents/gatekeeper_agent.py:141: getattr(..., 'flags', getattr(report, 'warning_flags', [])) [EXISTS on model(s): AuditedTokenOutcome, SecurityAssessment]
+alpha_engine/ruflo/agents/gatekeeper_agent.py:141: getattr(..., 'warning_flags', []) [EXISTS on model(s): SecurityReport]
+alpha_engine/ruflo/agents/scouting_agent.py:85: getattr(..., 'evm_ws_url', '') [NOT FOUND on any known pydantic model]
+alpha_engine/ruflo/agents/scouting_agent.py:86: getattr(..., 'svm_ws_url', '') [NOT FOUND on any known pydantic model]
+alpha_engine/ruflo/agents/scouting_agent.py:87: getattr(..., 'telegram_ingester', None) [NOT FOUND on any known pydantic model]
+alpha_engine/ruflo/agents/scouting_agent.py:88: getattr(..., 'x_ingester', None) [NOT FOUND on any known pydantic model]
+alpha_engine/ruflo/agents/supervisor_agent.py:175: getattr(..., 'risk_rationale', None) [NOT FOUND on any known pydantic model]
+alpha_engine/ruflo/agents/supervisor_agent.py:176: getattr(..., 'risk_score', None) [NOT FOUND on any known pydantic model]
+alpha_engine/ruflo/agents/supervisor_agent.py:178: getattr(..., 'confidence_score', confidence_score) [EXISTS on model(s): AISupervisorResponse, DecisionRecord]
+alpha_engine/ruflo/agents/supervisor_agent.py:185: getattr(..., 'confidence_score', confidence_score) [EXISTS on model(s): AISupervisorResponse, DecisionRecord]
+alpha_engine/ruflo/memory.py:309: getattr(..., 'feature_vector', None) [NOT FOUND on any known pydantic model]
+alpha_engine/ruflo/memory.py:330: getattr(..., 'actual_slippage_bps', 50) [NOT FOUND on any known pydantic model]
+alpha_engine/ruflo/memory.py:331: getattr(..., 'fill_latency_ms', 45.0) [EXISTS on model(s): PaperFill, TradeRecord]
+alpha_engine/ruflo/swarm.py:93: getattr(..., 'ruflo_topology', 'hierarchical') [EXISTS on model(s): EngineConfig]
+alpha_engine/ruflo/swarm.py:95: getattr(..., 'ruflo_consensus', 'bft') [EXISTS on model(s): EngineConfig]
+alpha_engine/ruflo/swarm.py:102: getattr(..., 'db_path', 'paper_trading.db') [EXISTS on model(s): EngineConfig]
+alpha_engine/ruflo/swarm.py:206: getattr(..., 'ruflo_reflection_interval_s', 60.0) [EXISTS on model(s): EngineConfig]
+alpha_engine/ruflo/swarm.py:327: getattr(..., 'signal_id', '') [EXISTS on model(s): DecisionRecord, DecisionSignal, NewsSignalEvent, RawSignalEvent (+3 more)]
+alpha_engine/ruflo/swarm.py:363: getattr(..., 'top10_concentration', 0.15) [EXISTS on model(s): PatternFeatureVector, SecurityReport]
+alpha_engine/ruflo/swarm.py:434: getattr(..., 'strategy_name', 'champion_peak_trailing_50') [EXISTS on model(s): SignalEvent, TradeRecord]
+alpha_engine/ruflo/swarm.py:442: getattr(..., 'is_direct_dm', False) [EXISTS on model(s): RawSignalEvent, SignalEvent]
+alpha_engine/ruflo/swarm.py:443: getattr(..., 'originating_channel', '') [EXISTS on model(s): NewsSignalEvent, RawSignalEvent, SignalEvent, TokenRequestRecord]
+alpha_engine/ruflo/swarm.py:444: getattr(..., 'originating_channel', '') [EXISTS on model(s): NewsSignalEvent, RawSignalEvent, SignalEvent, TokenRequestRecord]
+alpha_engine/ruflo/swarm.py:464: getattr(..., 'strategy_name', 'champion_peak_trailing_50') [EXISTS on model(s): SignalEvent, TradeRecord]
+alpha_engine/ruflo/swarm.py:495: getattr(..., 'strategy_name', 'champion_peak_trailing_50') [EXISTS on model(s): SignalEvent, TradeRecord]
+alpha_engine/ruflo/swarm.py:525: getattr(..., 'strategy_name', 'champion_peak_trailing_50') [EXISTS on model(s): SignalEvent, TradeRecord]
+alpha_engine/ruflo/swarm.py:558: getattr(..., 'strategy_name', 'champion_peak_trailing_50') [EXISTS on model(s): SignalEvent, TradeRecord]
+alpha_engine/ruflo/swarm.py:585: getattr(..., 'decision', '') [EXISTS on model(s): AISupervisorResponse, AuditedTokenOutcome]
+alpha_engine/ruflo/swarm.py:586: getattr(..., 'debate_transcript', []) [NOT FOUND on any known pydantic model]
+alpha_engine/ruflo/swarm.py:588: getattr(..., 'fatal_veto_agent', None) [NOT FOUND on any known pydantic model]
+alpha_engine/ruflo/swarm.py:593: getattr(..., 'value', str(reach_verdict.vote)) [NOT FOUND on any known pydantic model]
+alpha_engine/ruflo/swarm.py:621: getattr(..., 'strategy_name', 'champion_peak_trailing_50') [EXISTS on model(s): SignalEvent, TradeRecord]
+alpha_engine/ruflo/swarm.py:666: getattr(..., 'strategy_name', 'champion_peak_trailing_50') [EXISTS on model(s): SignalEvent, TradeRecord]
+alpha_engine/ruflo/swarm.py:712: getattr(..., 'debate_transcript', []) [NOT FOUND on any known pydantic model]
+alpha_engine/ruflo/swarm.py:726: getattr(..., 'strategy_name', 'champion_peak_trailing_50') [EXISTS on model(s): SignalEvent, TradeRecord]
+alpha_engine/security/gatekeeper.py:209: getattr(..., 'external_api_raw', '') [EXISTS on model(s): SecurityReport]
+alpha_engine/security/gatekeeper.py:210: getattr(..., 'is_honeypot', False) [EXISTS on model(s): SecurityReport]
+alpha_engine/security/gatekeeper.py:211: getattr(..., 'sell_tax_bps', 0) [EXISTS on model(s): SecurityReport]
+alpha_engine/security/gatekeeper.py:212: getattr(..., 'is_pump_fun', False) [NOT FOUND on any known pydantic model]
+alpha_engine/security/gatekeeper.py:690: getattr(..., 'warning_flags', []) [EXISTS on model(s): SecurityReport]
+
+--- [conditional_precedence] (Findings: 51) ---
+alpha_engine/chat_interface.py:435: ast.IfExp used as operand of BoolOp (Or): out.get('flags') or (out.get('security_assessment', {}).get('flags') if isinstance(out.get('security_assessment'), dict) else [])
+alpha_engine/chat_interface.py:438: ast.IfExp used as operand of BoolOp (Or): out.get('rationale') or (out.get('wallet_audit', {}).get('rationale') if isinstance(out.get('wallet_audit'), dict) else '')
+alpha_engine/council/quant_agent.py:37: ast.IfExp used as operand of BoolOp (Or): getattr(signal, 'volume_surge_multiplier', 0.0) or (getattr(staged_data, 'volume_surge_multiplier', 0.0) if staged_data else 1.0)
+alpha_engine/council/quant_agent.py:38: ast.IfExp used as operand of BoolOp (Or): getattr(signal, 'net_buy_delta', 0.5) or (getattr(staged_data, 'net_buy_delta', 0.5) if staged_data else 0.5)
+alpha_engine/council/quant_agent.py:44: ast.IfExp used as operand of BoolOp (Or): getattr(signal, 'market_cap_usd', 0.0) or (getattr(pool, 'market_cap_usd', 0.0) if pool else 0.0) or (getattr(staged_data, 'market_cap_usd', 0.0) if staged_data else 0.0) or 0.0
+alpha_engine/council/quant_agent.py:58: ast.IfExp whose orelse is a BoolOp: is_new_launch if is_new_launch is not None else not is_revival_swing and (getattr(signal, 'token_age_s', 0) <= 1800 or (getattr(signal, 'source', None) is not None and getattr(signal.source, 'value', str(signal.source)) in ('pump_fun_mint', 'dex_swap', 'dex_discovery', 'launch_stage')) or (staged_data is not None and hasattr(staged_data, 'unique_buyers')) or (surge_k <= 1.0 and dormant_mcap == 0.0))
+alpha_engine/dashboard/telemetry.py:368: ast.IfExp used as operand of BoolOp (Or): self.supervisor or (getattr(self.runner, '_ai_supervisor', None) if self.runner else None)
+alpha_engine/dashboard/telemetry.py:625: ast.IfExp used as operand of BoolOp (Or): r[15] or ('PROFIT_TAKE' if (pnl or 0) > 0 else 'STOP_LOSS' if pnl is not None else None)
+alpha_engine/dashboard/telemetry.py:704: ast.IfExp used as operand of BoolOp (Or): self.supervisor or (getattr(self.runner, '_ai_supervisor', None) if self.runner else None)
+alpha_engine/dashboard/telemetry.py:1901: ast.IfExp used as operand of BoolOp (Or): alias.strip() or ('Alpha Whale' if is_solana else 'Base Alpha')
+alpha_engine/dashboard/telemetry.py:1914: ast.IfExp used as operand of BoolOp (Or): copy_trade_size_native or ('0.1 SOL' if is_solana else '0.02 ETH')
+alpha_engine/engine/ai_supervisor.py:1146: ast.IfExp whose orelse is a BoolOp: sec if sec is not None else security_report or getattr(signal, 'security_report', None)
+alpha_engine/engine/ai_supervisor.py:1224: ast.IfExp whose body is a Compare: wallet_profile.total_trades > 30 if wallet_profile else False
+alpha_engine/engine/ai_supervisor.py:1254: ast.IfExp used as operand of BoolOp (Or): (resp.wallet_audit.rationale if resp.wallet_audit else None) or 'AI Veto'
+alpha_engine/engine/experimentation.py:808: ast.IfExp used directly as test of 'if': if m.max_drawdown_pct >= 12.0 if is_champ_underperforming else 8.0:
+alpha_engine/engine/experimentation.py:808: ast.IfExp whose body is a Compare: m.max_drawdown_pct >= 12.0 if is_champ_underperforming else 8.0
+alpha_engine/engine/runner.py:694: ast.IfExp used as operand of BoolOp (Or): manual_info.get('sol_equivalent') or (0.1 if manual_info.get('amount') is None else manual_info.get('amount'))
+alpha_engine/engine/runner.py:827: ast.IfExp used as operand of BoolOp (Or): self._pool_registry.get(lot.token_address) or (self._pool_registry.get(lot.pool_address) if lot.pool_address else None)
+alpha_engine/engine/runner.py:1345: ast.IfExp used as operand of BoolOp (Or): chain or (ChainIdentifier.BASE_MAINNET if clean_addr.startswith('0x') else ChainIdentifier.SOLANA_MAINNET)
+alpha_engine/engine/runner.py:1514: ast.IfExp used as operand of BoolOp (Or): getattr(signal, 'pool_address', '') or (pool.pool_address if pool else '')
+alpha_engine/engine/runner.py:1583: ast.IfExp used as operand of BoolOp (Or): chain or (ChainIdentifier.BASE_MAINNET if clean_addr.startswith('0x') else ChainIdentifier.SOLANA_MAINNET)
+alpha_engine/engine/runner.py:1811: ast.IfExp used as operand of BoolOp (Or): chain or (ChainIdentifier.BASE_MAINNET if clean_addr.startswith('0x') else ChainIdentifier.SOLANA_MAINNET)
+alpha_engine/engine/runner.py:2152: ast.IfExp whose orelse is a BoolOp: pool.pool_address if pool else getattr(signal, 'pool_address', '') or ''
+alpha_engine/engine/runner.py:2738: ast.IfExp whose orelse is a BoolOp: is_valid_solana_pubkey(clean_token) if is_sol else clean_token.startswith('0x') and len(clean_token) == 42
+alpha_engine/engine/runner.py:3521: ast.IfExp used as operand of BoolOp (Or): raw_sig.pool_address or (pool.pool_address if pool else '')
+alpha_engine/engine/runner.py:5258: ast.IfExp used as operand of BoolOp (Or): self._pool_registry.get(mint) or (self._pool_registry.get(pool_addr) if pool_addr else None)
+alpha_engine/engine/runner.py:5424: ast.IfExp used as operand of BoolOp (Or): self._pool_registry.get(t_addr) or (self._pool_registry.get(lot.pool_address) if lot.pool_address else None)
+alpha_engine/engine/staging.py:459: ast.IfExp used as operand of BoolOp (Or): narrative_cluster or (raw_signal.narrative_cluster if raw_signal else None)
+alpha_engine/engine/staging.py:567: ast.IfExp used as operand of BoolOp (Or): spot_price or (pool.spot_price_native_per_token if pool else tok.latest_price)
+alpha_engine/engine/staging.py:1058: ast.IfExp used as operand of BoolOp (Or): narrative_cluster or (raw_signal.narrative_cluster if raw_signal else None)
+alpha_engine/engine/staging.py:1191: ast.IfExp used as operand of BoolOp (Or): spot_price or (pool.spot_price_native_per_token if pool else tok.latest_price)
+alpha_engine/engine/strategy/screener_priority.py:281: ast.IfExp used as operand of BoolOp (Or): discovery.pool_address or (token_addr if len(token_addr) >= 32 else (token_addr + '0' * 32)[:32])
+alpha_engine/execution/book.py:502: ast.IfExp used as operand of BoolOp (Or): d.get('strategy_name') or ('peak_trailing_50' if is_pump else 'default')
+alpha_engine/ingestion/decoders.py:852: ast.IfExp used as operand of BoolOp (Or): buyer or (tx_sig[:44] if len(tx_sig) >= 32 else 'PumpBuyer111111111111111111111111111111111')
+alpha_engine/ingestion/decoders.py:853: ast.IfExp used as operand of BoolOp (Or): buyer or (tx_sig[:44] if len(tx_sig) >= 32 else 'PumpBuyer111111111111111111111111111111111')
+alpha_engine/ingestion/dex_metrics.py:288: ast.IfExp whose body is a BoolOp: pool_state.token_address or '' if pool_state else ''
+alpha_engine/ingestion/market_oracle.py:334: ast.IfExp used as operand of BoolOp (Or): attrs.get('address') or (top_pool.get('id', '').split('_')[-1] if '_' in top_pool.get('id', '') else top_pool.get('id', ''))
+alpha_engine/ingestion/svm.py:570: ast.IfExp used as operand of BoolOp (Or): sanitize_solana_pubkey(pump_trade.get('buyer')) or (tx_sig[:44] if len(tx_sig) >= 32 else 'PumpBuyer111111111111111111111111111111111')
+alpha_engine/ingestion/telegram.py:2260: ast.IfExp used as operand of BoolOp (Or): metrics.get('ai_supervisor') or (supervisor.get_status() if supervisor else {})
+alpha_engine/models/events.py:130: ast.IfExp used as operand of BoolOp (Or): data.get('strategy_pattern') or (data.get('strategy_type').value if hasattr(data.get('strategy_type'), 'value') else str(data.get('strategy_type') or '')) or 'default'
+alpha_engine/models/state.py:225: ast.IfExp whose orelse is a Compare: True if self.is_pump_fun else self.lp_burned_ratio >= 0.9
+alpha_engine/ruflo/agents/execution_agent.py:203: ast.IfExp used as operand of BoolOp (Or): amount_native or (amount_usd / 150.0 if amount_usd else 0.1)
+alpha_engine/ruflo/swarm.py:94: ast.IfExp used as operand of BoolOp (Or): topology or (SwarmTopology(top_cfg) if top_cfg in [e.value for e in SwarmTopology] else SwarmTopology.HIERARCHICAL)
+alpha_engine/ruflo/swarm.py:96: ast.IfExp used as operand of BoolOp (Or): consensus or (ConsensusProtocol(cons_cfg) if cons_cfg in [e.value for e in ConsensusProtocol] else ConsensusProtocol.BFT)
+alpha_engine/ruflo/swarm.py:113: ast.IfExp used as operand of BoolOp (Or): council_cro or (ai_supervisor._council if ai_supervisor and hasattr(ai_supervisor, '_council') else CouncilArbiterCRO())
+alpha_engine/ruflo/swarm.py:344: ast.IfExp used as operand of BoolOp (Or): pool_address or (token_address if len(token_address) >= 32 else '0' * 32)
+alpha_engine/security/gatekeeper.py:225: ast.IfExp whose orelse is a BoolOp: is_fatal if is_fatal is not None else not is_transient_or_unindexed and (is_honeypot or 'confirmed_honeypot' in reason_lower or 'honeypot' in reason_lower or ('honeypot' in report_raw) or ('drainer' in reason_lower) or (sell_tax >= 9000 and (not is_pump)))
+alpha_engine/security/rugcheck.py:368: ast.IfExp whose body is a BoolOp: first_m.get('lp') or {} if isinstance(first_m, dict) else {}
+alpha_engine/security/rugcheck.py:414: ast.IfExp whose orelse is a Compare: True if is_pump else lp_burned_ratio >= _MIN_LP_BURNED_RATIO
+alpha_engine/tracker/wallet_tracker.py:542: ast.IfExp used as operand of BoolOp (Or): dex_data.get('dexId') or ('Pump.fun' if clean_ca.lower().endswith('pump') else 'Raydium')
+alpha_engine/tracker/wallet_tracker.py:1149: ast.IfExp used as operand of BoolOp (Or): data.explorer_url or (f'https://solscan.io/account/{data.wallet_address}' if data.chain == ChainIdentifier.SOLANA_MAINNET else f'https://basescan.org/address/{data.wallet_address}')
+
+--- [swallowed_exceptions] (Findings: 102) ---
+alpha_engine/council/arbiter_cro.py:138: Swallowed exception at except Exception with only: logger.debug
+alpha_engine/council/arbiter_cro.py:486: Swallowed exception at except Exception with only: logger.debug
+alpha_engine/council/llm_client.py:200: Swallowed exception at except Exception with only: pass
+alpha_engine/council/reach_agent.py:70: Swallowed exception at except Exception with only: logger.debug
+alpha_engine/council/reach_agent.py:90: Swallowed exception at except Exception with only: logger.debug
+alpha_engine/council/reach_agent.py:109: Swallowed exception at except Exception with only: logger.debug
+alpha_engine/engine/ai_supervisor.py:859: Swallowed exception at except Exception with only: logger.debug
+alpha_engine/engine/ai_supervisor.py:1011: Swallowed exception at except Exception with only: pass
+alpha_engine/engine/ai_supervisor.py:1070: Swallowed exception at except Exception with only: logger.debug
+alpha_engine/engine/ai_supervisor.py:1087: Swallowed exception at except Exception with only: logger.debug
+alpha_engine/engine/ai_supervisor.py:1096: Swallowed exception at except Exception with only: logger.debug
+alpha_engine/engine/ai_supervisor.py:1138: Swallowed exception at except Exception with only: pass
+alpha_engine/engine/ai_supervisor.py:1195: Swallowed exception at except Exception with only: logger.debug
+alpha_engine/engine/ai_supervisor.py:1319: Swallowed exception at except Exception with only: pass
+alpha_engine/engine/experimentation.py:524: Swallowed exception at except Exception with only: logger.debug
+alpha_engine/engine/experimentation.py:874: Swallowed exception at except Exception with only: logger.debug
+alpha_engine/engine/experimentation.py:1121: Swallowed exception at except Exception with only: pass
+alpha_engine/engine/experimentation.py:1173: Swallowed exception at except Exception with only: logger.debug
+alpha_engine/engine/runner.py:559: Swallowed exception at except Exception with only: logger.debug
+alpha_engine/engine/runner.py:595: Swallowed exception at except Exception with only: logger.debug
+alpha_engine/engine/runner.py:1094: Swallowed exception at except Exception with only: logger.debug
+alpha_engine/engine/runner.py:1568: Swallowed exception at except Exception with only: pass
+alpha_engine/engine/runner.py:2304: Swallowed exception at except Exception with only: pass
+alpha_engine/engine/runner.py:3321: Swallowed exception at except Exception with only: logger.debug
+alpha_engine/engine/runner.py:3355: Swallowed exception at except Exception with only: logger.debug
+alpha_engine/engine/runner.py:4351: Swallowed exception at except Exception with only: logger.debug
+alpha_engine/engine/runner.py:4887: Swallowed exception at except Exception with only: logger.debug
+alpha_engine/engine/runner.py:4925: Swallowed exception at except Exception with only: logger.debug
+alpha_engine/engine/runner.py:4932: Swallowed exception at except Exception with only: pass
+alpha_engine/engine/runner.py:5124: Swallowed exception at except Exception with only: logger.debug
+alpha_engine/engine/runner.py:5151: Swallowed exception at except Exception with only: logger.debug
+alpha_engine/engine/runner.py:5230: Swallowed exception at except Exception with only: continue
+alpha_engine/engine/runner.py:5307: Swallowed exception at except Exception with only: pass
+alpha_engine/engine/runner.py:5313: Swallowed exception at except Exception with only: pass
+alpha_engine/engine/runner.py:5539: Swallowed exception at except Exception with only: logger.debug
+alpha_engine/engine/runner.py:5645: Swallowed exception at except Exception with only: logger.debug
+alpha_engine/engine/runner.py:6019: Swallowed exception at except Exception with only: logger.debug
+alpha_engine/engine/runner.py:6427: Swallowed exception at except Exception with only: pass
+alpha_engine/engine/runner.py:6434: Swallowed exception at except Exception with only: pass
+alpha_engine/engine/runner.py:6440: Swallowed exception at except Exception with only: pass
+alpha_engine/engine/self_learning/self_learning_engine.py:182: Swallowed exception at except Exception with only: pass
+alpha_engine/engine/strategy/strategy_manager.py:156: Swallowed exception at except Exception with only: pass
+alpha_engine/execution/ledger.py:367: Swallowed exception at except Exception with only: pass
+alpha_engine/execution/ledger.py:430: Swallowed exception at except Exception with only: logger.debug
+alpha_engine/execution/ledger.py:990: Swallowed exception at except Exception with only: logger.debug
+alpha_engine/execution/ledger.py:1075: Swallowed exception at except Exception with only: logger.debug
+alpha_engine/execution/ledger.py:1244: Swallowed exception at except Exception with only: logger.debug
+alpha_engine/execution/ledger.py:1364: Swallowed exception at except Exception with only: logger.debug
+alpha_engine/execution/reports.py:167: Swallowed exception at except Exception with only: pass
+alpha_engine/ingestion/decoders.py:543: Swallowed exception at except Exception with only: pass
+alpha_engine/ingestion/decoders.py:782: Swallowed exception at except Exception with only: pass
+alpha_engine/ingestion/decoders.py:824: Swallowed exception at except Exception with only: pass
+alpha_engine/ingestion/market_oracle.py:150: Swallowed exception at except Exception with only: logger.debug
+alpha_engine/ingestion/market_oracle.py:209: Swallowed exception at except Exception with only: logger.debug
+alpha_engine/ingestion/market_oracle.py:239: Swallowed exception at except Exception with only: logger.debug
+alpha_engine/ingestion/market_oracle.py:275: Swallowed exception at except Exception with only: logger.debug
+alpha_engine/ingestion/market_oracle.py:354: Swallowed exception at except Exception with only: logger.debug
+alpha_engine/ingestion/svm.py:399: Swallowed exception at except Exception with only: pass
+alpha_engine/ingestion/telegram.py:57: Swallowed exception at except Exception with only: pass
+alpha_engine/ingestion/telegram.py:100: Swallowed exception at except Exception with only: pass
+alpha_engine/ingestion/telegram.py:954: Swallowed exception at except Exception with only: logger.debug
+alpha_engine/ingestion/telegram.py:996: Swallowed exception at except Exception with only: pass
+alpha_engine/ingestion/telegram.py:1109: Swallowed exception at except Exception with only: pass
+alpha_engine/ingestion/telegram.py:1752: Swallowed exception at except Exception with only: pass
+alpha_engine/ingestion/telegram.py:1758: Swallowed exception at except Exception with only: pass
+alpha_engine/ingestion/telegram.py:1782: Swallowed exception at except Exception with only: logger.debug
+alpha_engine/ingestion/telegram.py:1958: Swallowed exception at except Exception with only: logger.debug
+alpha_engine/ingestion/telegram.py:1969: Swallowed exception at except Exception with only: logger.debug
+alpha_engine/ingestion/telegram.py:2729: Swallowed exception at except Exception with only: pass
+alpha_engine/ingestion/telegram.py:2757: Swallowed exception at except Exception with only: logger.debug
+alpha_engine/ingestion/telegram.py:2873: Swallowed exception at except Exception with only: logger.debug
+alpha_engine/ingestion/telegram.py:2908: Swallowed exception at except Exception with only: pass
+alpha_engine/ingestion/telegram.py:2936: Swallowed exception at except Exception with only: pass
+alpha_engine/ingestion/telegram.py:2998: Swallowed exception at except Exception with only: pass
+alpha_engine/ingestion/telegram.py:3063: Swallowed exception at except Exception with only: pass
+alpha_engine/ingestion/telegram.py:3403: Swallowed exception at except Exception with only: logger.debug
+alpha_engine/ingestion/telegram.py:3445: Swallowed exception at except Exception with only: pass
+alpha_engine/ingestion/telegram.py:3795: Swallowed exception at except Exception with only: logger.debug
+alpha_engine/ingestion/telegram.py:3850: Swallowed exception at except Exception with only: pass
+alpha_engine/profiler/whitelist_db.py:87: Swallowed exception at except Exception with only: pass
+alpha_engine/ruflo/memory.py:198: Swallowed exception at except Exception with only: logger.debug
+alpha_engine/ruflo/memory.py:342: Swallowed exception at except Exception with only: pass
+alpha_engine/ruflo/memory.py:547: Swallowed exception at except Exception with only: logger.debug
+alpha_engine/ruflo/memory.py:587: Swallowed exception at except Exception with only: logger.debug
+alpha_engine/ruflo/memory.py:677: Swallowed exception at except Exception with only: pass
+alpha_engine/ruflo/swarm.py:578: Swallowed exception at except Exception with only: logger.debug
+alpha_engine/tracker/wallet_tracker.py:352: Swallowed exception at except Exception with only: pass
+alpha_engine/tracker/wallet_tracker.py:396: Swallowed exception at except Exception with only: pass
+alpha_engine/tracker/wallet_tracker.py:446: Swallowed exception at except Exception with only: continue
+alpha_engine/tracker/wallet_tracker.py:469: Swallowed exception at except Exception with only: pass
+alpha_engine/tracker/wallet_tracker.py:486: Swallowed exception at except Exception with only: pass
+alpha_engine/tracker/wallet_tracker.py:525: Swallowed exception at except Exception with only: logger.debug
+alpha_engine/tracker/wallet_tracker.py:587: Swallowed exception at except Exception with only: logger.debug
+alpha_engine/tracker/wallet_tracker.py:652: Swallowed exception at except Exception with only: logger.debug
+alpha_engine/tracker/wallet_tracker.py:710: Swallowed exception at except Exception with only: logger.debug
+alpha_engine/tracker/wallet_tracker.py:764: Swallowed exception at except Exception with only: logger.debug
+alpha_engine/tracker/wallet_tracker.py:908: Swallowed exception at except Exception with only: continue, logger.debug
+alpha_engine/tracker/wallet_tracker.py:931: Swallowed exception at except Exception with only: logger.debug
+alpha_engine/tracker/wallet_tracker.py:1030: Swallowed exception at except Exception with only: logger.debug
+alpha_engine/tracker/wallet_tracker.py:1324: Swallowed exception at except Exception with only: pass
+alpha_engine/tracker/wallet_tracker.py:1367: Swallowed exception at except Exception with only: pass
+alpha_engine/tracker/wallet_tracker.py:1384: Swallowed exception at except Exception with only: logger.debug
+
+--- [invented_data] (Findings: 150) ---
+alpha_engine/chat_interface.py:370: Hardcoded invented market Decimal('0.000000028')
+alpha_engine/chat_interface.py:370: Hardcoded invented price fallback literal: '0.000000028'
+alpha_engine/cli.py:249: Hardcoded market parameter in call kwarg native_reserve=Decimal('50.0') if chain == ChainIdentifier.SOLANA_MAINNET else Decimal('2.0')
+alpha_engine/council/arbiter_cro.py:265: Hardcoded fallback reserve Decimal('30')
+alpha_engine/council/arbiter_cro.py:266: Hardcoded fallback reserve Decimal('30')
+alpha_engine/engine/ai_supervisor.py:286: Hardcoded invented market Decimal('0.000000028')
+alpha_engine/engine/ai_supervisor.py:286: Hardcoded invented price fallback literal: '0.000000028'
+alpha_engine/engine/ai_supervisor.py:1112: Hardcoded invented market Decimal('0.000000028')
+alpha_engine/engine/ai_supervisor.py:1112: Hardcoded invented price fallback literal: '0.000000028'
+alpha_engine/engine/runner.py:829: Hardcoded market parameter in call kwarg token_reserve=Decimal('1000000000')
+alpha_engine/engine/runner.py:832: Hardcoded invented market Decimal('1000000000')
+alpha_engine/engine/runner.py:832: Hardcoded invented token supply literal string: '1000000000'
+alpha_engine/engine/runner.py:2501: Hardcoded invented market Decimal('0.000000028')
+alpha_engine/engine/runner.py:2501: Hardcoded invented price fallback literal: '0.000000028'
+alpha_engine/engine/runner.py:2508: Hardcoded fallback market assignment native_res = Decimal('30.0') if chain == ChainIdentifier.SOLANA_MAINNET else Decimal('5.0')
+alpha_engine/engine/runner.py:2508: Hardcoded fallback reserve Decimal('30.0')
+alpha_engine/engine/runner.py:2508: Hardcoded fallback reserve Decimal('5.0')
+alpha_engine/engine/runner.py:2515: Hardcoded fallback market assignment token_res = Decimal('1073000000.0')
+alpha_engine/engine/runner.py:2515: Hardcoded invented market Decimal('1073000000.0')
+alpha_engine/engine/runner.py:2515: Hardcoded invented virtual token reserve literal: '1073000000.0'
+alpha_engine/engine/runner.py:2561: Hardcoded invented market Decimal('0.000000028')
+alpha_engine/engine/runner.py:2561: Hardcoded invented price fallback literal: '0.000000028'
+alpha_engine/engine/runner.py:2562: Hardcoded fallback market assignment native_res = Decimal(str(res_usd)) / Decimal('2.0') / native_price if res_usd > 0 else Decimal('30.0') if chain == ChainIdentifier.SOLANA_MAINNET else Decimal('5.0')
+alpha_engine/engine/runner.py:2562: Hardcoded fallback reserve Decimal('30.0')
+alpha_engine/engine/runner.py:2562: Hardcoded fallback reserve Decimal('5.0')
+alpha_engine/engine/runner.py:2563: Hardcoded fallback market assignment token_res = native_res / spot_p if spot_p > Decimal(0) else Decimal('1073000000.0')
+alpha_engine/engine/runner.py:2563: Hardcoded invented market Decimal('1073000000.0')
+alpha_engine/engine/runner.py:2563: Hardcoded invented virtual token reserve literal: '1073000000.0'
+alpha_engine/engine/runner.py:3268: Hardcoded invented market Decimal('0.000000028')
+alpha_engine/engine/runner.py:3268: Hardcoded invented price fallback literal: '0.000000028'
+alpha_engine/engine/runner.py:3342: Hardcoded invented market Decimal('0.000000028')
+alpha_engine/engine/runner.py:3342: Hardcoded invented price fallback literal: '0.000000028'
+alpha_engine/engine/runner.py:3434: Hardcoded invented market Decimal('0.000000028')
+alpha_engine/engine/runner.py:3434: Hardcoded invented price fallback literal: '0.000000028'
+alpha_engine/engine/runner.py:3517: Hardcoded invented market Decimal('0.000000028')
+alpha_engine/engine/runner.py:3517: Hardcoded invented price fallback literal: '0.000000028'
+alpha_engine/engine/runner.py:3726: Hardcoded invented market Decimal('1000000000')
+alpha_engine/engine/runner.py:3726: Hardcoded invented token supply literal string: '1000000000'
+alpha_engine/engine/runner.py:5469: Hardcoded invented market Decimal('0.000000028')
+alpha_engine/engine/runner.py:5469: Hardcoded invented price fallback literal: '0.000000028'
+alpha_engine/engine/runner.py:5471: Hardcoded invented market Decimal('0.000000028')
+alpha_engine/engine/runner.py:5471: Hardcoded invented price fallback literal: '0.000000028'
+alpha_engine/engine/runner.py:5496: Hardcoded fallback market assignment native_res = Decimal('30.0')
+alpha_engine/engine/runner.py:5496: Hardcoded fallback reserve Decimal('30.0')
+alpha_engine/engine/runner.py:5612: Hardcoded fallback market assignment native_res = Decimal('5.0')
+alpha_engine/engine/runner.py:5612: Hardcoded fallback reserve Decimal('5.0')
+alpha_engine/engine/runner.py:5922: Hardcoded invented market Decimal('1000000000')
+alpha_engine/engine/runner.py:5922: Hardcoded invented token supply literal string: '1000000000'
+alpha_engine/engine/runner.py:6613: Hardcoded market parameter in call kwarg token_reserve=Decimal('5_000_000_000_000')
+alpha_engine/engine/runner.py:6613: Hardcoded market parameter in call kwarg native_reserve=Decimal('1_500_000_000_000_000_000_000')
+alpha_engine/engine/runner.py:6624: Hardcoded market parameter in call kwarg native_reserve=Decimal('50_000_000_000_000_000_000')
+alpha_engine/engine/runner.py:6635: Hardcoded market parameter in call kwarg token_reserve=Decimal('50_000_000_000_00000')
+alpha_engine/engine/runner.py:6635: Hardcoded market parameter in call kwarg native_reserve=Decimal('5_000_000_000_000')
+alpha_engine/engine/signals.py:147: Hardcoded invented market Decimal('0.000000028')
+alpha_engine/engine/signals.py:147: Hardcoded invented price fallback literal: '0.000000028'
+alpha_engine/engine/signals.py:177: Hardcoded invented market Decimal('0.000000028')
+alpha_engine/engine/signals.py:177: Hardcoded invented price fallback literal: '0.000000028'
+alpha_engine/engine/signals.py:1069: Hardcoded fallback reserve Decimal('5.0')
+alpha_engine/engine/staging.py:432: Hardcoded invented market Decimal('0.000000028')
+alpha_engine/engine/staging.py:432: Hardcoded invented price fallback literal: '0.000000028'
+alpha_engine/engine/staging.py:447: Hardcoded invented market Decimal('0.000000028')
+alpha_engine/engine/staging.py:447: Hardcoded invented price fallback literal: '0.000000028'
+alpha_engine/engine/staging.py:800: Hardcoded market parameter in call kwarg token_reserve=Decimal('1000000000')
+alpha_engine/engine/staging.py:800: Hardcoded market parameter in call kwarg native_reserve=Decimal('30')
+alpha_engine/engine/staging.py:803: Hardcoded invented market Decimal('1000000000')
+alpha_engine/engine/staging.py:803: Hardcoded invented token supply literal string: '1000000000'
+alpha_engine/engine/staging.py:804: Hardcoded fallback reserve Decimal('30')
+alpha_engine/engine/staging.py:951: Hardcoded fallback reserve Decimal('5.0')
+alpha_engine/engine/staging.py:1022: Hardcoded invented market Decimal('0.000000028')
+alpha_engine/engine/staging.py:1022: Hardcoded invented price fallback literal: '0.000000028'
+alpha_engine/engine/staging.py:1040: Hardcoded invented market Decimal('0.000000028')
+alpha_engine/engine/staging.py:1040: Hardcoded invented price fallback literal: '0.000000028'
+alpha_engine/engine/staging.py:1219: Hardcoded fallback reserve Decimal('5.0')
+alpha_engine/engine/staging.py:1458: Hardcoded market parameter in call kwarg token_reserve=Decimal('1000000000')
+alpha_engine/engine/staging.py:1458: Hardcoded market parameter in call kwarg native_reserve=Decimal('30')
+alpha_engine/engine/staging.py:1461: Hardcoded invented market Decimal('1000000000')
+alpha_engine/engine/staging.py:1461: Hardcoded invented token supply literal string: '1000000000'
+alpha_engine/engine/staging.py:1462: Hardcoded fallback reserve Decimal('30')
+alpha_engine/execution/book.py:220: Hardcoded fallback reserve Decimal('5.0')
+alpha_engine/execution/book.py:1117: Hardcoded fallback reserve Decimal('5.0')
+alpha_engine/execution/book.py:1245: Hardcoded fallback reserve Decimal('5.0')
+alpha_engine/execution/book.py:1787: Hardcoded fallback reserve Decimal('5.0')
+alpha_engine/execution/book.py:2017: Hardcoded fallback reserve Decimal('5.0')
+alpha_engine/execution/bundle.py:369: Hardcoded invented market Decimal(1000000000)
+alpha_engine/ingestion/decoders.py:614: Hardcoded market parameter in call kwarg virtual_sol_reserves=Decimal('30.0')
+alpha_engine/ingestion/decoders.py:614: Hardcoded market parameter in call kwarg virtual_token_reserves=Decimal('1073000000.0')
+alpha_engine/ingestion/decoders.py:617: Hardcoded fallback reserve Decimal('30.0')
+alpha_engine/ingestion/decoders.py:618: Hardcoded invented market Decimal('1073000000.0')
+alpha_engine/ingestion/decoders.py:618: Hardcoded invented virtual token reserve literal: '1073000000.0'
+alpha_engine/ingestion/decoders.py:765: Hardcoded fallback market assignment v_sol = _normalise(v_sol_raw, 9) if v_sol_raw > 0 else Decimal('30.0')
+alpha_engine/ingestion/decoders.py:765: Hardcoded fallback reserve Decimal('30.0')
+alpha_engine/ingestion/decoders.py:766: Hardcoded fallback market assignment v_token = _normalise(v_token_raw, 6) if v_token_raw > 0 else Decimal('1073000000.0')
+alpha_engine/ingestion/decoders.py:766: Hardcoded invented market Decimal('1073000000.0')
+alpha_engine/ingestion/decoders.py:766: Hardcoded invented virtual token reserve literal: '1073000000.0'
+alpha_engine/ingestion/decoders.py:856: Hardcoded fallback reserve Decimal('30.0')
+alpha_engine/ingestion/decoders.py:857: Hardcoded invented market Decimal('1073000000.0')
+alpha_engine/ingestion/decoders.py:857: Hardcoded invented virtual token reserve literal: '1073000000.0'
+alpha_engine/ingestion/svm.py:634: Hardcoded market parameter in call kwarg virtual_sol_reserves=v_sol if v_sol > Decimal(0) else Decimal('30.0')
+alpha_engine/ingestion/svm.py:634: Hardcoded market parameter in call kwarg virtual_token_reserves=v_tok if v_tok > Decimal(0) else Decimal('1073000000.0')
+alpha_engine/ingestion/svm.py:651: Hardcoded fallback reserve Decimal('30.0')
+alpha_engine/ingestion/svm.py:652: Hardcoded invented market Decimal('1073000000.0')
+alpha_engine/ingestion/svm.py:652: Hardcoded invented virtual token reserve literal: '1073000000.0'
+alpha_engine/ingestion/svm.py:726: Hardcoded fallback market assignment v_sol = pump_info.get('virtual_sol_reserves', Decimal('30.0'))
+alpha_engine/ingestion/svm.py:726: Hardcoded fallback reserve Decimal('30.0')
+alpha_engine/ingestion/svm.py:727: Hardcoded fallback market assignment v_tok = pump_info.get('virtual_token_reserves', Decimal('1073000000.0'))
+alpha_engine/ingestion/svm.py:727: Hardcoded invented market Decimal('1073000000.0')
+alpha_engine/ingestion/svm.py:727: Hardcoded invented virtual token reserve literal: '1073000000.0'
+alpha_engine/ingestion/telegram.py:2437: Hardcoded market parameter in call kwarg native_reserve=Decimal('50.0') if chain == ChainIdentifier.SOLANA_MAINNET else Decimal('2.0')
+alpha_engine/math/cpmm.py:221: Hardcoded market parameter in call kwarg native_reserve=Decimal('30.0')
+alpha_engine/math/cpmm.py:221: Hardcoded market parameter in call kwarg token_reserve=Decimal('1073000000.0')
+alpha_engine/math/cpmm.py:225: Hardcoded fallback reserve Decimal('30.0')
+alpha_engine/math/cpmm.py:226: Hardcoded invented market Decimal('1073000000.0')
+alpha_engine/math/cpmm.py:226: Hardcoded invented virtual token reserve literal: '1073000000.0'
+alpha_engine/math/cpmm.py:233: Hardcoded market parameter in call kwarg token_reserve=Decimal('1000000000.0')
+alpha_engine/math/cpmm.py:238: Hardcoded invented market Decimal('1000000000.0')
+alpha_engine/math/cpmm.py:238: Hardcoded invented token supply literal string: '1000000000.0'
+alpha_engine/models/events.py:266: Hardcoded fallback market default in annotation virtual_sol_reserves = Decimal('30.0')
+alpha_engine/models/events.py:266: Hardcoded fallback reserve Decimal('30.0')
+alpha_engine/models/events.py:267: Hardcoded fallback market default in annotation virtual_token_reserves = Decimal('1073000000.0')
+alpha_engine/models/events.py:267: Hardcoded invented market Decimal('1073000000.0')
+alpha_engine/models/events.py:267: Hardcoded invented virtual token reserve literal: '1073000000.0'
+alpha_engine/models/events.py:315: Hardcoded fallback market default in annotation virtual_sol_reserves = Decimal('30.0')
+alpha_engine/models/events.py:315: Hardcoded fallback reserve Decimal('30.0')
+alpha_engine/models/events.py:316: Hardcoded fallback market default in annotation virtual_token_reserves = Decimal('1073000000.0')
+alpha_engine/models/events.py:316: Hardcoded invented market Decimal('1073000000.0')
+alpha_engine/models/events.py:316: Hardcoded invented virtual token reserve literal: '1073000000.0'
+alpha_engine/models/state.py:117: Hardcoded fallback market assignment supply = circulating_supply if circulating_supply is not None and circulating_supply > Decimal(0) else Decimal('1000000000')
+alpha_engine/models/state.py:117: Hardcoded invented market Decimal('1000000000')
+alpha_engine/models/state.py:117: Hardcoded invented token supply literal string: '1000000000'
+tools/audit/invented_data.py:34: Hardcoded invented price fallback literal: 2.8e-08
+tools/audit/invented_data.py:34: Hardcoded invented price fallback literal: '0.000000028'
+tools/audit/invented_data.py:40: Hardcoded invented virtual token reserve literal: 1073000000
+tools/audit/invented_data.py:40: Hardcoded invented virtual token reserve literal: 1073000000.0
+tools/audit/invented_data.py:40: Hardcoded invented virtual token reserve literal: '1073000000'
+tools/audit/invented_data.py:40: Hardcoded invented virtual token reserve literal: '1073000000.0'
+tools/audit/invented_data.py:46: Hardcoded invented token supply literal string: '1000000000'
+tools/audit/invented_data.py:46: Hardcoded invented token supply literal string: '1000000000.0'
+tools/audit/invented_data.py:59: Hardcoded invented price fallback literal: '0.000000028'
+tools/audit/invented_data.py:59: Hardcoded invented virtual token reserve literal: '1073000000'
+tools/audit/invented_data.py:59: Hardcoded invented virtual token reserve literal: '1073000000.0'
+tools/audit/invented_data.py:59: Hardcoded invented token supply literal string: '1000000000'
+tools/audit/invented_data.py:59: Hardcoded invented token supply literal string: '1000000000.0'
+tools/audit/invented_data.py:83: Hardcoded invented virtual token reserve literal: '1073000000'
+tools/audit/invented_data.py:83: Hardcoded invented token supply literal string: '1000000000'
+tools/audit/invented_data.py:99: Hardcoded invented virtual token reserve literal: '1073000000'
+tools/audit/invented_data.py:99: Hardcoded invented token supply literal string: '1000000000'
+tools/audit/invented_data.py:99: Hardcoded invented price fallback literal: '0.000000028'
+tools/audit/invented_data.py:111: Hardcoded invented virtual token reserve literal: '1073000000'
+tools/audit/invented_data.py:111: Hardcoded invented token supply literal string: '1000000000'
+tools/audit/invented_data.py:111: Hardcoded invented price fallback literal: '0.000000028'
+
+--- [unused_config] (Findings: 34) ---
+alpha_engine/config.py:69: Unused pydantic Settings field 'rpc_latency_threshold_ms' on EngineConfig (never read in non-definition code)
+alpha_engine/config.py:74: Unused pydantic Settings field 'rpc_max_block_lag' on EngineConfig (never read in non-definition code)
+alpha_engine/config.py:87: Unused pydantic Settings field 'titan_builder_rpc' on EngineConfig (never read in non-definition code)
+alpha_engine/config.py:95: Unused pydantic Settings field 'jito_tip_floor_url' on EngineConfig (never read in non-definition code)
+alpha_engine/config.py:115: Unused pydantic Settings field 'x_bearer_token' on EngineConfig (never read in non-definition code)
+alpha_engine/config.py:119: Unused pydantic Settings field 'x_api_key' on EngineConfig (never read in non-definition code)
+alpha_engine/config.py:123: Unused pydantic Settings field 'x_api_secret' on EngineConfig (never read in non-definition code)
+alpha_engine/config.py:241: Unused pydantic Settings field 'ruflo_max_memory_episodes' on EngineConfig (never read in non-definition code)
+alpha_engine/config.py:246: Unused pydantic Settings field 'paper_trading_mode' on EngineConfig (never read in non-definition code)
+alpha_engine/config.py:291: Unused pydantic Settings field 'wave2_staging_enabled' on EngineConfig (never read in non-definition code)
+alpha_engine/config.py:375: Unused pydantic Settings field 'max_portfolio_risk_pct' on EngineConfig (never read in non-definition code)
+alpha_engine/config.py:381: Unused pydantic Settings field 'max_autonomous_risk_pct' on EngineConfig (never read in non-definition code)
+alpha_engine/config.py:447: Unused pydantic Settings field 'MAX_TOP10_CONCENTRATION' on EngineConfig (never read in non-definition code)
+alpha_engine/config.py:448: Unused pydantic Settings field 'MAX_TOP10_CONCENTRATION_PUMP_FUN' on EngineConfig (never read in non-definition code)
+alpha_engine/config.py:456: Unused pydantic Settings field 'max_pump_fun_top10_concentration' on EngineConfig (never read in non-definition code)
+alpha_engine/config.py:599: Unused pydantic Settings field 'early_rally_volume_surge_multiplier' on EngineConfig (never read in non-definition code)
+alpha_engine/config.py:604: Unused pydantic Settings field 'early_rally_min_net_buy_delta' on EngineConfig (never read in non-definition code)
+alpha_engine/config.py:610: Unused pydantic Settings field 'early_rally_min_price_expansion_pct' on EngineConfig (never read in non-definition code)
+alpha_engine/config.py:615: Unused pydantic Settings field 'early_rally_max_fomo_expansion_pct' on EngineConfig (never read in non-definition code)
+alpha_engine/config.py:620: Unused pydantic Settings field 'early_rally_hard_sl_pct' on EngineConfig (never read in non-definition code)
+alpha_engine/config.py:626: Unused pydantic Settings field 'early_rally_tp1_pct' on EngineConfig (never read in non-definition code)
+alpha_engine/config.py:631: Unused pydantic Settings field 'early_rally_runner_trailing_stop_pct' on EngineConfig (never read in non-definition code)
+alpha_engine/config.py:707: Unused pydantic Settings field 'partial_exit_r_multiple' on EngineConfig (never read in non-definition code)
+alpha_engine/config.py:712: Unused pydantic Settings field 'partial_exit_fraction' on EngineConfig (never read in non-definition code)
+alpha_engine/config.py:718: Unused pydantic Settings field 'trailing_hl_buffer_pct' on EngineConfig (never read in non-definition code)
+alpha_engine/config.py:723: Unused pydantic Settings field 'daily_loss_limit_pct' on EngineConfig (never read in non-definition code)
+alpha_engine/config.py:740: Unused pydantic Settings field 'screener_graduated_priority_enabled' on EngineConfig (never read in non-definition code)
+alpha_engine/config.py:744: Unused pydantic Settings field 'screener_movers_priority_enabled' on EngineConfig (never read in non-definition code)
+alpha_engine/engine/experimentation.py:988: Unused extra_params key 'max_mcap_usd' (never read in non-definition code)
+alpha_engine/engine/experimentation.py:1004: Unused extra_params key 'min_surge_k' (never read in non-definition code)
+alpha_engine/engine/experimentation.py:1020: Unused extra_params key 'min_dormancy_hours' (never read in non-definition code)
+alpha_engine/engine/experimentation.py:1020: Unused extra_params key 'min_surge_multiplier' (never read in non-definition code)
+alpha_engine/engine/experimentation.py:1036: Unused extra_params key 'min_wallet_sortino' (never read in non-definition code)
+alpha_engine/engine/experimentation.py:1052: Unused extra_params key 'organic_conviction_min' (never read in non-definition code)
+
+================================================================================
+AUDIT SUMMARY BY SCRIPT
+================================================================================
+  - native_price_literals: 33 findings
+  - task_awaitables: 2 findings
+  - model_getattr_defaults: 896 findings
+  - conditional_precedence: 51 findings
+  - swallowed_exceptions: 102 findings
+  - invented_data: 150 findings
+  - unused_config: 34 findings
+
+Total findings across all scripts: 1268
