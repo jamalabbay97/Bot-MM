@@ -796,15 +796,39 @@ class EngineConfig(BaseSettings):
         gt=Decimal(0),
         description="Simulated starting capital in native ETH",
     )
-    sol_price_usd: Decimal = Field(
-        default=Decimal("150.0"),
-        gt=Decimal(0),
-        description="Baseline valuation for SOL in USD",
+    allow_static_native_prices: bool = Field(
+        default=False,
+        description="Explicit flag allowing static native prices for testing/offline bootstrap only.",
     )
-    eth_price_usd: Decimal = Field(
-        default=Decimal("3400.0"),
+    sol_price_usd: Optional[Decimal] = Field(
+        default=None,
         gt=Decimal(0),
-        description="Baseline valuation for ETH in USD",
+        description="Optional static override for SOL price in USD when allow_static_native_prices is True",
+    )
+    eth_price_usd: Optional[Decimal] = Field(
+        default=None,
+        gt=Decimal(0),
+        description="Optional static override for ETH price in USD when allow_static_native_prices is True",
+    )
+    native_price_refresh_interval_s: float = Field(
+        default=15.0,
+        gt=0.0,
+        description="Refresh interval in seconds for native price background poller",
+    )
+    native_price_cache_ttl_s: float = Field(
+        default=15.0,
+        gt=0.0,
+        description="TTL duration in seconds for in-memory native price cache",
+    )
+    native_price_max_age_s: float = Field(
+        default=60.0,
+        gt=0.0,
+        description="Maximum allowed staleness age in seconds before native price transitions to STALE",
+    )
+    native_price_divergence_tolerance_pct: float = Field(
+        default=5.0,
+        ge=0.0,
+        description="Maximum divergence percentage between primary and secondary price sources before flagging DIVERGENT",
     )
 
     # -------------------------------------------------------------------------
@@ -1009,9 +1033,11 @@ class EngineConfig(BaseSettings):
     @property
     def initial_equity_usd(self) -> Decimal:
         """Total starting portfolio equity in USD."""
+        sol_p = self.sol_price_usd if self.sol_price_usd is not None else Decimal(0)
+        eth_p = self.eth_price_usd if self.eth_price_usd is not None else Decimal(0)
         return (
-            self.initial_sol * self.sol_price_usd
-            + self.initial_eth * self.eth_price_usd
+            self.initial_sol * sol_p
+            + self.initial_eth * eth_p
         )
 
     @property

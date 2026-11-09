@@ -147,8 +147,10 @@ class ScreenerPriorityEvaluator:
         ledger: Optional[Any] = None,
         graduated_config: Optional[GraduatedProfileConfig] = None,
         movers_config: Optional[MoversProfileConfig] = None,
+        price_service: Optional[Any] = None,
     ) -> None:
         self.config = config
+        self._price_service = price_service
         self.gatekeeper = gatekeeper
         self.metrics_aggregator = metrics_aggregator
         self.ledger = ledger
@@ -210,6 +212,22 @@ class ScreenerPriorityEvaluator:
         self._evaluated_history: dict[str, float] = {}  # token -> last evaluated timestamp
         self._section_memberships: dict[str, set[ScreenerSection]] = {}
         self._audit_log: deque[ScreenerDecisionRecord] = deque(maxlen=1000)
+
+    def get_native_price(self, chain: ChainIdentifier | str) -> Decimal:
+        if getattr(self, "_price_service", None) is not None:
+            try:
+                res = self._price_service.get_price(chain)
+                p = res[0] if isinstance(res, (tuple, list)) else getattr(res, "price", None)
+                if p is not None and p > Decimal(0):
+                    return p
+            except Exception:
+                pass
+        chain_str = chain.value if hasattr(chain, "value") else str(chain).lower()
+        if "base" in chain_str or "eth" in chain_str:
+            p = self.config.eth_price_usd if hasattr(self.config, "eth_price_usd") else None
+        else:
+            p = self.config.sol_price_usd if hasattr(self.config, "sol_price_usd") else None
+        return p if p is not None and p > Decimal(0) else Decimal(0)
 
     @property
     def audit_log(self) -> deque[ScreenerDecisionRecord]:
@@ -275,8 +293,8 @@ class ScreenerPriorityEvaluator:
         pool_state = kwargs.get("pool_state")
         if pool_state is None and discovery.liquidity_usd is not None and discovery.liquidity_usd > 0:
             liq_dec = Decimal(str(discovery.liquidity_usd))
-            sol_price = Decimal(str(getattr(self.config, "sol_price_usd", 150.0)))
-            native_res = liq_dec / Decimal("2.0") / sol_price if sol_price > 0 else Decimal("100.0")
+            sol_price = self.get_native_price(discovery.chain)
+            native_res = liq_dec / Decimal("2.0") / sol_price if sol_price > Decimal(0) else Decimal("100.0")
             token_res = (liq_dec / Decimal("2.0")) / (cur_price or Decimal("0.001")) if (cur_price or Decimal("0.001")) > 0 else Decimal("1000000.0")
             fallback_pool_addr = discovery.pool_address or (token_addr if len(token_addr) >= 32 else (token_addr + "0" * 32)[:32])
             pool_state = PoolState(
@@ -433,7 +451,7 @@ class ScreenerPriorityEvaluator:
         market_cap_usd: Optional[Decimal] = None,
     ) -> ScreenerEvaluationResult:
         now_s = time.time()
-        native_price = getattr(self.config, "sol_price_usd", Decimal("150.0"))
+        native_price = self.get_native_price(chain)
 
         # 3. Market Data Freshness & Completeness Check
         is_fresh = raw_metadata.get("market_data_fresh", True)

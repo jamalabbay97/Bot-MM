@@ -877,7 +877,7 @@ class WalletTracker:
                                 d = await resp.json()
                                 lamports = d.get("result", {}).get("value", 0)
                                 balance_native = float(lamports) / 1e9
-                                sol_price = float(os.getenv("SOL_DEFAULT_PRICE", "150.0"))
+                                sol_price = float(os.getenv("SOL_DEFAULT_PRICE", "0.0"))
                                 balance_usd = balance_native * sol_price
 
                         # 2. getSignaturesForAddress
@@ -926,7 +926,7 @@ class WalletTracker:
                             d = await resp.json()
                             wei = int(d.get("result", "0x0"), 16)
                             balance_native = float(wei) / 1e18
-                            eth_price = float(os.getenv("ETH_DEFAULT_PRICE", "2600.0"))
+                            eth_price = float(os.getenv("ETH_DEFAULT_PRICE", "0.0"))
                             balance_usd = balance_native * eth_price
             except Exception as exc:
                 logger.debug("Base wallet on-chain fetch error: %s", exc)

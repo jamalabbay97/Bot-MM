@@ -504,6 +504,19 @@ INITIAL_ETH_BALANCE=2.0                    # Starting paper balance: 2 ETH
 MAX_PORTFOLIO_RISK_PCT=0.01                # 1% standard trade risk
 MAX_AUTONOMOUS_RISK_PCT=0.05               # 5% max risk cap for high-conviction trades
 STOP_LOSS_PCT=-0.15                        # Initial hard stop-loss trigger (-15%)
+
+# ------------------------------------------------------------------------------
+# 5. Live Native Price Service & Multi-Source Gating
+# ------------------------------------------------------------------------------
+# Single source of truth for native asset prices (SOL & ETH) in USD.
+# Primary source: DefiLlama. Secondary source: Coinbase / Binance.
+ALLOW_STATIC_NATIVE_PRICES=false           # Set true only for static bootstrap/test overrides
+SOL_PRICE_USD=150.0                        # Static override (only used when ALLOW_STATIC_NATIVE_PRICES=true)
+ETH_PRICE_USD=3400.0                       # Static override (only used when ALLOW_STATIC_NATIVE_PRICES=true)
+NATIVE_PRICE_REFRESH_INTERVAL_S=30.0       # Background refresh cadence in seconds
+NATIVE_PRICE_CACHE_TTL_S=15.0              # TTL cache validity in seconds
+NATIVE_PRICE_MAX_AGE_S=60.0                # Max price age before transitioning to STALE
+NATIVE_PRICE_DIVERGENCE_TOLERANCE_PCT=5.0  # Max divergence % between primary and secondary
 ```
 
 ---

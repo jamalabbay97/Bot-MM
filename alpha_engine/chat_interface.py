@@ -767,9 +767,23 @@ class ConversationalSupervisor:
         champ = next((b for b in board if b["status"] == "CHAMPION"), None)
         champ_name = champ["name"] if champ else "champion_fast_snipe"
 
+        # Native Price Service Status
+        native_status_str = "🟢 OK"
+        target = getattr(self, "execution_target", None)
+        if target and hasattr(target, "native_price_service"):
+            svc = target.native_price_service
+            if getattr(getattr(target, "_cfg", None), "allow_static_native_prices", False):
+                native_status_str = "⚠️ STATIC PRICES"
+            else:
+                from alpha_engine.models.enums import ChainIdentifier
+                sol_p, sol_age, sol_st = svc.get_price(ChainIdentifier.SOLANA_MAINNET)
+                eth_p, eth_age, eth_st = svc.get_price(ChainIdentifier.BASE_MAINNET)
+                native_status_str = f"SOL: ${float(sol_p):.2f} [{sol_st.value}] | ETH: ${float(eth_p):.2f} [{eth_st.value}]"
+
         lines = [
             "### 📊 التقرير التفصيلي المتكامل لحالة المحرك (Detailed Institutional Status)\n",
             f"- **وضع المخاطر العالمي (Global Risk Mode):** `🛡️ {risk_mode}`",
+            f"- **أسعار الأصول الأساسية (Native Prices):** `{native_status_str}`",
             f"- **بطل البطولة الحالي (Active Champion):** `{champ_name}`",
             f"- **المراكز المفتوحة (Open Positions):** `{open_lots_count}` صفقات قيد الإدارة",
             f"- **إجمالي القرارات (24h):** `{stats.get('total_decisions', 0)}` قرار",

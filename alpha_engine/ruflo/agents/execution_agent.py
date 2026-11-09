@@ -55,7 +55,7 @@ class ExecutionLedgerAgent(BaseRufloAgent):
         self.private_router = private_router or PrivateTxRouter()
         self.executor = executor or PaperExecutor(
             position_book=self.position_book,
-            native_price_usd=Decimal("150.0"),
+            native_price_usd=(config.sol_price_usd if hasattr(config, "sol_price_usd") else None) or Decimal(0),
             private_router=self.private_router,
         )
         self._register_agent_tools()

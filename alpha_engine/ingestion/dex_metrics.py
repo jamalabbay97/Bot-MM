@@ -308,7 +308,7 @@ class DEXMetricsAggregator:
         price_usd = (
             native_price_usd
             if native_price_usd is not None and native_price_usd > Decimal("0")
-            else self._latest_native_prices.get(chain, Decimal("150.0"))
+            else self._latest_native_prices.get(chain, Decimal("0"))
         )
         vol_2m_usd = vol_2m * price_usd
         mcap_usd = (
@@ -364,7 +364,7 @@ class DEXMetricsAggregator:
         price_usd = (
             native_price_usd
             if native_price_usd is not None and native_price_usd > Decimal("0")
-            else self._latest_native_prices.get(pool_state.chain, Decimal("150.0"))
+            else self._latest_native_prices.get(pool_state.chain, Decimal("0"))
         )
         return pool_state.calculate_market_cap_usd(price_usd, circulating_supply=circulating_supply)
 
@@ -442,7 +442,7 @@ class DEXMetricsAggregator:
         if native_price_usd is None or native_price_usd <= Decimal("0"):
             pool_state = self._pool_states.get(pool_address)
             chain = pool_state.chain if pool_state else ChainIdentifier.SOLANA_MAINNET
-            native_price_usd = self._latest_native_prices.get(chain, Decimal("150.0"))
+            native_price_usd = self._latest_native_prices.get(chain, Decimal("0"))
 
         return vol_native * native_price_usd
 

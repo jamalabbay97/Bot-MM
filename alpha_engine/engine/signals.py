@@ -535,14 +535,32 @@ class SignalGenerator:
         self,
         hold_seconds: float = 300.0,
         config: Optional[Any] = None,
+        price_service: Any = None,
     ) -> None:
         self._hold_s = hold_seconds
+        self._price_service = price_service
         
         # Load Strategy V2 engines if config is provided
         from alpha_engine.config import EngineConfig
         from alpha_engine.engine.strategy.scoring import ScoringEngine
         self.config = config if config is not None else EngineConfig()
         self.scoring_engine = ScoringEngine(self.config)
+
+    def get_native_price(self, chain: ChainIdentifier | str) -> Decimal:
+        if getattr(self, "_price_service", None) is not None:
+            try:
+                res = self._price_service.get_price(chain)
+                p = res[0] if isinstance(res, (tuple, list)) else getattr(res, "price", None)
+                if p is not None and p > Decimal(0):
+                    return p
+            except Exception:
+                pass
+        chain_str = chain.value if hasattr(chain, "value") else str(chain).lower()
+        if "base" in chain_str or "eth" in chain_str:
+            p = self.config.eth_price_usd if hasattr(self.config, "eth_price_usd") else None
+        else:
+            p = self.config.sol_price_usd if hasattr(self.config, "sol_price_usd") else None
+        return p if p is not None and p > Decimal(0) else Decimal(0)
 
     def validate_signal_strength(
         self,
@@ -718,7 +736,7 @@ class SignalGenerator:
             )
         )
 
-        native_price = getattr(self.config, "sol_price_usd", Decimal("150.0"))
+        native_price = self.get_native_price(staged.chain)
         mcap = pool.calculate_market_cap_usd(native_price_usd=native_price)
 
         signal = SignalEvent(
@@ -765,7 +783,7 @@ class SignalGenerator:
             if chain == ChainIdentifier.SOLANA_MAINNET
             else ExecutionVenue.UNISWAP_V2
         )
-        native_price = getattr(self.config, "sol_price_usd", Decimal("150.0"))
+        native_price = self.get_native_price(chain)
         mcap = market_cap_usd if market_cap_usd is not None and market_cap_usd > 0 else pool.calculate_market_cap_usd(native_price_usd=native_price)
         return SignalEvent(
             timestamp_ns=time.time_ns(),

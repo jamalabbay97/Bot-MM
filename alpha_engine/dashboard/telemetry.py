@@ -469,8 +469,8 @@ class DashboardTelemetryAggregator:
         if book:
             try:
                 lots = book.get_open_lots()
-                sol_p = float(getattr(self.runner, "_sol_price", 150.0)) if self.runner else 150.0
-                eth_p = float(getattr(self.runner, "_eth_price", 3400.0)) if self.runner else 3400.0
+                sol_p = float(self.runner.get_native_price(ChainIdentifier.SOLANA_MAINNET)) if self.runner and hasattr(self.runner, "get_native_price") else float(getattr(self.runner, "_sol_price", 0.0) or 0.0)
+                eth_p = float(self.runner.get_native_price(ChainIdentifier.BASE_MAINNET)) if self.runner and hasattr(self.runner, "get_native_price") else float(getattr(self.runner, "_eth_price", 0.0) or 0.0)
 
                 for lot in lots:
                     chain_val = lot.chain.value if hasattr(lot.chain, "value") else str(lot.chain)
@@ -570,8 +570,8 @@ class DashboardTelemetryAggregator:
         if self.ledger and hasattr(self.ledger, "_conn") and self.ledger._conn is not None:
             try:
                 conn = self.ledger._conn
-                sol_p = float(getattr(self.runner, "_sol_price", 150.0)) if self.runner else 150.0
-                eth_p = float(getattr(self.runner, "_eth_price", 3400.0)) if self.runner else 3400.0
+                sol_p = float(self.runner.get_native_price(ChainIdentifier.SOLANA_MAINNET)) if self.runner and hasattr(self.runner, "get_native_price") else float(getattr(self.runner, "_sol_price", 0.0) or 0.0)
+                eth_p = float(self.runner.get_native_price(ChainIdentifier.BASE_MAINNET)) if self.runner and hasattr(self.runner, "get_native_price") else float(getattr(self.runner, "_eth_price", 0.0) or 0.0)
 
                 query = """
                     SELECT t.trade_id, t.order_id, t.signal_id, t.chain, t.token_address,
@@ -1432,6 +1432,31 @@ class DashboardTelemetryAggregator:
                 except Exception:
                     pass
 
+            # Native Price Service Status
+            native_prices_info: dict[str, Any] = {"status": "OK", "solana": {}, "base_eth": {}}
+            if self.runner and hasattr(self.runner, "native_price_service"):
+                svc = self.runner.native_price_service
+                if getattr(getattr(self.runner, "_cfg", None), "allow_static_native_prices", False):
+                    native_prices_info["status"] = "STATIC PRICES"
+                else:
+                    from alpha_engine.pricing.native_price_service import NativePriceStatus
+                    sol_res = svc.get_price(ChainIdentifier.SOLANA_MAINNET)
+                    eth_res = svc.get_price(ChainIdentifier.BASE_MAINNET)
+                    native_prices_info["solana"] = {
+                        "price": float(sol_res.price),
+                        "age_s": float(sol_res.age_s),
+                        "status": sol_res.status.value,
+                        "source": sol_res.source,
+                    }
+                    native_prices_info["base_eth"] = {
+                        "price": float(eth_res.price),
+                        "age_s": float(eth_res.age_s),
+                        "status": eth_res.status.value,
+                        "source": eth_res.source,
+                    }
+                    all_ok = sol_res.status == NativePriceStatus.OK and eth_res.status == NativePriceStatus.OK
+                    native_prices_info["status"] = "OK" if all_ok else "DEGRADED"
+
             snapshot = {
                 "system": sys_info,
                 "connections": conn_health,
@@ -1446,6 +1471,7 @@ class DashboardTelemetryAggregator:
                 "activity_logs": recent_logs,
                 "swarm": swarm_info,
                 "alerts": alerts,
+                "native_prices": native_prices_info,
                 "timestamp": time.time(),
             }
             self._last_metrics_cache = snapshot
@@ -1517,8 +1543,8 @@ class DashboardTelemetryAggregator:
             return {"status": "ERROR", "message": f"Unsupported side '{side}'. Must be BUY or SELL."}
 
         # Price estimation
-        sol_p = Decimal(str(getattr(self.runner, "_sol_price", 150.0) if self.runner else 150.0))
-        eth_p = Decimal(str(getattr(self.runner, "_eth_price", 3400.0) if self.runner else 3400.0))
+        sol_p = Decimal(str(self.runner.get_native_price(ChainIdentifier.SOLANA_MAINNET) if self.runner and hasattr(self.runner, "get_native_price") else (getattr(self.runner, "_sol_price", Decimal(0)) or Decimal(0))))
+        eth_p = Decimal(str(self.runner.get_native_price(ChainIdentifier.BASE_MAINNET) if self.runner and hasattr(self.runner, "get_native_price") else (getattr(self.runner, "_eth_price", Decimal(0)) or Decimal(0))))
         native_usd = sol_p if chain_id == ChainIdentifier.SOLANA_MAINNET else eth_p
 
         native_amt_dec: Optional[Decimal] = None
@@ -1566,7 +1592,7 @@ class DashboardTelemetryAggregator:
                     component="InstantExecution",
                     token_address=clean_addr,
                     latency_ms=dur_ms,
-                    metadata={"side": side_clean, "chain": chain_id.value, "amount": str(native_amt_dec)},
+                    metadata={"side": side_clean, "chain": chain_id.value, "amount": str(native_amt_dec), "slippage_bps": slippage_bps},
                 )
                 if ok:
                     self.pipeline_counters["executed_orders"] += 1
@@ -1579,6 +1605,7 @@ class DashboardTelemetryAggregator:
                     "chain": chain_id.value,
                     "amount_native": str(native_amt_dec),
                     "execution_price_usd": float(native_usd),
+                    "slippage_bps": slippage_bps,
                     "tx_hash": f"inst_tx_{int(time.time()*1000)}_{clean_addr[:8]}",
                     "latency_ms": dur_ms,
                 }
@@ -1610,7 +1637,7 @@ class DashboardTelemetryAggregator:
                 simulated_native_spent=native_amt_dec,
                 tokens_acquired=tokens_acq,
                 effective_price=spot_native,
-                price_impact_bps=25,
+                price_impact_bps=min(slippage_bps, 25),
                 simulated_gas_cost_usd=Decimal("0.02") if chain_id == ChainIdentifier.SOLANA_MAINNET else Decimal("0.05"),
                 fill_latency_ms=45,
                 portfolio_equity_usd=Decimal("8300.00"),
@@ -1634,7 +1661,7 @@ class DashboardTelemetryAggregator:
                 component="InstantExecution",
                 token_address=clean_addr,
                 latency_ms=dur_ms,
-                metadata={"side": side_clean, "chain": chain_id.value, "amount": str(native_amt_dec), "lot_id": lot.lot_id},
+                metadata={"side": side_clean, "chain": chain_id.value, "amount": str(native_amt_dec), "lot_id": lot.lot_id, "slippage_bps": slippage_bps},
             )
             return {
                 "status": "SUCCESS",
@@ -1644,6 +1671,7 @@ class DashboardTelemetryAggregator:
                 "chain": chain_id.value,
                 "amount_native": str(native_amt_dec),
                 "execution_price_usd": float(native_usd),
+                "slippage_bps": slippage_bps,
                 "tx_hash": tx_hash,
                 "latency_ms": dur_ms,
                 "lot_id": lot.lot_id,

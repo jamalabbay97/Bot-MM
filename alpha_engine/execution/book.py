@@ -108,6 +108,8 @@ class OpenLot:
     exit_price_source: str = "DEX"
     exit_data_age_s: float = 0.0
     exit_mcap_usd: Decimal = Decimal(0)
+    entry_native_price_usd: Decimal = Decimal(0)
+    price_degraded: bool = False
 
     def record_tick(
         self,
@@ -689,6 +691,7 @@ class PositionBook:
         custom_stop_loss_pct: Optional[float] = None,
         hard_stop_loss_pct: Optional[float] = None,
         entry_feature_vector: Optional[list[float]] = None,
+        entry_native_price_usd: Decimal = Decimal(0),
     ) -> OpenLot:
         if fill.effective_price <= Decimal(0):
             raise ValueError(
@@ -744,6 +747,7 @@ class PositionBook:
             custom_stop_loss_pct=custom_stop_loss_pct,
             hard_stop_loss_pct=hard_stop_loss_pct,
             entry_feature_vector=list(entry_feature_vector) if entry_feature_vector else [],
+            entry_native_price_usd=entry_native_price_usd,
             price_history=[(entry_ts, fill.effective_price, fill.simulated_native_spent)],
             tick_prices_5m=[(entry_ts, fill.effective_price)],
             tick_returns_5m=[],

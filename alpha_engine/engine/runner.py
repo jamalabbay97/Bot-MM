@@ -33,6 +33,12 @@ except ImportError:  # pragma: no cover
 
 from collections import deque
 
+from alpha_engine.pricing.native_price_service import (
+    CoinbasePriceSource,
+    DefiLlamaPriceSource,
+    NativePriceService,
+    NativePriceStatus,
+)
 from alpha_engine.chat_interface import ConversationalSupervisor
 from alpha_engine.config import EngineConfig
 from alpha_engine.dns_resolver import patch_dns_resolvers
@@ -135,8 +141,26 @@ class PaperTradingEngine:
 
         self._cash_sol = config.initial_sol
         self._cash_eth = config.initial_eth
-        self._sol_price = config.sol_price_usd
-        self._eth_price = config.eth_price_usd
+
+        allow_static = getattr(config, "allow_static_native_prices", False)
+        if allow_static:
+            logger.warning("[AlphaEngine] ALLOW_STATIC_NATIVE_PRICES is True - using static native price overrides.")
+
+        self._native_price_service = NativePriceService(
+            primary_source=DefiLlamaPriceSource(),
+            secondary_source=CoinbasePriceSource(),
+            refresh_interval_s=getattr(config, "native_price_refresh_interval_s", 15.0),
+            cache_ttl_s=getattr(config, "native_price_cache_ttl_s", 15.0),
+            max_age_s=getattr(config, "native_price_max_age_s", 60.0),
+            divergence_tolerance_pct=getattr(config, "native_price_divergence_tolerance_pct", 5.0),
+            allow_static_prices=allow_static,
+            static_sol_price=config.sol_price_usd,
+            static_eth_price=config.eth_price_usd,
+        )
+        if config.sol_price_usd is not None:
+            self._native_price_service.set_price("solana", config.sol_price_usd, source="config")
+        if config.eth_price_usd is not None:
+            self._native_price_service.set_price("base_eth", config.eth_price_usd, source="config")
 
         max_q = getattr(config, "max_queue_size", 100)
         self._ingestion_q: asyncio.Queue[
@@ -642,12 +666,39 @@ class PaperTradingEngine:
         logger.info("Manual trade amount configured & persisted: %s %s", self.manual_trade_amount, self.manual_trade_currency)
         return self.get_manual_trade_amount()
 
+    @property
+    def native_price_service(self) -> NativePriceService:
+        return self._native_price_service
+
+    def get_native_price(self, chain: ChainIdentifier | str) -> Decimal:
+        """Single source of truth for native asset prices in USD."""
+        res = self._native_price_service.get_price(chain)
+        return res.price
+
+    @property
+    def _sol_price(self) -> Decimal:
+        return self.get_native_price(ChainIdentifier.SOLANA_MAINNET)
+
+    @_sol_price.setter
+    def _sol_price(self, val: Any) -> None:
+        if val is not None:
+            self._native_price_service.set_price("solana", Decimal(str(val)))
+
+    @property
+    def _eth_price(self) -> Decimal:
+        return self.get_native_price(ChainIdentifier.BASE_MAINNET)
+
+    @_eth_price.setter
+    def _eth_price(self, val: Any) -> None:
+        if val is not None:
+            self._native_price_service.set_price("base_eth", Decimal(str(val)))
+
     def get_manual_trade_amount(self) -> dict[str, Any]:
         """Returns the currently configured manual trade amount and status."""
         amt = float(self.manual_trade_amount) if self.manual_trade_amount is not None else None
         curr = self.manual_trade_currency
-        sol_p = float(self._sol_price)
-        eth_p = float(self._eth_price)
+        sol_p = float(self.get_native_price(ChainIdentifier.SOLANA_MAINNET))
+        eth_p = float(self.get_native_price(ChainIdentifier.BASE_MAINNET))
         usd_val = None
         sol_val = None
         if amt is not None:
@@ -677,8 +728,8 @@ class PaperTradingEngine:
         """Returns available trading balances, portfolio exposure, and purchasing capacity."""
         cash_sol = float(self._cash_sol)
         cash_eth = float(self._cash_eth)
-        sol_p = float(self._sol_price)
-        eth_p = float(self._eth_price)
+        sol_p = float(self.get_native_price(ChainIdentifier.SOLANA_MAINNET))
+        eth_p = float(self.get_native_price(ChainIdentifier.BASE_MAINNET))
         total_cash_usd = cash_sol * sol_p + cash_eth * eth_p
         total_equity_usd = float(self._current_equity_usd())
 
@@ -688,7 +739,7 @@ class PaperTradingEngine:
             for lot in lots:
                 if lot.tokens_held > 0 and lot.status in (LotStatus.OPEN, LotStatus.PENDING_BUY, LotStatus.PENDING_SELL):
                     open_exposure_native += lot.cost_basis_native
-        open_exposure_usd = float(open_exposure_native * self._sol_price)
+        open_exposure_usd = float(open_exposure_native * self.get_native_price(ChainIdentifier.SOLANA_MAINNET))
 
         manual_info = self.get_manual_trade_amount()
         trade_amt_sol = manual_info.get("sol_equivalent") or (0.1 if manual_info.get("amount") is None else manual_info.get("amount"))
@@ -870,8 +921,13 @@ class PaperTradingEngine:
                     pnl_native, _ = self._position_book.apply_exit_decision(
                         decision, sell_price=exit_fill.effective_price, net_native_received=exit_fill.simulated_native_spent
                     )
-                    native_price = self._eth_price if decision.chain == ChainIdentifier.BASE_MAINNET else self._sol_price
-                    exit_pnl_usd = (pnl_native * native_price).quantize(Decimal("0.01"))
+                    native_price = self.get_native_price(decision.chain)
+                    entry_native_p = getattr(lot, "entry_native_price_usd", Decimal(0))
+                    if entry_native_p <= Decimal(0):
+                        entry_native_p = native_price
+                    exit_usd = exit_fill.simulated_native_spent * native_price
+                    entry_usd = getattr(lot, "cost_basis_native", Decimal(0)) * entry_native_p
+                    exit_pnl_usd = (exit_usd - entry_usd).quantize(Decimal("0.01"))
                     if decision.chain == ChainIdentifier.BASE_MAINNET:
                         self._cash_eth += exit_fill.simulated_native_spent
                     else:
@@ -1041,8 +1097,11 @@ class PaperTradingEngine:
         side_str = "SELL (PARTIAL)" if is_partial else "SELL"
         exit_label = f"{decision_reason} (partial)" if is_partial and "partial" not in decision_reason.lower() else decision_reason
 
-        native_price = self._eth_price if lot.chain == ChainIdentifier.BASE_MAINNET else self._sol_price
-        ep_usd = float(ep * native_price) if ep > 0 and native_price > 0 else 0.0
+        native_price = self.get_native_price(lot.chain)
+        entry_native_price = getattr(lot, "entry_native_price_usd", Decimal(0))
+        if entry_native_price <= Decimal(0):
+            entry_native_price = native_price
+        ep_usd = float(ep * entry_native_price) if ep > 0 and entry_native_price > 0 else 0.0
         xp_usd = float(xp * native_price) if xp > 0 and native_price > 0 else 0.0
 
         self._recent_closed_trades.append({
@@ -1117,8 +1176,9 @@ class PaperTradingEngine:
             status_icon = "🔴"
             title = f"STOP-LOSS ({pct:.2f}%)"
         unit = "ETH" if lot.chain == ChainIdentifier.BASE_MAINNET else "SOL"
-        native_price = self._eth_price if lot.chain == ChainIdentifier.BASE_MAINNET else self._sol_price
-        ep_str = self._format_price_clean(ep, native_price, unit)
+        native_price = self.get_native_price(lot.chain)
+        entry_native_price = getattr(lot, "entry_native_price_usd", Decimal(0)) or native_price
+        ep_str = self._format_price_clean(ep, entry_native_price, unit)
         xp_str = self._format_price_clean(xp, native_price, unit)
         t_str = f"{lot.token_address[:4]}..{lot.token_address[-4:]}"
         usd_sign = "+" if exit_pnl_usd > 0 else ""
@@ -1300,9 +1360,11 @@ class PaperTradingEngine:
         logger.debug("Runtime queues reinitialized (capacity=%d).", max_q)
 
     def _current_equity_usd(self) -> Decimal:
+        sol_p = self.get_native_price(ChainIdentifier.SOLANA_MAINNET)
+        eth_p = self.get_native_price(ChainIdentifier.BASE_MAINNET)
         cash_usd = (
-            self._cash_sol * self._sol_price
-            + self._cash_eth * self._eth_price
+            self._cash_sol * sol_p
+            + self._cash_eth * eth_p
         )
         # Mark-to-market value of open positions without double-counting realized PnL
         open_lots = self._position_book.get_all_open_lots()
@@ -1311,7 +1373,7 @@ class PaperTradingEngine:
             pool = self._pool_registry.get(lot.token_address, expected_token=lot.token_address)
             if pool is None and lot.pool_address:
                 pool = self._pool_registry.get(lot.pool_address, expected_token=lot.token_address)
-            native_p = self._eth_price if lot.chain == ChainIdentifier.BASE_MAINNET else self._sol_price
+            native_p = self.get_native_price(lot.chain)
             if pool and getattr(pool, "last_updated_block", 0) > 0 and pool.spot_price_native_per_token > Decimal(0):
                 unrealized_positions_usd += lot.tokens_remaining * pool.spot_price_native_per_token * native_p
             else:
@@ -1350,7 +1412,11 @@ class PaperTradingEngine:
             return False, "يوجد مركز مفتوح بالفعل لهذه العملة (Position already open)", None
 
         # Pre-check cash balance if amount_native is provided or if default manual_trade_amount is set
-        native_p = self._eth_price if chain_id == ChainIdentifier.BASE_MAINNET else self._sol_price
+        price_res = self._native_price_service.get_price(chain_id)
+        if not getattr(self._cfg, "allow_static_native_prices", False) and price_res.status != NativePriceStatus.OK:
+            return False, f"Rejected: Native asset price is {price_res.status.value} (age={price_res.age_s:.1f}s)", None
+
+        native_p = price_res.price
         unit = "ETH" if chain_id == ChainIdentifier.BASE_MAINNET else "SOL"
         available_cash = self._cash_eth if chain_id == ChainIdentifier.BASE_MAINNET else self._cash_sol
         fee_est = Decimal("0.002") if chain_id == ChainIdentifier.BASE_MAINNET else Decimal("0.005")
@@ -1518,6 +1584,7 @@ class PaperTradingEngine:
             hard_stop_loss_pct=getattr(self, "hard_stop_loss_pct", getattr(self._cfg, "hard_stop_loss_pct", 0.20)),
             custom_take_profit_pct=getattr(self, "custom_take_profit_pct", getattr(self._cfg, "custom_take_profit_pct", 0.50)),
             trailing_stop_from_peak_pct=getattr(self, "trailing_stop_from_peak_pct", getattr(self._cfg, "trailing_stop_from_peak_pct", 0.15)),
+            entry_native_price_usd=self.get_native_price(fill.chain),
         )
 
         # 6. Commit reserved slot and register pool
@@ -1608,7 +1675,11 @@ class PaperTradingEngine:
             )
 
         current_price = pool.spot_price_native_per_token if pool and pool.spot_price_native_per_token > 0 else open_lots[0].entry_price
-        native_price = self._eth_price if chain_id == ChainIdentifier.BASE_MAINNET else self._sol_price
+        price_res = self._native_price_service.get_price(chain_id)
+        native_price = price_res.price
+        is_price_degraded = price_res.status != NativePriceStatus.OK
+        if is_price_degraded:
+            logger.warning("manual_exit_position: Native price status is %s (price degraded); proceeding with exit", price_res.status.value)
         exit_mcap = pool.calculate_market_cap_usd(native_price) if pool else Decimal(0)
         exit_source = getattr(pool, "price_source", None) or "EmergencyManualFallback"
         exit_age = getattr(pool, "data_age_s", None) or 0.0
@@ -1621,6 +1692,7 @@ class PaperTradingEngine:
         from alpha_engine.models.state import ExitDecision
 
         for lot in list(open_lots):
+            lot.price_degraded = is_price_degraded
             lot.exit_price_source = exit_source
             lot.exit_data_age_s = float(exit_age)
             lot.exit_mcap_usd = exit_mcap
@@ -1664,7 +1736,12 @@ class PaperTradingEngine:
                 pnl_native, _ = self._position_book.apply_exit_decision(
                     decision, sell_price=exit_fill.effective_price, net_native_received=exit_fill.simulated_native_spent
                 )
-                exit_pnl_usd = (pnl_native * native_price).quantize(Decimal("0.01"))
+                entry_native_p = getattr(lot, "entry_native_price_usd", Decimal(0))
+                if entry_native_p <= Decimal(0):
+                    entry_native_p = native_price
+                exit_proceed_usd = exit_fill.simulated_native_spent * native_price
+                entry_cost_usd = getattr(lot, "cost_basis_native", Decimal(0)) * entry_native_p
+                exit_pnl_usd = (exit_proceed_usd - entry_cost_usd).quantize(Decimal("0.01"))
                 total_pnl_usd += exit_pnl_usd
                 total_native_recovered += exit_fill.simulated_native_spent
                 total_tokens_sold += exit_fill.tokens_acquired
@@ -1746,7 +1823,7 @@ class PaperTradingEngine:
 
         # 2. Liquidity Score (0 - 25)
         liq_subscore = 0.0
-        native_price = self._eth_price if chain == ChainIdentifier.BASE_MAINNET else self._sol_price
+        native_price = self.get_native_price(chain)
         if pool is not None and pool.native_reserve > Decimal(0):
             liq_usd = float(pool.native_reserve * native_price)
             if liq_usd >= 50_000:
@@ -2040,7 +2117,16 @@ class PaperTradingEngine:
         if self._ledger:
             await self._ledger.update_token_request_status(record.request_id, TokenRequestState.EXECUTION_PENDING)
 
-        native_p = self._eth_price if record.chain == ChainIdentifier.BASE_MAINNET else self._sol_price
+        price_res = self._native_price_service.get_price(record.chain)
+        if not getattr(self._cfg, "allow_static_native_prices", False) and price_res.status != NativePriceStatus.OK:
+            record.state = TokenRequestState.REJECTED
+            record.note = f"Native asset price {price_res.status.value}"
+            self._position_book.release_position_slot(token_address=record.token_address)
+            if self._ledger:
+                await self._ledger.update_token_request_status(record.request_id, TokenRequestState.REJECTED, note=record.note)
+            return
+
+        native_p = price_res.price
         unit = "ETH" if record.chain == ChainIdentifier.BASE_MAINNET else "SOL"
         available_cash = self._cash_eth if record.chain == ChainIdentifier.BASE_MAINNET else self._cash_sol
         fee_est = Decimal("0.002") if record.chain == ChainIdentifier.BASE_MAINNET else Decimal("0.005")
@@ -2158,12 +2244,13 @@ class PaperTradingEngine:
             custom_stop_loss_pct=cust_sl,
             hard_stop_loss_pct=hard_sl,
             entry_feature_vector=entry_vec,
+            entry_native_price_usd=self.get_native_price(fill.chain),
         )
         self._position_book.commit_slot_to_lot_by_token(record.token_address, record.chain)
         if pool is not None and lot.pool_address:
             self._pool_registry.set(lot.pool_address, pool)
 
-        native_price = self._eth_price if record.chain == ChainIdentifier.BASE_MAINNET else self._sol_price
+        native_price = self.get_native_price(record.chain)
         gas_usd = fill.simulated_gas_cost_usd or Decimal("0.05")
         gas_native = (gas_usd / native_price).quantize(Decimal("1e-18")) if native_price > Decimal(0) else Decimal("0.0005")
 
@@ -2431,9 +2518,7 @@ class PaperTradingEngine:
     ) -> Optional[PoolState]:
         """Fetch and parse live market pool state from DexScreener with data age tracking."""
         chain_str = "solana" if chain == ChainIdentifier.SOLANA_MAINNET else "base"
-        sol_p = Decimal(str(getattr(self._cfg, "sol_price_usd", self._sol_price or Decimal("150.0"))))
-        eth_p = Decimal(str(getattr(self._cfg, "eth_price_usd", self._eth_price or Decimal("3400.0"))))
-        native_price = sol_p if chain == ChainIdentifier.SOLANA_MAINNET else eth_p
+        native_price = self.get_native_price(chain)
 
         t_start = time.perf_counter()
         try:
@@ -2546,9 +2631,7 @@ class PaperTradingEngine:
     ) -> Optional[PoolState]:
         """Fetch and parse live market pool stats from GeckoTerminal with data age tracking."""
         chain_str = "solana" if chain == ChainIdentifier.SOLANA_MAINNET else "base"
-        sol_p = Decimal(str(getattr(self._cfg, "sol_price_usd", self._sol_price or Decimal("150.0"))))
-        eth_p = Decimal(str(getattr(self._cfg, "eth_price_usd", self._eth_price or Decimal("3400.0"))))
-        native_price = sol_p if chain == ChainIdentifier.SOLANA_MAINNET else eth_p
+        native_price = self.get_native_price(chain)
 
         try:
             oracle = self.market_oracle
@@ -2744,9 +2827,7 @@ class PaperTradingEngine:
                 return pool
             return self.get_or_create_initial_pool_state(chain, clean_token, pool_address)
 
-        sol_p = Decimal(str(getattr(self._cfg, "sol_price_usd", self._sol_price or Decimal("150.0"))))
-        eth_p = Decimal(str(getattr(self._cfg, "eth_price_usd", self._eth_price or Decimal("3400.0"))))
-        native_price = sol_p if is_sol else eth_p
+        native_price = self.get_native_price(chain)
 
         # 2. Setup HTTP session for parallel queries
         owns_session = False
@@ -3665,15 +3746,19 @@ class PaperTradingEngine:
                         min_fill_timestamp_ns=lot.open_timestamp_ns,
                     )
                     if exit_fill is not None:
-                        native_price = (
-                            self._eth_price
-                            if decision.chain == ChainIdentifier.BASE_MAINNET
-                            else self._sol_price
-                        )
+                        price_res = self._native_price_service.get_price(decision.chain)
+                        native_price = price_res.price
+                        if price_res.status != NativePriceStatus.OK:
+                            lot.price_degraded = True
                         pnl_native, _ = self._position_book.apply_exit_decision(
                             decision, sell_price=exit_fill.effective_price, net_native_received=exit_fill.simulated_native_spent
                         )
-                        exit_pnl_usd = (pnl_native * native_price).quantize(Decimal("0.01"))
+                        entry_native_p = getattr(lot, "entry_native_price_usd", Decimal(0))
+                        if entry_native_p <= Decimal(0):
+                            entry_native_p = native_price
+                        exit_proceed_usd = exit_fill.simulated_native_spent * native_price
+                        entry_cost_usd = getattr(lot, "cost_basis_native", Decimal(0)) * entry_native_p
+                        exit_pnl_usd = (exit_proceed_usd - entry_cost_usd).quantize(Decimal("0.01"))
                         if decision.chain == ChainIdentifier.BASE_MAINNET:
                             self._cash_eth += exit_fill.simulated_native_spent
                         else:
@@ -4096,11 +4181,7 @@ class PaperTradingEngine:
                     min_mcap_usd = Decimal(str(getattr(self, "min_market_cap_usd", getattr(self._cfg, "min_market_cap_usd", 10000.0))))
                 sig_mcap = getattr(signal_item, "market_cap_usd", None)
                 if (sig_mcap is None or sig_mcap <= Decimal("0")) and signal_item.pool_state is not None:
-                    native_p = (
-                        self._eth_price
-                        if signal_item.chain == ChainIdentifier.BASE_MAINNET
-                        else self._sol_price
-                    )
+                    native_p = self.get_native_price(signal_item.chain)
                     sig_mcap = signal_item.pool_state.calculate_market_cap_usd(native_price_usd=native_p)
 
                 if is_direct_dm:
@@ -4176,12 +4257,32 @@ class PaperTradingEngine:
                     )
                     continue
 
-                # 2. Concurrency & Exposure Locks (Directive 1)
-                native_p = (
-                    self._eth_price
-                    if signal_item.chain == ChainIdentifier.BASE_MAINNET
-                    else self._sol_price
-                )
+                # 2. Native Price Service Freshness & Divergence Gate (Fail-Closed)
+                price_res = self._native_price_service.get_price(signal_item.chain)
+                if not getattr(self._cfg, "allow_static_native_prices", False) and price_res.status != NativePriceStatus.OK:
+                    logger.warning(
+                        "GATING REJECT: Native price for %s is %s (age=%.1fs, source=%s). Rejecting BUY for %s.",
+                        signal_item.chain.value,
+                        price_res.status.value,
+                        price_res.age_s,
+                        price_res.source,
+                        signal_item.token_address[:10],
+                    )
+                    if hasattr(self, "dashboard_telemetry") and self.dashboard_telemetry:
+                        self.dashboard_telemetry.record_stage_event("price_degraded_rejected", 1)
+                        self.dashboard_telemetry.pipeline_counters["price_degraded_rejected"] = (
+                            self.dashboard_telemetry.pipeline_counters.get("price_degraded_rejected", 0) + 1
+                        )
+                    self._record_gatekeeper_eval(
+                        signal_item.token_address,
+                        signal_item.chain,
+                        f"Native price {price_res.status.value} (age={price_res.age_s:.1f}s)",
+                        passed=False,
+                    )
+                    self._position_book.release_position_slot(token_address=signal_item.token_address)
+                    continue
+
+                native_p = price_res.price
                 equity_usd = self._current_equity_usd()
                 equity_native = equity_usd / native_p if native_p > Decimal(0) else Decimal(0)
                 
@@ -4341,7 +4442,7 @@ class PaperTradingEngine:
 
             # Record Shadow Lots for Tournament Registry
             if hasattr(self, "_strategy_tournament") and self._strategy_tournament and signal_item.pool_state:
-                native_p = self._eth_price if signal_item.chain == ChainIdentifier.BASE_MAINNET else self._sol_price
+                native_p = self.get_native_price(signal_item.chain)
                 try:
                     self._strategy_tournament.evaluate_signal_and_record_shadow_lots(
                         signal=signal_item,
@@ -4542,6 +4643,7 @@ class PaperTradingEngine:
                     custom_stop_loss_pct=selected_params.hard_stop_loss_pct,
                     hard_stop_loss_pct=selected_params.hard_stop_loss_pct,
                     entry_feature_vector=entry_feature_vector,
+                    entry_native_price_usd=self.get_native_price(fill.chain),
                 )
 
                 if self._ledger:
@@ -4554,7 +4656,7 @@ class PaperTradingEngine:
                 self._position_book.commit_slot_to_lot_by_token(signal_item.token_address, lot.lot_id)
                 if signal_item.pool_state is not None and lot.pool_address:
                     self._pool_registry.set(lot.pool_address, signal_item.pool_state)
-                native_price = self._eth_price if signal_item.chain == ChainIdentifier.BASE_MAINNET else self._sol_price
+                native_price = self.get_native_price(signal_item.chain)
                 gas_usd = fill.simulated_gas_cost_usd or Decimal("0.05")
                 gas_native = (gas_usd / native_price).quantize(Decimal("1e-18")) if native_price > Decimal(0) else Decimal("0.0005")
 
@@ -4567,7 +4669,7 @@ class PaperTradingEngine:
                 lot.cost_basis_native = fill.simulated_native_spent + gas_native
 
                 unit = "ETH" if signal_item.chain == ChainIdentifier.BASE_MAINNET else "SOL"
-                native_price = self._eth_price if signal_item.chain == ChainIdentifier.BASE_MAINNET else self._sol_price
+                native_price = self.get_native_price(signal_item.chain)
                 p_str = self._format_price_clean(fill.effective_price, native_price, unit)
                 t_str = f"{fill.token_address[:4]}..{fill.token_address[-4:]}"
                 spent_val = float(fill.simulated_native_spent)
@@ -4629,11 +4731,7 @@ class PaperTradingEngine:
                 asyncio.create_task(self._broadcast_trade_alert(buy_alert))
 
             elif fill.side == OrderSide.SELL:
-                native_price = (
-                    self._eth_price
-                    if signal_item.chain == ChainIdentifier.BASE_MAINNET
-                    else self._sol_price
-                )
+                native_price = self.get_native_price(signal_item.chain)
                 pnl_native, _ = self._position_book.close_lots_fifo(
                     chain=signal_item.chain,
                     token_address=signal_item.token_address,
@@ -4708,7 +4806,7 @@ class PaperTradingEngine:
                 usd_sign = "+" if (realized_pnl_usd or 0) > 0 else ""
                 icon = "🟢" if is_win else "🔴"
                 unit = "ETH" if fill.chain == ChainIdentifier.BASE_MAINNET else "SOL"
-                native_price = self._eth_price if fill.chain == ChainIdentifier.BASE_MAINNET else self._sol_price
+                native_price = self.get_native_price(fill.chain)
                 xp_str = self._format_price_clean(xp, native_price, unit)
                 sell_alert = (
                     f"{icon} **SELL EXECUTED (Paper Trade)**\n\n"
@@ -5257,7 +5355,7 @@ class PaperTradingEngine:
 
             pool_st = self._pool_registry.get(mint) or (self._pool_registry.get(pool_addr) if pool_addr else None)
             if pool_st is None and liq_usd > 0:
-                sol_p = Decimal(str(getattr(self._cfg, "sol_price_usd", self._sol_price or 150.0)))
+                sol_p = self.get_native_price(ChainIdentifier.SOLANA_MAINNET)
                 liq_dec = Decimal(str(liq_usd))
                 native_res = liq_dec / Decimal("2.0") / sol_p if sol_p > 0 else Decimal("100.0")
                 token_res = (liq_dec / Decimal("2.0")) / Decimal(str(price_usd or 0.001)) if (price_usd or 0.001) > 0 else Decimal("1000000.0")
@@ -5320,7 +5418,7 @@ class PaperTradingEngine:
             if pool is None and lot.pool_address:
                 pool = self._pool_registry.get(lot.pool_address, expected_token=lot.token_address)
             curr_p = pool.spot_price_native_per_token if (pool and getattr(pool, "last_updated_block", 0) > 0) else lot.entry_price
-            native_p = self._eth_price if lot.chain == ChainIdentifier.BASE_MAINNET else self._sol_price
+            native_p = self.get_native_price(lot.chain)
             unrealized_usd = (lot.tokens_held * (curr_p - lot.entry_price)) * native_p
             pos_val_usd = float(lot.tokens_held * curr_p * native_p)
             dur_s = (now_ns - lot.open_timestamp_ns) / 1e9 if lot.open_timestamp_ns > 0 else 0.0
@@ -5418,7 +5516,7 @@ class PaperTradingEngine:
                                     if base_addr:
                                         pairs_by_mint.setdefault(base_addr, []).append(p)
 
-                            sol_price = Decimal(str(getattr(self._cfg, "sol_price_usd", self._sol_price or Decimal("150.0"))))
+                            sol_price = self.get_native_price(ChainIdentifier.SOLANA_MAINNET)
                             for lot in sol_lots:
                                 t_addr = lot.token_address
                                 existing_pool = self._pool_registry.get(t_addr) or (self._pool_registry.get(lot.pool_address) if lot.pool_address else None)
@@ -5561,7 +5659,7 @@ class PaperTradingEngine:
                                     if base_addr:
                                         pairs_by_mint.setdefault(base_addr, []).append(p)
 
-                            eth_price = Decimal(str(getattr(self.config, "eth_price_usd", self._eth_price or 2500.0)))
+                            eth_price = self.get_native_price(ChainIdentifier.BASE_MAINNET)
                             for lot in evm_lots:
                                 t_addr = lot.token_address.lower()
                                 t_pairs = [p for p in pairs_by_mint.get(t_addr, []) if str(p.get("chainId", "")).lower() == "base"]
@@ -5730,7 +5828,8 @@ class PaperTradingEngine:
                     if pool is None or lot.unresolved_price or pool.spot_price_native_per_token <= Decimal(0) or getattr(pool, "last_updated_block", 0) == 0:
                         lot.stale_price_retries += 1
                         if lot.stale_price_retries >= 5 and dur_s > 120.0:
-                            native_price = self._eth_price if lot.chain == ChainIdentifier.BASE_MAINNET else self._sol_price
+                            native_price = self.get_native_price(lot.chain)
+                            entry_native_p = getattr(lot, "entry_native_price_usd", Decimal(0)) or native_price
                             logger.error(
                                 "Lot %s (%s) market is genuinely illiquid or unavailable (retries=%d, dur=%.1fs). Safely writing off under ILLIQUID_MARKET without fabricating synthetic market quotes.",
                                 lot.lot_id[:8],
@@ -5738,7 +5837,7 @@ class PaperTradingEngine:
                                 lot.stale_price_retries,
                                 dur_s,
                             )
-                            loss_usd = -float(lot.cost_basis_native * native_price)
+                            loss_usd = -float(lot.cost_basis_native * entry_native_p)
                             self._position_book.write_off_lot(lot)
                             new_equity = self._current_equity_usd()
                             is_launch = (getattr(lot, "exit_profile", None) not in (ExitProfile.REVIVAL_SWING, ExitProfile.EARLY_RALLY_SWING) and 
@@ -5781,7 +5880,7 @@ class PaperTradingEngine:
                             continue
 
                     current_price = pool.spot_price_native_per_token
-                    native_p = self._eth_price if lot.chain == ChainIdentifier.BASE_MAINNET else self._sol_price
+                    native_p = self.get_native_price(lot.chain)
                     lot.exit_price_source = getattr(pool, "price_source", None) or "DEX"
                     lot.exit_data_age_s = float(getattr(pool, "data_age_s", 0.0) or (now_s - getattr(pool, "timestamp_s", now_s)))
                     lot.exit_mcap_usd = pool.calculate_market_cap_usd(native_p)
@@ -5792,7 +5891,7 @@ class PaperTradingEngine:
                     )
                     # Update shadow strategy tournament prices
                     if hasattr(self, "_strategy_tournament") and self._strategy_tournament:
-                        native_p = self._eth_price if lot.chain == ChainIdentifier.BASE_MAINNET else self._sol_price
+                        native_p = self.get_native_price(lot.chain)
                         self._strategy_tournament.update_token_prices(
                             token_address=lot.token_address,
                             current_price=current_price,
@@ -5845,15 +5944,19 @@ class PaperTradingEngine:
                             min_fill_timestamp_ns=lot.open_timestamp_ns,
                         )
                         if exit_fill is not None and exit_fill.effective_price > Decimal(0):
-                            native_price = (
-                                self._eth_price
-                                if decision.chain == ChainIdentifier.BASE_MAINNET
-                                else self._sol_price
-                            )
+                            price_res = self._native_price_service.get_price(decision.chain)
+                            native_price = price_res.price
+                            if price_res.status != NativePriceStatus.OK:
+                                lot.price_degraded = True
                             pnl_native, _ = self._position_book.apply_exit_decision(
                                 decision, sell_price=exit_fill.effective_price, net_native_received=exit_fill.simulated_native_spent
                             )
-                            exit_pnl_usd = (pnl_native * native_price).quantize(Decimal("0.01"))
+                            entry_native_p = getattr(lot, "entry_native_price_usd", Decimal(0))
+                            if entry_native_p <= Decimal(0):
+                                entry_native_p = native_price
+                            exit_proceed_usd = exit_fill.simulated_native_spent * native_price
+                            entry_cost_usd = getattr(lot, "cost_basis_native", Decimal(0)) * entry_native_p
+                            exit_pnl_usd = (exit_proceed_usd - entry_cost_usd).quantize(Decimal("0.01"))
                             if decision.chain == ChainIdentifier.BASE_MAINNET:
                                 self._cash_eth += exit_fill.simulated_native_spent
                             else:
@@ -6010,7 +6113,7 @@ class PaperTradingEngine:
                         for s_tok in (shadow_tokens - active_token_addrs):
                             s_pool = self._pool_registry.get(s_tok)
                             if s_pool and s_pool.spot_price_native_per_token > 0:
-                                s_native_p = self._eth_price if s_pool.chain == ChainIdentifier.BASE_MAINNET else self._sol_price
+                                s_native_p = self.get_native_price(s_pool.chain)
                                 self._strategy_tournament.update_token_prices(
                                     token_address=s_tok,
                                     current_price=s_pool.spot_price_native_per_token,
@@ -6079,6 +6182,7 @@ class PaperTradingEngine:
             self._ledger = ledger
             self.tracer.ledger = self._ledger
             self.tracer.start_worker()
+            await self._native_price_service.start()
             await self._sync_ledger_settings()
 
             # Restore open lots from ledger to prevent state loss across restarts
@@ -6140,7 +6244,8 @@ class PaperTradingEngine:
 
             self._executor = PaperExecutor(
                 position_book=self._position_book,
-                native_price_usd=cfg.eth_price_usd,
+                native_price_usd=self.get_native_price(ChainIdentifier.SOLANA_MAINNET),
+                price_service=self._native_price_service,
             )
 
             svm_failovers = []
@@ -6437,6 +6542,10 @@ class PaperTradingEngine:
                     # 4. Flush traces and checkpoint SQLite database
                     try:
                         await self.tracer.stop_worker()
+                    except Exception:
+                        pass
+                    try:
+                        await self._native_price_service.stop()
                     except Exception:
                         pass
                     await ledger.checkpoint()

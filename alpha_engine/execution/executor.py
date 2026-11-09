@@ -7,11 +7,11 @@ Python 3.11+
 
 from __future__ import annotations
 
-import logging
+import logging 
 import time
 from decimal import Decimal
 
-from typing import Optional
+from typing import Optional, Any
 
 from alpha_engine.execution.book import PositionBook
 from alpha_engine.execution.bundle import PrivateTxRouter
@@ -50,11 +50,12 @@ class PaperExecutor:
     def __init__(
         self,
         position_book: PositionBook,
-        native_price_usd: Decimal,
+        native_price_usd: Decimal = Decimal(0),
         historical_win_rate: float = 0.5,
         avg_win_native: Decimal = Decimal("0.1"),
         avg_loss_native: Decimal = Decimal("0.05"),
         private_router: Optional[PrivateTxRouter] = None,
+        price_service: Any = None,
     ) -> None:
         self._positions = position_book
         self._native_price_usd = native_price_usd
@@ -62,6 +63,7 @@ class PaperExecutor:
         self._avg_win = avg_win_native
         self._avg_loss = avg_loss_native
         self._private_router = private_router or PrivateTxRouter()
+        self._price_service = price_service
 
     def update_native_price(self, new_price: Decimal) -> None:
         """Update the native asset price used for USD conversions."""
@@ -123,9 +125,19 @@ class PaperExecutor:
         )
         adjusted_pool = latency_result.adjusted_pool_state
 
+        current_native_price = self._native_price_usd
+        if self._price_service is not None:
+            try:
+                res = self._price_service.get_price(signal.chain)
+                p = res[0] if isinstance(res, (tuple, list)) else getattr(res, "price", None)
+                if p is not None and p > Decimal(0):
+                    current_native_price = p
+            except Exception:
+                pass
+
         if fixed_trade_amount_native is not None and fixed_trade_amount_native > Decimal(0):
             native_in = fixed_trade_amount_native
-            usd_at_risk = native_in * self._native_price_usd
+            usd_at_risk = native_in * current_native_price
             trade_gas_usd = gas_cost_usd(signal.chain)
             gas_threshold = trade_gas_usd * GAS_MULTIPLE_GATE
             if usd_at_risk < gas_threshold:
@@ -157,7 +169,7 @@ class PaperExecutor:
             sizing = compute_position_size(
                 kelly_fraction=kelly_f,
                 portfolio_equity_usd=portfolio_equity_usd,
-                native_price_usd=self._native_price_usd,
+                native_price_usd=current_native_price,
                 chain=signal.chain,
                 side=side,
                 max_position_fraction=max_position_fraction,

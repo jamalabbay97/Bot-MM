@@ -1794,11 +1794,24 @@ class TelegramIngester:
         signal_q_size = metrics.get("signal_q_size", 0)
         signal_q_max = metrics.get("signal_q_max", 100)
 
+        # Native Price Service Status
+        native_status_str = "🟢 OK"
+        target = self.execution_target
+        if target and hasattr(target, "native_price_service"):
+            svc = target.native_price_service
+            if getattr(getattr(target, "_cfg", None), "allow_static_native_prices", False):
+                native_status_str = "⚠️ STATIC PRICES"
+            else:
+                sol_p, sol_age, sol_st = svc.get_price(ChainIdentifier.SOLANA_MAINNET)
+                eth_p, eth_age, eth_st = svc.get_price(ChainIdentifier.BASE_MAINNET)
+                native_status_str = f"SOL: ${float(sol_p):.2f} [{sol_st.value}] | ETH: ${float(eth_p):.2f} [{eth_st.value}]"
+
         msg = (
             "📊 **تقرير حالة المحرك (Bot-MM Engine Status Report)**\n\n"
             f"⏱ **مدة التشغيل (Uptime):** `{uptime_str}`\n"
             f"🧠 **استهلاك الذاكرة (Memory RSS):** `{float(rss_mb):.1f} MB`\n"
             f"💰 **رأس مال المحفظة (Portfolio Equity):** `{equity_str}`\n"
+            f"🪙 **أسعار الأصول (Native Prices):** `{native_status_str}`\n"
             f"📈 **الأرباح المحققة (Realized PnL):** `{pnl_str}`\n"
             f"📦 **المراكز النشطة - Active Lots:** `{open_lots_val}`\n"
             f"🎯 **معدل النجاح (Win Rate WR):** `{wr_str}`\n"
@@ -2764,7 +2777,7 @@ class TelegramIngester:
         total_sol = summary.get("total_equity_sol", "0.0")
         total_usd = summary.get("total_equity_usd", "0.0")
         pos_count = summary.get("open_positions_count", 0)
-        sol_price = summary.get("sol_price_usd", "150.0")
+        sol_price = summary.get("sol_price_usd") or "0.0"
 
         # Check sufficiency against current manual amount
         sufficiency_status = "⚪ غير محدد (Dynamic Sizing)"
@@ -2900,9 +2913,14 @@ class TelegramIngester:
 
     def _calculate_equivalent_value_str(self, amt: Decimal, curr: str) -> str:
         """Calculate approximate counterpart currency string for user reference."""
-        sol_price = 150.0
+        sol_price = 0.0
         target = self.execution_target
-        if target and hasattr(target, "_current_sol_price_usd"):
+        if target and hasattr(target, "get_native_price"):
+            try:
+                sol_price = float(target.get_native_price(ChainIdentifier.SOLANA_MAINNET))
+            except Exception:
+                pass
+        elif target and hasattr(target, "_current_sol_price_usd"):
             try:
                 sol_price = float(target._current_sol_price_usd)
             except Exception:
