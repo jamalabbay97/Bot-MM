@@ -7,7 +7,6 @@ Python 3.11+ | aiosqlite | SQLite WAL Mode
 
 from __future__ import annotations
 
-import asyncio
 import logging
 import time
 from decimal import Decimal
@@ -190,6 +189,11 @@ class WhitelistDatabase:
         wr = win_rate if win_rate > 1.0 else win_rate * 100.0
         wins = int(total_t * (wr / 100.0))
         losses = total_t - wins
+        meta = dict(kwargs.get("custom_metadata", {}))
+        if profit_factor > 0.0:
+            meta["profit_factor"] = profit_factor
+        if max_drawdown_pct > 0.0:
+            meta["max_drawdown_pct"] = max_drawdown_pct
         profile = WalletProfile(
             wallet_address=wallet_address,
             chain=chain,
@@ -208,6 +212,7 @@ class WhitelistDatabase:
             first_tx_timestamp=int(kwargs.get("first_tx_timestamp", time.time() - 30 * 86400)),
             last_tx_timestamp=int(kwargs.get("last_tx_timestamp", time.time())),
             cluster_tag=kwargs.get("cluster_tag"),
+            custom_metadata=meta,
             rejection_reasons=[],
         )
         return await self.upsert_wallet(profile, status=status)

@@ -23,7 +23,7 @@ import asyncio
 import logging
 import time
 from decimal import Decimal
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -33,7 +33,7 @@ from alpha_engine.engine.strategy.risk_manager import RiskEngine
 from alpha_engine.execution.book import PositionBook
 from alpha_engine.execution.executor import PaperExecutor
 from alpha_engine.math.cpmm import get_initial_bonding_curve_pool
-from alpha_engine.math.sizing import half_kelly_fraction, shrink_win_rate
+from alpha_engine.math.sizing import shrink_win_rate
 from alpha_engine.models.enums import (
     ChainIdentifier,
     ExecutionVenue,
@@ -43,8 +43,7 @@ from alpha_engine.models.enums import (
     SignalStrength,
 )
 from alpha_engine.models.events import SecurityReport, SignalEvent, ShutdownSentinel
-from alpha_engine.models.state import PoolState
-from alpha_engine.pricing.native_price_service import NativePriceService, NativePriceStatus, PriceResult
+from alpha_engine.pricing.native_price_service import NativePriceStatus, PriceResult
 
 
 class MockPriceService:
@@ -113,11 +112,13 @@ def test_paper_executor_requires_price_service_and_no_update_native_price():
 
     # Attempting to construct without price_service must raise TypeError or ValueError
     with pytest.raises((TypeError, ValueError)):
-        PaperExecutor(position_book=book)
+        kwargs_no_svc = {"position_book": book}
+        PaperExecutor(**kwargs_no_svc)
 
     # Attempting to pass native_price_usd must raise TypeError (parameter removed)
     with pytest.raises(TypeError):
-        PaperExecutor(position_book=book, native_price_usd=Decimal("150.0"))
+        kwargs_legacy = {"position_book": book, "native_price_usd": Decimal("150.0")}
+        PaperExecutor(**kwargs_legacy)
 
     # Constructing with price_service succeeds
     price_svc = MockPriceService()

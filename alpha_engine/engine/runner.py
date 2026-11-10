@@ -6149,6 +6149,7 @@ class PaperTradingEngine:
         executor: PaperExecutor,
         ledger: SQLiteLedger,
     ) -> None:
+        _ = executor
         stats = await ledger.get_closed_trade_stats()
         self.risk_engine.update_ledger_stats(stats)
         self._trades_since_kelly_refresh = 0

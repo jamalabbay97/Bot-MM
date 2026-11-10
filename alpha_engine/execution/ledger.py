@@ -68,6 +68,7 @@ class AsyncRLock:
         return self
 
     async def __aexit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
+        _ = (exc_type, exc_val, exc_tb)
         self.release()
 
 

@@ -11,10 +11,9 @@ Comprehensive unit and integration test suite validating:
 7. Telegram & logging messages reporting Price Source, Data Age, and Market Cap
 """
 
-import asyncio
 import time
 from decimal import Decimal
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, patch
 
 import pytest
 

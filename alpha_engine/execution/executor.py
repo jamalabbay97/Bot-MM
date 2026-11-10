@@ -23,11 +23,8 @@ from alpha_engine.math.cpmm import (
 from alpha_engine.math.mev import simulate_latency
 from alpha_engine.math.sizing import (
     GAS_MULTIPLE_GATE,
-    KellySizing,
     apply_paper_trading_drag,
-    compute_position_size,
     gas_cost_usd,
-    half_kelly_fraction,
 )
 from alpha_engine.models.decisions import DecisionSignal
 from alpha_engine.models.enums import (
@@ -76,6 +73,7 @@ class PaperExecutor:
         Optionally applies realistic paper market drag (0.3% fee + 0.005 gas + 1% slippage).
         BUY signals require explicit fixed_trade_amount_native (>0) from the sizing authority.
         """
+        _ = max_position_fraction
         side = signal.suggested_side
         pool = getattr(signal, "pool_state", None)
         if pool is None or pool.token_reserve <= Decimal(0) or pool.native_reserve <= Decimal(0):
