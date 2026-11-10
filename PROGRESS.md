@@ -34,14 +34,42 @@ Track progress across all identified defects and phases. All items must satisfy 
 ---
 
 ## Issue 2 SOL sized with ETH price + double sizing + Kelly defaults
-- [ ] reproduced
-- [ ] red test
-- [ ] fix
-- [ ] green test
-- [ ] mutation check
-- [ ] sweep done
-- [ ] wiring proof
-- [ ] README/docs updated
+- [x] reproduced
+  - `runner.py`: Constructed `PaperExecutor(native_price_usd=cfg.eth_price_usd)` and passed `fixed_trade_amount_native=None` for autonomous buys.
+  - Sizing occurred twice: runner computed `preliminary_cost` with per-chain price, but executor silently re-sized via Kelly using `self._native_price_usd` ($3,400 ETH price).
+  - With default config (equity = $8,300, SOL = $150, ETH = $3,400), runner balance-checked 1% on SOL ($83 / $150 = 0.5533 SOL), but executor bought 1% of $8300 / $3400 = 0.0244 SOL (22.667x discrepancy).
+  - `PaperExecutor` defaulted `win_rate=0.5, avg_win=0.1, avg_loss=0.05`, fabricating positive Kelly edge before trades occurred.
+- [x] red test
+  - `tests/test_issue2_execution_sizing.py`: 6 tests created covering:
+    1. `test_paper_executor_requires_price_service_and_no_update_native_price`: constructing without `price_service` fails; `native_price_usd` and `update_native_price()` removed.
+    2. `test_sol_and_eth_sizes_inversely_proportional_to_prices`: SOL and ETH trades with equal USD risk produce native sizes inversely proportional to prices.
+    3. `test_kelly_calibration_and_shrinkage`: conservative uncalibrated fraction (<30 closed trades), Kelly with Bayesian shrinkage toward 0.5 (>=30 closed trades), negative edge rejection.
+    4. `test_sized_equals_balance_checked_equals_filled_all_modes`: exact equality of sized, balance-checked, and filled amounts across autonomous, manual-USD, and manual-native modes.
+    5. `test_integration_runner_signal_processing_per_chain_pricing`: end-to-end runner signal processing with SOL ($200) vs Base/ETH ($4,000).
+    6. `test_regression_22_7x_discrepancy_eliminated`: verifies 22.7x audit discrepancy is resolved.
+- [x] fix
+  - `alpha_engine/pricing/native_price_service.py`: Dynamic per-chain pricing injection.
+  - `alpha_engine/execution/executor.py`: Removed `native_price_usd` and `update_native_price()`; injected `price_service`; deleted duplicate Kelly sizing from `execute_signal()`; enforced explicit `fixed_trade_amount_native` on BUY; updated fill `kelly_fraction` to reflect real equity fraction.
+  - `alpha_engine/engine/strategy/risk_manager.py`: Established `calculate_order_size()` as single sizing authority; added `update_ledger_stats()`; implemented uncalibrated fixed fraction gating (<30 closed trades) and Bayesian shrinkage of win rate toward 0.5.
+  - `alpha_engine/math/sizing.py`: Added `shrink_win_rate()`; updated `half_kelly_fraction()` to use explicit 0.5 multiplier.
+  - `alpha_engine/engine/runner.py`: Balance-check exact sized amount from `risk_engine.calculate_order_size()`, pass explicit size and equity fraction to executor, update open exposure USD per-chain.
+  - `alpha_engine/config.py`: Added `kelly_min_closed_trades` (30), `kelly_uncalibrated_fraction` (0.01), `kelly_multiplier` (0.5), `kelly_shrinkage_trades` (20).
+- [x] green test
+  - `.venv/bin/pytest tests/test_issue2_execution_sizing.py` -> 6 passed in 22.53s.
+  - `.venv/bin/pytest` -> 442 passed in 118.82s.
+- [x] mutation check
+  - Mutation 1: Inverted calibration check in `risk_manager.py` (`if total_closed >= min_closed`); verified `test_kelly_calibration_and_shrinkage` failed immediately (`AssertionError: assert not True`); restored and verified green.
+  - Mutation 2: Inverted per-chain pricing in `runner.py` to always size with ETH price; verified `test_integration_runner_signal_processing_per_chain_pricing` failed with `assert Decimal('0.05') == Decimal('1.0')`; restored and verified green.
+- [x] sweep done
+  - Swept all `PaperExecutor` constructor usages across test suite (`test_manual_trade_amount_and_balance.py`, `test_platform_identification.py`, `test_strict_realtime_pricing.py`, `test_hft_risk_and_exits.py`, `test_audit_remediation_and_concurrency.py`, `test_strategy_v2_integration.py`, `test_pending_launch_buffer_telemetry_and_paper_exec.py`, `test_enterprise_engine_hardening.py`, `test_dex_trading_integration.py`, `test_execution_pricing_and_dedup.py`).
+  - Audited `alpha_engine/ruflo/swarm.py` and replaced static fallbacks with price service.
+  - Ran `tools/audit/native_price_literals.py` -> 0 findings across repository.
+- [x] wiring proof
+  - `runner.py`: `PaperTradingEngine` instantiates `PaperExecutor(position_book=self._position_book, price_service=self._native_price_service)` and passes `self._executor` to `RufloSwarmCoordinator`.
+  - Signal processing loop calls `self.risk_engine.calculate_order_size(...)` with live per-chain `native_p` from `self._native_price_service.get_price(signal_item.chain)`, balance-checks `sizing_res.native_trade_size`, and forwards `fixed_trade_amount_native=sizing_res.native_trade_size` to `executor.execute_signal(...)`.
+- [x] README/docs updated
+  - `README.md`: Reconciled Half-Kelly equation to $f^* = \frac{p \cdot b - q}{b} \times 0.5$, documented uncalibrated phase (<30 trades) and Bayesian shrinkage.
+  - `.env.example`: Added `KELLY_MIN_CLOSED_TRADES`, `KELLY_UNCALIBRATED_FRACTION`, `KELLY_MULTIPLIER`, `KELLY_SHRINKAGE_TRADES`.
 
 ---
 

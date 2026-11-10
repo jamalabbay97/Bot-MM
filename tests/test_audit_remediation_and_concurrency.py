@@ -48,7 +48,7 @@ async def make_test_engine(tmp_path, max_active_positions=3, max_q_size=10):
     await engine._ledger.__aenter__()
     engine._executor = PaperExecutor(
         position_book=engine._position_book,
-        native_price_usd=cfg.sol_price_usd,
+        price_service=engine._native_price_service,
     )
     engine._gatekeeper = MagicMock()
     clean_report = SecurityReport(
@@ -333,7 +333,7 @@ async def test_scenario_08_restart_recovery_from_ledger(tmp_path):
     engine1 = AlphaEngine(cfg)
     async with SQLiteLedger(cfg.db_path) as ledger1:
         engine1._ledger = ledger1
-        engine1._executor = PaperExecutor(position_book=engine1._position_book, native_price_usd=cfg.sol_price_usd)
+        engine1._executor = PaperExecutor(position_book=engine1._position_book, price_service=engine1._native_price_service)
         engine1._gatekeeper = MagicMock()
         clean_rep = SecurityReport(
             token_address=t1, chain=ChainIdentifier.SOLANA_MAINNET, tier=SecurityTier.CLEAN,

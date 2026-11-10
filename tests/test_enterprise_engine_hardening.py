@@ -27,6 +27,7 @@ from alpha_engine.engine.staging import StagedToken, VolumeBucket
 from alpha_engine.execution.book import PositionBook
 from alpha_engine.execution.bundle import DynamicTipAllocator, execute_scalp_via_private_relay
 from alpha_engine.execution.executor import PaperExecutor, PrivateTxRouter
+from alpha_engine.pricing.native_price_service import NativePriceService
 from alpha_engine.ingestion.dex_metrics import DEXMetricsAggregator
 from alpha_engine.models.decisions import DecisionSignal
 from alpha_engine.models.enums import (
@@ -437,7 +438,12 @@ def test_120s_two_wallet_copy_trade_gating():
 async def test_scalp_private_relay_execution():
     router = PrivateTxRouter()
     book = PositionBook()
-    executor = PaperExecutor(position_book=book, native_price_usd=Decimal("200.0"), private_router=router)
+    price_service = NativePriceService(
+        allow_static_prices=True,
+        static_sol_price=Decimal("150.0"),
+        static_eth_price=Decimal("200.0"),
+    )
+    executor = PaperExecutor(position_book=book, price_service=price_service, private_router=router)
 
     pool = PoolState(
         pool_address="0x" + "9" * 40,
@@ -469,6 +475,7 @@ async def test_scalp_private_relay_execution():
         signal=signal,
         portfolio_equity_usd=Decimal("10000.0"),
         priority_percentile="p95",
+        fixed_trade_amount_native=Decimal("0.5"),
     )
     assert fill is not None
     assert fill.token_address == signal.token_address
@@ -494,7 +501,12 @@ async def test_scalp_private_relay_execution():
 @pytest.mark.anyio
 async def test_swing_dca_batching_execution():
     book = PositionBook()
-    executor = PaperExecutor(position_book=book, native_price_usd=Decimal("200.0"))
+    price_service = NativePriceService(
+        allow_static_prices=True,
+        static_sol_price=Decimal("150.0"),
+        static_eth_price=Decimal("200.0"),
+    )
+    executor = PaperExecutor(position_book=book, price_service=price_service)
 
     pool = PoolState(
         pool_address="0x" + "9" * 40,
@@ -525,6 +537,7 @@ async def test_swing_dca_batching_execution():
         signal=signal,
         portfolio_equity_usd=Decimal("10000.0"),
         num_batches=3,
+        fixed_trade_amount_native=Decimal("0.5"),
     )
     assert len(fills) == 3
     total_spent = sum(f.simulated_native_spent for f in fills)
@@ -589,7 +602,12 @@ def test_sentiment_sensitivity_weight_tuning():
 async def test_post_entry_contract_mutation_and_emergency_exit():
     feedback = AdaptiveFeedbackEngine()
     book = PositionBook()
-    executor = PaperExecutor(position_book=book, native_price_usd=Decimal("200.0"))
+    price_service = NativePriceService(
+        allow_static_prices=True,
+        static_sol_price=Decimal("150.0"),
+        static_eth_price=Decimal("200.0"),
+    )
+    executor = PaperExecutor(position_book=book, price_service=price_service)
     token = "0x" + "7" * 40
     pool = PoolState(
         pool_address="0x" + "8" * 40,

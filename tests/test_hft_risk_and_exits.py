@@ -623,9 +623,15 @@ async def test_executor_exit_paper_fill_validates_and_succeeds():
     """Verify that PaperExecutor.execute_exit generates a valid PaperFill with positive portfolio_equity_usd."""
     from alpha_engine.execution.executor import PaperExecutor
     from alpha_engine.models.state import PoolState
+    from alpha_engine.pricing.native_price_service import NativePriceService
 
     book = PositionBook()
-    executor = PaperExecutor(position_book=book, native_price_usd=Decimal("150.0"))
+    price_service = NativePriceService(
+        allow_static_prices=True,
+        static_sol_price=Decimal("150.0"),
+        static_eth_price=Decimal("3400.0"),
+    )
+    executor = PaperExecutor(position_book=book, price_service=price_service)
     pool = PoolState(
         pool_address="Pool1111111111111111111111111111111111111111",
         chain=ChainIdentifier.SOLANA_MAINNET,

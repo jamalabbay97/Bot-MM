@@ -160,9 +160,11 @@ Located in `alpha_engine/council/`, the Council represents a decentralized hedge
 - **Differentiated Lifecycle Strategies**:
   - **Fast-Launch Early Momentum Strategy** (Token age $\le 30$ min or Pump.fun curve): Weights are 60% Forensic, 30% Quant, 10% Reach. Passing score $\ge 60/100$.
   - **Professional Market Strategy** (Mature / Revival tokens): Weights are 35% Forensic, 45% Quant, 20% Reach. Minimum 2 approvals required; passing score $\ge 65/100$.
-- **Fractional Kelly Sizing**: Dynamically computes position allocation using recent system win rates:
-  $$f^* = \frac{p \cdot b - q}{b} \times 0.25$$
-  Bounded between $0.35\%$ and $2.0\%$ of total equity.
+- **Fractional Half-Kelly Sizing**: Dynamically computes position allocation using historical closed trades from the ledger:
+  - **Uncalibrated State (< 30 closed trades)**: Uses a conservative fixed fraction (default $1.0\%$, configurable via `KELLY_UNCALIBRATED_FRACTION`) to prevent inventing statistical edge.
+  - **Calibrated State ($\ge 30$ closed trades)**: Calculates Half-Kelly with Bayesian win-rate shrinkage toward $0.5$ over small samples:
+  $$f^* = \frac{p \cdot b - q}{b} \times 0.5$$
+  Bounded by configurable portfolio risk caps (e.g. $1.5\%$ - $2.0\%$) and gated by gas friction thresholds.
 
 ---
 

@@ -92,7 +92,6 @@ async def test_price_changes_mid_run_updates_equity_pnl_mcap_and_conversions(tmp
     engine._native_price_service = service
     engine._executor = PaperExecutor(
         position_book=engine._position_book,
-        native_price_usd=Decimal("100.0"),
         price_service=service,
     )
 
@@ -224,7 +223,6 @@ async def test_stale_price_blocks_entries_allows_exits_flagged_degraded(tmp_path
     engine._native_price_service = service
     engine._executor = PaperExecutor(
         position_book=engine._position_book,
-        native_price_usd=Decimal("150.0"),
         price_service=service,
     )
 
@@ -340,7 +338,6 @@ async def test_source_disagreement_beyond_tolerance_blocks_entries(tmp_path):
     engine._native_price_service = service
     engine._executor = PaperExecutor(
         position_book=engine._position_book,
-        native_price_usd=Decimal("150.0"),
         price_service=service,
     )
 
@@ -467,7 +464,6 @@ async def test_integration_runner_entry_path_uses_live_native_price(tmp_path):
     engine._native_price_service = service
     engine._executor = PaperExecutor(
         position_book=engine._position_book,
-        native_price_usd=Decimal("200.0"),
         price_service=service,
     )
 

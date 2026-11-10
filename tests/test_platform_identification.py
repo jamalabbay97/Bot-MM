@@ -26,6 +26,7 @@ from alpha_engine.chat_interface import ConversationalSupervisor
 from alpha_engine.execution.book import PositionBook
 from alpha_engine.execution.executor import PaperExecutor
 from alpha_engine.execution.ledger import SQLiteLedger
+from alpha_engine.pricing.native_price_service import NativePriceService
 from alpha_engine.ingestion.telegram import TelegramIngester
 from alpha_engine.models.enums import (
     ChainIdentifier,
@@ -108,9 +109,14 @@ def test_paper_fill_and_open_lot_platform_retention():
 async def test_executor_terminal_logging_pump_fun_and_dex_scan(caplog):
     """Verify PaperExecutor terminal logs clearly display Platform=Pump.fun and Platform=DexScan."""
     book = PositionBook()
+    price_service = NativePriceService(
+        allow_static_prices=True,
+        static_sol_price=Decimal("150.0"),
+        static_eth_price=Decimal("3400.0"),
+    )
     executor = PaperExecutor(
         position_book=book,
-        native_price_usd=Decimal("150.0"),
+        price_service=price_service,
     )
 
     # 1. Execute BUY signal on Pump.fun token
@@ -146,7 +152,11 @@ async def test_executor_terminal_logging_pump_fun_and_dex_scan(caplog):
 
     with caplog.at_level(logging.INFO):
         caplog.clear()
-        fill_pump = await executor.execute_signal(signal_pump, portfolio_equity_usd=Decimal("10000.0"))
+        fill_pump = await executor.execute_signal(
+            signal_pump,
+            portfolio_equity_usd=Decimal("10000.0"),
+            fixed_trade_amount_native=Decimal("1.0"),
+        )
         assert fill_pump is not None
         assert fill_pump.platform == "Pump.fun"
         # Check that Platform=Pump.fun is present in the log records
@@ -192,7 +202,11 @@ async def test_executor_terminal_logging_pump_fun_and_dex_scan(caplog):
 
     with caplog.at_level(logging.INFO):
         caplog.clear()
-        fill_dex = await executor.execute_signal(signal_dex, portfolio_equity_usd=Decimal("10000.0"))
+        fill_dex = await executor.execute_signal(
+            signal_dex,
+            portfolio_equity_usd=Decimal("10000.0"),
+            fixed_trade_amount_native=Decimal("0.05"),
+        )
         assert fill_dex is not None
         assert fill_dex.platform == "DexScan"
         assert any("Platform=DexScan" in record.message for record in caplog.records)

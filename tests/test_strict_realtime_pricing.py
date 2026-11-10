@@ -45,7 +45,7 @@ async def engine(tmp_path):
     await eng._ledger.__aenter__()
     eng._executor = PaperExecutor(
         position_book=eng._position_book,
-        native_price_usd=cfg.sol_price_usd,
+        price_service=eng._native_price_service,
     )
     yield eng
     await eng._ledger.__aexit__(None, None, None)

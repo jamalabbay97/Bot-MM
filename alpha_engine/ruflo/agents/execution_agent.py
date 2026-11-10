@@ -53,9 +53,20 @@ class ExecutionLedgerAgent(BaseRufloAgent):
         self.position_book = position_book or PositionBook()
         self.ledger = ledger
         self.private_router = private_router or PrivateTxRouter()
+        price_service = kwargs.get("price_service") or getattr(config, "native_price_service", None)
+        if price_service is None:
+            from alpha_engine.pricing.native_price_service import NativePriceService
+            allow_static = getattr(config, "allow_static_native_prices", False) if config else False
+            sol_p = config.sol_price_usd if config and hasattr(config, "sol_price_usd") else None
+            eth_p = config.eth_price_usd if config and hasattr(config, "eth_price_usd") else None
+            price_service = NativePriceService(
+                allow_static_prices=allow_static,
+                static_sol_price=sol_p,
+                static_eth_price=eth_p,
+            )
         self.executor = executor or PaperExecutor(
             position_book=self.position_book,
-            native_price_usd=(config.sol_price_usd if hasattr(config, "sol_price_usd") else None) or Decimal(0),
+            price_service=price_service,
             private_router=self.private_router,
         )
         self._register_agent_tools()

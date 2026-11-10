@@ -63,13 +63,38 @@ def gas_cost_usd(chain: ChainIdentifier) -> Decimal:
             raise ValueError(f"Unknown chain: {chain}")
 
 
+def shrink_win_rate(
+    sample_wins: int,
+    sample_total: int,
+    prior_win_rate: float = 0.5,
+    shrinkage_trades: int = 20,
+) -> float:
+    """
+    Bayesian shrinkage of sample win rate toward prior (0.5) for small samples.
+    p_shrunk = (wins + shrinkage_trades * prior) / (total + shrinkage_trades)
+    """
+    if sample_total <= 0:
+        return prior_win_rate
+    eff_trades = max(0, int(shrinkage_trades))
+    return float(sample_wins + eff_trades * prior_win_rate) / float(sample_total + eff_trades)
+
+
 def half_kelly_fraction(
     win_rate: float,
     avg_win_native: Decimal,
     avg_loss_native: Decimal,
+    multiplier: float = 0.5,
 ) -> float:
     """
-    Compute the Half-Kelly bet fraction.
+    Compute the fractional (default Half-Kelly: multiplier=0.5) bet fraction.
+    Formula:
+        full_kelly = (p * b - q) / b
+        fraction = min(full_kelly * multiplier, 1.0)
+    Where:
+        p = historical win rate [0, 1]
+        q = 1 - p
+        b = avg_win / avg_loss (payoff ratio)
+        multiplier = 0.5 (Half-Kelly)
     """
     if win_rate <= 0.0 or win_rate >= 1.0:
         return 0.0
@@ -89,7 +114,8 @@ def half_kelly_fraction(
         )
         return 0.0
 
-    return min(full_kelly / 2.0, 1.0)
+    mult = max(0.0, float(multiplier))
+    return min(full_kelly * mult, 1.0)
 
 
 def compute_position_size(

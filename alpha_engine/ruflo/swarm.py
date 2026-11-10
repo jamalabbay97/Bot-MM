@@ -530,7 +530,23 @@ class RufloSwarmCoordinator:
                 return rejection
 
             # 4. Quant Sizing Check
-            native_p = 3400.0 if "base" in chain_str.lower() else 150.0
+            native_p = None
+            if (
+                self.execution_agent
+                and self.execution_agent.executor
+                and hasattr(self.execution_agent.executor, "_price_service")
+                and self.execution_agent.executor._price_service
+            ):
+                price_res = self.execution_agent.executor._price_service.get_price(signal.chain)
+                native_p = float(price_res.price if hasattr(price_res, "price") else price_res[0])
+            if native_p is None or native_p <= 0.0:
+                is_eth = "base" in chain_str.lower() or "eth" in chain_str.lower()
+                cfg_p = (
+                    self.config.eth_price_usd
+                    if is_eth and hasattr(self.config, "eth_price_usd")
+                    else (self.config.sol_price_usd if hasattr(self.config, "sol_price_usd") else None)
+                )
+                native_p = float(cfg_p) if cfg_p is not None else 1.0
             sizing_result = await self.quant_agent.tool_compute_position_size(
                 portfolio_equity_usd=10000.0,
                 native_price_usd=native_p,

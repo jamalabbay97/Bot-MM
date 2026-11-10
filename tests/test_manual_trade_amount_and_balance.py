@@ -250,7 +250,7 @@ async def test_manual_trade_amount_sizing_in_pipeline(tmp_path):
     runner._position_book.cash_balance = Decimal("100.0")
     runner._executor = PaperExecutor(
         position_book=runner._position_book,
-        native_price_usd=Decimal("150.0"),
+        price_service=runner._native_price_service,
     )
 
     # Mock execute_signal to observe fixed_trade_amount_native
@@ -337,7 +337,7 @@ async def test_insufficient_balance_prevents_execution_and_alerts(tmp_path):
     runner._position_book.cash_balance = Decimal("1.0")
     runner._executor = PaperExecutor(
         position_book=runner._position_book,
-        native_price_usd=Decimal("150.0"),
+        price_service=runner._native_price_service,
     )
     runner._executor.execute_signal = AsyncMock()
 

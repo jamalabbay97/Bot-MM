@@ -15,7 +15,7 @@ from typing import Any, Optional
 
 import aiosqlite
 
-from alpha_engine.execution.ledger import sqlite_retry
+from alpha_engine.execution.ledger import AsyncRLock, sqlite_retry
 from alpha_engine.models.enums import ChainIdentifier, WalletClassification, WhitelistStatus
 from alpha_engine.models.profiler import WalletProfile, WhitelistRecord
 
@@ -25,12 +25,12 @@ logger = logging.getLogger(__name__)
 class WhitelistDatabase:
     """
     SQLite persistence layer for curated alpha smart money wallets.
-    Enforces WAL mode, busy timeout, and asyncio.Lock for concurrency safety.
+    Enforces WAL mode, busy timeout, and AsyncRLock for concurrency safety.
     """
 
     def __init__(self, db_path: str = "paper_trading.db") -> None:
         self.db_path = db_path
-        self._lock = asyncio.Lock()
+        self._lock = AsyncRLock()
         self._conn: Optional[aiosqlite.Connection] = None
 
     @sqlite_retry(max_retries=5, base_delay=0.1)

@@ -384,6 +384,28 @@ class EngineConfig(BaseSettings):
         le=0.10,
         description="Maximum autonomous portfolio risk allocation per trade (2% to 5%)",
     )
+    kelly_min_closed_trades: int = Field(
+        default=30,
+        ge=1,
+        description="Minimum number of closed trades in ledger before Kelly sizing is active (default: 30)",
+    )
+    kelly_uncalibrated_fraction: float = Field(
+        default=0.01,
+        ge=0.0001,
+        le=0.10,
+        description="Conservative fixed fraction of equity to risk before Kelly is calibrated (default: 0.01 = 1%)",
+    )
+    kelly_multiplier: float = Field(
+        default=0.5,
+        ge=0.1,
+        le=1.0,
+        description="Kelly criterion fraction multiplier (0.5 = Half-Kelly)",
+    )
+    kelly_shrinkage_trades: int = Field(
+        default=20,
+        ge=1,
+        description="Sample size pseudo-count for shrinking win rate toward 0.5 (default: 20)",
+    )
     stop_loss_pct: float = Field(
         default=-0.08,
         le=-0.01,

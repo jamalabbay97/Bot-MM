@@ -115,7 +115,7 @@ async def test_v2_dynamic_exits_for_swap_execution():
 
     config = EngineConfig(strategy_v2_enabled=True)
     runner = PaperTradingEngine(config)
-    runner._executor = PaperExecutor(position_book=runner._position_book, native_price_usd=Decimal("150.0"))
+    runner._executor = PaperExecutor(position_book=runner._position_book, price_service=runner._native_price_service)
 
     token = "FakeTokenAddressFakeTokenAddress123"
     pool_addr = "FakePoolAddressFakePoolAddress1234"

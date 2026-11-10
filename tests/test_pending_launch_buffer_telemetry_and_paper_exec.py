@@ -15,6 +15,7 @@ from alpha_engine.config import EngineConfig
 from alpha_engine.engine.signals import PendingLaunchBuffer, SignalGenerator
 from alpha_engine.execution.executor import PaperExecutor
 from alpha_engine.execution.book import PositionBook
+from alpha_engine.pricing.native_price_service import NativePriceService
 from alpha_engine.models.enums import (
     ChainIdentifier,
     OrderSide,
@@ -313,16 +314,25 @@ async def test_buffer_graduation_and_paper_execution_pipeline(tmp_path: Path):
     # Now verify paper execution via PaperExecutor and SQLiteLedger
     db_file = tmp_path / "test_exec.db"
     book = PositionBook()
+    price_service = NativePriceService(
+        allow_static_prices=True,
+        static_sol_price=Decimal("150.0"),
+        static_eth_price=Decimal("3400.0"),
+    )
     executor = PaperExecutor(
         position_book=book,
-        native_price_usd=Decimal("150.0"),  # SOL = $150
+        price_service=price_service,
     )
 
     async with SQLiteLedger(str(db_file)) as ledger:
         await ledger.record_signal(grad_signal)
 
         # Execute paper trade
-        fill = await executor.execute_signal(grad_signal, portfolio_equity_usd=Decimal("1500.0"))
+        fill = await executor.execute_signal(
+            grad_signal,
+            portfolio_equity_usd=Decimal("1500.0"),
+            fixed_trade_amount_native=Decimal("0.1"),
+        )
         assert fill is not None
         assert fill.side == OrderSide.BUY
         assert fill.tokens_acquired > Decimal(0)

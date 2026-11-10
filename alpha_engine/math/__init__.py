@@ -29,6 +29,7 @@ from alpha_engine.math.sizing import (
     compute_position_size,
     gas_cost_usd,
     half_kelly_fraction,
+    shrink_win_rate,
 )
 
 __all__ = [
@@ -47,6 +48,7 @@ __all__ = [
     "simulate_latency",
     "KellySizing",
     "half_kelly_fraction",
+    "shrink_win_rate",
     "compute_position_size",
     "gas_cost_usd",
     "classify_alpha_score",

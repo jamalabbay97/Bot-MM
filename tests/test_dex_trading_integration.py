@@ -26,6 +26,7 @@ from alpha_engine.engine.signals import SignalGenerator
 from alpha_engine.execution.book import PositionBook
 from alpha_engine.execution.executor import PaperExecutor
 from alpha_engine.execution.ledger import SQLiteLedger
+from alpha_engine.pricing.native_price_service import NativePriceService
 from alpha_engine.ingestion.decoders import (
     RAYDIUM_AMM_PROGRAM_ID,
     _parse_raydium_initialize2_logs,
@@ -206,9 +207,14 @@ async def test_dex_lot_opening_and_exit_platform_preservation():
         db_path = Path(tmpdir) / "test_dex_platform.db"
         async with SQLiteLedger(db_path=db_path) as ledger:
             book = PositionBook()
+            price_service = NativePriceService(
+                allow_static_prices=True,
+                static_sol_price=Decimal("150.0"),
+                static_eth_price=Decimal("3400.0"),
+            )
             executor = PaperExecutor(
                 position_book=book,
-                native_price_usd=Decimal("150.0"),
+                price_service=price_service,
             )
 
             pool_addr = "6UmmUiYo5ZbzK8kQ8FkL6Z5uN6fS7Q3eT5bY9cV3mX2a"
@@ -252,7 +258,11 @@ async def test_dex_lot_opening_and_exit_platform_preservation():
                 security_report=report,
             )
 
-            fill = await executor.execute_signal(signal, portfolio_equity_usd=Decimal("10000"))
+            fill = await executor.execute_signal(
+                signal,
+                portfolio_equity_usd=Decimal("10000"),
+                fixed_trade_amount_native=Decimal("1.0"),
+            )
             assert fill is not None
             assert fill.platform == "DexScan"
 

@@ -118,7 +118,11 @@ class PaperTradingEngine:
     Top-level engine that wires all subsystems together and runs the
     async event loop under an autonomous self-healing supervisor.
     """
-    def __init__(self, config: EngineConfig) -> None:
+    def __init__(
+        self,
+        config: EngineConfig,
+        native_price_service: Optional[Any] = None,
+    ) -> None:
         self._cfg = config
         self.config = config
         self._shutdown_event = asyncio.Event()
@@ -142,25 +146,28 @@ class PaperTradingEngine:
         self._cash_sol = config.initial_sol
         self._cash_eth = config.initial_eth
 
-        allow_static = getattr(config, "allow_static_native_prices", False)
-        if allow_static:
-            logger.warning("[AlphaEngine] ALLOW_STATIC_NATIVE_PRICES is True - using static native price overrides.")
+        if native_price_service is not None:
+            self._native_price_service = native_price_service
+        else:
+            allow_static = getattr(config, "allow_static_native_prices", False)
+            if allow_static:
+                logger.warning("[AlphaEngine] ALLOW_STATIC_NATIVE_PRICES is True - using static native price overrides.")
 
-        self._native_price_service = NativePriceService(
-            primary_source=DefiLlamaPriceSource(),
-            secondary_source=CoinbasePriceSource(),
-            refresh_interval_s=getattr(config, "native_price_refresh_interval_s", 15.0),
-            cache_ttl_s=getattr(config, "native_price_cache_ttl_s", 15.0),
-            max_age_s=getattr(config, "native_price_max_age_s", 60.0),
-            divergence_tolerance_pct=getattr(config, "native_price_divergence_tolerance_pct", 5.0),
-            allow_static_prices=allow_static,
-            static_sol_price=config.sol_price_usd,
-            static_eth_price=config.eth_price_usd,
-        )
-        if config.sol_price_usd is not None:
-            self._native_price_service.set_price("solana", config.sol_price_usd, source="config")
-        if config.eth_price_usd is not None:
-            self._native_price_service.set_price("base_eth", config.eth_price_usd, source="config")
+            self._native_price_service = NativePriceService(
+                primary_source=DefiLlamaPriceSource(),
+                secondary_source=CoinbasePriceSource(),
+                refresh_interval_s=getattr(config, "native_price_refresh_interval_s", 15.0),
+                cache_ttl_s=getattr(config, "native_price_cache_ttl_s", 15.0),
+                max_age_s=getattr(config, "native_price_max_age_s", 60.0),
+                divergence_tolerance_pct=getattr(config, "native_price_divergence_tolerance_pct", 5.0),
+                allow_static_prices=allow_static,
+                static_sol_price=config.sol_price_usd,
+                static_eth_price=config.eth_price_usd,
+            )
+            if config.sol_price_usd is not None:
+                self._native_price_service.set_price("solana", config.sol_price_usd, source="config")
+            if config.eth_price_usd is not None:
+                self._native_price_service.set_price("base_eth", config.eth_price_usd, source="config")
 
         max_q = getattr(config, "max_queue_size", 100)
         self._ingestion_q: asyncio.Queue[
@@ -250,7 +257,10 @@ class PaperTradingEngine:
         self._load_persisted_trade_amount()
 
         self._explainer: Optional[ConversationalSupervisor] = None
-        self._executor: PaperExecutor | None = None
+        self._executor: PaperExecutor | None = PaperExecutor(
+            position_book=self._position_book,
+            price_service=self._native_price_service,
+        )
         self._ledger: SQLiteLedger | None = None
         self.tracer = tracer
         self._gatekeeper: SecurityGatekeeper | None = None
@@ -298,7 +308,7 @@ class PaperTradingEngine:
                 config=config,
                 coordinator=None,
                 gatekeeper=None,
-                executor=None,
+                executor=self._executor,
                 position_book=self._position_book,
                 ledger=None,
                 ai_supervisor=self._ai_supervisor,
@@ -735,11 +745,13 @@ class PaperTradingEngine:
 
         open_positions = self._position_book.open_position_count()
         open_exposure_native = Decimal(0)
+        open_exposure_usd_dec = Decimal(0)
         for lots in self._position_book._lots.values():
             for lot in lots:
                 if lot.tokens_held > 0 and lot.status in (LotStatus.OPEN, LotStatus.PENDING_BUY, LotStatus.PENDING_SELL):
                     open_exposure_native += lot.cost_basis_native
-        open_exposure_usd = float(open_exposure_native * self.get_native_price(ChainIdentifier.SOLANA_MAINNET))
+                    open_exposure_usd_dec += lot.cost_basis_native * self.get_native_price(lot.chain)
+        open_exposure_usd = float(open_exposure_usd_dec)
 
         manual_info = self.get_manual_trade_amount()
         trade_amt_sol = manual_info.get("sol_equivalent") or (0.1 if manual_info.get("amount") is None else manual_info.get("amount"))
@@ -4071,6 +4083,8 @@ class PaperTradingEngine:
 
             signal_item: SignalEvent = item
             is_new_launch = self._is_new_launch_signal(signal_item)
+            sizing_res = None
+            preliminary_cost = None
 
             if signal_item.suggested_side == OrderSide.BUY:
                 is_direct_dm = bool(getattr(signal_item, "is_direct_dm", False)) or (
@@ -4284,42 +4298,41 @@ class PaperTradingEngine:
 
                 native_p = price_res.price
                 equity_usd = self._current_equity_usd()
-                equity_native = equity_usd / native_p if native_p > Decimal(0) else Decimal(0)
-                
-                custom_amt = getattr(signal_item, "custom_amount_native", None)
-                is_manual_size = (
-                    (custom_amt is not None and custom_amt > Decimal(0))
-                    or (self.manual_trade_amount is not None and self.manual_trade_amount > Decimal(0))
-                )
-                if custom_amt is not None and custom_amt > Decimal(0):
-                    preliminary_cost = custom_amt
-                elif is_manual_size:
-                    if self.manual_trade_currency == "USD":
-                        target_native = self.manual_trade_amount / native_p if native_p > Decimal(0) else Decimal(0)
-                    else:
-                        target_native = self.manual_trade_amount
-                    preliminary_cost = target_native
-                elif self._cfg.strategy_v2_enabled:
+
+                # V2 RiskEngine daily limits check
+                if self._cfg.strategy_v2_enabled:
                     metrics_dict = {
                         "consecutive_losses": self._metrics.consecutive_launch_losses if is_new_launch else self._metrics.consecutive_losses,
-                        "daily_drawdown_pct": getattr(self._metrics, "daily_drawdown_pct", 0.0) 
+                        "daily_drawdown_pct": getattr(self._metrics, "daily_drawdown_pct", 0.0),
                     }
                     if not self.risk_engine.check_daily_limits(metrics_dict):
-                        logger.warning("V2 RiskEngine: Daily limits breached. Dropping BUY signal.")
+                        logger.warning("V2 RiskEngine: Daily limits breached. Dropping BUY signal for %s.", signal_item.token_address[:10])
+                        self._position_book.release_position_slot(token_address=signal_item.token_address)
                         continue
-                        
-                    prelim_native = self.risk_engine.calculate_position_size(
-                        current_capital=equity_native,
-                        score=signal_item.alpha_score * 100.0,
-                        is_new_launch=is_new_launch,
+
+                # Single Sizing Authority (RiskEngine)
+                custom_amt = getattr(signal_item, "custom_amount_native", None)
+                sizing_res = self.risk_engine.calculate_order_size(
+                    portfolio_equity_usd=equity_usd,
+                    native_price_usd=native_p,
+                    chain=signal_item.chain,
+                    score=signal_item.alpha_score * 100.0,
+                    is_new_launch=is_new_launch,
+                    manual_amount=self.manual_trade_amount,
+                    manual_currency=self.manual_trade_currency,
+                    custom_amount_native=custom_amt,
+                )
+
+                if not sizing_res.is_approved:
+                    logger.info(
+                        "RiskEngine: BUY signal rejected for %s (%s).",
+                        signal_item.token_address[:10],
+                        sizing_res.rejection_reason or "size <= 0",
                     )
-                    preliminary_cost = prelim_native
-                    
-                    if preliminary_cost <= Decimal(0):
-                        logger.info("V2 RiskEngine: Position size calculated as 0 (score too low). Dropping BUY.")
-                        continue
-                else:
-                    preliminary_cost = equity_native * Decimal("0.015")
+                    self._position_book.release_position_slot(token_address=signal_item.token_address)
+                    continue
+
+                preliminary_cost = sizing_res.native_trade_size
 
                 # Verify balance and network fee availability before attempting trade execution (Requirement 8)
                 unit = "ETH" if signal_item.chain == ChainIdentifier.BASE_MAINNET else "SOL"
@@ -4351,9 +4364,12 @@ class PaperTradingEngine:
                         preliminary_cost,
                         simulated_fee,
                     )
+                    self._position_book.release_position_slot(token_address=signal_item.token_address)
                     asyncio.create_task(self._broadcast_trade_alert(insufficient_alert))
                     continue
 
+                is_manual_size = sizing_res.is_manual
+                equity_native = equity_usd / native_p if native_p > Decimal("0") else Decimal("0")
                 has_reserved = self._position_book.has_reserved_slot(signal_item.token_address)
                 if not has_reserved:
                     can_open, reject_reason = self._position_book.can_open_position(
@@ -4568,7 +4584,8 @@ class PaperTradingEngine:
                     signal_item,
                     portfolio_equity_usd=equity,
                     is_new_launch=is_new_launch,
-                    fixed_trade_amount_native=preliminary_cost if (signal_item.suggested_side == OrderSide.BUY and is_manual_size) else None,
+                    fixed_trade_amount_native=preliminary_cost if signal_item.suggested_side == OrderSide.BUY else None,
+                    equity_fraction=sizing_res.fraction_of_equity if signal_item.suggested_side == OrderSide.BUY else None,
                 )
                 if fill is None or fill.effective_price <= Decimal(0):
                     exec_trace.status = TraceStatus.REJECTED
@@ -6133,18 +6150,15 @@ class PaperTradingEngine:
         ledger: SQLiteLedger,
     ) -> None:
         stats = await ledger.get_closed_trade_stats()
-        executor.update_historical_stats(
-            win_rate=stats["win_rate"],
-            avg_win=stats["avg_win_native"],
-            avg_loss=stats["avg_loss_native"],
-        )
+        self.risk_engine.update_ledger_stats(stats)
         self._trades_since_kelly_refresh = 0
         logger.info(
-            "Kelly refreshed: win_rate=%.2f avg_win=%.4f avg_loss=%.4f total=%d",
+            "Kelly stats refreshed in RiskEngine: win_rate=%.2f avg_win=%.4f avg_loss=%.4f total=%d (wins=%d)",
             stats["win_rate"],
             float(stats["avg_win_native"]),
             float(stats["avg_loss_native"]),
             stats["total_trades"],
+            stats.get("wins", 0),
         )
 
     async def _run_single_cycle(
@@ -6244,9 +6258,9 @@ class PaperTradingEngine:
 
             self._executor = PaperExecutor(
                 position_book=self._position_book,
-                native_price_usd=self.get_native_price(ChainIdentifier.SOLANA_MAINNET),
                 price_service=self._native_price_service,
             )
+            await self._refresh_kelly(self._executor, self._ledger)
 
             svm_failovers = []
             for rpc in getattr(cfg, "solana_fallback_rpcs", []):

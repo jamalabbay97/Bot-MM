@@ -45,40 +45,21 @@ logger = logging.getLogger(__name__)
 class PaperExecutor:
     """
     Converts a validated SignalEvent into a PaperFill.
+    Obtains live per-chain native asset prices from injected NativePriceService.
+    Does NOT size trades — sizing is owned exclusively by RiskEngine.
     """
 
     def __init__(
         self,
         position_book: PositionBook,
-        native_price_usd: Decimal = Decimal(0),
-        historical_win_rate: float = 0.5,
-        avg_win_native: Decimal = Decimal("0.1"),
-        avg_loss_native: Decimal = Decimal("0.05"),
+        price_service: Any,
         private_router: Optional[PrivateTxRouter] = None,
-        price_service: Any = None,
     ) -> None:
+        if price_service is None:
+            raise ValueError("PaperExecutor requires a valid price_service (NativePriceService)")
         self._positions = position_book
-        self._native_price_usd = native_price_usd
-        self._win_rate = historical_win_rate
-        self._avg_win = avg_win_native
-        self._avg_loss = avg_loss_native
-        self._private_router = private_router or PrivateTxRouter()
         self._price_service = price_service
-
-    def update_native_price(self, new_price: Decimal) -> None:
-        """Update the native asset price used for USD conversions."""
-        self._native_price_usd = new_price
-
-    def update_historical_stats(
-        self,
-        win_rate: float,
-        avg_win: Decimal,
-        avg_loss: Decimal,
-    ) -> None:
-        """Refresh Kelly parameters from the ledger after each closed trade."""
-        self._win_rate = win_rate
-        self._avg_win = avg_win
-        self._avg_loss = avg_loss
+        self._private_router = private_router or PrivateTxRouter()
 
     async def execute_signal(
         self,
@@ -88,11 +69,12 @@ class PaperExecutor:
         apply_drag: bool = False,
         is_new_launch: bool = False,
         fixed_trade_amount_native: Decimal | None = None,
+        equity_fraction: float | None = None,
     ) -> PaperFill | None:
         """
         Produce a PaperFill for the given signal, or return None if skipped.
-        Optionally applies realistic paper market drag (0.3% fee + 0.005 gas + 5% slippage).
-        If fixed_trade_amount_native is provided (>0), uses that exact amount instead of dynamic Kelly sizing.
+        Optionally applies realistic paper market drag (0.3% fee + 0.005 gas + 1% slippage).
+        BUY signals require explicit fixed_trade_amount_native (>0) from the sizing authority.
         """
         side = signal.suggested_side
         pool = getattr(signal, "pool_state", None)
@@ -125,65 +107,50 @@ class PaperExecutor:
         )
         adjusted_pool = latency_result.adjusted_pool_state
 
-        current_native_price = self._native_price_usd
-        if self._price_service is not None:
-            try:
-                res = self._price_service.get_price(signal.chain)
-                p = res[0] if isinstance(res, (tuple, list)) else getattr(res, "price", None)
-                if p is not None and p > Decimal(0):
-                    current_native_price = p
-            except Exception:
-                pass
+        # Obtain per-chain native price dynamically from NativePriceService
+        price_res = self._price_service.get_price(signal.chain)
+        current_native_price = (
+            price_res.price if hasattr(price_res, "price")
+            else (price_res[0] if isinstance(price_res, (tuple, list)) else Decimal(0))
+        )
+        if current_native_price is None or current_native_price <= Decimal(0):
+            logger.warning(
+                "execute_signal: Invalid or non-positive native price (%s) for %s; rejecting fill.",
+                current_native_price,
+                signal.chain.value,
+            )
+            return None
 
-        if fixed_trade_amount_native is not None and fixed_trade_amount_native > Decimal(0):
+        fill_kelly_fraction = 0.0
+
+        if side == OrderSide.BUY:
+            if fixed_trade_amount_native is None or fixed_trade_amount_native <= Decimal(0):
+                raise ValueError(
+                    f"fixed_trade_amount_native must be explicitly provided for BUY signals "
+                    f"(got {fixed_trade_amount_native}); re-sizing in executor is forbidden."
+                )
+
             native_in = fixed_trade_amount_native
             usd_at_risk = native_in * current_native_price
             trade_gas_usd = gas_cost_usd(signal.chain)
-            gas_threshold = trade_gas_usd * GAS_MULTIPLE_GATE
+            gas_threshold = trade_gas_usd * Decimal(str(GAS_MULTIPLE_GATE))
             if usd_at_risk < gas_threshold:
                 logger.info(
                     "Gas-drag gate REJECTED fixed trade amount [%s %s]: usd_at_risk=%s < gas_threshold=%s. Position too small to overcome fees.",
-                    side.value.upper(), signal.chain.value, usd_at_risk, gas_threshold,
-                )
-                return None
-            sizing = KellySizing(
-                kelly_fraction=1.0,
-                capped_fraction=float(usd_at_risk / portfolio_equity_usd) if portfolio_equity_usd > Decimal(0) else 1.0,
-                native_trade_size=native_in,
-                usd_at_risk=usd_at_risk,
-                gas_rejected=False,
-            )
-        else:
-            kelly_f = half_kelly_fraction(
-                win_rate=self._win_rate,
-                avg_win_native=self._avg_win,
-                avg_loss_native=self._avg_loss,
-            )
-
-            if kelly_f <= 0.0 and side == OrderSide.BUY:
-                logger.debug(
-                    "Kelly edge <= 0 for signal %s — skipping BUY.", signal.signal_id[:8]
+                    side.value.upper(),
+                    signal.chain.value,
+                    usd_at_risk,
+                    gas_threshold,
                 )
                 return None
 
-            sizing = compute_position_size(
-                kelly_fraction=kelly_f,
-                portfolio_equity_usd=portfolio_equity_usd,
-                native_price_usd=current_native_price,
-                chain=signal.chain,
-                side=side,
-                max_position_fraction=max_position_fraction,
+            real_fraction = (
+                float(usd_at_risk / portfolio_equity_usd)
+                if portfolio_equity_usd > Decimal(0)
+                else 0.0
             )
+            fill_kelly_fraction = equity_fraction if equity_fraction is not None else real_fraction
 
-            if sizing.gas_rejected:
-                logger.debug(
-                    "Gas-drag gate rejected signal %s on %s — size too small.",
-                    signal.signal_id[:8], signal.chain.value,
-                )
-                return None
-
-        if side == OrderSide.BUY:
-            native_in = sizing.native_trade_size
             try:
                 quote = cpmm_buy_quote(adjusted_pool, native_in)
             except ValueError as exc:
@@ -260,7 +227,7 @@ class PaperExecutor:
             fill_latency_ms=latency_result.latency_ms,
             signal_timestamp_ns=signal.timestamp_ns,
             fill_timestamp_ns=latency_result.fill_timestamp_ns,
-            kelly_fraction=sizing.capped_fraction,
+            kelly_fraction=fill_kelly_fraction,
             portfolio_equity_usd=portfolio_equity_usd,
             platform=platform,
             is_new_launch=is_new_launch,

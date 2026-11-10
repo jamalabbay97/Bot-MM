@@ -564,9 +564,10 @@ class SQLiteLedger:
         conn = self._conn
         if conn is None:
             return {
-                "win_rate": 0.5,
-                "avg_win_native": Decimal("0.1"),
-                "avg_loss_native": Decimal("0.05"),
+                "win_rate": 0.0,
+                "wins": 0,
+                "avg_win_native": Decimal("0.0"),
+                "avg_loss_native": Decimal("0.0"),
                 "total_trades": 0,
             }
 
@@ -587,12 +588,13 @@ class SQLiteLedger:
 
         total = row[0] or 0
         wins = row[1] or 0
-        avg_win = Decimal(str(row[2])) if row[2] else Decimal("0.1")
-        avg_loss = Decimal(str(row[3])) if row[3] else Decimal("0.05")
-        win_rate = wins / total if total > 0 else 0.5
+        avg_win = Decimal(str(row[2])) if row[2] else Decimal("0.0")
+        avg_loss = Decimal(str(row[3])) if row[3] else Decimal("0.0")
+        win_rate = wins / total if total > 0 else 0.0
 
         return {
             "win_rate": win_rate,
+            "wins": wins,
             "avg_win_native": avg_win,
             "avg_loss_native": avg_loss,
             "total_trades": total,

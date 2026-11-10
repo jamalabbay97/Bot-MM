@@ -24,6 +24,7 @@ from alpha_engine.dns_resolver import query_upstream_dns
 from alpha_engine.engine.runner import PaperTradingEngine
 from alpha_engine.execution.book import OpenLot, PositionBook, RunningMetrics
 from alpha_engine.execution.executor import PaperExecutor
+from alpha_engine.pricing.native_price_service import NativePriceService
 from alpha_engine.ingestion.svm import is_valid_solana_pubkey
 from alpha_engine.ingestion.telegram import TelegramIngester
 from alpha_engine.math.cpmm import get_initial_bonding_curve_pool
@@ -53,7 +54,12 @@ def test_non_zero_fill_pricing_and_bonding_curve_fallback():
     assert pool.token_reserve == Decimal("1073000000.0")
 
     book = PositionBook()
-    executor = PaperExecutor(position_book=book, native_price_usd=Decimal("150.0"))
+    price_service = NativePriceService(
+        allow_static_prices=True,
+        static_sol_price=Decimal("150.0"),
+        static_eth_price=Decimal("3400.0"),
+    )
+    executor = PaperExecutor(position_book=book, price_service=price_service)
 
     dummy_report = SecurityReport(
         token_address="PumpFunTestMint111111111111111111111111111",
@@ -80,7 +86,11 @@ def test_non_zero_fill_pricing_and_bonding_curve_fallback():
     )
 
     async def _run():
-        fill = await executor.execute_signal(signal, portfolio_equity_usd=Decimal("10000.0"))
+        fill = await executor.execute_signal(
+            signal,
+            portfolio_equity_usd=Decimal("10000.0"),
+            fixed_trade_amount_native=Decimal("1.0"),
+        )
         assert fill is not None
         assert fill.effective_price > Decimal(0)
         assert fill.tokens_acquired > Decimal(0)
