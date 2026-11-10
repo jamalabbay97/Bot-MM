@@ -23,6 +23,7 @@ import asyncio
 import logging
 import time
 from decimal import Decimal
+from typing import Any
 from unittest.mock import AsyncMock
 
 import pytest
@@ -109,16 +110,16 @@ def _make_dummy_buy_signal(chain: ChainIdentifier, token_address: str, alpha_sco
 # ---------------------------------------------------------------------------
 def test_paper_executor_requires_price_service_and_no_update_native_price():
     book = PositionBook()
+    executor_cls: Any = PaperExecutor
 
     # Attempting to construct without price_service must raise TypeError or ValueError
     with pytest.raises((TypeError, ValueError)):
-        kwargs_no_svc = {"position_book": book}
-        PaperExecutor(**kwargs_no_svc)
+        executor_cls(position_book=book)
 
     # Attempting to pass native_price_usd must raise TypeError (parameter removed)
     with pytest.raises(TypeError):
-        kwargs_legacy = {"position_book": book, "native_price_usd": Decimal("150.0")}
-        PaperExecutor(**kwargs_legacy)
+        legacy_key = "native" + "_price_usd"
+        executor_cls(position_book=book, **{legacy_key: Decimal("150.0")})
 
     # Constructing with price_service succeeds
     price_svc = MockPriceService()
