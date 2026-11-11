@@ -651,7 +651,6 @@ async def test_executor_exit_paper_fill_validates_and_succeeds():
         pool=pool,
         tokens_to_sell=Decimal("1000.0"),
         reason=TradeExitReason.TIMEOUT_VELOCITY_DECAY,
-        apply_drag=True,
     )
     assert fill is not None
     assert fill.side == OrderSide.SELL
@@ -665,7 +664,6 @@ async def test_executor_exit_paper_fill_validates_and_succeeds():
         pool=pool,
         tokens_to_sell=Decimal("1000.0"),
         reason=TradeExitReason.TP_25,
-        apply_drag=True,
         portfolio_equity_usd=Decimal("8500.0"),
     )
     assert fill2 is not None

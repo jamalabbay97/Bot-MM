@@ -74,14 +74,45 @@ Track progress across all identified defects and phases. All items must satisfy 
 ---
 
 ## Issue 3 Asymmetric/inconsistent cost model
-- [ ] reproduced
-- [ ] red test
-- [ ] fix
-- [ ] green test
-- [ ] mutation check
-- [ ] sweep done
-- [ ] wiring proof
-- [ ] README/docs updated
+- [x] reproduced
+  - `runner.py`: All 3 entry calls (`execute_signal`) omitted `apply_drag` (default `False`, free entry) while all 4 exit calls (`execute_exit`) passed `apply_drag=True`.
+  - `sizing.py`: Hardcoded `ASSUMED_SLIPPAGE_PCT = Decimal("0.01")` was added on top of CPMM pool math (double-counting price impact).
+  - Docstring/constant mismatch: docstring claimed "5% slippage" and "0.005 gas" while constants defined 1% and 0.0005.
+  - `runner.py`: Hardcoded `simulated_fee = Decimal("0.002") if BASE else Decimal("0.005")` in 3 balance check sites.
+  - `experimentation.py`: Shadow lots used static `gas_usd = Decimal("0.05")`, fixed 0.10 size, and static 0.05 exit gas.
+- [x] red test
+  - Created `tests/test_issue3_cost_model.py` with 6 tests:
+    1. `test_ast_audit_no_apply_drag_in_codebase`: AST scan across repository ensuring `apply_drag` is completely removed.
+    2. `test_symmetric_round_trip_at_zero_price_change`: Verifies a zero-price-change round-trip loses exactly modeled swap fees + CPMM price impact + network fees symmetrically.
+    3. `test_entry_and_exit_costs_identical_functions_of_inputs`: Verifies fee schedules and gas formulas are identical functions for BUY and SELL.
+    4. `test_each_venue_fee_schedule_applied_and_unknown_venue_fails_closed`: Verifies all venues apply exact fees from config and unknown venues fail closed (`UnknownVenueError`).
+    5. `test_shadow_lots_parity_with_live_paper_fills`: Verifies parity between live-paper fills and shadow tournament lots for identical inputs.
+    6. `test_balance_check_uses_same_estimate_as_fill`: Verifies balance checks in runner use `cost_model.get_network_fee_native` rather than hardcoded 0.005 / 0.002.
+- [x] fix
+  - `alpha_engine/config.py`: Added Section 5.1 strongly typed fee schedule (`fee_pump_fun_bps=100`, `fee_pumpswap_bps=30`, `fee_raydium_amm_bps=25`, `fee_raydium_cpmm_bps=25`, `fee_raydium_clmm_bps=25`, `fee_uniswap_v2_bps=30`, `fee_uniswap_v3_bps=30`, `fee_aerodrome_bps=30`), `extra_slippage_bps=0`, and Solana/Base network fee parameters with official URLs and `verified_on: 2026-11-11`.
+  - `alpha_engine/models/enums.py`: Added `PUMPSWAP` and `AERODROME` to `ExecutionVenue`. Implemented `resolve_trade_venue(...)` failing closed on unknown venues, avoiding false-positive substrings.
+  - `alpha_engine/execution/costs.py`: Created `TradeCostModel`, `TradeCostBreakdown`, `UnknownVenueError`. Calculates CPMM quotes using venue-specific fee rates, price impact from pool math only, extra slippage allowance, and dynamic network fees in native and USD.
+  - `alpha_engine/execution/executor.py`: Injected `cost_model: Optional[TradeCostModel]`. Removed `apply_drag` from `execute_signal`, `execute_exit`, `execute_scalp_pipeline`, and `execute_swing_dca_pipeline`. Applied unified cost calculation to both BUY and SELL.
+  - `alpha_engine/engine/runner.py`: Initialized `self._cost_model` in `__init__` and wired into `PaperExecutor`. Replaced hardcoded `0.002`/`0.005` in all 3 balance check sites with `self._cost_model.get_network_fee_native()`. Removed `apply_drag=True` from all 4 `execute_exit` calls.
+  - `alpha_engine/engine/experimentation.py`: Injected `cost_model` in `StrategyTournamentRegistry`. Replaced hardcoded `gas_usd=0.05` with `cost_model.calculate_trade_costs`. Replaced hardcoded exit gas with symmetric `lot.gas_drag_usd`.
+  - `alpha_engine/engine/backtester.py`: Injected `cost_model` in `WalkForwardBacktester` and replaced hardcoded `$0.10` drag with dynamic venue and network fees.
+  - `alpha_engine/math/sizing.py`: Fixed constant `ASSUMED_SLIPPAGE_PCT = Decimal("0.0")` to prevent double counting. Reconciled docstrings and constants ($0.02 Solana, 0.0005 gas, 0% extra slippage).
+- [x] green test
+  - `tests/test_issue3_cost_model.py`: 6/6 passed.
+  - Full test suite: 448 passed, 0 failed in 114s.
+- [x] mutation check
+  - Mutated `alpha_engine/execution/costs.py` line 295 (`if side == OrderSide.BUY: fee_bps = 0`); ran `test_symmetric_round_trip_at_zero_price_change`; verified test failed with `AssertionError: assert Decimal('24.508...') < Decimal('0.000001')`. Restored code and confirmed green.
+- [x] sweep done
+  - Repo-wide search for `apply_drag` -> 0 occurrences remaining.
+  - Repo-wide audit `tools/audit/native_price_literals.py` -> 0 hardcoded native price literals.
+  - All test files updated (`tests/test_dex_trading_integration.py`, `tests/test_hft_risk_and_exits.py`, `tests/test_strategy_experimentation_and_swarm.py`).
+- [x] wiring proof
+  - `runner.py`: `PaperTradingEngine.__init__` creates `self._cost_model = TradeCostModel(config=self.config, price_service=self._native_price_service)` and passes `cost_model=self._cost_model` to `PaperExecutor`.
+  - Runner pre-trade balance check uses `self._cost_model.get_network_fee_native(signal_item.chain)` at all 3 balance check sites.
+  - `executor.execute_signal` and `executor.execute_exit` call `self._cost_model.calculate_trade_costs(...)` symmetrically.
+- [x] README/docs updated
+  - `.env.example`: Added Section 9 documenting all venue fee BPS, extra slippage BPS, and network fee parameters.
+  - `alpha_engine/math/sizing.py`: Reconciled docstrings and constants.
 
 ---
 

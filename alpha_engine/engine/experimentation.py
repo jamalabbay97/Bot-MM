@@ -259,9 +259,10 @@ class StrategyVariant:
                 lot.exit_timestamp = now
                 lot.exit_reason = close_reason
 
-                # Accounting including gas and MEV drag
+                # Accounting including symmetric entry/exit gas and MEV drag
                 exit_gross_usd = (lot.tokens_acquired * current_price) * native_price_usd
-                total_drag_usd = lot.gas_drag_usd + lot.mev_drag_usd + Decimal("0.05") # 5c exit gas
+                exit_gas_usd = lot.gas_drag_usd
+                total_drag_usd = lot.gas_drag_usd + lot.mev_drag_usd + exit_gas_usd
                 net_pnl_usd = exit_gross_usd - lot.cost_basis_usd - total_drag_usd
                 lot.realized_pnl_usd = net_pnl_usd
                 lot.roi_pct = float(net_pnl_usd / lot.cost_basis_usd * 100) if lot.cost_basis_usd > Decimal(0) else 0.0
@@ -405,8 +406,14 @@ class StrategyTournamentRegistry:
     and runs statistical promotion/demotion governance.
     """
 
-    def __init__(self, ledger: Optional[Any] = None) -> None:
+    def __init__(
+        self,
+        ledger: Optional[Any] = None,
+        cost_model: Optional[Any] = None,
+    ) -> None:
         self.ledger = ledger
+        from alpha_engine.execution.costs import TradeCostModel
+        self.cost_model = cost_model or TradeCostModel()
         self.current_regime: MarketRegime = MarketRegime.NEUTRAL
         self.on_promotion_callbacks: list[Callable[[StrategyVariant, str], Any]] = []
 
@@ -670,19 +677,28 @@ class StrategyTournamentRegistry:
         latency_res = simulate_latency(pool, now_ns)
         sim_pool = latency_res.adjusted_pool_state or pool
 
-        # CPMM quote
+        # CPMM quote and unified cost calculation
+        venue = getattr(signal, "execution_venue", None)
         try:
-            quote = cpmm_buy_quote(sim_pool, base_trade_size_native)
-            exec_price = quote.execution_price
-            tokens_acquired = quote.amount_out
-            slippage_bps = quote.price_impact_bps
+            cost_res = self.cost_model.calculate_trade_costs(
+                side=OrderSide.BUY,
+                gross_amount=base_trade_size_native,
+                pool=sim_pool,
+                chain=signal.chain,
+                venue=venue,
+                native_price_usd=native_price_usd,
+                platform=getattr(signal, "platform", None),
+            )
+            exec_price = cost_res.effective_price
+            tokens_acquired = cost_res.amount_out
+            slippage_bps = cost_res.price_impact_bps
+            gas_usd = cost_res.network_fee_usd
         except Exception:
             # Fallback to pool spot price if degenerate
             exec_price = pool.spot_price_native_per_token
             tokens_acquired = (base_trade_size_native / exec_price) if exec_price > 0 else Decimal("0")
             slippage_bps = 50
-
-        gas_usd = Decimal("0.05")
+            gas_usd = self.cost_model.get_network_fee_usd(signal.chain, native_price_usd=native_price_usd)
         mev_drag_usd = Decimal(str(float(latency_res.frontrun_volume) * 0.02 * float(native_price_usd))) if latency_res.frontrun_volume else Decimal("0.0")
 
         created_lots: list[ShadowLot] = []

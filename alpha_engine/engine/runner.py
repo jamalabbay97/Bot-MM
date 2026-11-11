@@ -52,6 +52,7 @@ from alpha_engine.ruflo.protocol import ConsensusProtocol, SwarmTopology
 from alpha_engine.ruflo.swarm import RufloSwarmCoordinator
 from alpha_engine.engine.experimentation import AutonomousStrategyGenerator, StrategyTournamentRegistry
 from alpha_engine.execution.book import OpenLot, PositionBook, RunningMetrics
+from alpha_engine.execution.costs import TradeCostModel
 from alpha_engine.execution.executor import PaperExecutor
 from alpha_engine.execution.ledger import SQLiteLedger
 from alpha_engine.tracer import tracer
@@ -257,9 +258,12 @@ class PaperTradingEngine:
         self._load_persisted_trade_amount()
 
         self._explainer: Optional[ConversationalSupervisor] = None
+        self._cost_model = TradeCostModel(config=self.config, price_service=self._native_price_service)
         self._executor: PaperExecutor | None = PaperExecutor(
             position_book=self._position_book,
             price_service=self._native_price_service,
+            cost_model=self._cost_model,
+            config=self.config,
         )
         self._ledger: SQLiteLedger | None = None
         self.tracer = tracer
@@ -924,7 +928,6 @@ class PaperTradingEngine:
                     pool=pool,
                     tokens_to_sell=decision.tokens_to_sell,
                     reason=decision.exit_reason,
-                    apply_drag=True,
                     portfolio_equity_usd=max(Decimal("1.0"), self._current_equity_usd()),
                     platform=getattr(lot, "platform", None),
                     min_fill_timestamp_ns=lot.open_timestamp_ns,
@@ -1431,7 +1434,7 @@ class PaperTradingEngine:
         native_p = price_res.price
         unit = "ETH" if chain_id == ChainIdentifier.BASE_MAINNET else "SOL"
         available_cash = self._cash_eth if chain_id == ChainIdentifier.BASE_MAINNET else self._cash_sol
-        fee_est = Decimal("0.002") if chain_id == ChainIdentifier.BASE_MAINNET else Decimal("0.005")
+        fee_est = self._cost_model.get_network_fee_native(chain_id)
 
         req_amount = amount_native
         if req_amount is None and self.manual_trade_amount is not None and self.manual_trade_amount > Decimal(0):
@@ -1738,7 +1741,6 @@ class PaperTradingEngine:
                 pool=pool,
                 tokens_to_sell=decision.tokens_to_sell,
                 reason=decision.exit_reason,
-                apply_drag=True,
                 portfolio_equity_usd=max(Decimal("1.0"), self._current_equity_usd()),
                 platform=getattr(lot, "platform", None),
                 min_fill_timestamp_ns=lot.open_timestamp_ns,
@@ -2141,7 +2143,7 @@ class PaperTradingEngine:
         native_p = price_res.price
         unit = "ETH" if record.chain == ChainIdentifier.BASE_MAINNET else "SOL"
         available_cash = self._cash_eth if record.chain == ChainIdentifier.BASE_MAINNET else self._cash_sol
-        fee_est = Decimal("0.002") if record.chain == ChainIdentifier.BASE_MAINNET else Decimal("0.005")
+        fee_est = self._cost_model.get_network_fee_native(record.chain)
 
         req_amount = record.custom_amount_native
         if req_amount is None and self.manual_trade_amount is not None and self.manual_trade_amount > Decimal(0):
@@ -3752,7 +3754,6 @@ class PaperTradingEngine:
                         pool=pool,
                         tokens_to_sell=decision.tokens_to_sell,
                         reason=decision.exit_reason,
-                        apply_drag=True,
                         portfolio_equity_usd=max(Decimal("1.0"), self._current_equity_usd()),
                         platform=getattr(lot, "platform", None),
                         min_fill_timestamp_ns=lot.open_timestamp_ns,
@@ -4337,7 +4338,7 @@ class PaperTradingEngine:
                 # Verify balance and network fee availability before attempting trade execution (Requirement 8)
                 unit = "ETH" if signal_item.chain == ChainIdentifier.BASE_MAINNET else "SOL"
                 available_cash = self._cash_eth if signal_item.chain == ChainIdentifier.BASE_MAINNET else self._cash_sol
-                simulated_fee = Decimal("0.002") if signal_item.chain == ChainIdentifier.BASE_MAINNET else Decimal("0.005")
+                simulated_fee = self._cost_model.get_network_fee_native(signal_item.chain)
                 total_needed = preliminary_cost + simulated_fee
 
                 if available_cash < total_needed:
@@ -5955,7 +5956,6 @@ class PaperTradingEngine:
                             pool=pool,
                             tokens_to_sell=decision.tokens_to_sell,
                             reason=decision.exit_reason,
-                            apply_drag=True,
                             portfolio_equity_usd=max(Decimal("1.0"), self._current_equity_usd()),
                             platform=getattr(lot, "platform", None),
                             min_fill_timestamp_ns=lot.open_timestamp_ns,
@@ -6260,6 +6260,8 @@ class PaperTradingEngine:
             self._executor = PaperExecutor(
                 position_book=self._position_book,
                 price_service=self._native_price_service,
+                cost_model=self._cost_model,
+                config=cfg,
             )
             await self._refresh_kelly(self._executor, self._ledger)
 

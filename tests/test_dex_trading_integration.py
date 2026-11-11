@@ -306,7 +306,6 @@ async def test_dex_lot_opening_and_exit_platform_preservation():
                 pool=pool,
                 tokens_to_sell=lot.tokens_held,
                 reason=TradeExitReason.TP_25,
-                apply_drag=True,
                 portfolio_equity_usd=Decimal("10000"),
                 platform=getattr(lot, "platform", None),
             )

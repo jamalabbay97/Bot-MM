@@ -318,7 +318,8 @@ def test_shadow_tournament_accounting_and_exits(sample_signal, sample_pool):
         assert lot.status == LotStatus.OPEN
         assert lot.tokens_acquired > Decimal(0)
         assert lot.cpmm_slippage_bps >= 0
-        assert lot.gas_drag_usd == Decimal("0.05")
+        assert lot.gas_drag_usd == tournament.cost_model.get_network_fee_usd(sample_signal.chain, native_price_usd=native_price)
+        assert lot.gas_drag_usd > Decimal(0)
         assert lot.cost_basis_usd > Decimal(0)
 
     # Test Stop-Loss trigger: drop price by 20%

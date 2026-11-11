@@ -406,6 +406,118 @@ class EngineConfig(BaseSettings):
         ge=1,
         description="Sample size pseudo-count for shrinking win rate toward 0.5 (default: 20)",
     )
+
+    # -------------------------------------------------------------------------
+    # 5.1 Execution Cost & Fee Schedule Parameters
+    # -------------------------------------------------------------------------
+    # Venue-specific swap fee schedule in basis points (1 bps = 0.01% = 0.0001):
+    # 1. Pump.fun bonding curve: 1.0% (100 bps)
+    #    Source: https://pump.fun/docs (Verified on: 2026-11-11)
+    fee_pump_fun_bps: int = Field(
+        default=100,
+        ge=0,
+        description="Pump.fun bonding curve trading fee in bps (1.0%, Source: https://pump.fun/docs, Verified on: 2026-11-11)",
+    )
+    # 2. PumpSwap: 0.30% (30 bps) standard tier
+    #    Source: https://pump.fun (Verified on: 2026-11-11)
+    fee_pumpswap_bps: int = Field(
+        default=30,
+        ge=0,
+        description="PumpSwap standard trading fee in bps (0.30%, Source: https://pump.fun, Verified on: 2026-11-11)",
+    )
+    # 3. Raydium AMM v4: 0.25% (25 bps)
+    #    Source: https://docs.raydium.io/raydium/protocol/fees (Verified on: 2026-11-11)
+    fee_raydium_amm_bps: int = Field(
+        default=25,
+        ge=0,
+        description="Raydium AMM v4 trading fee in bps (0.25%, Source: https://docs.raydium.io/raydium/protocol/fees, Verified on: 2026-11-11)",
+    )
+    # 4. Raydium CPMM: 0.25% (25 bps standard tier)
+    #    Source: https://docs.raydium.io/raydium/protocol/fees (Verified on: 2026-11-11)
+    fee_raydium_cpmm_bps: int = Field(
+        default=25,
+        ge=0,
+        description="Raydium CPMM trading fee in bps (0.25%, Source: https://docs.raydium.io/raydium/protocol/fees, Verified on: 2026-11-11)",
+    )
+    # 5. Raydium CLMM: 0.25% (25 bps default tier)
+    #    Source: https://docs.raydium.io/raydium/protocol/fees (Verified on: 2026-11-11)
+    fee_raydium_clmm_bps: int = Field(
+        default=25,
+        ge=0,
+        description="Raydium CLMM trading fee in bps (0.25%, Source: https://docs.raydium.io/raydium/protocol/fees, Verified on: 2026-11-11)",
+    )
+    # 6. Uniswap v2: 0.30% (30 bps)
+    #    Source: https://docs.uniswap.org/contracts/v2/concepts/protocol-overview/how-uniswap-works (Verified on: 2026-11-11)
+    fee_uniswap_v2_bps: int = Field(
+        default=30,
+        ge=0,
+        description="Uniswap v2 trading fee in bps (0.30%, Source: https://docs.uniswap.org, Verified on: 2026-11-11)",
+    )
+    # 7. Uniswap v3: 0.30% (30 bps standard tier)
+    #    Source: https://docs.uniswap.org/concepts/protocol/fees (Verified on: 2026-11-11)
+    fee_uniswap_v3_bps: int = Field(
+        default=30,
+        ge=0,
+        description="Uniswap v3 trading fee in bps (0.30%, Source: https://docs.uniswap.org, Verified on: 2026-11-11)",
+    )
+    # 8. Aerodrome: 0.30% (30 bps volatile pool default)
+    #    Source: https://docs.aerodrome.finance/protocol-overview/fees (Verified on: 2026-11-11)
+    fee_aerodrome_bps: int = Field(
+        default=30,
+        ge=0,
+        description="Aerodrome volatile AMM trading fee in bps (0.30%, Source: https://docs.aerodrome.finance, Verified on: 2026-11-11)",
+    )
+
+    # Extra slippage allowance: empirically calibrated parameter (default 0), NOT arbitrary constant
+    extra_slippage_bps: int = Field(
+        default=0,
+        ge=0,
+        description="Empirically calibrated extra slippage allowance in bps beyond CPMM pool math (default: 0)",
+    )
+
+    # Solana network fee parameters:
+    solana_base_fee_lamports: int = Field(
+        default=5_000,
+        ge=0,
+        description="Solana base transaction fee in lamports (Source: https://docs.solana.com/transaction_fees, Verified on: 2026-11-11)",
+    )
+    solana_priority_fee_lamports: int = Field(
+        default=100_000,
+        ge=0,
+        description="Solana compute budget priority fee in lamports (Source: https://solana.com/docs/core/fees, Verified on: 2026-11-11)",
+    )
+    solana_jito_tip_lamports: int = Field(
+        default=10_000,
+        ge=0,
+        description="Solana Jito tip floor in lamports (Source: https://jito-labs.gitbook.io/mev/searcher-resources/bundles, Verified on: 2026-11-11)",
+    )
+    solana_conservative_fee_sol: Decimal = Field(
+        default=Decimal("0.0005"),
+        gt=Decimal(0),
+        description="Conservative fallback network fee in SOL when live fee data is unavailable (Verified on: 2026-11-11)",
+    )
+
+    # Base (EVM) network fee parameters:
+    base_swap_gas_units: int = Field(
+        default=180_000,
+        ge=21_000,
+        description="Estimated gas units for DEX router swap on Base (Source: https://docs.base.org/fees, Verified on: 2026-11-11)",
+    )
+    base_gas_price_gwei: Decimal = Field(
+        default=Decimal("0.05"),
+        gt=Decimal(0),
+        description="Base L2 execution gas price in gwei (Source: https://docs.base.org/fees, Verified on: 2026-11-11)",
+    )
+    base_l1_data_fee_eth: Decimal = Field(
+        default=Decimal("0.00001"),
+        ge=Decimal(0),
+        description="Base L1 blob/data fee in ETH (Source: https://docs.base.org/fees, Verified on: 2026-11-11)",
+    )
+    base_conservative_fee_eth: Decimal = Field(
+        default=Decimal("0.00005"),
+        gt=Decimal(0),
+        description="Conservative fallback network fee in ETH when live gas data is unavailable (Verified on: 2026-11-11)",
+    )
     stop_loss_pct: float = Field(
         default=-0.08,
         le=-0.01,

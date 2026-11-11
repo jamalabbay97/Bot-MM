@@ -23,10 +23,10 @@ GAS_COST_BASE_USD: Decimal = Decimal("0.05")
 MAX_POSITION_FRACTION: Decimal = Decimal("0.01")  # Default 1%
 MAX_AUTONOMOUS_CAP: Decimal = Decimal("0.05")     # Autonomous hard-stop cap 5%
 
-# Realistic paper-trading drag constants:
-DEX_SWAP_FEE_PCT: Decimal = Decimal("0.003")      # 0.3% DEX swap fee
-SIMULATED_GAS_NATIVE: Decimal = Decimal("0.0005") # 0.0005 SOL or ETH (~$0.07 realistic priority gas)
-ASSUMED_SLIPPAGE_PCT: Decimal = Decimal("0.01")   # 1% assumed execution slippage (instead of 5%)
+# Paper-trading drag constants (aligned with TradeCostModel):
+DEX_SWAP_FEE_PCT: Decimal = Decimal("0.003")      # 0.3% default DEX swap fee
+SIMULATED_GAS_NATIVE: Decimal = Decimal("0.0005") # 0.0005 SOL or ETH conservative priority gas
+ASSUMED_SLIPPAGE_PCT: Decimal = Decimal("0.0")    # 0% extra slippage default (price impact modeled in CPMM pool math)
 
 # Gas drag gate: reject trade if gas > 5 % of position value (usd_at_risk < gas_cost * 20).
 GAS_MULTIPLE_GATE: int = 20
@@ -51,7 +51,7 @@ class KellySizing:
 def gas_cost_usd(chain: ChainIdentifier) -> Decimal:
     """
     Return the fixed simulated gas / priority-fee cost in USD per trade.
-    Solana : $0.03
+    Solana : $0.02
     Base   : $0.05
     """
     match chain:
@@ -189,10 +189,10 @@ def apply_paper_trading_drag(
     slippage_pct: Decimal = ASSUMED_SLIPPAGE_PCT,
 ) -> tuple[Decimal, Decimal, Decimal]:
     """
-    Deduct dynamic simulated fees to reflect live market drag:
+    Deduct simulated fees to reflect market drag:
     - 0.3% DEX swap fee
-    - 0.005 SOL/ETH gas
-    - 5% assumed execution slippage
+    - 0.0005 SOL/ETH gas
+    - 0% assumed execution slippage (price impact comes from pool math)
     Returns: (net_amount, adjusted_price, fee_drag_usd)
     """
     if side == OrderSide.BUY:

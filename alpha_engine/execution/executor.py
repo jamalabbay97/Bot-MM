@@ -13,8 +13,10 @@ from decimal import Decimal
 
 from typing import Optional, Any
 
+from alpha_engine.config import EngineConfig
 from alpha_engine.execution.book import PositionBook
 from alpha_engine.execution.bundle import PrivateTxRouter
+from alpha_engine.execution.costs import TradeCostModel
 from alpha_engine.math.cpmm import (
     cpmm_buy_quote,
     cpmm_sell_quote,
@@ -23,7 +25,6 @@ from alpha_engine.math.cpmm import (
 from alpha_engine.math.mev import simulate_latency
 from alpha_engine.math.sizing import (
     GAS_MULTIPLE_GATE,
-    apply_paper_trading_drag,
     gas_cost_usd,
 )
 from alpha_engine.models.decisions import DecisionSignal
@@ -51,26 +52,29 @@ class PaperExecutor:
         position_book: PositionBook,
         price_service: Any,
         private_router: Optional[PrivateTxRouter] = None,
+        cost_model: Optional[TradeCostModel] = None,
+        config: Optional[EngineConfig] = None,
     ) -> None:
         if price_service is None:
             raise ValueError("PaperExecutor requires a valid price_service (NativePriceService)")
         self._positions = position_book
         self._price_service = price_service
         self._private_router = private_router or PrivateTxRouter()
+        self.config = config or EngineConfig()
+        self._cost_model = cost_model or TradeCostModel(config=self.config, price_service=price_service)
 
     async def execute_signal(
         self,
         signal: SignalEvent,
         portfolio_equity_usd: Decimal,
         max_position_fraction: Decimal | None = None,
-        apply_drag: bool = False,
         is_new_launch: bool = False,
         fixed_trade_amount_native: Decimal | None = None,
         equity_fraction: float | None = None,
     ) -> PaperFill | None:
         """
         Produce a PaperFill for the given signal, or return None if skipped.
-        Optionally applies realistic paper market drag (0.3% fee + 0.005 gas + 1% slippage).
+        Applies unified, symmetric trade costs (venue swap fee, CPMM impact, network fees).
         BUY signals require explicit fixed_trade_amount_native (>0) from the sizing authority.
         """
         _ = max_position_fraction
@@ -130,7 +134,9 @@ class PaperExecutor:
 
             native_in = fixed_trade_amount_native
             usd_at_risk = native_in * current_native_price
-            trade_gas_usd = gas_cost_usd(signal.chain)
+            trade_gas_usd = self._cost_model.get_network_fee_usd(
+                signal.chain, native_price_usd=current_native_price
+            )
             gas_threshold = trade_gas_usd * Decimal(str(GAS_MULTIPLE_GATE))
             if usd_at_risk < gas_threshold:
                 logger.info(
@@ -149,26 +155,29 @@ class PaperExecutor:
             )
             fill_kelly_fraction = equity_fraction if equity_fraction is not None else real_fraction
 
+            venue = getattr(signal, "execution_venue", None)
             try:
-                quote = cpmm_buy_quote(adjusted_pool, native_in)
-            except ValueError as exc:
-                logger.warning("CPMM BUY quote failed for %s: %s", signal.signal_id[:8], exc)
+                cost_res = self._cost_model.calculate_trade_costs(
+                    side=OrderSide.BUY,
+                    gross_amount=native_in,
+                    pool=adjusted_pool,
+                    chain=signal.chain,
+                    venue=venue,
+                    native_price_usd=current_native_price,
+                    platform=getattr(signal, "platform", None),
+                )
+            except Exception as exc:
+                logger.warning("Cost model execution failed for BUY %s: %s", signal.signal_id[:8], exc)
                 return None
 
             simulated_native_spent = native_in
-            tokens_acquired = quote.amount_out
+            tokens_acquired = cost_res.amount_out
             if tokens_acquired <= Decimal(0):
                 logger.warning("CPMM output 0 tokens for %s — skipping.", signal.signal_id[:8])
                 return None
-            effective_price = native_in / tokens_acquired
-            price_impact_bps = quote.price_impact_bps
-
-            if apply_drag:
-                tokens_acquired, effective_price, _ = apply_paper_trading_drag(
-                    gross_amount=native_in,
-                    execution_price=effective_price,
-                    side=OrderSide.BUY,
-                )
+            effective_price = cost_res.effective_price
+            price_impact_bps = cost_res.price_impact_bps
+            gas = cost_res.network_fee_usd
 
             if effective_price <= Decimal(0):
                 logger.warning("Effective price <= 0 for %s — skipping.", signal.signal_id[:8])
@@ -185,26 +194,28 @@ class PaperExecutor:
                 )
                 return None
 
+            venue = getattr(signal, "execution_venue", None)
             try:
-                quote = cpmm_sell_quote(adjusted_pool, tokens_held)
-            except ValueError as exc:
-                logger.warning("CPMM SELL quote failed for %s: %s", signal.signal_id[:8], exc)
+                cost_res = self._cost_model.calculate_trade_costs(
+                    side=OrderSide.SELL,
+                    gross_amount=tokens_held,
+                    pool=adjusted_pool,
+                    chain=signal.chain,
+                    venue=venue,
+                    native_price_usd=current_native_price,
+                    platform=getattr(signal, "platform", None),
+                )
+            except Exception as exc:
+                logger.warning("Cost model execution failed for SELL %s: %s", signal.signal_id[:8], exc)
                 return None
 
             tokens_acquired = tokens_held
-            simulated_native_spent = quote.amount_out
-            effective_price = simulated_native_spent / tokens_acquired
-            price_impact_bps = quote.price_impact_bps
+            simulated_native_spent = max(Decimal(0), cost_res.amount_out - cost_res.network_fee_native)
+            effective_price = (simulated_native_spent / tokens_acquired) if tokens_acquired > Decimal(0) else Decimal(0)
+            price_impact_bps = cost_res.price_impact_bps
+            gas = cost_res.network_fee_usd
 
-            if apply_drag:
-                simulated_native_spent, effective_price, _ = apply_paper_trading_drag(
-                    gross_amount=tokens_held,
-                    execution_price=effective_price,
-                    side=OrderSide.SELL,
-                )
-
-        gas = gas_cost_usd(signal.chain)
-        platform = resolve_trade_platform(
+        platform = getattr(signal, "platform", None) or resolve_trade_platform(
             token_address=signal.token_address,
             chain=signal.chain,
             source=getattr(signal, "source", None),
@@ -252,13 +263,13 @@ class PaperExecutor:
         pool: PoolState,
         tokens_to_sell: Decimal,
         reason: TradeExitReason | None = None,
-        apply_drag: bool = False,
         portfolio_equity_usd: Decimal = Decimal("10000.0"),
         platform: Optional[str] = None,
         min_fill_timestamp_ns: Optional[int] = None,
     ) -> PaperFill | None:
         """
         Produce a PaperFill for a dynamic exit SELL order (TP ladder, trailing stop, emergency drain).
+        Applies unified, symmetric trade costs (venue swap fee, CPMM impact, network fees).
         """
         if tokens_to_sell <= 0:
             return None
@@ -273,11 +284,25 @@ class PaperExecutor:
         )
         adjusted_pool = latency_result.adjusted_pool_state
 
+        price_res = self._price_service.get_price(chain)
+        current_native_price = (
+            price_res.price if hasattr(price_res, "price")
+            else (price_res[0] if isinstance(price_res, (tuple, list)) else Decimal(0))
+        )
+
         try:
-            quote = cpmm_sell_quote(adjusted_pool, tokens_to_sell)
-        except ValueError as exc:
+            cost_res = self._cost_model.calculate_trade_costs(
+                side=OrderSide.SELL,
+                gross_amount=tokens_to_sell,
+                pool=adjusted_pool,
+                chain=chain,
+                venue=None,
+                native_price_usd=current_native_price,
+                platform=platform,
+            )
+        except Exception as exc:
             logger.warning(
-                "CPMM SELL quote failed for exit %s (%s): %s",
+                "Cost model calculation failed for exit %s (%s): %s",
                 token_address[:10],
                 reason.value if reason else "manual",
                 exc,
@@ -285,33 +310,24 @@ class PaperExecutor:
             return None
 
         tokens_acquired = tokens_to_sell
-        simulated_native_spent = quote.amount_out
+        gross_native = cost_res.amount_out
         max_allowed_native = adjusted_pool.native_reserve * Decimal("0.30")
-        if simulated_native_spent > max_allowed_native and max_allowed_native > Decimal(0):
+        if gross_native > max_allowed_native and max_allowed_native > Decimal(0):
             logger.warning(
                 "CPMM SELL quote native output %s exceeded 30%% of pool native reserve %s; capping to prevent unrealistic paper fills.",
-                simulated_native_spent,
+                gross_native,
                 adjusted_pool.native_reserve,
             )
-            simulated_native_spent = max_allowed_native
+            gross_native = max_allowed_native
 
         if reason in (TradeExitReason.EMERGENCY_DRAIN, TradeExitReason.RUG_LIQUIDITY_DRAIN):
             # In confirmed emergency drain / rug pull, liquidity is collapsed: apply heavy slippage cap
             max_drain_native = adjusted_pool.native_reserve * Decimal("0.05")
-            if simulated_native_spent > max_drain_native and max_drain_native > Decimal(0):
-                simulated_native_spent = max_drain_native
-
-        effective_price = simulated_native_spent / tokens_acquired
-        price_impact_bps = quote.price_impact_bps
-        if reason in (TradeExitReason.EMERGENCY_DRAIN, TradeExitReason.RUG_LIQUIDITY_DRAIN):
-            price_impact_bps = max(price_impact_bps, 5000)
-
-        if apply_drag:
-            simulated_native_spent, effective_price, _ = apply_paper_trading_drag(
-                gross_amount=tokens_to_sell,
-                execution_price=effective_price,
-                side=OrderSide.SELL,
-            )
+            if gross_native > max_drain_native and max_drain_native > Decimal(0):
+                gross_native = max_drain_native
+            price_impact_bps = max(cost_res.price_impact_bps, 5000)
+        else:
+            price_impact_bps = cost_res.price_impact_bps
 
         if reason == TradeExitReason.EMERGENCY_HONEYPOT_MUTATION:
             # Route emergency dump through private relay with highest priority
@@ -321,7 +337,11 @@ class PaperExecutor:
                 tip_wei_or_lamports=10_000_000,
             )
 
-        gas = gas_cost_usd(chain)
+        # Net native received = gross native - exit network fee
+        simulated_native_spent = max(Decimal(0), gross_native - cost_res.network_fee_native)
+        effective_price = (simulated_native_spent / tokens_acquired) if tokens_acquired > Decimal(0) else Decimal(0)
+        gas = cost_res.network_fee_usd
+
         resolved_platform = platform or resolve_trade_platform(
             token_address=token_address,
             chain=chain,
@@ -367,7 +387,6 @@ class PaperExecutor:
         signal: DecisionSignal | SignalEvent,
         portfolio_equity_usd: Decimal,
         max_position_fraction: Decimal | None = None,
-        apply_drag: bool = False,
         priority_percentile: str = "p95",
         fixed_trade_amount_native: Decimal | None = None,
     ) -> PaperFill | None:
@@ -382,7 +401,6 @@ class PaperExecutor:
             signal=signal,
             portfolio_equity_usd=portfolio_equity_usd,
             max_position_fraction=max_position_fraction,
-            apply_drag=apply_drag,
             fixed_trade_amount_native=fixed_trade_amount_native,
         )
         if fill is None:
@@ -410,7 +428,6 @@ class PaperExecutor:
         num_batches: int = 3,
         block_interval: int = 2,
         max_position_fraction: Decimal | None = None,
-        apply_drag: bool = False,
         fixed_trade_amount_native: Decimal | None = None,
     ) -> list[PaperFill]:
         """
@@ -423,7 +440,6 @@ class PaperExecutor:
             signal=signal,
             portfolio_equity_usd=portfolio_equity_usd,
             max_position_fraction=max_position_fraction,
-            apply_drag=apply_drag,
             fixed_trade_amount_native=fixed_trade_amount_native,
         )
         if total_fill is None:

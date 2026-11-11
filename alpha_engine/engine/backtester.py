@@ -113,10 +113,17 @@ class WalkForwardBacktester:
     and tests strategy parameter permutations with out-of-sample cross-validation.
     """
 
-    def __init__(self, db_path: str = "paper_trading.db", split_ratio: float = 0.70) -> None:
+    def __init__(
+        self,
+        db_path: str = "paper_trading.db",
+        split_ratio: float = 0.70,
+        cost_model: Optional[Any] = None,
+    ) -> None:
         self.db_path = db_path
         self.split_ratio = max(0.50, min(0.90, split_ratio))
         self._historical_trades: List[BacktestTradeRecord] = []
+        from alpha_engine.execution.costs import TradeCostModel
+        self.cost_model = cost_model or TradeCostModel()
 
     def partition_records(self) -> Tuple[List[BacktestTradeRecord], List[BacktestTradeRecord]]:
         """Return (in_sample, out_of_sample) trade record partitions."""
@@ -219,9 +226,33 @@ class WalkForwardBacktester:
 
         # Re-evaluate each trade under strategy exit rules
         simulated_trades: list[Tuple[float, float]] = [] # list of (pnl_usd, roi_pct)
-        gas_slippage_drag_usd = 0.10 # $0.05 buy gas + $0.05 sell gas + slippage drag
+        from alpha_engine.models.enums import ChainIdentifier, ExecutionVenue
 
         for t in qualifying_trades:
+            # Derive chain and cost model fees
+            chain = (
+                ChainIdentifier.SOLANA_MAINNET
+                if "solana" in str(t.chain).lower()
+                else ChainIdentifier.BASE_MAINNET
+            )
+            venue = (
+                ExecutionVenue.RAYDIUM_AMM
+                if chain == ChainIdentifier.SOLANA_MAINNET
+                else ExecutionVenue.UNISWAP_V2
+            )
+            inferred_price = (
+                Decimal(str(t.cost_basis_usd)) / Decimal(str(t.native_spent))
+                if t.native_spent > 0 and t.cost_basis_usd > 0
+                else None
+            )
+            try:
+                round_trip_gas_usd = float(
+                    self.cost_model.get_network_fee_usd(chain, native_price_usd=inferred_price) * Decimal(2)
+                )
+            except Exception:
+                round_trip_gas_usd = 0.05
+            round_trip_fee_pct = float(self.cost_model.get_venue_fee_pct(venue) * Decimal(2))
+
             # Baseline market price path from peak multiplier and actual realized roi
             actual_roi = t.roi_pct / 100.0
             peak_gain = t.peak_multiplier - 1.0
@@ -242,7 +273,8 @@ class WalkForwardBacktester:
                 sim_roi = actual_roi
 
             cost = t.cost_basis_usd
-            sim_pnl = (cost * sim_roi) - gas_slippage_drag_usd
+            trade_fee_drag_usd = (cost * round_trip_fee_pct) + round_trip_gas_usd
+            sim_pnl = (cost * sim_roi) - trade_fee_drag_usd
             sim_roi_pct = (sim_pnl / cost) * 100.0 if cost > 0 else 0.0
             simulated_trades.append((sim_pnl, sim_roi_pct))
 

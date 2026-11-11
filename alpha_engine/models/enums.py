@@ -232,6 +232,8 @@ class ExecutionVenue(str, Enum):
     RAYDIUM_CLMM = "raydium_clmm"
     ORCA_WHIRLPOOL = "orca_whirlpool"
     PUMP_FUN = "pump_fun"
+    PUMPSWAP = "pumpswap"
+    AERODROME = "aerodrome"
 
 
 class TradingPlatform(str, Enum):
@@ -323,6 +325,101 @@ def resolve_trade_platform(
             return TradingPlatform.DEX_SCAN.value
 
     return TradingPlatform.DEX_SCAN.value
+
+
+def resolve_trade_venue(
+    token_address: Optional[str] = None,
+    chain: Optional[Any] = None,
+    source: Optional[Any] = None,
+    execution_venue: Optional[Any] = None,
+    pool_address: Optional[str] = None,
+    bonding_curve_mode: bool = False,
+    is_pump_fun: Optional[bool] = None,
+    originating_channel: Optional[str] = None,
+    platform: Optional[str] = None,
+) -> ExecutionVenue:
+    """
+    Deterministically resolves the exact ExecutionVenue for fee schedule lookup.
+    Fails closed if the venue cannot be identified.
+    """
+    # 1. Explicit execution venue override
+    if execution_venue is not None:
+        if isinstance(execution_venue, ExecutionVenue):
+            return execution_venue
+        v_str = str(getattr(execution_venue, "value", execution_venue)).strip().lower()
+        for member in ExecutionVenue:
+            if member.value == v_str or member.name.lower() == v_str:
+                return member
+        if "pumpswap" in v_str:
+            return ExecutionVenue.PUMPSWAP
+        if "pump" in v_str:
+            return ExecutionVenue.PUMP_FUN
+        if "raydium_clmm" in v_str:
+            return ExecutionVenue.RAYDIUM_CLMM
+        if "raydium_cpmm" in v_str:
+            return ExecutionVenue.RAYDIUM_CPMM
+        if "raydium" in v_str:
+            return ExecutionVenue.RAYDIUM_AMM
+        if "uniswap_v3" in v_str:
+            return ExecutionVenue.UNISWAP_V3
+        if "uniswap" in v_str:
+            return ExecutionVenue.UNISWAP_V2
+        if "aerodrome" in v_str:
+            return ExecutionVenue.AERODROME
+        if "orca" in v_str:
+            return ExecutionVenue.ORCA_WHIRLPOOL
+
+    # 2. Platform override
+    if platform:
+        p_clean = str(platform).strip().lower()
+        if p_clean in ("pump.fun", "pump_fun", "pump"):
+            return ExecutionVenue.PUMP_FUN
+        if p_clean in ("pumpswap",):
+            return ExecutionVenue.PUMPSWAP
+        for member in ExecutionVenue:
+            if member.value == p_clean or member.name.lower() == p_clean:
+                return member
+
+    # 3. Explicit pump.fun / bonding curve mode
+    if is_pump_fun is True or bonding_curve_mode:
+        return ExecutionVenue.PUMP_FUN
+
+    # 4. Check pool address
+    if pool_address:
+        p_str = str(pool_address).lower()
+        if "pumpswap" in p_str:
+            return ExecutionVenue.PUMPSWAP
+        if "pump" in p_str:
+            return ExecutionVenue.PUMP_FUN
+        if "raydium_clmm" in p_str:
+            return ExecutionVenue.RAYDIUM_CLMM
+        if "raydium_cpmm" in p_str:
+            return ExecutionVenue.RAYDIUM_CPMM
+        if "raydium" in p_str:
+            return ExecutionVenue.RAYDIUM_AMM
+        if "aerodrome" in p_str:
+            return ExecutionVenue.AERODROME
+        if "uniswap_v3" in p_str:
+            return ExecutionVenue.UNISWAP_V3
+        if "uniswap" in p_str:
+            return ExecutionVenue.UNISWAP_V2
+
+    # 5. Token address pump check (if Solana)
+    if token_address:
+        t_clean = str(token_address).strip().lower()
+        if t_clean.endswith("pump") or "pump" in t_clean:
+            chain_str = str(getattr(chain, "value", chain or "")).lower()
+            if not chain_str or "solana" in chain_str or not t_clean.startswith("0x"):
+                return ExecutionVenue.PUMP_FUN
+
+    # 6. Fallback based on chain
+    chain_val = getattr(chain, "value", chain)
+    if chain_val in (ChainIdentifier.SOLANA_MAINNET, ChainIdentifier.SOLANA_MAINNET.value, "solana"):
+        return ExecutionVenue.RAYDIUM_AMM
+    if chain_val in (ChainIdentifier.BASE_MAINNET, ChainIdentifier.BASE_MAINNET.value, "base"):
+        return ExecutionVenue.UNISWAP_V2
+
+    raise ValueError(f"Cannot resolve ExecutionVenue for token {token_address} on chain {chain}")
 
 
 class TokenRequestState(str, Enum):

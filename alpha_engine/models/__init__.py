@@ -24,6 +24,7 @@ from alpha_engine.models.enums import (
     WalletClassification,
     WhitelistStatus,
     resolve_trade_platform,
+    resolve_trade_venue,
 )
 from alpha_engine.models.events import (
     PoolStateUpdateEvent,
@@ -106,6 +107,7 @@ __all__ = [
     "TradingPlatform",
     "PlatformSource",
     "resolve_trade_platform",
+    "resolve_trade_venue",
     "ScreenerSection",
     # Ingestion & Pipeline Events
     "SwapEvent",
