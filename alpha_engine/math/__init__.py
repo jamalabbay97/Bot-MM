@@ -17,6 +17,8 @@ from alpha_engine.math.cpmm import (
 from alpha_engine.math.mev import (
     LatencyResult,
     apply_frontrun_to_pool,
+    calculate_sandwich_risk,
+    determine_market_state_at_fill,
     sample_fill_latency,
     simulate_frontrun_volume,
     simulate_latency,
@@ -46,6 +48,8 @@ __all__ = [
     "simulate_frontrun_volume",
     "apply_frontrun_to_pool",
     "simulate_latency",
+    "determine_market_state_at_fill",
+    "calculate_sandwich_risk",
     "KellySizing",
     "half_kelly_fraction",
     "shrink_win_rate",

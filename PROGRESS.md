@@ -117,14 +117,44 @@ Track progress across all identified defects and phases. All items must satisfy 
 ---
 
 ## Issue 4 Latency/MEV does not model price movement
-- [ ] reproduced
-- [ ] red test
-- [ ] fix
-- [ ] green test
-- [ ] mutation check
-- [ ] sweep done
-- [ ] wiring proof
-- [ ] README/docs updated
+- [x] reproduced
+  - `alpha_engine/math/mev.py`: `simulate_latency()` sampled latency uniformly in [1200, 3500] ms, but only shifted `fill_timestamp_ns`; pool state was never re-read at fill time.
+  - `simulate_frontrun_volume()` drew an unconditional adverse LogNormal fraction (0.1%-2.5% of native reserve) regardless of venue, route exposure (private vs public), priority fee, or trade size.
+  - README claimed 45-320 ms while code executed 1200-3500 ms.
+  - Shadow tournament and backtester used inconsistent or detached execution models.
+- [x] red test
+  - `tests/test_issue4_latency_and_mev.py`: 6 exhaustive tests:
+    1. `test_moving_market_price_reflected_at_fill`: deterministic seed + price series moving up (+21%) and down (-19%) during latency window confirms fill price reflects market move at fill time.
+    2. `test_stale_pool_at_fill_rejected_with_counter`: if no market state fresher than `fill_max_stale_ms` exists at fill time, rejects fail-closed with `stale_pool_at_fill_rejected`.
+    3. `test_private_route_zero_sandwich_impact_and_public_route_scales`: private routes (`is_private_route=True`) have zero MEV sandwich frontrun impact; public routes scale with trade size / depth and slippage tolerance, bounded by `mev_max_sandwich_impact_bps`.
+    4. `test_seeded_rng_reproducibility`: identical config seed produces identical latencies and MEV impacts; different seeds produce different draws.
+    5. `test_parity_shadow_tournament_and_live_paper_fills`: live `PaperExecutor` and `StrategyTournamentRegistry` invoke the exact same `alpha_engine.math.mev` module and pending-fill logic with identical outputs.
+    6. `test_integration_runner_entry_path_scripted_feed`: end-to-end runner test with a scripted price feed demonstrating pending order resolution and fill-time pricing.
+- [x] fix
+  - `alpha_engine/config.py`: Added Section 5.3 (`execution_seed`, `latency_min_ms_solana=45`, `latency_max_ms_solana=320`, `latency_min_ms_base=150`, `latency_max_ms_base=2000`, `latency_distribution="lognormal"`, `fill_max_stale_ms=4000`, `fill_timeout_ms=10000`, `default_is_private_route=False`, `mev_sandwich_depth_threshold=0.005`, `mev_sandwich_slippage_threshold_bps=50`, `mev_max_sandwich_impact_bps=500`).
+  - `alpha_engine/math/mev.py`: Completely revamped: `sample_fill_latency()` with chain-specific defaults and seeded RNG; conditional `simulate_frontrun_volume()` requiring public mempool, depth > 0.5%, slippage > 50 bps; `determine_market_state_at_fill()` resolving freshest pool state and failing closed on staleness; unified `simulate_latency()`.
+  - `alpha_engine/execution/executor.py`: Injected `pool_resolver` and `is_private_route`; added seeded RNG and `telemetry_counters`; in paper mode, awaits pending fill delay up to `fill_timeout_ms`, resolves freshest pool state at fill time, rejects stale states fail-closed, and calculates execution quotes on `adjusted_pool`.
+  - `alpha_engine/engine/experimentation.py`: Wired `config` and seeded RNG into `StrategyTournamentRegistry`; updated `evaluate_signal_and_record_shadow_lots` to call unified `simulate_latency()` with `market_state_resolver`.
+  - `alpha_engine/engine/backtester.py`: Wired `config` and seeded RNG into `WalkForwardBacktester`; updated backtest simulation to sample latency and apply conditional MEV.
+  - `alpha_engine/engine/runner.py`: Passed `config` and pool resolvers (`_resolve_pool_for_executor`, `_resolve_pool_for_tournament`) to `PaperExecutor` and `StrategyTournamentRegistry`.
+- [x] green test
+  - `tests/test_issue4_latency_and_mev.py` -> 6/6 passed in 8.91s.
+  - `tests/test_native_price_service.py`, `tests/test_issue2_execution_sizing.py`, `tests/test_issue3_cost_model.py`, `tests/test_issue4_latency_and_mev.py`, `tests/test_issue5_pool_data_and_venue_math.py` -> 30/30 passed.
+  - All modular architecture and swarm tests pass cleanly.
+- [x] mutation check
+  - Mutated `executor.py` to bypass fill-time pool resolution and use signal-time pool: `test_moving_market_price_reflected_at_fill` failed (`AssertionError: assert Decimal('9.90099...') != Decimal('9.90099...')`).
+  - Mutated `mev.py` to apply frontrunning even on private routes: `test_private_route_zero_sandwich_impact_and_public_route_scales` failed (`AssertionError: assert Decimal('0.05') == Decimal('0.0')`).
+- [x] sweep done
+  - Repo-wide search for unseeded `random.` in execution paths -> None.
+  - Verified tournament registry and backtester use the unified `mev.py` module.
+  - Ran `tools/audit/native_price_literals.py` -> 0 findings.
+- [x] wiring proof
+  - `runner.py`: `PaperTradingEngine` creates `PaperExecutor` and `StrategyTournamentRegistry` with `config=self.config` and pool resolvers wired to `_pool_registry`.
+  - `executor.py`: `execute_signal` and `execute_exit` await fill delay in paper mode, call `determine_market_state_at_fill` via `simulate_latency`, quote against `adjusted_pool`.
+  - `experimentation.py`: `evaluate_signal_and_record_shadow_lots` calls `simulate_latency` with `market_state_resolver` resolving from pool registry.
+- [x] README/docs updated
+  - `README.md`: Section 3 updated with real latency ranges (Solana: 45–320ms, Base: 150–2000ms), official documentation citations, conditional MEV rules, and pending-fill mechanics.
+  - `.env.example`: Added Section 11 documenting all latency, timeout, and MEV configuration parameters.
 
 ---
 

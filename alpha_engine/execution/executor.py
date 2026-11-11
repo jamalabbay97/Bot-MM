@@ -7,18 +7,24 @@ Python 3.11+
 
 from __future__ import annotations
 
+import asyncio
+import inspect
 import logging 
 import time
 from decimal import Decimal
 
-from typing import Optional, Any
+from typing import Optional, Any, Callable
 
 from alpha_engine.config import EngineConfig
 from alpha_engine.execution.book import PositionBook
 from alpha_engine.execution.bundle import PrivateTxRouter
 from alpha_engine.execution.costs import TradeCostModel
 from alpha_engine.math.cpmm import cpmm_buy_quote
-from alpha_engine.math.mev import simulate_latency
+from alpha_engine.math.mev import (
+    sample_fill_latency,
+    simulate_frontrun_volume,
+    simulate_latency,
+)
 from alpha_engine.math.sizing import (
     GAS_MULTIPLE_GATE,
     gas_cost_usd,
@@ -54,6 +60,8 @@ class PaperExecutor:
         private_router: Optional[PrivateTxRouter] = None,
         cost_model: Optional[TradeCostModel] = None,
         config: Optional[EngineConfig] = None,
+        pool_resolver: Optional[Callable] = None,
+        is_private_route: Optional[bool] = None,
         derived_reserves_policy: Optional[str] = None,
         derived_reserves_depth_cap_pct: Optional[Decimal] = None,
     ) -> None:
@@ -64,6 +72,8 @@ class PaperExecutor:
         self._private_router = private_router or PrivateTxRouter()
         self.config = config or EngineConfig()
         self._cost_model = cost_model or TradeCostModel(config=self.config, price_service=price_service)
+        self._pool_resolver = pool_resolver
+        self.is_private_route = is_private_route
         self.derived_reserves_policy = (
             derived_reserves_policy
             if derived_reserves_policy is not None
@@ -74,6 +84,9 @@ class PaperExecutor:
             if derived_reserves_depth_cap_pct is not None
             else getattr(self.config, "derived_reserves_depth_cap_pct", Decimal("0.02"))
         )
+        seed = getattr(self.config, "execution_seed", None)
+        import random
+        self._rng = random.Random(seed) if seed is not None else random.Random()
         self.telemetry_counters: dict[str, int] = {}
 
     async def execute_signal(
@@ -154,19 +167,82 @@ class PaperExecutor:
                         )
                         fixed_trade_amount_native = max_depth
 
-        pool_age = time.time() - getattr(pool, "timestamp_s", 0.0) if pool else 999.0
-        if not is_new_launch and pool_age > 4.0:
-            logger.warning(
-                "execute_signal: pool_state for %s is stale (age=%.2fs > 4.0s); rejecting fill.",
-                signal.token_address[:10],
-                pool_age,
-            )
+        # Determine routing protection
+        route_private = getattr(signal, "is_private_route", None)
+        if route_private is None:
+            route_private = self.is_private_route if self.is_private_route is not None else getattr(self.config, "default_is_private_route", False)
+
+        # 1. Sample fill latency per chain and determine target fill time
+        signal_ts_ns = signal.timestamp_ns or time.time_ns()
+        latency_ms = sample_fill_latency(chain=signal.chain, config=self.config, rng=self._rng)
+        fill_ts_ns = signal_ts_ns + latency_ms * 1_000_000
+
+        # 2. In paper trading mode where future state is not yet known:
+        # hold order pending until fill time (bounded by timeout)
+        now_ns = time.time_ns()
+        if fill_ts_ns > now_ns:
+            delay_s = (fill_ts_ns - now_ns) / 1e9
+            timeout_s = (getattr(self.config, "fill_timeout_ms", 10000) / 1000.0) if self.config else 10.0
+            if delay_s > timeout_s:
+                logger.warning(
+                    "execute_signal: fill delay %.2fs exceeds timeout %.2fs; rejecting fill.",
+                    delay_s,
+                    timeout_s,
+                )
+                self.telemetry_counters["fill_timeout_rejected"] = self.telemetry_counters.get("fill_timeout_rejected", 0) + 1
+                return None
+            await asyncio.sleep(delay_s)
+
+        # 3. Resolve freshest real pool state at fill time
+        market_feed = getattr(signal, "market_state_provider", None) or self._pool_resolver
+        pool_at_fill = pool
+        if market_feed is not None:
+            try:
+                if inspect.iscoroutinefunction(market_feed):
+                    resolved = await market_feed(signal.chain, signal.token_address, getattr(signal, "pool_address", ""), fill_ts_ns)
+                elif callable(market_feed):
+                    res = market_feed(signal.chain, signal.token_address, at_ts_ns=fill_ts_ns)
+                    if asyncio.iscoroutine(res):
+                        resolved = await res
+                    else:
+                        resolved = res
+                else:
+                    resolved = market_feed
+                if resolved is not None:
+                    pool_at_fill = resolved
+            except TypeError:
+                try:
+                    res = market_feed(signal.chain, signal.token_address, fill_ts_ns)
+                    if asyncio.iscoroutine(res):
+                        resolved = await res
+                    else:
+                        resolved = res
+                    if resolved is not None:
+                        pool_at_fill = resolved
+                except Exception as exc:
+                    logger.debug("Failed to query market_feed with fallback signature: %s", exc)
+            except Exception as exc:
+                logger.debug("Failed to query market_feed: %s", exc)
+
+        # 4. Simulate latency and conditional MEV on pool at fill time
+        max_slip = getattr(signal, "max_slippage_bps", 50)
+        trade_native = fixed_trade_amount_native if side == OrderSide.BUY else None
+        latency_result = simulate_latency(
+            pool=pool_at_fill,
+            signal_timestamp_ns=signal_ts_ns,
+            chain=signal.chain,
+            trade_size_native=trade_native,
+            max_slippage_bps=max_slip,
+            is_private_route=route_private,
+            config=self.config,
+            rng=self._rng,
+        )
+        if latency_result.adjusted_pool_state is None or latency_result.rejection_reason:
+            rej = latency_result.rejection_reason or "stale_pool_at_fill_rejected"
+            logger.warning("execute_signal: fill rejected at fill time: %s", rej)
+            self.telemetry_counters[rej] = self.telemetry_counters.get(rej, 0) + 1
             return None
 
-        latency_result = simulate_latency(
-            pool=pool,
-            signal_timestamp_ns=signal.timestamp_ns,
-        )
         adjusted_pool = latency_result.adjusted_pool_state
 
         # Obtain per-chain native price dynamically from NativePriceService
@@ -372,10 +448,63 @@ class PaperExecutor:
             portfolio_equity_usd = Decimal("10000.0")
 
         now_ns = time.time_ns()
+        latency_ms = sample_fill_latency(chain=chain, config=self.config, rng=self._rng)
+        fill_ts_ns = now_ns + latency_ms * 1_000_000
+
+        # Paper mode hold pending if in future
+        current_wall_ns = time.time_ns()
+        if fill_ts_ns > current_wall_ns:
+            delay_s = (fill_ts_ns - current_wall_ns) / 1e9
+            timeout_s = (getattr(self.config, "fill_timeout_ms", 10000) / 1000.0) if self.config else 10.0
+            if delay_s > timeout_s:
+                logger.warning(
+                    "execute_exit: fill delay %.2fs exceeds timeout %.2fs; rejecting fill.",
+                    delay_s,
+                    timeout_s,
+                )
+                self.telemetry_counters["fill_timeout_rejected"] = self.telemetry_counters.get("fill_timeout_rejected", 0) + 1
+                return None
+            await asyncio.sleep(delay_s)
+
+        # Resolve pool state at fill time
+        pool_at_fill = pool
+        if self._pool_resolver is not None:
+            try:
+                if inspect.iscoroutinefunction(self._pool_resolver):
+                    resolved = await self._pool_resolver(chain, token_address, getattr(pool, "pool_address", ""), fill_ts_ns)
+                elif callable(self._pool_resolver):
+                    res = self._pool_resolver(chain, token_address, at_ts_ns=fill_ts_ns)
+                    if asyncio.iscoroutine(res):
+                        resolved = await res
+                    else:
+                        resolved = res
+                else:
+                    resolved = self._pool_resolver
+                if resolved is not None:
+                    pool_at_fill = resolved
+            except Exception as exc:
+                logger.debug("execute_exit failed to query pool_resolver: %s", exc)
+
+        # Estimate native trade size from tokens to sell
+        est_spot = pool_at_fill.spot_price_native_per_token if pool_at_fill else Decimal("0")
+        trade_size_native = tokens_to_sell * est_spot if est_spot > Decimal("0") else None
+
         latency_result = simulate_latency(
-            pool=pool,
+            pool=pool_at_fill,
             signal_timestamp_ns=now_ns,
+            chain=chain,
+            trade_size_native=trade_size_native,
+            max_slippage_bps=150,
+            is_private_route=True,  # Exits route privately by default (Flashbots/Jito)
+            config=self.config,
+            rng=self._rng,
         )
+        if latency_result.adjusted_pool_state is None or latency_result.rejection_reason:
+            rej = latency_result.rejection_reason or "stale_pool_at_fill_rejected"
+            logger.warning("execute_exit: fill rejected at fill time: %s", rej)
+            self.telemetry_counters[rej] = self.telemetry_counters.get(rej, 0) + 1
+            return None
+
         adjusted_pool = latency_result.adjusted_pool_state
 
         price_res = self._price_service.get_price(chain)

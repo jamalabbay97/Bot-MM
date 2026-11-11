@@ -218,7 +218,7 @@ def test_cpmm_math_and_unified_price():
 
 
 def test_mev_lognormal_burst_and_latency():
-    """Verify stochastic latency and depth-relative LogNormal MEV model."""
+    """Verify stochastic latency and conditional LogNormal MEV model (Issue 4)."""
     from alpha_engine.models import ChainIdentifier, PoolState
     from alpha_engine.math import simulate_latency
 
@@ -233,11 +233,18 @@ def test_mev_lognormal_burst_and_latency():
     )
 
     signal_ts = 1_000_000_000_000_000
-    res = simulate_latency(pool, signal_ts)
+    # Base latency configured in [150, 2000] ms. Trade size of 50 native (5% depth) with 300 bps slippage triggers MEV.
+    res = simulate_latency(
+        pool=pool,
+        signal_timestamp_ns=signal_ts,
+        chain=ChainIdentifier.BASE_MAINNET,
+        trade_size_native=Decimal("50.0"),
+        max_slippage_bps=300,
+    )
 
-    assert 1200 <= res.latency_ms <= 3500
+    assert 150 <= res.latency_ms <= 2000
     assert res.fill_timestamp_ns == signal_ts + res.latency_ms * 1_000_000
-    assert 0.001 <= res.frontrun_fraction <= 0.025
+    assert res.frontrun_fraction > 0.0
     # Adjusted pool native reserve should have grown from MEV buy pressure
     assert res.adjusted_pool_state.native_reserve > pool.native_reserve
     assert res.adjusted_pool_state.token_reserve < pool.token_reserve

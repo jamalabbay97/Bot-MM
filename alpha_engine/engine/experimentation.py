@@ -410,10 +410,16 @@ class StrategyTournamentRegistry:
         self,
         ledger: Optional[Any] = None,
         cost_model: Optional[Any] = None,
+        config: Optional[Any] = None,
     ) -> None:
         self.ledger = ledger
         from alpha_engine.execution.costs import TradeCostModel
         self.cost_model = cost_model or TradeCostModel()
+        from alpha_engine.config import EngineConfig
+        self.config = config or getattr(self.cost_model, "config", None) or EngineConfig()
+        import random
+        seed = getattr(self.config, "execution_seed", None)
+        self._rng = random.Random(seed) if seed is not None else random.Random()
         self.current_regime: MarketRegime = MarketRegime.NEUTRAL
         self.on_promotion_callbacks: list[Callable[[StrategyVariant, str], Any]] = []
 
@@ -664,6 +670,8 @@ class StrategyTournamentRegistry:
         pool: PoolState,
         native_price_usd: Decimal,
         base_trade_size_native: Decimal = Decimal("0.10"),
+        market_state_provider: Optional[Any] = None,
+        is_private_route: Optional[bool] = None,
     ) -> list[ShadowLot]:
         """
         Simulate shadow trade execution for Champion and qualifying Challenger variants.
@@ -672,10 +680,25 @@ class StrategyTournamentRegistry:
         if signal.suggested_side != OrderSide.BUY:
             return []
 
-        # 1. Simulate CPMM execution and LogNormal latency
-        now_ns = time.time_ns()
-        latency_res = simulate_latency(pool, now_ns)
-        sim_pool = latency_res.adjusted_pool_state or pool
+        # 1. Simulate CPMM execution and LogNormal latency using unified module
+        signal_ts_ns = signal.timestamp_ns or time.time_ns()
+        route_private = is_private_route if is_private_route is not None else getattr(signal, "is_private_route", False)
+        max_slip = getattr(signal, "max_slippage_bps", 50)
+        latency_res = simulate_latency(
+            pool=pool,
+            signal_timestamp_ns=signal_ts_ns,
+            chain=signal.chain,
+            trade_size_native=base_trade_size_native,
+            max_slippage_bps=max_slip,
+            is_private_route=route_private,
+            market_state_provider=market_state_provider,
+            config=self.config,
+            rng=self._rng,
+        )
+        if latency_res.adjusted_pool_state is None:
+            logger.warning("Shadow lot execution rejected: %s", latency_res.rejection_reason)
+            return []
+        sim_pool = latency_res.adjusted_pool_state
 
         # CPMM quote and unified cost calculation
         venue = getattr(signal, "execution_venue", None)
@@ -699,7 +722,7 @@ class StrategyTournamentRegistry:
             tokens_acquired = (base_trade_size_native / exec_price) if exec_price > 0 else Decimal("0")
             slippage_bps = 50
             gas_usd = self.cost_model.get_network_fee_usd(signal.chain, native_price_usd=native_price_usd)
-        mev_drag_usd = Decimal(str(float(latency_res.frontrun_volume) * 0.02 * float(native_price_usd))) if latency_res.frontrun_volume else Decimal("0.0")
+        mev_drag_usd = (latency_res.frontrun_volume * native_price_usd) if latency_res.frontrun_volume > Decimal("0") else Decimal("0.0")
 
         created_lots: list[ShadowLot] = []
 

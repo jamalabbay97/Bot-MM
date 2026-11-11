@@ -278,9 +278,16 @@ Deterministic pricing mechanics for standard constant-product pools ($x \cdot y 
 - **Gas-Drag Gate**: Rejects any trade where estimated transaction fees exceed $2.5\%$ of expected alpha yield.
 
 ### Stochastic MEV & Latency Simulation
-To ensure realistic paper trading without historical over-fitting, the engine models real-world execution friction:
-- **Latency Distribution**: Log-Normal latency sampling ($45\text{ms} - 320\text{ms}$).
-- **MEV Front-Run Burst**: Simulates predatory sandwich attacks and priority fee front-running by injecting adverse price slippage proportional to pool volatility and block congestion.
+To ensure realistic paper trading without historical over-fitting, the engine models real-world execution friction, price movement during latency, and route-conditional MEV:
+- **Per-Chain Latency Distribution**:
+  - **Solana**: $45\text{ms} - 320\text{ms}$ Log-Normal latency sampling (Source: [Solana Labs Consensus Docs](https://docs.solanalabs.com/consensus/fork-generation#slot-time) reflecting 400ms target slot time, sub-slot TPU/QUIC broadcast, and Jito bundle landing).
+  - **Base**: $150\text{ms} - 2000\text{ms}$ Log-Normal latency sampling (Source: [Base Docs](https://docs.base.org/chain/block-time/) reflecting 2.0s OP Stack block production time and sequencer receipt).
+- **Latency-Aware Fill Determination**: Fills are priced from the freshest pool state observed AT `signal_time + latency`. In paper mode, orders are held pending until the target fill time is reached (bounded by `fill_timeout_ms`). If the market moves up or down during the latency window, the fill price reflects that movement. If no pool state fresher than `fill_max_stale_ms` (default 4.0s) exists at fill time, the fill is rejected fail-closed with telemetry counter `stale_pool_at_fill_rejected`.
+- **Route-Conditional MEV & Sandwich Attack Model**:
+  - **Private Relays & Bundles (`is_private_route=True`)**: Transactions routed through private endpoints (Flashbots/Titan on EVM, Jito bundles on SVM) have ZERO public mempool exposure, resulting in 0 frontrun volume and 0 adverse price drag.
+  - **Public Mempool Exploitation**: In unprotected routes, frontrunning applies only when the trade has sufficient pool depth impact (`depth >= 0.5%`) and wide slippage tolerance (`slippage >= 50 bps`). Searcher extraction scales with trade size and depth, consuming allowable slippage up to `mev_max_sandwich_impact_bps` (500 bps ceiling).
+  - **Deterministic Seeding**: All stochastic latency and MEV draws are seeded via `execution_seed` (default: 42) for reproducible simulation.
+- **Unified Engine Simulation Parity**: Live Paper (`PaperExecutor`), Shadow Tournament (`StrategyTournamentRegistry`), and Walk-Forward Optimization (`WalkForwardBacktester`) share the exact same `alpha_engine.math.mev` module and pending-fill execution assumptions.
 
 ### Position Book & State Persistence
 - **PositionBook (`book.py`)**: In-memory portfolio tracking with First-In-First-Out (FIFO) tax lots, tracking realized PnL, unrealized PnL, and maximum run-up.

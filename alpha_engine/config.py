@@ -534,6 +534,73 @@ class EngineConfig(BaseSettings):
         le=Decimal("0.20"),
         description="Fraction of derived native depth allowed as maximum order size under 'cap_size' policy (default 2%)",
     )
+
+    # 5.3 Latency & Conditional MEV Execution Simulation
+    # -------------------------------------------------------------------------
+    execution_seed: Optional[int] = Field(
+        default=42,
+        description="Deterministic RNG seed for latency and MEV simulation (None for unseeded random)",
+    )
+    # Solana latency: 45ms to 320ms
+    # Justification: Solana 400ms target slot time (Solana Labs Consensus Docs: https://docs.solanalabs.com/consensus/fork-generation#slot-time).
+    # Direct TPU/QUIC transaction broadcast and Jito bundles achieve sub-slot confirmation between 45ms and 320ms.
+    latency_min_ms_solana: int = Field(
+        default=45,
+        ge=1,
+        description="Minimum simulated fill latency for Solana transactions in milliseconds (Source: https://docs.solanalabs.com/consensus/fork-generation#slot-time, Verified on: 2026-11-11)",
+    )
+    latency_max_ms_solana: int = Field(
+        default=320,
+        ge=1,
+        description="Maximum simulated fill latency for Solana transactions in milliseconds (Source: https://docs.solanalabs.com/consensus/fork-generation#slot-time, Verified on: 2026-11-11)",
+    )
+    # Base latency: 150ms to 2000ms
+    # Justification: Base (OP Stack) block time is 2.0s (2,000ms) (Base Docs: https://docs.base.org/chain/block-time/).
+    # Sequencer propagation to block inclusion ranges from 150ms (sequencer receipt / Flashblocks) to 2000ms (next block boundary).
+    latency_min_ms_base: int = Field(
+        default=150,
+        ge=1,
+        description="Minimum simulated fill latency for Base transactions in milliseconds (Source: https://docs.base.org/chain/block-time/, Verified on: 2026-11-11)",
+    )
+    latency_max_ms_base: int = Field(
+        default=2000,
+        ge=1,
+        description="Maximum simulated fill latency for Base transactions in milliseconds (Source: https://docs.base.org/chain/block-time/, Verified on: 2026-11-11)",
+    )
+    latency_distribution: str = Field(
+        default="lognormal",
+        description="Latency sampling distribution: 'lognormal' (default per README) or 'uniform'",
+    )
+    fill_max_stale_ms: int = Field(
+        default=4000,
+        ge=100,
+        description="Maximum age of pool state in milliseconds at fill time before rejecting fill (fail-closed)",
+    )
+    fill_timeout_ms: int = Field(
+        default=10000,
+        ge=500,
+        description="Timeout in milliseconds to wait for future market state at fill time in paper trading mode",
+    )
+    default_is_private_route: bool = Field(
+        default=False,
+        description="Default routing type: True for private relay/bundle (MEV protected), False for public mempool",
+    )
+    mev_sandwich_depth_threshold: float = Field(
+        default=0.005,
+        ge=0.0,
+        le=1.0,
+        description="Minimum trade size as fraction of pool depth to attract sandwich searchers (default: 0.5% depth)",
+    )
+    mev_sandwich_slippage_threshold_bps: int = Field(
+        default=50,
+        ge=0,
+        description="Minimum slippage tolerance in basis points required for profitable sandwich extraction (default: 50 bps)",
+    )
+    mev_max_sandwich_impact_bps: int = Field(
+        default=500,
+        ge=0,
+        description="Maximum adverse price impact in basis points that can be extracted by MEV frontrunning (ceiling)",
+    )
     stop_loss_pct: float = Field(
         default=-0.08,
         le=-0.01,

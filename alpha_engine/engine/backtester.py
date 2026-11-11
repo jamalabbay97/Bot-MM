@@ -118,12 +118,18 @@ class WalkForwardBacktester:
         db_path: str = "paper_trading.db",
         split_ratio: float = 0.70,
         cost_model: Optional[Any] = None,
+        config: Optional[Any] = None,
     ) -> None:
         self.db_path = db_path
         self.split_ratio = max(0.50, min(0.90, split_ratio))
         self._historical_trades: List[BacktestTradeRecord] = []
         from alpha_engine.execution.costs import TradeCostModel
         self.cost_model = cost_model or TradeCostModel()
+        from alpha_engine.config import EngineConfig
+        self.config = config or getattr(self.cost_model, "config", None) or EngineConfig()
+        import random
+        seed = getattr(self.config, "execution_seed", 42)
+        self.rng = random.Random(seed) if seed is not None else random.Random()
 
     def partition_records(self) -> Tuple[List[BacktestTradeRecord], List[BacktestTradeRecord]]:
         """Return (in_sample, out_of_sample) trade record partitions."""
@@ -227,6 +233,8 @@ class WalkForwardBacktester:
         # Re-evaluate each trade under strategy exit rules
         simulated_trades: list[Tuple[float, float]] = [] # list of (pnl_usd, roi_pct)
         from alpha_engine.models.enums import ChainIdentifier, ExecutionVenue
+        from alpha_engine.math.mev import sample_fill_latency, simulate_frontrun_volume
+        from alpha_engine.models.state import PoolState
 
         for t in qualifying_trades:
             # Derive chain and cost model fees
@@ -253,6 +261,33 @@ class WalkForwardBacktester:
                 round_trip_gas_usd = 0.05
             round_trip_fee_pct = float(self.cost_model.get_venue_fee_pct(venue) * Decimal(2))
 
+            # Latency and conditional MEV drag simulation
+            lat_ms = sample_fill_latency(chain=chain, config=self.config, rng=self.rng)
+            is_private = getattr(self.config, "default_is_private_route", False)
+            sim_native_reserve = Decimal(str(t.native_spent * 100)) if t.native_spent > 0 else Decimal("100.0")
+            dummy_pool = PoolState(
+                pool_address="backtest_pool_address_111111111111111111111111",
+                chain=chain,
+                native_reserve=sim_native_reserve,
+                token_reserve=Decimal("1000000.0"),
+                fee_numerator=25,
+                fee_denominator=10000,
+                last_updated_block=100,
+            )
+            _, frontrun_vol = simulate_frontrun_volume(
+                pool=dummy_pool,
+                trade_size_native=Decimal(str(t.native_spent)),
+                max_slippage_bps=100,
+                is_private_route=is_private,
+                config=self.config,
+                rng=self.rng,
+            )
+            native_p = inferred_price
+            if native_p is None and hasattr(self.cost_model, "_price_service") and self.cost_model._price_service:
+                p_res = self.cost_model._price_service.get_price(chain)
+                native_p = getattr(p_res, "price", None)
+            mev_drag_usd = float(frontrun_vol * native_p) if native_p else 0.0
+
             # Baseline market price path from peak multiplier and actual realized roi
             actual_roi = t.roi_pct / 100.0
             peak_gain = t.peak_multiplier - 1.0
@@ -273,7 +308,7 @@ class WalkForwardBacktester:
                 sim_roi = actual_roi
 
             cost = t.cost_basis_usd
-            trade_fee_drag_usd = (cost * round_trip_fee_pct) + round_trip_gas_usd
+            trade_fee_drag_usd = (cost * round_trip_fee_pct) + round_trip_gas_usd + mev_drag_usd
             sim_pnl = (cost * sim_roi) - trade_fee_drag_usd
             sim_roi_pct = (sim_pnl / cost) * 100.0 if cost > 0 else 0.0
             simulated_trades.append((sim_pnl, sim_roi_pct))

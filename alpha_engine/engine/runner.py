@@ -266,6 +266,7 @@ class PaperTradingEngine:
             price_service=self._native_price_service,
             cost_model=self._cost_model,
             config=self.config,
+            pool_resolver=self._resolve_pool_for_executor,
         )
         self._ledger: SQLiteLedger | None = None
         self.tracer = tracer
@@ -328,7 +329,11 @@ class PaperTradingEngine:
             self._ai_supervisor.set_episodic_memory(self._swarm_coordinator.memory)
 
         # Multi-Strategy Tournament & Evolution Framework
-        self._strategy_tournament: StrategyTournamentRegistry = StrategyTournamentRegistry(ledger=None)
+        self._strategy_tournament: StrategyTournamentRegistry = StrategyTournamentRegistry(
+            ledger=None,
+            cost_model=self._cost_model,
+            config=self.config,
+        )
         self._strategy_generator: Optional[AutonomousStrategyGenerator] = None
 
         # Institutional Strategy Manager & Self-Learning Engine
@@ -3054,6 +3059,70 @@ class PaperTradingEngine:
             if owns_session and not session.closed:
                 await session.close()
 
+    async def _resolve_pool_for_executor(
+        self,
+        chain: ChainIdentifier,
+        token_address: str,
+        pool_address: str = "",
+        at_timestamp_ns: Optional[int] = None,
+    ) -> Optional[PoolState]:
+        """
+        Resolves freshest real pool state at fill time for PaperExecutor.
+        Supports custom pool_resolver feeds (e.g. scripted test feeds) before falling back to live poll.
+        """
+        clean_token = token_address.strip()
+        if hasattr(self, "_pool_resolver") and callable(self._pool_resolver):
+            try:
+                res = self._pool_resolver(chain, token_address, pool_address, at_timestamp_ns)
+                if asyncio.iscoroutine(res):
+                    return await res
+                return res
+            except TypeError:
+                res = self._pool_resolver(chain, token_address, at_timestamp_ns)
+                if asyncio.iscoroutine(res):
+                    return await res
+                return res
+
+        # Check local registry first to avoid blocking network I/O
+        pool = self._pool_registry.get(clean_token)
+        if pool is None and pool_address:
+            pool = self._pool_registry.get(pool_address)
+        if pool is not None and getattr(pool, "spot_price_native_per_token", Decimal(0)) > Decimal(0):
+            return pool
+
+        return await self.get_or_fetch_pool_state(chain, token_address, pool_address, force_refresh=False)
+
+    def _resolve_pool_for_tournament(
+        self,
+        chain: ChainIdentifier,
+        token_address: str,
+        pool_address: str = "",
+        at_timestamp_ns: Optional[int] = None,
+    ) -> Optional[PoolState]:
+        """
+        Synchronously resolves freshest pool state for shadow tournament evaluation.
+        """
+        clean_token = token_address.strip()
+        pool = self._pool_registry.get(clean_token)
+        if pool is None and pool_address:
+            pool = self._pool_registry.get(pool_address)
+        if pool is not None:
+            return pool
+        if hasattr(self, "_pool_resolver") and callable(self._pool_resolver):
+            try:
+                res = self._pool_resolver(chain, token_address, pool_address, at_timestamp_ns)
+                if not asyncio.iscoroutine(res):
+                    return res
+            except TypeError:
+                try:
+                    res = self._pool_resolver(chain, token_address, at_timestamp_ns)
+                    if not asyncio.iscoroutine(res):
+                        return res
+                except Exception:
+                    pass
+            except Exception:
+                pass
+        return None
 
     def get_or_create_initial_pool_state(
         self,
@@ -4533,13 +4602,10 @@ class PaperTradingEngine:
                     or signal_item.pool_state.spot_price_native_per_token <= Decimal(0)
                     or getattr(signal_item.pool_state, "last_updated_block", 0) <= 0
                 ):
-                    fresh_pool = await self.get_or_fetch_pool_state(
+                    fresh_pool = await self._resolve_pool_for_executor(
                         chain=signal_item.chain,
                         token_address=signal_item.token_address,
                         pool_address=getattr(signal_item, "pool_address", "") or "",
-                        force_refresh=True,
-                        strict_realtime=True,
-                        max_data_age_s=4.0,
                     )
                     if fresh_pool is not None:
                         signal_item = signal_item.model_copy(update={"pool_state": fresh_pool})
@@ -4576,6 +4642,8 @@ class PaperTradingEngine:
                         signal=signal_item,
                         pool=signal_item.pool_state,
                         native_price_usd=native_p,
+                        market_state_provider=self._resolve_pool_for_tournament,
+                        is_private_route=getattr(signal_item, "is_private_route", False),
                     )
                 except Exception as exc:
                     logger.debug("Shadow tournament evaluation skipped for %s: %s", signal_item.token_address[:10], exc)
@@ -6418,6 +6486,7 @@ class PaperTradingEngine:
                 price_service=self._native_price_service,
                 cost_model=self._cost_model,
                 config=cfg,
+                pool_resolver=self._resolve_pool_for_executor,
             )
             await self._refresh_kelly(self._executor, self._ledger)
 
