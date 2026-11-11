@@ -263,8 +263,8 @@ class PumpMintEvent(BaseModel):
     chain: ChainIdentifier = ChainIdentifier.SOLANA_MAINNET
     mint: Annotated[str, Field(min_length=32, max_length=66)]
     bonding_curve: Annotated[str, Field(min_length=32, max_length=66)]
-    virtual_sol_reserves: Decimal = Decimal("30.0")
-    virtual_token_reserves: Decimal = Decimal("1073000000.0")
+    virtual_sol_reserves: Optional[Decimal] = None
+    virtual_token_reserves: Optional[Decimal] = None
     token_decimals: int = 6
     native_decimals: int = 9
     tx_hash: str = ""
@@ -312,8 +312,8 @@ class PumpSwapEvent(SwapEvent):
     token_amount: Decimal = Decimal("0")
     buyer: str = ""
     is_buy: bool = True
-    virtual_sol_reserves: Decimal = Decimal("30.0")
-    virtual_token_reserves: Decimal = Decimal("1073000000.0")
+    virtual_sol_reserves: Optional[Decimal] = None
+    virtual_token_reserves: Optional[Decimal] = None
     has_authoritative_reserves: bool = False
     slot: int = 0
 

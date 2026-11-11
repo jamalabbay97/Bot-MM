@@ -31,6 +31,14 @@ from alpha_engine.models.enums import (
     resolve_trade_venue,
 )
 from alpha_engine.models.state import PoolState
+from alpha_engine.pricing.venue_capabilities import (
+    EvmUniswapV3Quoter,
+    IVenueQuoter,
+    UnsupportedVenueError,
+    VenueQuote,
+    VenueStatus,
+    get_venue_capability,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -69,10 +77,40 @@ class TradeCostModel:
         self,
         config: Optional[EngineConfig] = None,
         price_service: Optional[Any] = None,
+        quoter: Optional[IVenueQuoter] = None,
     ) -> None:
         self.config = config or EngineConfig()
         self.price_service = price_service
+        self.quoter = quoter
         self._build_fee_schedule()
+
+    async def get_venue_quote(
+        self,
+        side: OrderSide,
+        gross_amount: Decimal,
+        pool: PoolState,
+        chain: ChainIdentifier,
+        venue: ExecutionVenue,
+    ) -> VenueQuote:
+        """Fetch exact quotation from verified venue quoter."""
+        quoter = self.quoter or EvmUniswapV3Quoter()
+        if side == OrderSide.BUY:
+            return await quoter.quote_buy(
+                chain=chain,
+                token_address=getattr(pool, "token_address", "") or "",
+                pool_address=getattr(pool, "pool_address", "") or "",
+                native_amount_in=gross_amount,
+                venue=venue,
+                pool=pool,
+            )
+        return await quoter.quote_sell(
+            chain=chain,
+            token_address=getattr(pool, "token_address", "") or "",
+            pool_address=getattr(pool, "pool_address", "") or "",
+            token_amount_in=gross_amount,
+            venue=venue,
+            pool=pool,
+        )
 
     def _build_fee_schedule(self) -> None:
         """
@@ -270,13 +308,14 @@ class TradeCostModel:
         observed_network_fee_native: Optional[Decimal] = None,
         extra_slippage_bps: Optional[int] = None,
         platform: Optional[str] = None,
+        venue_quote: Optional[VenueQuote] = None,
     ) -> TradeCostBreakdown:
         """
         Single, unified cost function applied IDENTICALLY to entries and exits.
         
         Calculates:
         - Venue trading fee from configured schedule
-        - CPMM swap quote and price impact
+        - Quoter quote or CPMM swap quote and price impact
         - Empirically calibrated extra slippage allowance (default 0)
         - Dynamic network / priority fees
         """
@@ -292,6 +331,13 @@ class TradeCostModel:
             bonding_curve_mode=(getattr(pool, "pool_address", "").startswith("pump_") or platform == "Pump.fun"),
             platform=platform,
         )
+
+        venue_cap = get_venue_capability(resolved_venue)
+        if venue_cap.status == VenueStatus.UNSUPPORTED:
+            raise UnsupportedVenueError(
+                f"Venue {resolved_venue.value} is marked UNSUPPORTED: concentrated liquidity math not modeled without verified quoter"
+            )
+
         fee_bps = self.get_venue_fee_bps(resolved_venue)
         fee_pct = Decimal(fee_bps) / Decimal("10000")
 
@@ -303,8 +349,44 @@ class TradeCostModel:
         slip_bps = extra_slippage_bps if extra_slippage_bps is not None else self.config.extra_slippage_bps
         slip_fraction = Decimal(slip_bps) / Decimal("10000")
 
-        # 4. CPMM swap execution with venue-specific fee applied inside pool math
-        if side == OrderSide.BUY:
+        # 4. Quoter or CPMM swap execution with venue-specific fee applied
+        if venue_cap.pricing_model in ("quoter", "jupiter") or venue_quote is not None:
+            if venue_quote is None:
+                raise UnsupportedVenueError(
+                    f"Venue {resolved_venue.value} requires an active Quoter quote; none provided"
+                )
+            if side == OrderSide.BUY:
+                native_in = gross_amount
+                raw_tokens_out = venue_quote.amount_out
+                base_exec_price = venue_quote.effective_price
+                if slip_fraction > Decimal(0):
+                    adj_exec_price = base_exec_price * (Decimal("1") + slip_fraction)
+                    tokens_out = native_in / adj_exec_price
+                else:
+                    adj_exec_price = base_exec_price
+                    tokens_out = raw_tokens_out
+
+                fee_native = venue_quote.fee_amount
+                amount_out = tokens_out
+                effective_price = adj_exec_price
+                price_impact_bps = venue_quote.price_impact_bps
+            else:  # OrderSide.SELL
+                tokens_in = gross_amount
+                raw_native_out = venue_quote.amount_out
+                base_exec_price = venue_quote.effective_price
+                if slip_fraction > Decimal(0):
+                    adj_exec_price = base_exec_price * (Decimal("1") - slip_fraction)
+                    native_out = tokens_in * adj_exec_price
+                else:
+                    adj_exec_price = base_exec_price
+                    native_out = raw_native_out
+
+                fee_native = venue_quote.fee_amount
+                amount_out = native_out
+                effective_price = adj_exec_price
+                price_impact_bps = venue_quote.price_impact_bps
+
+        elif side == OrderSide.BUY:
             native_in = gross_amount
             quote = cpmm_out(
                 reserve_in=pool.native_reserve,
@@ -330,6 +412,7 @@ class TradeCostModel:
             fee_native = native_in * fee_pct
             amount_out = tokens_out
             effective_price = adj_exec_price
+            price_impact_bps = quote.price_impact_bps
 
         else:  # OrderSide.SELL
             tokens_in = gross_amount
@@ -357,6 +440,7 @@ class TradeCostModel:
             fee_native = raw_native_out * fee_pct
             amount_out = native_out
             effective_price = adj_exec_price
+            price_impact_bps = quote.price_impact_bps
 
         return TradeCostBreakdown(
             venue=resolved_venue,
@@ -366,7 +450,7 @@ class TradeCostModel:
             fee_bps=fee_bps,
             fee_pct=fee_pct,
             fee_native=fee_native,
-            price_impact_bps=quote.price_impact_bps,
+            price_impact_bps=price_impact_bps,
             extra_slippage_bps=slip_bps,
             network_fee_native=network_fee_native,
             network_fee_usd=network_fee_usd,

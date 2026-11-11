@@ -61,6 +61,7 @@ from alpha_engine.ingestion.coordinator import IngestionCoordinator
 from alpha_engine.ingestion.market_oracle import MarketOracle
 from alpha_engine.logging_config import setup_production_logging
 from alpha_engine.math.cpmm import get_initial_bonding_curve_pool
+from alpha_engine.pricing.venue_capabilities import get_venue_capability
 from alpha_engine.models.ai import ActionParameters, AISupervisorDecisionEnum
 from alpha_engine.models.decisions import DecisionRecord, DecisionType, PatternFeatureVector, RevivalPatternFeatureVector
 from alpha_engine.ingestion.dex_metrics import DEXMetricsAggregator
@@ -95,6 +96,7 @@ from alpha_engine.models.state import (
     PaperFill,
     PoolState,
     PortfolioSnapshot,
+    ReserveType,
     SecurityReport,
     TokenRequestRecord,
     TradeRecord,
@@ -273,6 +275,8 @@ class PaperTradingEngine:
         self._telegram: Any = None
         self._coordinator: Any | None = None
         self._recent_closed_trades: deque[dict[str, Any]] = deque(maxlen=50)
+        self.telemetry_counters: dict[str, int] = {}
+        self._last_warning_log_times: dict[str, float] = {}
 
         self._trades_since_kelly_refresh = 0
         self._kelly_refresh_interval = 10
@@ -402,6 +406,24 @@ class PaperTradingEngine:
     @config.setter
     def config(self, val: EngineConfig) -> None:
         self._cfg = val
+
+    def _record_telemetry_counter(self, reason: str, count: int = 1) -> None:
+        self.telemetry_counters[reason] = self.telemetry_counters.get(reason, 0) + count
+        if hasattr(self, "dashboard_telemetry") and self.dashboard_telemetry:
+            self.dashboard_telemetry.record_stage_event(reason, count)
+            if hasattr(self.dashboard_telemetry, "pipeline_counters"):
+                self.dashboard_telemetry.pipeline_counters[reason] = (
+                    self.dashboard_telemetry.pipeline_counters.get(reason, 0) + count
+                )
+
+    def _log_warning_rate_limited(self, key: str, msg: str, *args: Any, interval_s: float = 5.0) -> None:
+        now = time.time()
+        last = self._last_warning_log_times.get(key, 0.0)
+        if now - last >= interval_s:
+            self._last_warning_log_times[key] = now
+            logger.warning(msg, *args)
+        else:
+            logger.debug(msg, *args)
 
     @property
     def feedback_engine(self) -> AdaptiveFeedbackEngine:
@@ -887,25 +909,18 @@ class PaperTradingEngine:
             return 0
 
         closed_count = 0
-        now_s = time.time()
         now_ns = time.time_ns()
         for lot in open_lots:
             logger.info("Force-closing lot %s (chain=%s) at timestamp_ns=%d", lot.lot_id, lot.chain.value, now_ns)
             pool = self._pool_registry.get(lot.token_address) or (self._pool_registry.get(lot.pool_address) if lot.pool_address else None)
             if pool is None or getattr(pool, "last_updated_block", 0) <= 0:
-                pool = PoolState(
-                    pool_address=lot.pool_address or lot.token_address,
-                    chain=lot.chain,
-                    token_reserve=Decimal("1000000000"),
-                    native_reserve=Decimal("0.0001"),
-                    fee_numerator=25,
-                    fee_denominator=10000,
-                    last_updated_block=1000,
-                    timestamp_s=now_s,
-                    token_decimals=6 if lot.chain == ChainIdentifier.SOLANA_MAINNET else 18,
-                    native_decimals=9 if lot.chain == ChainIdentifier.SOLANA_MAINNET else 18,
-                )
-                self._pool_registry.set(lot.token_address, pool)
+                pool = await self.get_or_fetch_pool_state(lot.chain, lot.token_address, lot.pool_address or "", force_refresh=True)
+
+            if pool is None:
+                logger.warning("Force-close: real pool unavailable for %s; closing lot via emergency drain at entry price", lot.token_address[:10])
+                self._position_book.close_lot(lot.lot_id, exit_price=lot.entry_price, reason=TradeExitReason.EMERGENCY_DRAIN)
+                closed_count += 1
+                continue
 
             curr_price = pool.spot_price_native_per_token if pool else lot.entry_price
             decision = ExitDecision(
@@ -1519,7 +1534,7 @@ class PaperTradingEngine:
             clean_addr[:10],
             pool.price_source or "UNKNOWN",
             pool.data_age_s or 0.0,
-            float(mcap),
+            float(mcap) if mcap is not None else 0.0,
             pool.spot_price_native_per_token,
         )
 
@@ -1649,7 +1664,8 @@ class PaperTradingEngine:
             object.__setattr__(signal, "lot", lot)
         except Exception:
             pass
-        return True, f"تم إرسال أمر الشراء وتنفيذه بنجاح عبر السعر الفوري (Lot: {lot.lot_id[:8]} | Source: {pool.price_source or 'DEX'} | Age: {pool.data_age_s or 0.0:.2f}s | Mcap: ${float(mcap):,.2f})", signal
+        mcap_str = f"${float(mcap):,.2f}" if mcap is not None else "n/a"
+        return True, f"تم إرسال أمر الشراء وتنفيذه بنجاح عبر السعر الفوري (Lot: {lot.lot_id[:8]} | Source: {pool.price_source or 'DEX'} | Age: {pool.data_age_s or 0.0:.2f}s | Mcap: {mcap_str})", signal
 
     async def manual_exit_position(
         self,
@@ -2592,28 +2608,58 @@ class PaperTradingEngine:
                 dex_id = str(selected.get("dexId") or "").lower()
 
                 if price_usd <= 0 and (not price_native_str or float(price_native_str) <= 0):
+                    self._record_telemetry_counter("no_price")
+                    self._log_warning_rate_limited(
+                        f"dex_no_price_{clean_token}",
+                        "DexScreener missing price for token %s: rejecting",
+                        clean_token[:10],
+                    )
                     return None
 
                 if price_native_str and float(price_native_str) > 0:
                     spot_p = Decimal(str(price_native_str))
+                elif price_usd > 0 and native_price > Decimal(0):
+                    spot_p = Decimal(str(price_usd)) / native_price
                 else:
-                    spot_p = Decimal(str(price_usd)) / native_price if native_price > Decimal(0) else Decimal("0.000000028")
+                    self._record_telemetry_counter("no_price")
+                    self._log_warning_rate_limited(
+                        f"dex_no_spot_{clean_token}",
+                        "DexScreener unable to derive spot price for token %s: rejecting",
+                        clean_token[:10],
+                    )
+                    return None
 
                 if quote_res is not None and float(quote_res) > 0:
                     native_res = Decimal(str(quote_res))
                 elif liq_usd > 0 and native_price > Decimal(0):
                     native_res = Decimal(str(liq_usd)) / Decimal("2.0") / native_price
                 else:
-                    native_res = Decimal("30.0") if chain == ChainIdentifier.SOLANA_MAINNET else Decimal("5.0")
+                    self._record_telemetry_counter("no_liquidity_data")
+                    self._log_warning_rate_limited(
+                        f"dex_no_liq_{clean_token}",
+                        "DexScreener missing liquidity for token %s: rejecting (never invent reserves)",
+                        clean_token[:10],
+                    )
+                    return None
 
                 if base_res is not None and float(base_res) > 0:
                     token_res = Decimal(str(base_res))
                 elif spot_p > Decimal(0):
                     token_res = native_res / spot_p
                 else:
-                    token_res = Decimal("1073000000.0")
+                    self._record_telemetry_counter("no_liquidity_data")
+                    return None
+
+                if native_res <= Decimal(0) or token_res <= Decimal(0) or spot_p <= Decimal(0):
+                    self._record_telemetry_counter("no_liquidity_data")
+                    return None
 
                 price_src = f"DexScreener:{dex_id}" if dex_id else "DexScreener"
+                fdv_val = selected.get("fdv") or selected.get("marketCap")
+                reported_supply = None
+                if fdv_val and float(fdv_val) > 0 and price_usd > 0:
+                    reported_supply = (Decimal(str(fdv_val)) / Decimal(str(price_usd))).quantize(Decimal("1e-4"))
+
                 pool = PoolState(
                     pool_address=pair_addr,
                     chain=chain,
@@ -2628,13 +2674,23 @@ class PaperTradingEngine:
                     native_decimals=9 if chain == ChainIdentifier.SOLANA_MAINNET else 18,
                     price_source=price_src,
                     data_age_s=round(data_age, 2),
+                    reserve_type=ReserveType.DERIVED,
+                    source=price_src,
+                    fetched_at=time.time(),
+                    data_age=round(data_age, 2),
+                    total_supply=reported_supply,
                 )
                 setattr(pool, "_dex_id", dex_id)
                 setattr(pool, "_fdv_usd", float(selected.get("fdv") or selected.get("marketCap") or 0.0))
                 setattr(pool, "_reserve_usd", liq_usd)
                 return pool
         except Exception as exc:
-            logger.debug("_fetch_dexscreener_state failed for %s: %s", clean_token[:10], exc)
+            self._log_warning_rate_limited(
+                f"dex_err_{clean_token}",
+                "_fetch_dexscreener_state failed for %s: %s",
+                clean_token[:10],
+                exc,
+            )
             return None
 
     async def _fetch_geckoterminal_state(
@@ -2651,15 +2707,38 @@ class PaperTradingEngine:
             oracle = self.market_oracle
             stats = await oracle.get_geckoterminal_pool_stats(chain_str, clean_token)
             if not stats or stats.get("base_token_price_usd", 0) <= 0:
+                self._record_telemetry_counter("no_price")
+                self._log_warning_rate_limited(
+                    f"gt_no_price_{clean_token}",
+                    "GeckoTerminal missing price for token %s: rejecting",
+                    clean_token[:10],
+                )
                 return None
 
             price_usd = float(stats["base_token_price_usd"])
             res_usd = float(stats.get("reserve_in_usd", 0.0))
-            spot_p = Decimal(str(price_usd)) / native_price if native_price > Decimal(0) else Decimal("0.000000028")
-            native_res = (Decimal(str(res_usd)) / Decimal("2.0") / native_price) if res_usd > 0 else (Decimal("30.0") if chain == ChainIdentifier.SOLANA_MAINNET else Decimal("5.0"))
-            token_res = (native_res / spot_p) if spot_p > Decimal(0) else Decimal("1073000000.0")
+            if res_usd <= 0 or native_price <= Decimal(0):
+                self._record_telemetry_counter("no_liquidity_data")
+                self._log_warning_rate_limited(
+                    f"gt_no_liq_{clean_token}",
+                    "GeckoTerminal missing liquidity for token %s: rejecting (never invent reserves)",
+                    clean_token[:10],
+                )
+                return None
+
+            spot_p = Decimal(str(price_usd)) / native_price
+            native_res = Decimal(str(res_usd)) / Decimal("2.0") / native_price
+            token_res = native_res / spot_p
+            if native_res <= Decimal(0) or token_res <= Decimal(0) or spot_p <= Decimal(0):
+                self._record_telemetry_counter("no_liquidity_data")
+                return None
+
             pair_addr = str(stats.get("pool_address") or pool_address or clean_token)
             data_age = float(stats.get("data_age_s", 1.0))
+            fdv_f = float(stats.get("fdv_usd", 0.0))
+            reported_supply = None
+            if fdv_f > 0 and price_usd > 0:
+                reported_supply = (Decimal(str(fdv_f)) / Decimal(str(price_usd))).quantize(Decimal("1e-4"))
 
             pool = PoolState(
                 pool_address=pair_addr,
@@ -2675,13 +2754,23 @@ class PaperTradingEngine:
                 native_decimals=9 if chain == ChainIdentifier.SOLANA_MAINNET else 18,
                 price_source="GeckoTerminal",
                 data_age_s=round(data_age, 2),
+                reserve_type=ReserveType.DERIVED,
+                source="GeckoTerminal",
+                fetched_at=float(stats.get("fetched_at", time.time())),
+                data_age=round(data_age, 2),
+                total_supply=reported_supply,
             )
             setattr(pool, "_dex_id", "geckoterminal")
-            setattr(pool, "_fdv_usd", float(stats.get("fdv_usd", 0.0)))
+            setattr(pool, "_fdv_usd", fdv_f)
             setattr(pool, "_reserve_usd", res_usd)
             return pool
         except Exception as exc:
-            logger.debug("_fetch_geckoterminal_state failed for %s: %s", clean_token[:10], exc)
+            self._log_warning_rate_limited(
+                f"gt_err_{clean_token}",
+                "_fetch_geckoterminal_state failed for %s: %s",
+                clean_token[:10],
+                exc,
+            )
             return None
 
     async def _fetch_pump_curve_onchain(
@@ -2763,6 +2852,7 @@ class PaperTradingEngine:
 
                 token_res = Decimal(v_token) / Decimal("1e6")
                 native_res = Decimal(v_sol) / Decimal("1e9")
+                supply_tokens = Decimal(total_supply) / Decimal("1e6")
                 if token_res <= Decimal(0) or native_res <= Decimal(0):
                     return None
 
@@ -2780,6 +2870,12 @@ class PaperTradingEngine:
                     native_decimals=9,
                     price_source="PumpFunOnChainCurve",
                     data_age_s=round(t_rtt, 3),
+                    reserve_type=ReserveType.EXACT,
+                    source="PumpFunOnChainCurve",
+                    fetched_at=time.time(),
+                    data_age=round(t_rtt, 3),
+                    total_supply=supply_tokens,
+                    venue=ExecutionVenue.PUMP_FUN,
                 )
                 setattr(pool, "_dex_id", "pumpfun")
                 setattr(pool, "_is_pump_curve", True)
@@ -2937,9 +3033,10 @@ class PaperTradingEngine:
                 self._ai_supervisor.record_price_update(clean_token, selected_pool.spot_price_native_per_token)
 
             mcap_usd = selected_pool.calculate_market_cap_usd(native_price_usd=native_price)
+            mcap_str = f"${float(mcap_usd):,.2f}" if mcap_usd is not None else "UNKNOWN"
             logger.info(
                 "get_or_fetch_pool_state: Authoritative [%s] pool resolved for %s (%s): price=%s ($%.6f), "
-                "data_age=%.2fs, reserve=%.2f native, MCAP=$%.2f",
+                "data_age=%.2fs, reserve=%.2f native, MCAP=%s",
                 selected_pool.price_source or "UNKNOWN",
                 clean_token[:10],
                 selected_pool.pool_address[:10] if selected_pool.pool_address else "N/A",
@@ -2947,16 +3044,12 @@ class PaperTradingEngine:
                 float(selected_pool.spot_price_native_per_token * native_price),
                 selected_pool.data_age_s or 0.0,
                 float(selected_pool.native_reserve),
-                float(mcap_usd),
+                mcap_str,
             )
             return selected_pool
         except Exception as exc:
             logger.error("get_or_fetch_pool_state encountered unexpected error for %s: %s", clean_token[:10], exc)
-            if strict_realtime:
-                return None
-            if pool is not None:
-                return pool
-            return self.get_or_create_initial_pool_state(chain, clean_token, pool_address)
+            return pool
         finally:
             if owns_session and not session.closed:
                 await session.close()
@@ -2967,19 +3060,20 @@ class PaperTradingEngine:
         chain: ChainIdentifier,
         token_address: str,
         pool_address: str = "",
-    ) -> PoolState:
+    ) -> Optional[PoolState]:
         pool = self._pool_registry.get(token_address)
         if pool is None and pool_address:
             pool = self._pool_registry.get(pool_address)
         if pool is None:
             pool = get_initial_bonding_curve_pool(
-                chain=chain,
                 token_address=token_address,
+                chain=chain,
                 pool_address=pool_address,
             )
-            self._pool_registry.set(token_address, pool)
-            if pool_address:
-                self._pool_registry.set(pool_address, pool)
+            if pool is not None:
+                self._pool_registry.set(token_address, pool)
+                if pool_address:
+                    self._pool_registry.set(pool_address, pool)
         return pool
 
     async def _safe_record_signal(self, signal_event: SignalEvent) -> None:
@@ -3360,7 +3454,10 @@ class PaperTradingEngine:
                 self._record_gatekeeper_eval(token_address, chain, disc_reason, passed=disc_report.passes_hard_gates)
                 if disc_report.passes_hard_gates:
                     initial_pool = self._pool_registry.get(token_address) or self.get_or_create_initial_pool_state(chain, token_address, pool_address)
-                    init_price = initial_pool.spot_price_native_per_token if initial_pool else Decimal("0.000000028")
+                    if initial_pool is None or initial_pool.spot_price_native_per_token <= Decimal(0):
+                        logger.warning("Auto-discovery skipping token %s: no verified initial pool price", token_address[:10])
+                        return
+                    init_price = initial_pool.spot_price_native_per_token
                     if is_pump is None:
                         is_pump = "pump" in token_address.lower() or "pump" in pool_address.lower()
                     
@@ -3434,7 +3531,15 @@ class PaperTradingEngine:
                 )
                 if reassessed_rep.passes_hard_gates and not self._pending_launch_buffer.is_staged(token_address):
                     initial_pool = await self.get_or_fetch_pool_state(chain, token_address, pool_address)
-                    init_price = initial_pool.spot_price_native_per_token if initial_pool else Decimal("0.000000028")
+                    if initial_pool is None or initial_pool.spot_price_native_per_token is None:
+                        self._record_telemetry_counter("no_price")
+                        self._log_warning_rate_limited(
+                            f"no_price_{token_address}",
+                            "Reassessment could not stage %s: missing pool or spot price",
+                            token_address[:10],
+                        )
+                        return
+                    init_price = initial_pool.spot_price_native_per_token
                     self._pending_launch_buffer.stage_token(
                         token_address=token_address,
                         chain=chain,
@@ -3526,7 +3631,15 @@ class PaperTradingEngine:
                 return
 
             pool = self.get_or_create_initial_pool_state(chain, mint, curve_addr)
-            init_price = pool.spot_price_native_per_token if pool else Decimal("0.000000028")
+            if pool is None or pool.spot_price_native_per_token is None:
+                self._record_telemetry_counter("no_price")
+                self._log_warning_rate_limited(
+                    f"pump_mint_no_price_{mint}",
+                    "Pump.fun mint %s dropped: pool or spot price unavailable",
+                    mint[:10],
+                )
+                return
+            init_price = pool.spot_price_native_per_token
 
             self._pending_launch_buffer.stage_token(
                 token_address=mint,
@@ -3609,7 +3722,15 @@ class PaperTradingEngine:
                     return
 
             if raw_sig.source == SignalSource.PUMP_FUN_MINT:
-                init_price = pool.spot_price_native_per_token if pool else Decimal("0.000000028")
+                if pool is None or pool.spot_price_native_per_token is None:
+                    self._record_telemetry_counter("no_price")
+                    self._log_warning_rate_limited(
+                        f"raw_pump_no_price_{raw_sig.token_address}",
+                        "Raw signal dropped for %s: missing pool or spot price",
+                        raw_sig.token_address[:10],
+                    )
+                    return
+                init_price = pool.spot_price_native_per_token
                 self._pending_launch_buffer.stage_token(
                     token_address=raw_sig.token_address,
                     chain=raw_sig.chain,
@@ -3821,7 +3942,7 @@ class PaperTradingEngine:
                                 chain=decision.chain,
                                 signal_id=lot.signal_id,
                                 token_symbol=getattr(lot, "token_symbol", "UNKNOWN"),
-                                market_cap_usd=float(pool.spot_price_native_per_token * native_price * Decimal("1000000000")) if pool else 0.0,
+                                market_cap_usd=float(pool.calculate_market_cap_usd(native_price) or Decimal("0.0")) if pool else 0.0,
                                 liquidity_usd=float(pool.native_reserve * native_price * 2) if pool else 0.0,
                                 volume_5m_usd=float(vol * native_price) if vol else 0.0,
                                 volume_1h_usd=0.0,
@@ -4207,27 +4328,17 @@ class PaperTradingEngine:
                         f"{sig_mcap:.2f}" if sig_mcap else "n/a",
                     )
                 else:
-                    # Strict Market Cap check for new tokens / launches:
-                    if is_new_launch or signal_item.source in (
-                        SignalSource.PUMP_FUN_MINT,
-                        SignalSource.SCREENER_GRADUATED,
-                        SignalSource.SCREENER_MOVERS,
-                    ):
-                        if sig_mcap is None or sig_mcap <= Decimal("0"):
-                            logger.warning(
-                                "Dropping BUY signal for %s: Market Cap is missing, unverifiable, or stale",
-                                signal_item.token_address[:10],
-                            )
-                            continue
-                        if sig_mcap < min_mcap_usd:
-                            logger.info(
-                                "Dropping BUY signal for %s: Market Cap $%.2f < minimum required threshold $%.2f",
-                                signal_item.token_address[:10],
-                                sig_mcap,
-                                min_mcap_usd,
-                            )
-                            continue
-                    elif sig_mcap is not None and sig_mcap > Decimal("0") and sig_mcap < min_mcap_usd:
+                    # Strict Market Cap check: fail closed if market cap is unknown or below minimum
+                    if sig_mcap is None or sig_mcap <= Decimal("0"):
+                        self._record_telemetry_counter("mcap_unknown_rejected")
+                        self._log_warning_rate_limited(
+                            f"mcap_unknown_{signal_item.token_address}",
+                            "Dropping BUY signal for %s: Market Cap is unknown or unverifiable (supply unavailable)",
+                            signal_item.token_address[:10],
+                        )
+                        continue
+                    if sig_mcap < min_mcap_usd:
+                        self._record_telemetry_counter("mcap_below_min")
                         logger.info(
                             "Dropping BUY signal for %s: Market Cap $%.2f < minimum required threshold $%.2f",
                             signal_item.token_address[:10],
@@ -5578,13 +5689,24 @@ class PaperTradingEngine:
                                 if selected_pair is not None:
                                     price_usd = float(selected_pair.get("priceUsd") or 0.0)
                                     price_native_str = selected_pair.get("priceNative")
+                                    spot_p = None
                                     if price_native_str:
                                         try:
                                             spot_p = Decimal(str(price_native_str))
                                         except Exception:
-                                            spot_p = Decimal(str(price_usd)) / sol_price if sol_price > Decimal(0) else Decimal("0.000000028")
-                                    else:
-                                        spot_p = Decimal(str(price_usd)) / sol_price if sol_price > Decimal(0) else Decimal("0.000000028")
+                                            spot_p = None
+                                    if (spot_p is None or spot_p <= Decimal(0)) and price_usd > 0 and sol_price > Decimal(0):
+                                        spot_p = Decimal(str(price_usd)) / sol_price
+
+                                    if spot_p is None or spot_p <= Decimal(0):
+                                        self._record_telemetry_counter("no_price")
+                                        self._log_warning_rate_limited(
+                                            f"sol_poller_no_price_{t_addr}",
+                                            "Solana active price poller for %s: missing or invalid price",
+                                            t_addr[:10],
+                                        )
+                                        lot.unresolved_price = True
+                                        continue
 
                                     # Stale drop guard for young positions:
                                     lot_age_s = (time.time_ns() - lot.open_timestamp_ns) / 1e9 if getattr(lot, "open_timestamp_ns", 0) > 0 else 999.0
@@ -5599,8 +5721,9 @@ class PaperTradingEngine:
 
                                     liq_usd = float((selected_pair.get("liquidity") or {}).get("usd") or 0.0)
                                     pair_addr = selected_pair.get("pairAddress") or lot.pool_address
-                                    if spot_p > Decimal(0) and pair_addr:
+                                    if pair_addr:
                                         liq_dec = Decimal(str(liq_usd))
+                                        reserve_type = ReserveType.DERIVED
                                         # Strictly derive reserves from selected pair; never mix with another pool's reserves
                                         if liq_dec > Decimal(0) and sol_price > Decimal(0):
                                             native_res = liq_dec / Decimal("2.0") / sol_price
@@ -5608,9 +5731,16 @@ class PaperTradingEngine:
                                         elif existing_pool is not None and existing_pool.native_reserve > Decimal(0):
                                             native_res = existing_pool.native_reserve
                                             token_res = native_res / spot_p
+                                            reserve_type = existing_pool.reserve_type
                                         else:
-                                            native_res = Decimal("30.0")
-                                            token_res = native_res / spot_p
+                                            self._record_telemetry_counter("no_liquidity_data")
+                                            self._log_warning_rate_limited(
+                                                f"sol_poller_no_liq_{t_addr}",
+                                                "Solana active price poller for %s: missing liquidity data",
+                                                t_addr[:10],
+                                            )
+                                            lot.unresolved_price = True
+                                            continue
                                         pool = PoolState(
                                             pool_address=pair_addr,
                                             chain=ChainIdentifier.SOLANA_MAINNET,
@@ -5625,6 +5755,10 @@ class PaperTradingEngine:
                                             native_decimals=9,
                                             price_source="DexScreener:Poller",
                                             data_age_s=0.5,
+                                            reserve_type=reserve_type,
+                                            source="dexscreener_poller",
+                                            fetched_at=now,
+                                            data_age=0.5,
                                         )
                                         self._pool_registry.set(pair_addr, pool)
                                         self._pool_registry.set(t_addr, pool)
@@ -5710,23 +5844,41 @@ class PaperTradingEngine:
                                 if selected_pair is not None:
                                     price_usd = float(selected_pair.get("priceUsd") or 0.0)
                                     price_native_str = selected_pair.get("priceNative")
+                                    spot_p = None
                                     if price_native_str:
                                         try:
                                             spot_p = Decimal(str(price_native_str))
                                         except Exception:
-                                            spot_p = Decimal(str(price_usd)) / eth_price if eth_price > Decimal(0) else Decimal("0.0000001")
-                                    else:
-                                        spot_p = Decimal(str(price_usd)) / eth_price if eth_price > Decimal(0) else Decimal("0.0000001")
+                                            spot_p = None
+                                    if (spot_p is None or spot_p <= Decimal(0)) and price_usd > 0 and eth_price > Decimal(0):
+                                        spot_p = Decimal(str(price_usd)) / eth_price
+
+                                    if spot_p is None or spot_p <= Decimal(0):
+                                        self._record_telemetry_counter("no_price")
+                                        self._log_warning_rate_limited(
+                                            f"base_poller_no_price_{lot.token_address}",
+                                            "Base active price poller for %s: missing or invalid price",
+                                            lot.token_address[:10],
+                                        )
+                                        lot.unresolved_price = True
+                                        continue
+
                                     liq_usd = float((selected_pair.get("liquidity") or {}).get("usd") or 0.0)
                                     pair_addr = selected_pair.get("pairAddress") or lot.pool_address
-                                    if spot_p > Decimal(0) and pair_addr:
+                                    if pair_addr:
                                         liq_dec = Decimal(str(liq_usd))
                                         if liq_dec > Decimal(0) and eth_price > Decimal(0):
                                             native_res = liq_dec / Decimal("2.0") / eth_price
                                             token_res = native_res / spot_p
                                         else:
-                                            native_res = Decimal("5.0")
-                                            token_res = native_res / spot_p
+                                            self._record_telemetry_counter("no_liquidity_data")
+                                            self._log_warning_rate_limited(
+                                                f"base_poller_no_liq_{lot.token_address}",
+                                                "Base active price poller for %s: missing liquidity data",
+                                                lot.token_address[:10],
+                                            )
+                                            lot.unresolved_price = True
+                                            continue
                                         pool = PoolState(
                                             pool_address=pair_addr,
                                             chain=ChainIdentifier.BASE_MAINNET,
@@ -5741,6 +5893,10 @@ class PaperTradingEngine:
                                             native_decimals=18,
                                             price_source="DexScreener:Poller",
                                             data_age_s=0.5,
+                                            reserve_type=ReserveType.DERIVED,
+                                            source="dexscreener_poller",
+                                            fetched_at=now,
+                                            data_age=0.5,
                                         )
                                         self._pool_registry.set(pair_addr, pool)
                                         lot.pool_address = pair_addr
@@ -6039,7 +6195,7 @@ class PaperTradingEngine:
                                     chain=decision.chain,
                                     signal_id=lot.signal_id,
                                     token_symbol=getattr(lot, "token_symbol", "UNKNOWN"),
-                                    market_cap_usd=float(pool.spot_price_native_per_token * native_price * Decimal("1000000000")) if pool else 0.0,
+                                    market_cap_usd=float(pool.calculate_market_cap_usd(native_price) or Decimal("0.0")) if pool else 0.0,
                                     liquidity_usd=float(pool.native_reserve * native_price * 2) if pool else 0.0,
                                     volume_5m_usd=0.0,
                                     volume_1h_usd=0.0,

@@ -21,6 +21,10 @@ from alpha_engine.models.events import (
     SwapEvent,
 )
 from alpha_engine.models.state import PoolState
+from alpha_engine.security.constants import (
+    PUMP_FUN_INITIAL_VIRTUAL_SOL_RESERVE,
+    PUMP_FUN_INITIAL_VIRTUAL_TOKEN_RESERVE,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -609,13 +613,12 @@ def _parse_pump_fun_logs(
     ):
         return None
 
-    # Pump.fun standard bonding curve initial reserves:
-    # 30 SOL virtual reserve, 1.073B virtual tokens
+    # Pump.fun standard bonding curve verified initial reserves on creation:
     return PumpMintEvent(
         mint=mint_address,
         bonding_curve=bonding_curve or mint_address,
-        virtual_sol_reserves=Decimal("30.0"),
-        virtual_token_reserves=Decimal("1073000000.0"),
+        virtual_sol_reserves=PUMP_FUN_INITIAL_VIRTUAL_SOL_RESERVE,
+        virtual_token_reserves=PUMP_FUN_INITIAL_VIRTUAL_TOKEN_RESERVE,
         token_decimals=6,
         native_decimals=9,
         tx_hash=tx_sig,
@@ -762,9 +765,9 @@ def _parse_pump_fun_trade_logs(
 
                     sol_amount = _normalise(sol_raw, 9)
                     token_amount = _normalise(token_raw, 6)
-                    v_sol = _normalise(v_sol_raw, 9) if v_sol_raw > 0 else Decimal("30.0")
-                    v_token = _normalise(v_token_raw, 6) if v_token_raw > 0 else Decimal("1073000000.0")
-                    has_auth = bool(v_sol_raw > 0 and v_token_raw > 0)
+                    v_sol = _normalise(v_sol_raw, 9) if v_sol_raw > 0 else None
+                    v_token = _normalise(v_token_raw, 6) if v_token_raw > 0 else None
+                    has_auth = bool(v_sol is not None and v_token is not None)
 
                     return PumpFunTradeResult({
                         "mint": mint,
@@ -840,10 +843,9 @@ def _parse_pump_fun_trade_logs(
     if not is_trade or not mint:
         return None
 
-    if sol_amount == 0:
-        sol_amount = Decimal("0.1")
-    if token_amount == 0:
-        token_amount = Decimal("1000000")
+    if sol_amount <= Decimal(0) and token_amount <= Decimal(0):
+        # Must have at least one real observed trade amount
+        return None
 
     return PumpFunTradeResult({
         "mint": mint,
@@ -853,8 +855,9 @@ def _parse_pump_fun_trade_logs(
         "user": buyer or (tx_sig[:44] if len(tx_sig) >= 32 else "PumpBuyer111111111111111111111111111111111"),
         "slot": slot,
         "is_buy": is_buy,
-        "virtual_sol_reserves": Decimal("30.0"),
-        "virtual_token_reserves": Decimal("1073000000.0"),
+        "virtual_sol_reserves": None,
+        "virtual_token_reserves": None,
+        "has_authoritative_reserves": False,
         "tx_hash": tx_sig,
     })
 

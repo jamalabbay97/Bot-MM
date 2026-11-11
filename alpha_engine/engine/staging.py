@@ -27,7 +27,7 @@ from alpha_engine.models.enums import (
     StrategyType,
 )
 from alpha_engine.models.events import RawSignalEvent, SignalEvent, SwapEvent
-from alpha_engine.models.state import PoolState, SecurityReport
+from alpha_engine.models.state import PoolState, ReserveType, SecurityReport
 
 logger = logging.getLogger(__name__)
 
@@ -429,7 +429,7 @@ class Wave2StagingBuffer:
         token_address: str,
         chain: ChainIdentifier = ChainIdentifier.SOLANA_MAINNET,
         pool_address: str = "",
-        initial_price: Decimal = Decimal("0.000000028"),
+        initial_price: Optional[Decimal] = None,
         report: Optional[SecurityReport] = None,
         raw_signal: Optional[RawSignalEvent] = None,
         dev_wallet: str = "",
@@ -444,7 +444,7 @@ class Wave2StagingBuffer:
         Can transition from PendingLaunchBuffer (after initial dump) or from external scanner.
         """
         now = t_staged if t_staged is not None else time.time()
-        init_p = initial_price if initial_price > 0 else Decimal("0.000000028")
+        init_p = initial_price if (initial_price is not None and initial_price > Decimal(0)) else Decimal(0)
 
         sec_rep = report or SecurityReport(
             token_address=token_address,
@@ -797,17 +797,10 @@ class Wave2StagingBuffer:
             self._dispatch_decision(decision)
 
             # Generate SignalEvent
-            p_state = pool or PoolState(
-                pool_address=tok.pool_address or "0x" + "0" * 40,
-                chain=tok.chain,
-                token_reserve=Decimal("1000000000"),
-                native_reserve=Decimal("30"),
-                fee_numerator=30,
-                fee_denominator=10000,
-                last_updated_block=1000,
-                token_decimals=6,
-                native_decimals=9,
-            )
+            if pool is None or pool.spot_price_native_per_token is None or pool.spot_price_native_per_token <= Decimal(0):
+                logger.warning("Cannot emit breakout signal for %s: missing or invalid pool state", tok.token_address[:10])
+                return None
+            p_state = pool
 
             signal = SignalEvent(
                 timestamp_ns=time.time_ns(),
@@ -1019,7 +1012,7 @@ class RevivalBreakoutBuffer:
         token_address: str,
         chain: ChainIdentifier = ChainIdentifier.SOLANA_MAINNET,
         pool_address: str = "",
-        initial_price: Decimal = Decimal("0.000000028"),
+        initial_price: Optional[Decimal] = None,
         token_creation_timestamp: Optional[float] = None,
         consolidation_base_price: Optional[Decimal] = None,
         consolidation_base_mcap: Optional[Decimal] = None,
@@ -1037,7 +1030,7 @@ class RevivalBreakoutBuffer:
     ) -> StagedToken:
         """Buffer an aged or neglected token into the RevivalBreakout staging watchlist."""
         now = t_staged if t_staged is not None else time.time()
-        init_p = initial_price if initial_price > 0 else Decimal("0.000000028")
+        init_p = initial_price if (initial_price is not None and initial_price > Decimal(0)) else Decimal(0)
 
         sec_rep = report or SecurityReport(
             token_address=token_address,
@@ -1455,17 +1448,27 @@ class RevivalBreakoutBuffer:
             )
             self._dispatch_decision(decision)
 
-            p_state = pool or PoolState(
-                pool_address=tok.pool_address or "0x" + "0" * 40,
-                chain=tok.chain,
-                token_reserve=Decimal("1000000000"),
-                native_reserve=Decimal("30"),
-                fee_numerator=30,
-                fee_denominator=10000,
-                last_updated_block=1000,
-                token_decimals=6,
-                native_decimals=9,
-            )
+            if pool is None or pool.spot_price_native_per_token is None or pool.spot_price_native_per_token <= Decimal(0):
+                curr_price = tok.latest_price or tok.initial_price
+                if curr_price and curr_price > Decimal(0):
+                    p_state = PoolState(
+                        pool_address=tok.pool_address or (tok.token_address if len(tok.token_address) >= 32 else (tok.token_address + "0" * 32)[:32]),
+                        chain=tok.chain,
+                        token_reserve=Decimal("1000000.0"),
+                        native_reserve=Decimal("1000000.0") * curr_price,
+                        fee_numerator=30,
+                        fee_denominator=10000,
+                        last_updated_block=1000,
+                        token_decimals=6,
+                        native_decimals=9,
+                        reserve_type=ReserveType.DERIVED,
+                        source="revival_breakout_staged_price",
+                    )
+                else:
+                    logger.warning("Cannot emit revival breakout signal for %s: missing or invalid pool state", tok.token_address[:10])
+                    return None
+            else:
+                p_state = pool
 
             signal = SignalEvent(
                 timestamp_ns=time.time_ns(),

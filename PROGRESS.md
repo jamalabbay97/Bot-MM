@@ -129,14 +129,43 @@ Track progress across all identified defects and phases. All items must satisfy 
 ---
 
 ## Issue 5 Fabricated pool data + wrong venue math
-- [ ] reproduced
-- [ ] red test
-- [ ] fix
-- [ ] green test
-- [ ] mutation check
-- [ ] sweep done
-- [ ] wiring proof
-- [ ] README/docs updated
+- [x] reproduced
+  - `runner.py`: DexScreener/GeckoTerminal pool builders substituted fabricated reserves (`native_reserve = Decimal("30.0")` SOL / `Decimal("5.0")` ETH, `token_reserve = Decimal("1073000000.0")`, `spot_price = Decimal("0.000000028")`) when APIs returned empty/partial JSON.
+  - `models/state.py`: `calculate_market_cap_usd` assumed a 1B token supply when `total_supply` was `None`.
+  - `math/cpmm.py`: `get_initial_bonding_curve_pool` assumed initial virtual reserves for arbitrary tokens whose curve state was unknown.
+  - Wrong pricing math: Concentrated liquidity pools (Uniswap v3, Raydium CLMM, Orca Whirlpool) silently used CPMM $x \cdot y = k$.
+- [x] red test
+  - Created `tests/test_issue5_pool_data_and_venue_math.py` with 6 exhaustive tests:
+    1. `test_missing_liquidity_price_supply_rejects_and_counts_telemetry`: missing liquidity/price returns `None`, logs rate-limited WARNING, increments telemetry counters (`no_liquidity_data`, `no_price`, `stale_state`).
+    2. `test_derived_reserves_policy_enforcement`: verifies `ReserveType.DERIVED` provenance and tests both `"reject"` (default) and `"cap_size"` policies.
+    3. `test_unsupported_venue_rejected_and_supported_venue_quoted`: verifies `VENUE_CAPABILITIES` table; unsupported venues (Raydium CLMM, Orca Whirlpool) reject fail-closed; supported venues (Uniswap v3) quote via `IVenueQuoter`.
+    4. `test_market_cap_unknown_rejects_explicitly`: verifies unknown supply produces `market_cap_usd = None` and mcap-dependent filters reject explicitly with `mcap_unknown_rejected`.
+    5. `test_pump_fun_unknown_state_rejects_and_decoded_state_quotes_accurately`: unverified/unknown curves reject; decoded curve states quote accurately against hand-computed values.
+    6. `test_integration_runner_dexscreener_and_geckoterminal_empty_partial_json`: runner DexScreener and GeckoTerminal paths return `None` on empty or partial API responses without inventing data.
+- [x] fix
+  - `alpha_engine/models/state.py`: Added `ReserveType` enum (`EXACT`, `DERIVED`) and provenance fields (`reserve_type`, `source`, `fetched_at`, `data_age`, `is_derived`, `is_verified`) to `PoolState`. Updated `calculate_market_cap_usd` to return `None` when supply is unknown (except for verified Solana Pump.fun tokens per official Anchor IDL).
+  - `alpha_engine/engine/runner.py`: Removed all invented fallback reserves, prices, and supplies. When API data is missing/incomplete, returns `None`, logs rate-limited `WARNING`, and increments counted telemetry reasons.
+  - `alpha_engine/pricing/venue_capabilities.py`: Created `VENUE_CAPABILITIES` table mapping venues to `SUPPORTED`, `UNSUPPORTED`, `DERIVED_ONLY`. Created `IVenueQuoter` interface with `EvmUniswapV3Quoter` computing single-tick concentrated liquidity ($L = \sqrt{x \cdot y}$) in simulation, while rejecting unsupported CLMMs (`UnsupportedVenueError`).
+  - `alpha_engine/execution/costs.py`: Wired `TradeCostModel.get_venue_quote` to `IVenueQuoter` and enforced venue support validation.
+  - `alpha_engine/execution/executor.py`: Implemented configurable `derived_reserves_policy` (`"reject"` default or `"cap_size"`).
+  - `alpha_engine/security/gatekeeper.py`: Enforced venue support checks and explicit rejection of tokens with unknown market cap when filters depend on it (`mcap_unknown_rejected`).
+  - `alpha_engine/math/cpmm.py`: Derived Pump.fun state strictly from real on-chain curve account data or verified launch events; rejected unknown curves (`create_verified_pump_launch_pool`). Defined verified IDL constants (`PUMP_FUN_INITIAL_VIRTUAL_SOL_RESERVE`, `PUMP_FUN_INITIAL_VIRTUAL_TOKEN_RESERVE`, `PUMP_FUN_TOTAL_TOKEN_SUPPLY`, `PUMP_FUN_FEE_BASIS_POINTS`, `PUMP_FUN_INITIAL_SPOT_PRICE`).
+- [x] green test
+  - `.venv/bin/pytest tests/test_issue5_pool_data_and_venue_math.py` -> 6 passed in 5.03s.
+  - `.venv/bin/pytest -q` -> 454 passed, 0 failed in 248.21s.
+- [x] mutation check
+  - Mutation 1: Bypassed `derived_reserves_policy == "reject"` in `executor.py`; verified `test_derived_reserves_policy_enforcement` failed immediately (`AssertionError: Executor must reject signal when pool has derived reserves and policy='reject'`). Restored and verified green.
+  - Mutation 2: Mutated `VENUE_CAPABILITIES[ExecutionVenue.RAYDIUM_CLMM]` to `SUPPORTED`; verified `test_unsupported_venue_rejected_and_supported_venue_quoted` failed immediately (`AssertionError: assert <VenueStatus.SUPPORTED> == <VenueStatus.UNSUPPORTED>`). Restored and verified green.
+- [x] sweep done
+  - Ran `tools/audit/invented_data.py`: Total findings dropped from 152 to 66 (20 are in the audit script itself; remaining 46 are verified Anchor IDL constants, volume thresholds, or unit conversions).
+  - Eliminated all occurrences of hardcoded price fallback `Decimal("0.000000028")` and hardcoded reserve `Decimal("30")` across the entire codebase.
+- [x] wiring proof
+  - DexScreener and GeckoTerminal ingestion in `runner.py`: Missing price, liquidity, or supply returns `None` and increments counted telemetry (`no_liquidity_data`, `no_price`, `stale_state`, `mcap_unknown_rejected`).
+  - `PaperExecutor.execute_signal` enforces `derived_reserves_policy` ("reject" by default, or "cap_size" with `derived_reserves_depth_cap_pct=0.02`).
+  - `SecurityGatekeeper` and `TradeCostModel` check `is_venue_supported` against `VENUE_CAPABILITIES`. Unsupported venues (Raydium CLMM, Orca Whirlpool) are rejected fail-closed with telemetry reason `unsupported_venue_rejected`. Supported concentrated liquidity venues (Uniswap v3) use `IVenueQuoter` (`EvmUniswapV3Quoter`).
+  - Market cap: `calculate_market_cap_usd` in `models/state.py` returns `None` if supply is unknown. `SecurityGatekeeper` rejects tokens with unknown market cap when filters depend on it, logging a warning and incrementing `mcap_unknown_rejected`.
+- [x] README/docs updated
+  - `.env.example`: Added Section 10 documenting `DERIVED_RESERVES_POLICY` and `DERIVED_RESERVES_DEPTH_CAP_PCT`.
 
 ---
 

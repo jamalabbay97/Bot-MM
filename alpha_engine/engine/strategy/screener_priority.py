@@ -31,7 +31,7 @@ from alpha_engine.models.enums import (
 )
 from alpha_engine.math.sizing import classify_alpha_score
 from alpha_engine.models.events import ScreenerDiscoveryEvent, SignalEvent
-from alpha_engine.models.state import PoolState, SecurityReport
+from alpha_engine.models.state import PoolState, ReserveType, SecurityReport
 
 logger = logging.getLogger(__name__)
 
@@ -297,6 +297,7 @@ class ScreenerPriorityEvaluator:
             native_res = liq_dec / Decimal("2.0") / sol_price if sol_price > Decimal(0) else Decimal("100.0")
             token_res = (liq_dec / Decimal("2.0")) / (cur_price or Decimal("0.001")) if (cur_price or Decimal("0.001")) > 0 else Decimal("1000000.0")
             fallback_pool_addr = discovery.pool_address or (token_addr if len(token_addr) >= 32 else (token_addr + "0" * 32)[:32])
+            supply = Decimal("1000000000.0") if discovery.chain == ChainIdentifier.SOLANA_MAINNET else None
             pool_state = PoolState(
                 pool_address=fallback_pool_addr,
                 chain=discovery.chain,
@@ -307,6 +308,9 @@ class ScreenerPriorityEvaluator:
                 last_updated_block=1000,
                 token_decimals=6,
                 native_decimals=9,
+                reserve_type=ReserveType.DERIVED,
+                source="screener_liquidity",
+                total_supply=supply,
             )
 
         raw_meta = dict(discovery.raw_metadata)
@@ -508,6 +512,9 @@ class ScreenerPriorityEvaluator:
                 pool_address=pool_state.pool_address,
                 native_price_usd=native_price,
             )
+        elif chain == ChainIdentifier.SOLANA_MAINNET and current_price is not None and current_price > Decimal("0"):
+            # Graduated / Movers pump tokens on Solana have Anchor IDL-verified 1B total supply
+            qualifying_mcap_usd = current_price * Decimal("1000000000.0")
 
         active_prof = self.movers_profile if section == ScreenerSection.MOVERS else self.graduated_profile
         min_mcap_required = getattr(active_prof, "min_market_cap_usd", Decimal("10000.0"))

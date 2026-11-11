@@ -138,6 +138,7 @@ async def test_price_changes_mid_run_updates_equity_pnl_mcap_and_conversions(tmp
             fee_denominator=10000,
             last_updated_block=100,
             timestamp_s=time.time(),
+            total_supply=Decimal("1000000000.0"),
         )
         engine._pool_registry.set(lot.pool_address, pool)
         engine._pool_registry.set(token_addr, pool)

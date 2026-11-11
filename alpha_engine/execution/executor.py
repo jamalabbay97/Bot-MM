@@ -17,11 +17,7 @@ from alpha_engine.config import EngineConfig
 from alpha_engine.execution.book import PositionBook
 from alpha_engine.execution.bundle import PrivateTxRouter
 from alpha_engine.execution.costs import TradeCostModel
-from alpha_engine.math.cpmm import (
-    cpmm_buy_quote,
-    cpmm_sell_quote,
-    get_initial_bonding_curve_pool,
-)
+from alpha_engine.math.cpmm import cpmm_buy_quote
 from alpha_engine.math.mev import simulate_latency
 from alpha_engine.math.sizing import (
     GAS_MULTIPLE_GATE,
@@ -36,6 +32,10 @@ from alpha_engine.models.enums import (
 )
 from alpha_engine.models.events import SignalEvent
 from alpha_engine.models.state import PaperFill, PoolState
+from alpha_engine.pricing.venue_capabilities import (
+    VenueStatus,
+    get_venue_capability,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -54,6 +54,8 @@ class PaperExecutor:
         private_router: Optional[PrivateTxRouter] = None,
         cost_model: Optional[TradeCostModel] = None,
         config: Optional[EngineConfig] = None,
+        derived_reserves_policy: Optional[str] = None,
+        derived_reserves_depth_cap_pct: Optional[Decimal] = None,
     ) -> None:
         if price_service is None:
             raise ValueError("PaperExecutor requires a valid price_service (NativePriceService)")
@@ -62,6 +64,17 @@ class PaperExecutor:
         self._private_router = private_router or PrivateTxRouter()
         self.config = config or EngineConfig()
         self._cost_model = cost_model or TradeCostModel(config=self.config, price_service=price_service)
+        self.derived_reserves_policy = (
+            derived_reserves_policy
+            if derived_reserves_policy is not None
+            else getattr(self.config, "derived_reserves_policy", "reject")
+        )
+        self.derived_reserves_depth_cap_pct = (
+            derived_reserves_depth_cap_pct
+            if derived_reserves_depth_cap_pct is not None
+            else getattr(self.config, "derived_reserves_depth_cap_pct", Decimal("0.02"))
+        )
+        self.telemetry_counters: dict[str, int] = {}
 
     async def execute_signal(
         self,
@@ -80,19 +93,66 @@ class PaperExecutor:
         _ = max_position_fraction
         side = signal.suggested_side
         pool = getattr(signal, "pool_state", None)
+
+        # 1. Resolve venue and verify against venue capabilities table
+        venue = getattr(signal, "venue", None) or getattr(signal, "execution_venue", None)
+        resolved_venue = self._cost_model.resolve_venue(
+            venue=venue,
+            token_address=getattr(pool, "token_address", None) or signal.token_address,
+            chain=signal.chain,
+            pool_address=getattr(pool, "pool_address", "") or getattr(signal, "pool_address", ""),
+            bonding_curve_mode=(
+                (pool is not None and getattr(pool, "pool_address", "").startswith("pump_"))
+                or getattr(signal, "platform", None) == "Pump.fun"
+            ),
+            platform=getattr(signal, "platform", None),
+        )
+        venue_cap = get_venue_capability(resolved_venue)
+        if venue_cap.status == VenueStatus.UNSUPPORTED:
+            logger.warning(
+                "execute_signal: Refusing fill for %s: Venue %s is UNSUPPORTED.",
+                signal.token_address[:10],
+                resolved_venue.value,
+            )
+            self.telemetry_counters[f"unsupported_venue_{resolved_venue.value}"] = (
+                self.telemetry_counters.get(f"unsupported_venue_{resolved_venue.value}", 0) + 1
+            )
+            return None
+
+        # 2. Strict pool existence and liquidity verification (never invent data)
         if pool is None or pool.token_reserve <= Decimal(0) or pool.native_reserve <= Decimal(0):
-            if is_new_launch:
-                pool = get_initial_bonding_curve_pool(
-                    token_address=signal.token_address,
-                    chain=signal.chain,
-                    pool_address=signal.pool_address,
-                )
-            else:
+            logger.warning(
+                "execute_signal: No valid pool_state for %s; refusing fill without real-time pool data.",
+                signal.token_address[:10],
+            )
+            self.telemetry_counters["no_liquidity_data"] = self.telemetry_counters.get("no_liquidity_data", 0) + 1
+            return None
+
+        # 3. Derived reserves policy enforcement (reject or cap_size)
+        if getattr(pool, "is_derived", False):
+            if self.derived_reserves_policy == "reject":
                 logger.warning(
-                    "execute_signal: No valid pool_state for %s; refusing fill without real-time price.",
+                    "execute_signal: Refusing fill for %s: Pool reserves are DERIVED (%s) and policy is 'reject'.",
                     signal.token_address[:10],
+                    getattr(pool, "source", "unknown"),
+                )
+                self.telemetry_counters["derived_reserves_rejected"] = (
+                    self.telemetry_counters.get("derived_reserves_rejected", 0) + 1
                 )
                 return None
+            elif self.derived_reserves_policy == "cap_size":
+                if fixed_trade_amount_native is not None:
+                    max_depth = (pool.native_reserve * self.derived_reserves_depth_cap_pct).quantize(Decimal("1e-9"))
+                    if fixed_trade_amount_native > max_depth:
+                        logger.warning(
+                            "execute_signal: Capping trade size from %s to %s for %s under 'cap_size' policy (max %s%% of %s)",
+                            fixed_trade_amount_native,
+                            max_depth,
+                            signal.token_address[:10],
+                            self.derived_reserves_depth_cap_pct * Decimal("100"),
+                            pool.native_reserve,
+                        )
+                        fixed_trade_amount_native = max_depth
 
         pool_age = time.time() - getattr(pool, "timestamp_s", 0.0) if pool else 999.0
         if not is_new_launch and pool_age > 4.0:
@@ -155,16 +215,33 @@ class PaperExecutor:
             )
             fill_kelly_fraction = equity_fraction if equity_fraction is not None else real_fraction
 
-            venue = getattr(signal, "execution_venue", None)
+            venue_quote = None
+            if venue_cap.pricing_model in ("quoter", "jupiter"):
+                try:
+                    venue_quote = await self._cost_model.get_venue_quote(
+                        side=OrderSide.BUY,
+                        gross_amount=native_in,
+                        pool=adjusted_pool,
+                        chain=signal.chain,
+                        venue=resolved_venue,
+                    )
+                except Exception as exc:
+                    logger.warning("Quoter failed for BUY %s: %s", signal.signal_id[:8], exc)
+                    self.telemetry_counters[f"quoter_failed_{resolved_venue.value}"] = (
+                        self.telemetry_counters.get(f"quoter_failed_{resolved_venue.value}", 0) + 1
+                    )
+                    return None
+
             try:
                 cost_res = self._cost_model.calculate_trade_costs(
                     side=OrderSide.BUY,
                     gross_amount=native_in,
                     pool=adjusted_pool,
                     chain=signal.chain,
-                    venue=venue,
+                    venue=resolved_venue,
                     native_price_usd=current_native_price,
                     platform=getattr(signal, "platform", None),
+                    venue_quote=venue_quote,
                 )
             except Exception as exc:
                 logger.warning("Cost model execution failed for BUY %s: %s", signal.signal_id[:8], exc)
@@ -194,16 +271,33 @@ class PaperExecutor:
                 )
                 return None
 
-            venue = getattr(signal, "execution_venue", None)
+            venue_quote = None
+            if venue_cap.pricing_model in ("quoter", "jupiter"):
+                try:
+                    venue_quote = await self._cost_model.get_venue_quote(
+                        side=OrderSide.SELL,
+                        gross_amount=tokens_held,
+                        pool=adjusted_pool,
+                        chain=signal.chain,
+                        venue=resolved_venue,
+                    )
+                except Exception as exc:
+                    logger.warning("Quoter failed for SELL %s: %s", signal.signal_id[:8], exc)
+                    self.telemetry_counters[f"quoter_failed_{resolved_venue.value}"] = (
+                        self.telemetry_counters.get(f"quoter_failed_{resolved_venue.value}", 0) + 1
+                    )
+                    return None
+
             try:
                 cost_res = self._cost_model.calculate_trade_costs(
                     side=OrderSide.SELL,
                     gross_amount=tokens_held,
                     pool=adjusted_pool,
                     chain=signal.chain,
-                    venue=venue,
+                    venue=resolved_venue,
                     native_price_usd=current_native_price,
                     platform=getattr(signal, "platform", None),
+                    venue_quote=venue_quote,
                 )
             except Exception as exc:
                 logger.warning("Cost model execution failed for SELL %s: %s", signal.signal_id[:8], exc)
@@ -449,11 +543,8 @@ class PaperExecutor:
         batch_native = total_native / Decimal(str(num_batches))
         pool = getattr(signal, "pool_state", None)
         if pool is None:
-            pool = get_initial_bonding_curve_pool(
-                token_address=signal.token_address,
-                chain=signal.chain,
-                pool_address=signal.pool_address,
-            )
+            logger.warning("execute_swing_dca_pipeline: No valid pool_state; refusing DCA fill.")
+            return []
 
         fills: list[PaperFill] = []
         curr_pool = pool

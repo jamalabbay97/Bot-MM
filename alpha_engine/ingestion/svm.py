@@ -38,9 +38,15 @@ from alpha_engine.models.events import (
     ShutdownSentinel,
     SwapEvent,
 )
-from alpha_engine.models.state import PoolState
+from alpha_engine.models.state import PoolState, ReserveType
 from alpha_engine.rate_limiter.registry import RateLimiterRegistry
-from alpha_engine.security.constants import SOLANA_SYSTEM_PROGRAM_IDS, derive_pump_fun_bonding_curve
+from alpha_engine.security.constants import (
+    PUMP_FUN_INITIAL_VIRTUAL_SOL_RESERVE,
+    PUMP_FUN_INITIAL_VIRTUAL_TOKEN_RESERVE,
+    PUMP_FUN_TOTAL_TOKEN_SUPPLY,
+    SOLANA_SYSTEM_PROGRAM_IDS,
+    derive_pump_fun_bonding_curve,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -648,8 +654,8 @@ class SVMIngester:
                                         token_amount=tok_amt,
                                         buyer=buyer_addr,
                                         is_buy=is_buy,
-                                        virtual_sol_reserves=v_sol if v_sol > Decimal(0) else Decimal("30.0"),
-                                        virtual_token_reserves=v_tok if v_tok > Decimal(0) else Decimal("1073000000.0"),
+                                        virtual_sol_reserves=v_sol if (v_sol is not None and v_sol > Decimal(0)) else None,
+                                        virtual_token_reserves=v_tok if (v_tok is not None and v_tok > Decimal(0)) else None,
                                         has_authoritative_reserves=bool(pump_trade.get("has_authoritative_reserves", False)),
                                         slot=slot,
                                     )
@@ -723,15 +729,15 @@ class SVMIngester:
 
                                 tok_dec = pump_info.get("token_decimals", 6)
                                 nat_dec = pump_info.get("native_decimals", 9)
-                                v_sol = pump_info.get("virtual_sol_reserves", Decimal("30.0"))
-                                v_tok = pump_info.get("virtual_token_reserves", Decimal("1073000000.0"))
+                                v_sol = pump_info.get("virtual_sol_reserves") or PUMP_FUN_INITIAL_VIRTUAL_SOL_RESERVE
+                                v_tok = pump_info.get("virtual_token_reserves") or PUMP_FUN_INITIAL_VIRTUAL_TOKEN_RESERVE
 
                                 self._pool_registry[curve_addr] = (
                                     mint_addr,
                                     "So11111111111111111111111111111111111111112",
                                     tok_dec,
                                     nat_dec,
-                                )
+                                    )
                                 pool_state = PoolState(
                                     pool_address=curve_addr,
                                     chain=ChainIdentifier.SOLANA_MAINNET,
@@ -743,6 +749,9 @@ class SVMIngester:
                                     last_updated_block=slot,
                                     token_decimals=tok_dec,
                                     native_decimals=nat_dec,
+                                    reserve_type=ReserveType.EXACT,
+                                    source="pump_fun_mint_creation",
+                                    total_supply=PUMP_FUN_TOTAL_TOKEN_SUPPLY,
                                 )
                                 await self._queue.put(
                                     PoolStateUpdateEvent(

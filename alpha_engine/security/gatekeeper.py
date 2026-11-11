@@ -548,6 +548,11 @@ class SecurityGatekeeper:
           - Liquidity Pool unlocked: LP burn or lock verified must be >= 99%.
           - Sybil / Top-Holder Concentration: Top 10 non-DEX, non-burn wallets hold > 15% of total supply.
         """
+        if getattr(report, "venue", None) is not None:
+            from alpha_engine.pricing.venue_capabilities import VenueStatus, get_venue_capability
+            v_cap = get_venue_capability(report.venue)
+            if v_cap.status == VenueStatus.UNSUPPORTED:
+                return False, f"UNSUPPORTED_VENUE_{report.venue.value.upper()}: Venue {report.venue.value} is marked UNSUPPORTED"
         if report.is_honeypot:
             return False, "HONEYPOT_DETECTED: sell simulation failed / honeypot logic"
         if report.buy_tax_bps > 300:

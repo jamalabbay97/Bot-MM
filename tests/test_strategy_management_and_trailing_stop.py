@@ -247,6 +247,7 @@ def test_minimum_market_cap_10k_enforcement_with_pool_state():
         last_updated_block=5000,
         token_decimals=6,
         native_decimals=9,
+        total_supply=Decimal("1000000000.0"),
     )
     pool_update = PoolStateUpdateEvent(
         timestamp_ns=int(time.time() * 1e9),
@@ -609,6 +610,7 @@ def test_screener_exclusive_focus_graduated_and_movers_definition():
         last_updated_block=1000,
         token_decimals=6,
         native_decimals=9,
+        total_supply=Decimal("1000000000.0"),
     )
     dummy_report = SecurityReport(
         token_address="FiJ7513iZHCT6yqG9NgZQ9MP8d8E6Kw6NGEM327ppump",

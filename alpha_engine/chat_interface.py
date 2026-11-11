@@ -367,13 +367,13 @@ class ConversationalSupervisor:
         elif action == "stage":
             if not val:
                 return "Specify token address to force into Wave-2 staging."
-            price = Decimal(parts[2]) if len(parts) > 2 else Decimal("0.000000028")
+            price = Decimal(parts[2]) if len(parts) > 2 else None
             if self.staging_buffer:
                 self.staging_buffer.stage_token(
                     token_address=val,
                     initial_price=price,
                 )
-                return f"🌊 Token `{val[:10]}` manually injected into Wave-2 staging buffer with initial price `{price}`."
+                return f"🌊 Token `{val[:10]}` manually injected into Wave-2 staging buffer with initial price `{price if price is not None else 'unknown'}`."
             return "Staging buffer not attached."
 
         elif action == "strict_veto":

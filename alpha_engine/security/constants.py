@@ -32,6 +32,20 @@ PUMP_FUN_PROGRAM_ID: str = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"
 SPL_TOKEN_PROGRAM_ID: str = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
 SPL_ATA_PROGRAM_ID: str = "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL"
 
+# =============================================================================
+# Official Pump.fun Program Parameters (Solana)
+# Program ID: 6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P
+# Source: Pump.fun Anchor IDL (BondingCurve account structure & create instruction)
+# Verified on: 2026-11-11
+# =============================================================================
+PUMP_FUN_FEE_BASIS_POINTS: int = 100  # 1.0% official trading fee
+PUMP_FUN_INITIAL_VIRTUAL_TOKEN_RESERVE: Decimal = Decimal("1073000000.0")  # 1.073B virtual tokens
+PUMP_FUN_INITIAL_VIRTUAL_SOL_RESERVE: Decimal = Decimal("30.0")  # 30.0 SOL virtual reserve
+PUMP_FUN_TOTAL_TOKEN_SUPPLY: Decimal = Decimal("1000000000.0")  # 1.0B tokens total supply
+PUMP_FUN_INITIAL_REAL_TOKEN_RESERVE: Decimal = Decimal("793100000.0")  # 793.1M tokens on curve
+PUMP_FUN_INITIAL_REAL_SOL_RESERVE: Decimal = Decimal("0.0")
+PUMP_FUN_MIGRATION_REAL_SOL_TARGET: Decimal = Decimal("85.0")  # ~85 SOL real migration threshold
+
 
 def is_pump_fun_token(token_address: str, chain: ChainIdentifier | None = None) -> bool:
     """Return True if token matches Pump.fun naming / chain conventions."""

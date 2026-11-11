@@ -380,6 +380,12 @@ def resolve_trade_venue(
             if member.value == p_clean or member.name.lower() == p_clean:
                 return member
 
+    # 2b. Source or originating channel override
+    if source is not None and "pump" in str(getattr(source, "value", source)).lower():
+        return ExecutionVenue.PUMP_FUN
+    if originating_channel and "pump" in str(originating_channel).lower():
+        return ExecutionVenue.PUMP_FUN
+
     # 3. Explicit pump.fun / bonding curve mode
     if is_pump_fun is True or bonding_curve_mode:
         return ExecutionVenue.PUMP_FUN

@@ -16,6 +16,7 @@ from dataclasses import dataclass, field
 from decimal import Decimal
 from typing import Any, Callable, Optional
 
+from alpha_engine.math.cpmm import PUMP_FUN_INITIAL_SPOT_PRICE
 from alpha_engine.math.mev import calculate_sandwich_risk
 from alpha_engine.math.sizing import classify_alpha_score
 from alpha_engine.models.decisions import DecisionSignal
@@ -144,7 +145,7 @@ class PendingLaunchBuffer:
         is_screener_priority: bool = False,
     ) -> StagedLaunch:
         now_s = t_0 if t_0 is not None else time.time()
-        init_p = initial_price if initial_price > 0 else Decimal("0.000000028")
+        init_p = initial_price if initial_price > 0 else PUMP_FUN_INITIAL_SPOT_PRICE
         staged = StagedLaunch(
             token_address=token_address,
             chain=chain,
@@ -174,7 +175,7 @@ class PendingLaunchBuffer:
         token_address: str,
         chain: ChainIdentifier = ChainIdentifier.SOLANA_MAINNET,
         pool_address: str = "",
-        initial_price: Decimal = Decimal("0.000000028"),
+        initial_price: Decimal = PUMP_FUN_INITIAL_SPOT_PRICE,
         report: SecurityReport | None = None,
         raw_signal: RawSignalEvent | None = None,
         t_0: float | None = None,

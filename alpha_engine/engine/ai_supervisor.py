@@ -283,7 +283,7 @@ class AIOutcomeTracker:
         flags: list[str],
         confidence: float,
     ) -> AuditedTokenOutcome:
-        init_p = initial_price if initial_price > Decimal(0) else Decimal("0.000000028")
+        init_p = initial_price if (initial_price is not None and initial_price > Decimal(0)) else Decimal(0)
         outcome = AuditedTokenOutcome(
             token_address=token_address,
             chain=chain,
@@ -1109,7 +1109,7 @@ class AlphaSupervisorAI:
             elif resp.decision == AISupervisorDecisionEnum.EXECUTE_BUY:
                 self._buy_approval_count += 1
 
-            init_price = Decimal("0.000000028")
+            init_price = Decimal(0)
             if pool_state and hasattr(pool_state, "spot_price_native_per_token") and pool_state.spot_price_native_per_token > 0:
                 init_price = pool_state.spot_price_native_per_token
             elif getattr(signal, "spot_price", None) and signal.spot_price > 0:

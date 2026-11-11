@@ -20,9 +20,12 @@ from pydantic import (
     model_validator,
 )
 
+from enum import Enum
+
 from alpha_engine.models.base import _STRICT_MODEL_CFG
 from alpha_engine.models.enums import (
     ChainIdentifier,
+    ExecutionVenue,
     ExitProfile,
     ExitStage,
     OrderSide,
@@ -33,9 +36,16 @@ from alpha_engine.models.enums import (
 )
 
 
+class ReserveType(str, Enum):
+    """Provenance of pool reserves."""
+
+    EXACT = "exact"       # On-chain verified reserves (RPC eth_call, getAccountInfo, on-chain event)
+    DERIVED = "derived"   # Derived from API liquidity USD (DexScreener, GeckoTerminal)
+
+
 class PoolState(BaseModel):
     """
-    Current on-chain reserve state for a CPMM liquidity pool.
+    Current reserve state for a liquidity pool or bonding curve.
 
     The invariant  token_reserve * native_reserve = k  must hold
     (modulo fee collection). All values are in raw token units —
@@ -52,6 +62,13 @@ class PoolState(BaseModel):
     last_updated_block  : Block / slot at which reserves were last refreshed.
     token_decimals      : On-chain decimal places for the non-native token.
     native_decimals     : On-chain decimal places for the native asset (18=ETH, 9=SOL).
+    reserve_type        : EXACT (on-chain verified) or DERIVED (from API liquidity USD).
+    source              : Provenance identifier (e.g. "onchain_rpc", "DexScreener", "PumpFunOnChainCurve").
+    fetched_at          : Epoch timestamp in seconds when state was retrieved.
+    data_age            : Latency/age of pool data in seconds.
+    total_supply        : Verified total supply (SPL mint supply / ERC-20 totalSupply).
+    circulating_supply  : Verified circulating supply.
+    venue               : Execution venue if known.
     """
 
     model_config = _STRICT_MODEL_CFG
@@ -69,6 +86,13 @@ class PoolState(BaseModel):
     timestamp_s: Optional[float] = Field(default_factory=time.time)
     price_source: Optional[str] = None
     data_age_s: Optional[float] = None
+    reserve_type: ReserveType = ReserveType.EXACT
+    source: str = "unknown"
+    fetched_at: float = Field(default_factory=time.time)
+    data_age: Optional[float] = None
+    total_supply: Optional[Decimal] = None
+    circulating_supply: Optional[Decimal] = None
+    venue: Optional[ExecutionVenue] = None
 
     @model_validator(mode="after")
     def fee_fraction_sane(self) -> "PoolState":
@@ -77,13 +101,27 @@ class PoolState(BaseModel):
             raise ValueError(
                 f"Fee fraction {fee} >= 0.5; this is almost certainly wrong."
             )
+        # Sync backward compatibility aliases
+        if self.price_source and self.source == "unknown":
+            object.__setattr__(self, "source", self.price_source)
+        if self.data_age_s is not None and self.data_age is None:
+            object.__setattr__(self, "data_age", self.data_age_s)
         return self
 
     @property
+    def is_derived(self) -> bool:
+        """True if pool reserves are derived from off-chain API liquidity USD rather than exact on-chain data."""
+        return self.reserve_type == ReserveType.DERIVED
+
+    @property
     def effective_data_age_s(self) -> float:
-        """Returns the data age in seconds or computed from timestamp_s, defaulting to 999.0."""
+        """Returns the data age in seconds or computed from timestamp_s/fetched_at, defaulting to 999.0."""
+        if self.data_age is not None:
+            return float(self.data_age)
         if self.data_age_s is not None:
             return float(self.data_age_s)
+        if self.fetched_at > 0:
+            return float(max(0.0, time.time() - self.fetched_at))
         if self.timestamp_s is not None:
             return float(max(0.0, time.time() - self.timestamp_s))
         return 999.0
@@ -107,14 +145,25 @@ class PoolState(BaseModel):
         self,
         native_price_usd: Decimal,
         circulating_supply: Optional[Decimal] = None,
-    ) -> Decimal:
+    ) -> Optional[Decimal]:
         """
-        Calculate current market capitalization in USD based on spot price and circulating supply.
-        For standard Solana memecoins (Pump.fun, Raydium), supply defaults to 1,000,000,000 (1B).
+        Calculate current market capitalization in USD based on spot price and real token supply.
+        Never assumes 1B supply. If real supply is unavailable, returns None.
         """
         if self.token_reserve <= Decimal(0) or self.native_reserve <= Decimal(0) or native_price_usd <= Decimal(0):
-            return Decimal("0")
-        supply = circulating_supply if circulating_supply is not None and circulating_supply > Decimal(0) else Decimal("1000000000")
+            return None
+        supply = circulating_supply
+        if supply is None or supply <= Decimal(0):
+            supply = self.circulating_supply or self.total_supply
+        if (supply is None or supply <= Decimal(0)) and self.chain == ChainIdentifier.SOLANA_MAINNET and (
+            self.venue == ExecutionVenue.PUMP_FUN
+            or (self.token_address and self.token_address.endswith("pump"))
+            or (self.pool_address and "BondingCurve" in self.pool_address)
+        ):
+            from alpha_engine.math.cpmm import PUMP_FUN_TOTAL_TOKEN_SUPPLY
+            supply = PUMP_FUN_TOTAL_TOKEN_SUPPLY
+        if supply is None or supply <= Decimal(0):
+            return None
         spot_price_usd = self.spot_price_native_per_token * native_price_usd
         return (spot_price_usd * supply).quantize(Decimal("1e-4"))
 
@@ -161,6 +210,7 @@ class SecurityReport(BaseModel):
     dev_balance_ratio: Optional[float] = None
     external_api_raw: Optional[str] = None  # JSON string, not parsed dict
     warning_flags: list[str] = Field(default_factory=list)
+    venue: Optional[ExecutionVenue] = None
 
     @model_validator(mode="before")
     @classmethod
@@ -223,6 +273,10 @@ class SecurityReport(BaseModel):
         """
         max_conc = 0.65 if self.is_pump_fun else 0.20
         lp_burned_ok = True if self.is_pump_fun else (self.lp_burned_ratio >= 0.90)
+        venue_ok = True
+        if self.venue is not None:
+            from alpha_engine.pricing.venue_capabilities import VenueStatus, get_venue_capability
+            venue_ok = (get_venue_capability(self.venue).status != VenueStatus.UNSUPPORTED)
         return (
             self.sell_tax_bps <= 500
             and self.buy_tax_bps <= 500
@@ -230,6 +284,7 @@ class SecurityReport(BaseModel):
             and self.mint_authority_disabled
             and self.top10_concentration <= max_conc
             and not self.is_honeypot
+            and venue_ok
         )
 
     @property

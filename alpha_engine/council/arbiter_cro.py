@@ -25,6 +25,7 @@ from alpha_engine.council.models import (
 )
 from alpha_engine.council.quant_agent import QuantTechnicalsAgent
 from alpha_engine.council.reach_agent import ReachAnalystAgent
+from alpha_engine.math.cpmm import PUMP_FUN_INITIAL_VIRTUAL_SOL_RESERVE
 from alpha_engine.models.enums import ChainIdentifier, ExitProfile
 from alpha_engine.models.observability import TraceStage, TraceStatus
 from alpha_engine.models.state import PoolState, SecurityReport
@@ -262,8 +263,8 @@ class CouncilArbiterCRO:
                 # Stress-test 1: Liquidity depth / Bonding curve migration void
                 top10_conc = getattr(report, "top10_concentration", 0.12) if report else 0.12
                 curve_progress = 0.0
-                if pool and pool.native_reserve > Decimal("30"):
-                    curve_progress = min(1.0, float(pool.native_reserve - Decimal("30")) / 55.0)
+                if pool and pool.native_reserve > PUMP_FUN_INITIAL_VIRTUAL_SOL_RESERVE:
+                    curve_progress = min(1.0, float(pool.native_reserve - PUMP_FUN_INITIAL_VIRTUAL_SOL_RESERVE) / 55.0)
 
                 fatal_flaw = False
                 flaw_reason = ""

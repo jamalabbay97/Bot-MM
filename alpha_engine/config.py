@@ -518,6 +518,22 @@ class EngineConfig(BaseSettings):
         gt=Decimal(0),
         description="Conservative fallback network fee in ETH when live gas data is unavailable (Verified on: 2026-11-11)",
     )
+
+    # 5.2 Derived Reserves Execution Policy
+    # -------------------------------------------------------------------------
+    # Policy when pool reserves are derived from API liquidity USD rather than exact on-chain reserves:
+    # "reject" (safer default): fail closed and refuse fill
+    # "cap_size": cap trade size to a small fraction of derived native depth
+    derived_reserves_policy: str = Field(
+        default="reject",
+        description="Policy for trading pools with derived reserves ('reject' or 'cap_size')",
+    )
+    derived_reserves_depth_cap_pct: Decimal = Field(
+        default=Decimal("0.02"),
+        gt=Decimal(0),
+        le=Decimal("0.20"),
+        description="Fraction of derived native depth allowed as maximum order size under 'cap_size' policy (default 2%)",
+    )
     stop_loss_pct: float = Field(
         default=-0.08,
         le=-0.01,
