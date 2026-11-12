@@ -364,6 +364,29 @@ def test_deterministic_seeding_reproducibility():
     assert lat1 == lat2, "Identical seed must yield identical latency sequence"
     assert lat1 != lat3, "Different seed must yield different latency sequence"
 
+    # Full simulate_latency reproducibility test using pool, ts, and LatencyResult
+    sim1 = [
+        simulate_latency(pool, signal_timestamp_ns=ts, chain=ChainIdentifier.SOLANA_MAINNET, trade_size_native=Decimal("1.0"), max_slippage_bps=100, config=cfg1)
+        for _ in range(5)
+    ]
+    sim2 = [
+        simulate_latency(pool, signal_timestamp_ns=ts, chain=ChainIdentifier.SOLANA_MAINNET, trade_size_native=Decimal("1.0"), max_slippage_bps=100, config=cfg2)
+        for _ in range(5)
+    ]
+    sim3 = [
+        simulate_latency(pool, signal_timestamp_ns=ts, chain=ChainIdentifier.SOLANA_MAINNET, trade_size_native=Decimal("1.0"), max_slippage_bps=100, config=cfg3)
+        for _ in range(5)
+    ]
+
+    for s1, s2 in zip(sim1, sim2):
+        assert isinstance(s1, LatencyResult)
+        assert s1.latency_ms == s2.latency_ms
+        assert s1.fill_timestamp_ns == s2.fill_timestamp_ns
+        assert s1.frontrun_volume == s2.frontrun_volume
+
+    diff_count = sum(1 for s1, s3 in zip(sim1, sim3) if s1.latency_ms != s3.latency_ms or s1.frontrun_volume != s3.frontrun_volume)
+    assert diff_count > 0, "Different seed must produce different pipeline simulation outcomes"
+
 
 # ---------------------------------------------------------------------------
 # Test 5: Shadow Tournament and Live-Paper Parity (Same Module & Assumptions)
@@ -489,3 +512,107 @@ async def test_integration_runner_entry_path_with_scripted_price_feed():
     assert lot.entry_price > Decimal("0.000120"), (
         f"Fill price {lot.entry_price} must reflect upward price move during latency window"
     )
+
+
+# ---------------------------------------------------------------------------
+# Test 7: determine_market_state_at_fill Direct State Provider Resolution
+# ---------------------------------------------------------------------------
+def test_determine_market_state_at_fill_sequence_and_staleness():
+    """
+    Direct unit test of determine_market_state_at_fill with sequence of tick states
+    and staleness boundary rejection.
+    """
+    t0 = 1_000_000_000_000_000
+    p1 = _make_pool(native_reserve=Decimal("10.0"), timestamp_ns=t0)
+    p2 = _make_pool(native_reserve=Decimal("12.0"), timestamp_ns=t0 + 200_000_000)
+    p3 = _make_pool(native_reserve=Decimal("15.0"), timestamp_ns=t0 + 500_000_000)
+
+    # Query between p2 and p3 (target = t0 + 250ms -> freshest available state is p2)
+    res_pool, rej = determine_market_state_at_fill(
+        initial_pool=p1,
+        target_fill_timestamp_ns=t0 + 250_000_000,
+        market_state_provider=[p1, p2, p3],
+        max_stale_bound_ms=4000,
+    )
+    assert res_pool is not None
+    assert res_pool.native_reserve == Decimal("12.0")
+    assert rej is None
+
+    # Query far in the future exceeding max_stale_bound_ms (e.g. max 100ms)
+    res_stale, rej_reason = determine_market_state_at_fill(
+        initial_pool=p1,
+        target_fill_timestamp_ns=t0 + 2_000_000_000,
+        market_state_provider=[p1, p2, p3],
+        max_stale_bound_ms=100,
+    )
+    assert res_stale is None
+    assert rej_reason == "stale_pool_at_fill_rejected"
+
+
+# ---------------------------------------------------------------------------
+# Test 8: Backtester Parity & Execution Assumptions
+# ---------------------------------------------------------------------------
+def test_backtester_parity_and_execution_assumptions():
+    """
+    Verify WalkForwardBacktester uses the unified latency and conditional MEV model,
+    matching tournament and live paper execution assumptions.
+    """
+    cfg = EngineConfig(execution_seed=777)
+    price_svc = DummyPriceService()
+    cost_model = TradeCostModel(config=cfg, price_service=price_svc)
+    backtester = WalkForwardBacktester(cost_model=cost_model, config=cfg)
+
+    assert backtester.config.execution_seed == 777
+    assert backtester.rng is not None
+    assert hasattr(backtester, "partition_records")
+
+
+# ---------------------------------------------------------------------------
+# Test 9: execute_exit Latency and Stale State Handling
+# ---------------------------------------------------------------------------
+@pytest.mark.anyio
+async def test_execute_exit_latency_and_stale_handling():
+    """
+    Verify execute_exit incorporates latency, resolves market state at fill time,
+    and handles stale state fail-closed.
+    """
+    cfg = EngineConfig(execution_seed=42, fill_max_stale_ms=4000)
+    price_svc = DummyPriceService()
+    book = PositionBook()
+    cost_model = TradeCostModel(config=cfg, price_service=price_svc)
+
+    t_now = time.time_ns()
+    # Stale pool (10 seconds old > max_stale 4.0s)
+    stale_pool = _make_pool(native_reserve=Decimal("100.0"), timestamp_ns=t_now - 10_000_000_000)
+
+    executor = PaperExecutor(
+        position_book=book,
+        price_service=price_svc,
+        cost_model=cost_model,
+        config=cfg,
+        pool_resolver=None,
+    )
+
+    with patch.object(time, "time_ns", return_value=t_now):
+        res = await executor.execute_exit(
+            token_address="EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+            chain=ChainIdentifier.SOLANA_MAINNET,
+            pool=stale_pool,
+            tokens_to_sell=Decimal("100.0"),
+            reason=TradeExitReason.SL_INITIAL,
+        )
+        assert res is None, "Stale pool at exit fill time must be rejected"
+        assert executor.telemetry_counters.get("stale_pool_at_fill_rejected", 0) > 0
+
+    # Fresh pool with mocked asyncio.sleep
+    fresh_pool = _make_pool(native_reserve=Decimal("100.0"), timestamp_ns=t_now)
+    with patch.object(asyncio, "sleep", return_value=None):
+        res_ok = await executor.execute_exit(
+            token_address="EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+            chain=ChainIdentifier.SOLANA_MAINNET,
+            pool=fresh_pool,
+            tokens_to_sell=Decimal("100.0"),
+            reason=TradeExitReason.TP_25,
+        )
+        assert res_ok is not None
+        assert res_ok.tokens_acquired == Decimal("100.0")

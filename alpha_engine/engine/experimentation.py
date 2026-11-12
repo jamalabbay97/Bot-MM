@@ -277,6 +277,20 @@ class StrategyVariant:
 
         return closed_this_tick
 
+    def simulate_cpmm_buy_quote(
+        self,
+        pool: PoolState,
+        native_amount_in: Decimal,
+    ) -> Decimal:
+        """
+        Simulate CPMM buy execution price for shadow position entry.
+        """
+        try:
+            quote = cpmm_buy_quote(pool, native_amount_in)
+            return quote.execution_price
+        except Exception:
+            return pool.spot_price_native_per_token
+
     def simulate_cpmm_sell_quote(
         self,
         pool: PoolState,
@@ -717,10 +731,16 @@ class StrategyTournamentRegistry:
             slippage_bps = cost_res.price_impact_bps
             gas_usd = cost_res.network_fee_usd
         except Exception:
-            # Fallback to pool spot price if degenerate
-            exec_price = pool.spot_price_native_per_token
-            tokens_acquired = (base_trade_size_native / exec_price) if exec_price > 0 else Decimal("0")
-            slippage_bps = 50
+            # Fallback to CPMM buy quote if cost model calculation fails
+            try:
+                cpmm_q = cpmm_buy_quote(sim_pool, base_trade_size_native)
+                exec_price = cpmm_q.execution_price
+                tokens_acquired = cpmm_q.tokens_out
+                slippage_bps = cpmm_q.price_impact_bps
+            except Exception:
+                exec_price = pool.spot_price_native_per_token
+                tokens_acquired = (base_trade_size_native / exec_price) if exec_price > 0 else Decimal("0")
+                slippage_bps = 50
             gas_usd = self.cost_model.get_network_fee_usd(signal.chain, native_price_usd=native_price_usd)
         mev_drag_usd = (latency_res.frontrun_volume * native_price_usd) if latency_res.frontrun_volume > Decimal("0") else Decimal("0.0")
 

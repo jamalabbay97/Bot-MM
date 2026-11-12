@@ -89,6 +89,26 @@ class PaperExecutor:
         self._rng = random.Random(seed) if seed is not None else random.Random()
         self.telemetry_counters: dict[str, int] = {}
 
+    def simulate_frontrun_impact(
+        self,
+        pool: PoolState,
+        trade_size_native: Optional[Decimal] = None,
+        max_slippage_bps: int = 50,
+        is_private_route: bool = False,
+    ) -> tuple[float, Decimal]:
+        """
+        Estimate frontrun volume and impact fraction for a trade under current config.
+        Exposes simulate_frontrun_volume for preflight risk evaluation and testing.
+        """
+        return simulate_frontrun_volume(
+            pool=pool,
+            trade_size_native=trade_size_native,
+            max_slippage_bps=max_slippage_bps,
+            is_private_route=is_private_route,
+            config=self.config,
+            rng=self._rng,
+        )
+
     async def execute_signal(
         self,
         signal: SignalEvent,

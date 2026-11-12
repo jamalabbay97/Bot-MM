@@ -252,7 +252,7 @@ def apply_frontrun_to_pool(
 def determine_market_state_at_fill(
     initial_pool: PoolState,
     target_fill_timestamp_ns: int,
-    market_state_provider: Optional[Any] = None,
+    market_state_provider: Optional[Union[Callable, Sequence[PoolState], Any]] = None,
     max_stale_bound_ms: int = 4000,
 ) -> tuple[Optional[PoolState], Optional[str]]:
     """
@@ -343,7 +343,7 @@ def simulate_latency(
     trade_size_native: Optional[Decimal] = None,
     max_slippage_bps: int = 50,
     is_private_route: bool = False,
-    market_state_provider: Optional[Any] = None,
+    market_state_provider: Optional[Union[Callable, Sequence[PoolState], Any]] = None,
     config: Optional[EngineConfig] = None,
     rng: Optional[random.Random] = None,
 ) -> LatencyResult:

@@ -4425,6 +4425,19 @@ class PaperTradingEngine:
                     )
                     continue
 
+                # 0c. Venue Capability Check (Fail-Closed)
+                sig_venue = getattr(signal_item, "execution_venue", None)
+                if sig_venue is not None:
+                    v_cap = get_venue_capability(sig_venue)
+                    if getattr(v_cap, "status", None) and getattr(v_cap.status, "value", "") == "UNSUPPORTED":
+                        logger.warning(
+                            "UNSUPPORTED VENUE: Venue %s is unsupported; rejecting BUY for %s.",
+                            sig_venue,
+                            signal_item.token_address[:10],
+                        )
+                        self._record_telemetry_counter("unsupported_venue_rejected")
+                        continue
+
                 # 0b. تطبيق حاكم الوتيرة على العملات الجديدة فقط
                 if is_new_launch and self.is_trading_paused_by_governor():
                     remaining_cd = max(0.0, self._cooldown_until - time.time())

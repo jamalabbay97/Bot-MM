@@ -1,7 +1,7 @@
 {
   "manual_trade_amount": "0.05",
   "manual_trade_currency": "SOL",
-  "updated_at": 1794045926,
+  "updated_at": 1794481428,
   "autonomous_hyperparameters": {
     "council_weights": {
       "ChainForensic": 0.333,
@@ -10,11 +10,11 @@
     },
     "max_slippage_bps": 300,
     "min_volume_surge_multiplier": 2.5,
-    "min_alpha_score_entry": 0.67,
+    "min_alpha_score_entry": 0.65,
     "hard_stop_loss_pct": -8.0,
     "kelly_fraction_multiplier": 0.3,
     "trailing_stop_pct": 20.0,
     "min_entry_price_sol": "0.0001",
-    "last_tuned_timestamp": 1794045926.0018432
+    "last_tuned_timestamp": 1794481428.5991132
   }
 }
