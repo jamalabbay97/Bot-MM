@@ -362,6 +362,7 @@ class PaperFill(BaseModel):
     tokens_acquired: Decimal
     effective_price: Decimal
     price_impact_bps: Annotated[int, Field(ge=0)] = 10
+    slippage_bps: Annotated[int, Field(ge=0, description="Realized slippage in basis points vs decision-time reference price")] = 0
     simulated_gas_cost_usd: Annotated[Decimal, Field(ge=Decimal(0))] = Decimal("0.05")
     fill_latency_ms: Annotated[int, Field(ge=0)] = 50
     signal_timestamp_ns: Annotated[int, Field(gt=0)] = Field(
@@ -390,11 +391,6 @@ class PaperFill(BaseModel):
         """Alias for tokens_acquired."""
         return self.tokens_acquired
 
-    @property
-    def slippage_bps(self) -> int:
-        """Alias for price_impact_bps."""
-        return self.price_impact_bps
-
 
 class TradeRecord(BaseModel):
     """
@@ -417,6 +413,7 @@ class TradeRecord(BaseModel):
     tokens_delta: Decimal           # positive for BUY, negative for SELL
     effective_price: Decimal
     price_impact_bps: int
+    slippage_bps: int = Field(default=0, description="Realized slippage in basis points vs decision-time reference price")
     gas_cost_usd: Decimal
     fill_latency_ms: int
     kelly_fraction: float
@@ -479,6 +476,7 @@ class TradeRecord(BaseModel):
             tokens_delta=tokens_delta,
             effective_price=fill.effective_price,
             price_impact_bps=fill.price_impact_bps,
+            slippage_bps=fill.slippage_bps,
             gas_cost_usd=fill.simulated_gas_cost_usd,
             fill_latency_ms=fill.fill_latency_ms,
             kelly_fraction=fill.kelly_fraction,
@@ -487,7 +485,7 @@ class TradeRecord(BaseModel):
             exit_reason=exit_reason,
             exit_stage=exit_stage,
             platform=resolved_platform,
-            is_new_launch=getattr(fill, "is_new_launch", False),
+            is_new_launch=fill.is_new_launch,
             hard_stop_loss_pct=hard_stop_loss_pct if hard_stop_loss_pct is not None else getattr(fill, "hard_stop_loss_pct", None),
             custom_stop_loss_pct=custom_stop_loss_pct if custom_stop_loss_pct is not None else getattr(fill, "custom_stop_loss_pct", None),
             custom_take_profit_pct=custom_take_profit_pct if custom_take_profit_pct is not None else getattr(fill, "custom_take_profit_pct", None),
@@ -496,6 +494,11 @@ class TradeRecord(BaseModel):
             signal_timestamp_ns=fill.signal_timestamp_ns,
             fill_timestamp_ns=fill.fill_timestamp_ns,
         )
+
+    @property
+    def actual_slippage_bps(self) -> int:
+        """Alias for slippage_bps."""
+        return self.slippage_bps
 
 
 class OpenPositionLot(BaseModel):

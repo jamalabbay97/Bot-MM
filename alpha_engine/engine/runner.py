@@ -1181,8 +1181,8 @@ class PaperTradingEngine:
 
         # Self-Learning Engine & Ruflo Swarm post-mortem hook
         strat_label = str(getattr(lot, "strategy_name", None) or getattr(lot, "strategy_type", "DYNAMIC_ADAPTIVE"))
-        actual_slip = int(getattr(exit_fill, "slippage_bps", 0) if hasattr(exit_fill, "slippage_bps") else 0)
-        fill_lat = float(exit_fill.fill_latency_ms) if hasattr(exit_fill, "fill_latency_ms") else 35.0
+        actual_slip = int(exit_fill.slippage_bps)
+        fill_lat = float(exit_fill.fill_latency_ms)
         closed_trade_payload = {
             "trade_id": str(getattr(lot, "lot_id", uuid.uuid4().hex[:8])),
             "token_address": lot.token_address,
@@ -1261,7 +1261,7 @@ class PaperTradingEngine:
                     realized_pnl_usd=exit_pnl_usd,
                     roi_pct=pct,
                     hold_time_s=dur_s,
-                    gas_drag_usd=getattr(exit_fill, "simulated_gas_cost_usd", Decimal("0")),
+                    gas_drag_usd=exit_fill.simulated_gas_cost_usd,
                     cpmm_slippage_bps=actual_slip,
                     latency_ms=fill_lat,
                     exit_reason=exit_label,
@@ -1400,7 +1400,7 @@ class PaperTradingEngine:
 
         if hasattr(self, "_ai_supervisor") and self._ai_supervisor:
             reflection = TradeReflection.from_trade(
-                trade_id=str(getattr(exit_fill, "order_id", "")),
+                trade_id=str(exit_fill.order_id),
                 token_address=lot.token_address,
                 chain=lot.chain,
                 signal_source=SignalSource.DEX_SWAP,
@@ -1408,7 +1408,7 @@ class PaperTradingEngine:
                 exit_price=xp,
                 realized_pnl_usd=exit_pnl_usd,
                 realized_pnl_native=pnl_native,
-                time_to_fill_ms=float(getattr(exit_fill, "fill_latency_ms", 50.0)),
+                time_to_fill_ms=float(exit_fill.fill_latency_ms),
                 entry_feature_vector=getattr(lot, "entry_feature_vector", []),
             )
             try:
@@ -1425,7 +1425,7 @@ class PaperTradingEngine:
                 agent = getattr(self._swarm_coordinator, "supervisor_agent", None)
                 if agent and hasattr(agent, "tool_reflect_trade"):
                     coro = agent.tool_reflect_trade(
-                        trade_id=str(getattr(exit_fill, "order_id", "")),
+                        trade_id=str(exit_fill.order_id),
                         token_address=lot.token_address,
                         realized_pnl_usd=float(exit_pnl_usd),
                         roi_pct=pct,

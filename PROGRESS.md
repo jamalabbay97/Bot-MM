@@ -200,26 +200,76 @@ Track progress across all identified defects and phases. All items must satisfy 
 ---
 
 ## Issue 6 Broken post-trade hook (create_task on sync fn)
-- [ ] reproduced
-- [ ] red test
-- [ ] fix
-- [ ] green test
-- [ ] mutation check
-- [ ] sweep done
-- [ ] wiring proof
-- [ ] README/docs updated
+- [x] reproduced
+  - `runner.py:5707`: `asyncio.create_task(self._self_learning_engine.on_trade_closed(self_learning_payload))` called on synchronous `SelfLearningEngine.on_trade_closed`, raising `TypeError: a coroutine was expected`.
+  - Swallowed by `except Exception` logged at DEBUG (`logger.debug("Self-learning hook failed: %s", e)`).
+  - First statement in shared try block skipped `swarm_coordinator.on_trade_closed` and `strategy_tournament.record_live_trade_outcome`.
+  - `record_live_trade_outcome` fabricated fake lot (entry 1.0, basis $100, token "LIVE_SETTLED_TRADE", chain forced Solana) and inverted PnL sign to match `is_win`.
+- [x] red test
+  - `tests/test_issue6_post_trade_learning_hook.py`:
+    1. `test_post_trade_hooks_invoked_exactly_once`: Confirms all 3 consumers invoked exactly once per closed trade.
+    2. `test_failure_in_one_consumer_does_not_skip_others_and_logged_at_error`: Confirms failure in one consumer logs ERROR with traceback, increments telemetry `post_trade_hook_failure_total`, and allows remaining consumers to execute.
+    3. `test_record_live_trade_outcome_records_real_trade_data`: Verifies tournament records real lot data (token, chain, basis, prices, fees, hold time).
+    4. `test_record_live_trade_outcome_never_rewrites_pnl_sign_and_trusts_pnl`: Verifies conflicting `is_win` logs ERROR and trusts PnL without rewriting sign.
+    5. `test_task_awaitables_audit_zero_findings`: Audits repo for any `create_task`/`await` on non-coroutines.
+    6. `test_integration_runner_real_close_path`: Full runner cycle closing a position exercises all hooks.
+- [x] fix
+  - `alpha_engine/engine/self_learning/self_learning_engine.py`: Converted `on_trade_closed` to an honest `async def`, added `on_trade_closed_sync` for sync callers, awaited `_record_to_ruflo_memory_async`.
+  - `alpha_engine/engine/experimentation.py`: Overhauled `record_live_trade_outcome` to accept genuine trade attributes, construct real `ShadowLot`, log ERROR on `is_win`/`realized_pnl_usd` contradiction, and trust PnL.
+  - `alpha_engine/security/preflight.py`: Added `inspect_bytecode_from_rpc` async function, resolving await on sync function.
+  - `alpha_engine/engine/runner.py`: Wrapped consumers in isolated try/except blocks with ERROR logging, exc_info=True, and `self.telemetry.increment("post_trade_hook_failure_total")`.
+- [x] green test
+  - `.venv/bin/pytest tests/test_issue6_post_trade_learning_hook.py` -> 6 passed.
+- [x] mutation check
+  - Inverted PnL sign rewrite in `record_live_trade_outcome`: `realized_pnl_usd = -abs(realized_pnl_usd) if not is_win else abs(realized_pnl_usd)`.
+  - Verified `test_record_live_trade_outcome_never_rewrites_pnl_sign_and_trusts_pnl` failed (`AssertionError: 20.0 == -20.0`); restored fix.
+- [x] sweep done
+  - `tools/audit/task_awaitables.py`: Baseline 2 findings -> 0 findings (`[task_awaitables] Total findings: 0`).
+- [x] wiring proof
+  - `runner.py:_close_lot_and_record`: Invokes `self._self_learning_engine.on_trade_closed`, `self._swarm_coordinator.on_trade_closed`, and `self._strategy_tournament.record_live_trade_outcome`.
+  - Exercised by `test_integration_runner_real_close_path`.
+- [x] README/docs updated
+  - Documented post-trade hook architecture and telemetry counter `post_trade_hook_failure_total`.
 
 ---
 
 ## Issue 7 Slippage fed to tuner always 50
-- [ ] reproduced
-- [ ] red test
-- [ ] fix
-- [ ] green test
-- [ ] mutation check
-- [ ] sweep done
-- [ ] wiring proof
-- [ ] README/docs updated
+- [x] reproduced
+  - `runner.py:1184`: `actual_slip = int(getattr(exit_fill, "slippage_bps", 50))` fell back to 50 because `PaperFill` had no `slippage_bps` attribute.
+  - `AutonomousHyperparameterTuner._recalibrate_hyperparameters` always saw constant 50, calibrating `max_slippage_bps` to the 75 bps floor with no empirical variance.
+  - `fill_latency_ms` and other model attributes similarly used loose `getattr` defaults.
+- [x] red test
+  - `tests/test_issue7_slippage_and_tuner.py`:
+    1. `test_paper_fill_has_typed_slippage_bps_field`: Validates `PaperFill` has typed `slippage_bps` field.
+    2. `test_paper_executor_computes_realized_slippage_buy`: Verifies realized BUY slippage vs spot reference price.
+    3. `test_paper_executor_computes_realized_slippage_sell`: Verifies realized SELL slippage vs spot reference price.
+    4. `test_varying_trade_sizes_produce_varying_realized_slippage`: Verifies price impact causes varying realized slippage across small and large trades.
+    5. `test_tuner_keeps_defaults_below_min_samples`: Verifies tuner preserves defaults when observations < `min_slippage_samples` (10).
+    6. `test_tuner_calibrates_when_samples_reach_threshold`: Verifies tuner calibrates 75th percentile + 20% margin, bounded within `[75, 300]` bps.
+    7. `test_runner_feeds_real_slippage_to_tuner`: Integration test verifying runner passes real slippage into tuner.
+    8. `test_no_getattr_with_literal_default_targeting_fill_slippage`: AST audit ensuring no `getattr` defaults target fill slippage in execution/closed-trade paths.
+- [x] fix
+  - `alpha_engine/models/state.py`: Added typed `slippage_bps: Annotated[int, Field(ge=0)] = 0` to `PaperFill`, added `slippage_bps` and `actual_slippage_bps` alias to `TradeRecord`, updated `TradeRecord.from_fill` to copy typed fields directly.
+  - `alpha_engine/execution/executor.py`: Realized slippage computed in `execute_signal`, `execute_exit`, and `execute_swing_dca_pipeline` as effective fill price vs reference pool price:
+    - BUY: `max(0, int(round((effective_price - ref_price) / ref_price * 10000)))`
+    - SELL: `max(0, int(round((ref_price - effective_price) / ref_price * 10000)))`
+  - `alpha_engine/engine/runner.py`: Replaced `getattr(exit_fill, "slippage_bps", 50)` with `exit_fill.slippage_bps`, `fill_latency_ms`, `simulated_gas_cost_usd`, `order_id` with direct typed access.
+  - `alpha_engine/ruflo/memory.py`: Replaced hardcoded fallback 50 with typed attribute access.
+  - `alpha_engine/engine/self_learning/hyperparameter_tuner.py`: Added `min_slippage_samples: int = 10` parameter, required minimum sample size before recalibrating `max_slippage_bps`, documented bounds `[75, 300]` bps.
+- [x] green test
+  - `.venv/bin/pytest tests/test_issue7_slippage_and_tuner.py` -> 8 passed.
+- [x] mutation check
+  - Mutation 1 (Executor): Forcing `realized_slippage_bps = 50` failed `test_paper_executor_computes_realized_slippage_sell` and `test_varying_trade_sizes_produce_varying_realized_slippage` (`AssertionError: 50 != 50`).
+  - Mutation 2 (Tuner): Removing `min_slippage_samples` check failed `test_tuner_keeps_defaults_below_min_samples` (`AssertionError: Expected default 150, got 264`). Both restored.
+- [x] sweep done
+  - `tools/audit/model_getattr_defaults.py`: Decreased from 995 to 987 findings; all literal defaults on fill slippage/latency in runner/executor eliminated.
+- [x] wiring proof
+  - `PaperExecutor.execute_signal` and `execute_exit` compute `slippage_bps` and assign to `PaperFill`.
+  - `runner.py:_close_lot_and_record` reads `exit_fill.slippage_bps` directly and passes it to `SelfLearningEngine.on_trade_closed`.
+  - `SelfLearningEngine` passes `actual_slippage_bps` into `AutonomousHyperparameterTuner.record_trade_outcome`.
+  - Exercised end-to-end by `test_runner_feeds_real_slippage_to_tuner`.
+- [x] README/docs updated
+  - Documented realized slippage computation formula, `min_slippage_samples` threshold, and `[75, 300]` bps calibration range.
 
 ---
 

@@ -88,6 +88,15 @@ def _create_sample_lot_and_fill(chain: ChainIdentifier = ChainIdentifier.BASE_MA
         portfolio_equity_usd=Decimal("10000.0"),
         platform="Uniswap_v3",
     )
+    decision = ExitDecision(
+        lot_id=lot.lot_id,
+        token_address=lot.token_address,
+        chain=lot.chain,
+        should_exit=True,
+        exit_reason=TradeExitReason.TP_50,
+        tokens_to_sell=Decimal("1000.0"),
+    )
+    assert decision.exit_reason == TradeExitReason.TP_50
     return lot, fill
 
 
@@ -99,32 +108,32 @@ async def test_post_trade_hooks_invoked_exactly_once():
     price_svc = _create_test_price_service()
     engine._native_price_service = price_svc
 
-    mock_learning = MagicMock()
+    mock_learning = MagicMock(spec=SelfLearningEngine)
     mock_learning.on_trade_closed = AsyncMock(return_value={"status": "ok"})
-    engine.self_learning_engine = mock_learning
 
-    mock_swarm = MagicMock()
+    mock_swarm = MagicMock(spec=RufloSwarmCoordinator)
     mock_swarm.on_trade_closed = AsyncMock(return_value={"status": "ok"})
-    engine._swarm_coordinator = mock_swarm
 
     mock_tournament = MagicMock()
     mock_tournament.record_live_trade_outcome = MagicMock()
-    engine._strategy_tournament = mock_tournament
 
     lot, fill = _create_sample_lot_and_fill()
 
-    engine._record_closed_trade_and_notify(
-        lot=lot,
-        exit_fill=fill,
-        decision_reason="take_profit_target_hit",
-        exit_pnl_usd=Decimal("300.0"),
-        pnl_native=Decimal("0.1"),
-    )
+    with patch.object(engine, "self_learning_engine", mock_learning), \
+         patch.object(engine, "_swarm_coordinator", mock_swarm), \
+         patch.object(engine, "_strategy_tournament", mock_tournament):
+        engine._record_closed_trade_and_notify(
+            lot=lot,
+            exit_fill=fill,
+            decision_reason=TradeExitReason.TP_50.value,
+            exit_pnl_usd=Decimal("300.0"),
+            pnl_native=Decimal("0.1"),
+        )
 
-    if hasattr(engine, "await_pending_hooks"):
-        await engine.await_pending_hooks()
-    else:
-        await asyncio.sleep(0.05)
+        if hasattr(engine, "await_pending_hooks"):
+            await engine.await_pending_hooks()
+        else:
+            await asyncio.sleep(0.05)
 
     assert mock_learning.on_trade_closed.await_count == 1, (
         f"Expected self_learning_engine.on_trade_closed awaited exactly once, got {mock_learning.on_trade_closed.await_count}"
@@ -145,11 +154,11 @@ async def test_failure_in_one_consumer_does_not_skip_others_and_logged_at_error(
     price_svc = _create_test_price_service()
     engine._native_price_service = price_svc
 
-    mock_learning = MagicMock()
+    mock_learning = MagicMock(spec=SelfLearningEngine)
     mock_learning.on_trade_closed = AsyncMock(side_effect=RuntimeError("Simulated SelfLearning failure!"))
     engine.self_learning_engine = mock_learning
 
-    mock_swarm = MagicMock()
+    mock_swarm = MagicMock(spec=RufloSwarmCoordinator)
     mock_swarm.on_trade_closed = AsyncMock(return_value={"status": "ok"})
     engine._swarm_coordinator = mock_swarm
 
@@ -202,7 +211,7 @@ def test_record_live_trade_outcome_records_real_trade_data():
     gas_drag_usd = Decimal("0.12")
     cpmm_slippage_bps = 85
     latency_ms = 145.0
-    exit_reason = "PARTIAL_TAKE_PROFIT_TP1"
+    exit_reason = TradeExitReason.TP_50.value
 
     registry.record_live_trade_outcome(
         strategy_name=champion.strategy_name,
@@ -399,10 +408,12 @@ async def test_integration_runner_real_close_path():
 
     # 1. Position book reflects closure
     assert lot.status == LotStatus.CLOSED
+    assert isinstance(engine.self_learning_engine, SelfLearningEngine)
     # 2. Learning hook called
     assert len(learning_called) == 1, "Self-learning hook was not called in real closing path"
     # 3. Swarm coordinator called if present
     if engine._swarm_coordinator:
+        assert isinstance(engine._swarm_coordinator, RufloSwarmCoordinator)
         assert len(swarm_called) == 1, "Swarm coordinator hook was not called in real closing path"
     # 4. Tournament recorded real lot
     champion_lots = engine._strategy_tournament.champion.closed_lots

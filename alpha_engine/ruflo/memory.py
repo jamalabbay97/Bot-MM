@@ -327,8 +327,8 @@ class RufloEpisodicMemory:
             feature_vector=vec,
             realized_pnl_usd=pnl,
             roi_pct=roi,
-            actual_slippage_bps=int(getattr(trade, "actual_slippage_bps", 50)),
-            fill_latency_ms=float(getattr(trade, "fill_latency_ms", 45.0)),
+            actual_slippage_bps=int(trade.slippage_bps if hasattr(trade, "slippage_bps") else (trade.actual_slippage_bps if hasattr(trade, "actual_slippage_bps") else 0)),
+            fill_latency_ms=float(trade.fill_latency_ms if hasattr(trade, "fill_latency_ms") else 0.0),
             root_cause_tag=trade.exit_reason.value if hasattr(trade, "exit_reason") and hasattr(trade.exit_reason, "value") else "EXIT",
             summary_reflection=summary_reflection or f"Trade {trade.trade_id} on {trade.token_address[:8]} with PnL ${pnl:.2f}",
         )

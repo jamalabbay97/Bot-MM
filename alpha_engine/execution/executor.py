@@ -356,6 +356,12 @@ class PaperExecutor:
                 logger.warning("Effective price <= 0 for %s — skipping.", signal.signal_id[:8])
                 return None
 
+            ref_price = pool.spot_price_native_per_token if pool else Decimal(0)
+            if ref_price > Decimal(0):
+                realized_slippage_bps = max(0, int(round((effective_price - ref_price) / ref_price * Decimal(10000))))
+            else:
+                realized_slippage_bps = price_impact_bps
+
         else:  # SELL
             tokens_held = self._positions.get_holdings(
                 signal.chain, signal.token_address
@@ -405,6 +411,12 @@ class PaperExecutor:
             price_impact_bps = cost_res.price_impact_bps
             gas = cost_res.network_fee_usd
 
+            ref_price = pool.spot_price_native_per_token if pool else Decimal(0)
+            if ref_price > Decimal(0):
+                realized_slippage_bps = max(0, int(round((ref_price - effective_price) / ref_price * Decimal(10000))))
+            else:
+                realized_slippage_bps = price_impact_bps
+
         platform = getattr(signal, "platform", None) or resolve_trade_platform(
             token_address=signal.token_address,
             chain=signal.chain,
@@ -422,6 +434,7 @@ class PaperExecutor:
             tokens_acquired=tokens_acquired,
             effective_price=effective_price,
             price_impact_bps=price_impact_bps,
+            slippage_bps=realized_slippage_bps,
             simulated_gas_cost_usd=gas,
             fill_latency_ms=latency_result.latency_ms,
             signal_timestamp_ns=signal.timestamp_ns,
@@ -585,6 +598,12 @@ class PaperExecutor:
         effective_price = (simulated_native_spent / tokens_acquired) if tokens_acquired > Decimal(0) else Decimal(0)
         gas = cost_res.network_fee_usd
 
+        ref_price = pool.spot_price_native_per_token if pool else Decimal(0)
+        if ref_price > Decimal(0):
+            realized_slippage_bps = max(0, int(round((ref_price - effective_price) / ref_price * Decimal(10000))))
+        else:
+            realized_slippage_bps = price_impact_bps
+
         resolved_platform = platform or resolve_trade_platform(
             token_address=token_address,
             chain=chain,
@@ -605,6 +624,7 @@ class PaperExecutor:
             tokens_acquired=tokens_acquired,
             effective_price=effective_price,
             price_impact_bps=price_impact_bps,
+            slippage_bps=realized_slippage_bps,
             simulated_gas_cost_usd=gas,
             fill_latency_ms=latency_result.latency_ms,
             signal_timestamp_ns=now_ns,
@@ -705,6 +725,11 @@ class PaperExecutor:
             tokens_batch = quote.amount_out
             eff_price = batch_native / tokens_batch if tokens_batch > 0 else Decimal("0")
             gas = gas_cost_usd(signal.chain)
+            batch_ref = curr_pool.spot_price_native_per_token if curr_pool else Decimal(0)
+            if batch_ref > Decimal(0):
+                batch_slip = max(0, int(round((eff_price - batch_ref) / batch_ref * Decimal(10000))))
+            else:
+                batch_slip = quote.price_impact_bps
             fill_b = PaperFill(
                 token_address=signal.token_address,
                 pool_address=signal.pool_address,
@@ -714,6 +739,7 @@ class PaperExecutor:
                 tokens_acquired=tokens_batch,
                 effective_price=eff_price,
                 price_impact_bps=quote.price_impact_bps,
+                slippage_bps=batch_slip,
                 simulated_gas_cost_usd=gas,
                 fill_latency_ms=25.0 * (b_idx + 1),
                 signal_timestamp_ns=signal.timestamp_ns,

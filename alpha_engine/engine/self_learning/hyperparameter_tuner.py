@@ -57,9 +57,11 @@ class AutonomousHyperparameterTuner:
         self,
         settings_file_path: str = "bot_runtime_settings.json",
         min_trades_between_tuning: int = 3,
+        min_slippage_samples: int = 10,
     ) -> None:
         self.settings_file_path = settings_file_path
         self.min_trades_between_tuning = min_trades_between_tuning
+        self.min_slippage_samples = min_slippage_samples
         self.current_params = TunedHyperparameters()
         self._trades_since_last_tune: int = 0
         self._agent_accuracy: dict[str, list[int]] = {
@@ -132,7 +134,9 @@ class AutonomousHyperparameterTuner:
             }
 
         # 2. Calibrate Max Slippage Tolerance from empirical distribution
-        if self._slippage_observations:
+        # Requires minimum sample size (min_slippage_samples) to avoid calibrating from insufficient observations.
+        # Calibrates to 75th percentile with 20% safety margin, bounded within [75, 300] bps.
+        if len(self._slippage_observations) >= self.min_slippage_samples:
             sorted_slip = sorted(self._slippage_observations)
             p75_idx = int(len(sorted_slip) * 0.75)
             p75_slip = sorted_slip[min(p75_idx, len(sorted_slip) - 1)]
