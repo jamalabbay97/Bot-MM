@@ -284,6 +284,7 @@ class PaperTradingEngine:
         self._signal_handlers_installed = False
         self._screening_semaphore = asyncio.Semaphore(10)
         self._screening_tasks: set[asyncio.Task[Any]] = set()
+        self._active_hook_tasks: set[asyncio.Task[Any]] = set()
 
         self._feedback = AdaptiveFeedbackEngine()
         self._ai_supervisor = AlphaSupervisorAI(config=config, session=self._session)
@@ -420,6 +421,27 @@ class PaperTradingEngine:
                 self.dashboard_telemetry.pipeline_counters[reason] = (
                     self.dashboard_telemetry.pipeline_counters.get(reason, 0) + count
                 )
+
+    async def _safe_invoke_post_trade_hook(self, hook_name: str, coro_or_res: Any) -> None:
+        """Safely awaits a post-trade learning hook, catching exceptions and logging at ERROR with traceback."""
+        try:
+            if asyncio.iscoroutine(coro_or_res):
+                await coro_or_res
+        except Exception as exc:
+            logger.error("Error executing post-trade hook %s: %s", hook_name, exc, exc_info=True)
+            self._record_telemetry_counter(f"hook_{hook_name}_failed")
+            self._record_telemetry_counter("post_trade_hook_failed")
+
+    async def await_pending_hooks(self, timeout: float = 5.0) -> None:
+        """Awaits all currently active asynchronous post-trade hook tasks."""
+        if not self._active_hook_tasks:
+            return
+        pending = [t for t in self._active_hook_tasks if not t.done()]
+        if pending:
+            try:
+                await asyncio.wait_for(asyncio.gather(*pending, return_exceptions=True), timeout=timeout)
+            except asyncio.TimeoutError:
+                logger.warning("await_pending_hooks timed out after %.2fs", timeout)
 
     def _log_warning_rate_limited(self, key: str, msg: str, *args: Any, interval_s: float = 5.0) -> None:
         now = time.time()
@@ -1159,6 +1181,8 @@ class PaperTradingEngine:
 
         # Self-Learning Engine & Ruflo Swarm post-mortem hook
         strat_label = str(getattr(lot, "strategy_name", None) or getattr(lot, "strategy_type", "DYNAMIC_ADAPTIVE"))
+        actual_slip = int(getattr(exit_fill, "slippage_bps", 0) if hasattr(exit_fill, "slippage_bps") else 0)
+        fill_lat = float(exit_fill.fill_latency_ms) if hasattr(exit_fill, "fill_latency_ms") else 35.0
         closed_trade_payload = {
             "trade_id": str(getattr(lot, "lot_id", uuid.uuid4().hex[:8])),
             "token_address": lot.token_address,
@@ -1166,27 +1190,87 @@ class PaperTradingEngine:
             "strategy_type": strat_label,
             "realized_pnl_usd": float(exit_pnl_usd),
             "roi_pct": pct,
-            "actual_slippage_bps": int(getattr(exit_fill, "slippage_bps", 50)),
-            "fill_latency_ms": float(getattr(exit_fill, "fill_latency_ms", 35.0)),
+            "actual_slippage_bps": actual_slip,
+            "fill_latency_ms": fill_lat,
             "exit_reason": exit_label,
             "duration_s": dur_s,
             "is_win": is_win,
             "timestamp_ns": time.time_ns(),
         }
-        try:
-            asyncio.create_task(self.self_learning_engine.on_trade_closed(closed_trade_payload))
-            if self._swarm_coordinator:
-                asyncio.create_task(self._swarm_coordinator.on_trade_closed(closed_trade_payload))
-            if hasattr(self, "_strategy_tournament") and self._strategy_tournament:
+
+        # Consumer 1: Self-Learning Engine (async hook)
+        if hasattr(self, "self_learning_engine") and self.self_learning_engine is not None:
+            try:
+                res = self.self_learning_engine.on_trade_closed(closed_trade_payload)
+                if asyncio.iscoroutine(res):
+                    task = asyncio.create_task(
+                        self._safe_invoke_post_trade_hook(
+                            "self_learning_engine",
+                            res,
+                        )
+                    )
+                    self._active_hook_tasks.add(task)
+                    task.add_done_callback(self._active_hook_tasks.discard)
+            except Exception as learn_err:
+                logger.error("Failed scheduling self-learning engine post-trade hook: %s", learn_err, exc_info=True)
+                self._record_telemetry_counter("hook_self_learning_engine_failed")
+                self._record_telemetry_counter("post_trade_hook_failed")
+
+        # Consumer 2: Ruflo Swarm Coordinator (async hook)
+        if hasattr(self, "_swarm_coordinator") and self._swarm_coordinator is not None:
+            try:
+                res = self._swarm_coordinator.on_trade_closed(closed_trade_payload)
+                if asyncio.iscoroutine(res):
+                    task = asyncio.create_task(
+                        self._safe_invoke_post_trade_hook(
+                            "swarm_coordinator",
+                            res,
+                        )
+                    )
+                    self._active_hook_tasks.add(task)
+                    task.add_done_callback(self._active_hook_tasks.discard)
+            except Exception as swarm_err:
+                logger.error("Failed scheduling swarm coordinator post-trade hook: %s", swarm_err, exc_info=True)
+                self._record_telemetry_counter("hook_swarm_coordinator_failed")
+                self._record_telemetry_counter("post_trade_hook_failed")
+
+        # Consumer 3: Strategy Tournament Registry (real lot outcome hook)
+        if hasattr(self, "_strategy_tournament") and self._strategy_tournament is not None:
+            try:
+                cost_native = getattr(lot, "cost_basis_native", Decimal(0))
+                if cost_native <= Decimal(0):
+                    init_tok = getattr(lot, "initial_tokens", Decimal(0))
+                    if init_tok > Decimal(0) and ep > Decimal(0):
+                        cost_native = init_tok * ep
+                    else:
+                        cost_native = abs(getattr(exit_fill, "tokens_delta", Decimal(0))) * ep
+                ep_usd_basis = (
+                    Decimal(str(cost_native * entry_native_price))
+                    if cost_native > Decimal(0)
+                    else Decimal("0")
+                )
+                tokens_sold = abs(getattr(exit_fill, "tokens_delta", Decimal(0))) or getattr(lot, "initial_tokens", Decimal("1.0"))
                 self._strategy_tournament.record_live_trade_outcome(
                     strategy_name=str(getattr(lot, "strategy_name", getattr(lot, "strategy_type", "default"))),
-                    pnl_usd=float(exit_pnl_usd),
-                    is_win=is_win,
+                    token_address=lot.token_address,
+                    chain=lot.chain,
+                    entry_price=ep,
+                    exit_price=xp,
+                    tokens_acquired=tokens_sold,
+                    cost_basis_usd=ep_usd_basis,
+                    realized_pnl_usd=exit_pnl_usd,
                     roi_pct=pct,
                     hold_time_s=dur_s,
+                    gas_drag_usd=getattr(exit_fill, "simulated_gas_cost_usd", Decimal("0")),
+                    cpmm_slippage_bps=actual_slip,
+                    latency_ms=fill_lat,
+                    exit_reason=exit_label,
+                    is_win=is_win,
                 )
-        except Exception as learn_err:
-            logger.debug("Failed triggering post-mortem self-learning hook: %s", learn_err)
+            except Exception as tourney_err:
+                logger.error("Failed recording live trade outcome in StrategyTournament: %s", tourney_err, exc_info=True)
+                self._record_telemetry_counter("hook_strategy_tournament_failed")
+                self._record_telemetry_counter("post_trade_hook_failed")
 
         d_reason_lower = str(decision_reason).lower()
         if "emergency_drain" in d_reason_lower or "rug_liquidity_drain" in d_reason_lower:
@@ -1305,7 +1389,15 @@ class PaperTradingEngine:
                 f"• **Exit Reason:** `{decision_reason}`\n"
                 f"• **Holding Time:** `{dur_s:.1f}s`"
             )
-        asyncio.create_task(self._broadcast_trade_alert(exit_msg))
+        try:
+            alert_coro = self._broadcast_trade_alert(exit_msg)
+            if asyncio.iscoroutine(alert_coro):
+                alert_task = asyncio.create_task(self._safe_invoke_post_trade_hook("broadcast_trade_alert", alert_coro))
+                self._active_hook_tasks.add(alert_task)
+                alert_task.add_done_callback(self._active_hook_tasks.discard)
+        except Exception as exc:
+            logger.error("Failed scheduling broadcast_trade_alert: %s", exc, exc_info=True)
+
         if hasattr(self, "_ai_supervisor") and self._ai_supervisor:
             reflection = TradeReflection.from_trade(
                 trade_id=str(getattr(exit_fill, "order_id", "")),
@@ -1316,22 +1408,36 @@ class PaperTradingEngine:
                 exit_price=xp,
                 realized_pnl_usd=exit_pnl_usd,
                 realized_pnl_native=pnl_native,
-                time_to_fill_ms=getattr(exit_fill, "fill_latency_ms", 50.0),
+                time_to_fill_ms=float(getattr(exit_fill, "fill_latency_ms", 50.0)),
                 entry_feature_vector=getattr(lot, "entry_feature_vector", []),
             )
-            asyncio.create_task(self._ai_supervisor.reflect_on_trade(reflection))
+            try:
+                reflect_coro = self._ai_supervisor.reflect_on_trade(reflection)
+                if asyncio.iscoroutine(reflect_coro):
+                    reflect_task = asyncio.create_task(self._safe_invoke_post_trade_hook("ai_supervisor_reflect", reflect_coro))
+                    self._active_hook_tasks.add(reflect_task)
+                    reflect_task.add_done_callback(self._active_hook_tasks.discard)
+            except Exception as exc:
+                logger.error("Failed scheduling _ai_supervisor.reflect_on_trade: %s", exc, exc_info=True)
 
         if hasattr(self, "_swarm_coordinator") and self._swarm_coordinator:
-            asyncio.create_task(
-                self._swarm_coordinator.supervisor_agent.tool_reflect_trade(
-                    trade_id=str(getattr(exit_fill, "order_id", "")),
-                    token_address=lot.token_address,
-                    realized_pnl_usd=float(exit_pnl_usd),
-                    roi_pct=pct,
-                    chain=lot.chain.value if hasattr(lot.chain, "value") else str(lot.chain),
-                    feature_vector=getattr(lot, "entry_feature_vector", None),
-                )
-            )
+            try:
+                agent = getattr(self._swarm_coordinator, "supervisor_agent", None)
+                if agent and hasattr(agent, "tool_reflect_trade"):
+                    coro = agent.tool_reflect_trade(
+                        trade_id=str(getattr(exit_fill, "order_id", "")),
+                        token_address=lot.token_address,
+                        realized_pnl_usd=float(exit_pnl_usd),
+                        roi_pct=pct,
+                        chain=lot.chain.value if hasattr(lot.chain, "value") else str(lot.chain),
+                        feature_vector=getattr(lot, "entry_feature_vector", None),
+                    )
+                    if asyncio.iscoroutine(coro):
+                        task = asyncio.create_task(self._safe_invoke_post_trade_hook("swarm_tool_reflect_trade", coro))
+                        self._active_hook_tasks.add(task)
+                        task.add_done_callback(self._active_hook_tasks.discard)
+            except Exception as exc:
+                logger.error("Failed scheduling supervisor_agent.tool_reflect_trade: %s", exc, exc_info=True)
 
     def _propagate_dynamic_hyperparameters(self, params: Any) -> None:
         """

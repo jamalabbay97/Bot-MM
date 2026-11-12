@@ -584,63 +584,139 @@ class StrategyTournamentRegistry:
     def record_live_trade_outcome(
         self,
         strategy_name: str,
-        pnl_usd: float,
-        is_win: bool,
-        roi_pct: float,
+        pnl_usd: Optional[float | Decimal] = None,
+        is_win: Optional[bool] = None,
+        roi_pct: float = 0.0,
         hold_time_s: float = 0.0,
+        token_address: Optional[str] = None,
+        chain: Optional[ChainIdentifier] = None,
+        entry_price: Optional[Decimal] = None,
+        exit_price: Optional[Decimal] = None,
+        tokens_acquired: Optional[Decimal] = None,
+        cost_basis_usd: Optional[Decimal] = None,
+        realized_pnl_usd: Optional[Decimal] = None,
+        gas_drag_usd: Decimal = Decimal("0.0"),
+        cpmm_slippage_bps: int = 0,
+        latency_ms: float = 0.0,
+        mev_drag_usd: Decimal = Decimal("0.0"),
+        exit_reason: Optional[str] = None,
+        **kwargs: Any,
     ) -> None:
         """
         Feed real-world settled live trades back into the Champion strategy's metrics,
         ensuring the live tournament continuously reflects genuine live market performance.
+        Records genuine trade attributes instead of fabricated constants and strictly
+        preserves the true PnL sign (trusting PnL if is_win disagrees).
         """
         target = None
         if self.champion and self.champion.strategy_name == strategy_name:
             target = self.champion
         elif strategy_name in self.challengers:
             target = self.challengers[strategy_name]
+        elif self.champion is not None:
+            target = self.champion
 
         if target is not None:
+            # Resolve realized_pnl_usd from either parameter
+            if realized_pnl_usd is None:
+                if pnl_usd is not None:
+                    realized_pnl = Decimal(str(pnl_usd))
+                else:
+                    realized_pnl = Decimal("0.0")
+            else:
+                realized_pnl = Decimal(str(realized_pnl_usd))
+
+            # Audit and enforce agreement between is_win and realized PnL
+            if is_win is not None:
+                pnl_positive = realized_pnl > Decimal(0)
+                if is_win != pnl_positive and realized_pnl != Decimal(0):
+                    logger.error(
+                        "record_live_trade_outcome: is_win=%s disagrees with realized_pnl_usd=%s for strategy=%s; trusting PnL",
+                        is_win, realized_pnl, strategy_name,
+                    )
+                    # Trust the PnL; NEVER rewrite PnL sign
+                    is_win = pnl_positive
+            else:
+                is_win = realized_pnl > Decimal(0)
+
             now = time.time()
             entry_ts = (now - hold_time_s) if hold_time_s > 0 else now
             outcome_label = "WIN" if is_win else "LOSS"
 
-            # Align PnL sign with outcome if non-zero
-            adjusted_pnl = Decimal(str(pnl_usd))
-            if is_win and adjusted_pnl < Decimal(0):
-                adjusted_pnl = abs(adjusted_pnl)
-            elif not is_win and adjusted_pnl > Decimal(0):
-                adjusted_pnl = -abs(adjusted_pnl)
+            actual_token = str(token_address or kwargs.get("token_addr", "LIVE_SETTLED_TRADE"))
+            actual_chain = chain if chain is not None else ChainIdentifier.SOLANA_MAINNET
+            actual_entry_p = Decimal(str(entry_price)) if entry_price is not None else Decimal("1.0")
+            if exit_price is not None:
+                actual_exit_p = Decimal(str(exit_price))
+            else:
+                actual_exit_p = actual_entry_p * Decimal(str(max(0.0001, 1.0 + roi_pct / 100.0)))
+            actual_tokens = Decimal(str(tokens_acquired)) if tokens_acquired is not None else Decimal("1.0")
+            actual_cost_basis = Decimal(str(cost_basis_usd)) if cost_basis_usd is not None else (actual_tokens * actual_entry_p)
+            actual_exit_reason = str(exit_reason or f"LIVE_SETTLED_TRADE_{outcome_label}")
 
             sim_lot = ShadowLot(
                 lot_id=f"live_{uuid.uuid4().hex[:8]}",
                 strategy_id=target.experiment_id,
-                token_address="LIVE_SETTLED_TRADE",
-                chain=ChainIdentifier.SOLANA_MAINNET,
-                entry_price=Decimal("1.0"),
+                token_address=actual_token,
+                chain=actual_chain,
+                entry_price=actual_entry_p,
                 entry_timestamp=entry_ts,
-                tokens_acquired=Decimal("1.0"),
-                simulated_native_spent=Decimal("1.0"),
-                cost_basis_usd=Decimal("100.0"),
-                gas_drag_usd=Decimal("0.0"),
-                cpmm_slippage_bps=0,
-                latency_ms=0.0,
-                mev_drag_usd=Decimal("0.0"),
-                highest_price=Decimal("1.0"),
+                tokens_acquired=actual_tokens,
+                simulated_native_spent=actual_tokens * actual_entry_p,
+                cost_basis_usd=actual_cost_basis,
+                gas_drag_usd=Decimal(str(gas_drag_usd)),
+                cpmm_slippage_bps=int(cpmm_slippage_bps),
+                latency_ms=float(latency_ms),
+                mev_drag_usd=Decimal(str(mev_drag_usd)),
+                highest_price=max(actual_entry_p, actual_exit_p),
                 is_closed=True,
                 status=LotStatus.CLOSED,
-                exit_price=Decimal("1.0") * Decimal(str(max(0.0001, 1.0 + roi_pct / 100.0))),
+                exit_price=actual_exit_p,
                 exit_timestamp=now,
-                exit_reason=f"LIVE_SETTLED_TRADE_{outcome_label}",
-                realized_pnl_usd=adjusted_pnl,
-                roi_pct=roi_pct,
+                exit_reason=actual_exit_reason,
+                realized_pnl_usd=realized_pnl,
+                roi_pct=float(roi_pct),
             )
             target.closed_lots.append(sim_lot)
             m = target.recompute_metrics()
 
             logger.info(
-                "StrategyTournamentRegistry: Recorded live %s trade for %s -> PnL=$%.2f, ROI=%.2f%%, HoldTime=%.1fs (Trades=%d, WinRate=%.1f%%, PF=%.2f, Sortino=%.2f)",
-                outcome_label, strategy_name, pnl_usd, roi_pct, hold_time_s, m.trades_count, m.win_rate, m.profit_factor, m.sortino_ratio,
+                "StrategyTournamentRegistry: Recorded live %s trade for %s (%s) -> PnL=$%.2f, ROI=%.2f%%, HoldTime=%.1fs (Trades=%d, WinRate=%.1f%%, PF=%.2f, Sortino=%.2f)",
+                outcome_label, strategy_name, actual_token[:10], float(realized_pnl), float(roi_pct), float(hold_time_s), m.trades_count, m.win_rate, m.profit_factor, m.sortino_ratio,
             )
+
+    async def on_trade_closed(self, trade_outcome: dict[str, Any]) -> None:
+        """Async hook adapter for post-trade lifecycle."""
+        strat_name = str(trade_outcome.get("strategy_type") or trade_outcome.get("strategy_name", "default"))
+        pnl = trade_outcome.get("realized_pnl_usd", 0.0)
+        roi = float(trade_outcome.get("roi_pct", 0.0))
+        dur = float(trade_outcome.get("duration_s", trade_outcome.get("holding_time_seconds", 0.0)))
+        is_w = trade_outcome.get("is_win")
+        chain_raw = trade_outcome.get("chain")
+        chain_enum = None
+        if chain_raw:
+            for c in ChainIdentifier:
+                if c.value.lower() == str(chain_raw).lower():
+                    chain_enum = c
+                    break
+        self.record_live_trade_outcome(
+            strategy_name=strat_name,
+            pnl_usd=pnl,
+            is_win=is_w,
+            roi_pct=roi,
+            hold_time_s=dur,
+            token_address=trade_outcome.get("token_address"),
+            chain=chain_enum,
+            entry_price=Decimal(str(trade_outcome.get("entry_price", "1.0"))),
+            exit_price=Decimal(str(trade_outcome.get("exit_price", "1.0"))),
+            tokens_acquired=Decimal(str(trade_outcome.get("tokens_acquired", "1.0"))),
+            cost_basis_usd=Decimal(str(trade_outcome.get("cost_basis_usd", "100.0"))),
+            realized_pnl_usd=Decimal(str(pnl)),
+            gas_drag_usd=Decimal(str(trade_outcome.get("simulated_gas_cost_usd", "0.0"))),
+            cpmm_slippage_bps=int(trade_outcome.get("actual_slippage_bps", 0)),
+            latency_ms=float(trade_outcome.get("fill_latency_ms", 0.0)),
+            exit_reason=trade_outcome.get("exit_reason"),
+        )
 
     def get_active_challengers(self) -> list[StrategyVariant]:
         """Return list of active challenger variants in shadow mode."""

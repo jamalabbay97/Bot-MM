@@ -255,7 +255,8 @@ def test_autonomous_hyperparameter_tuner():
             os.remove(tmp_path)
 
 
-def test_self_learning_engine_end_to_end():
+@pytest.mark.asyncio
+async def test_self_learning_engine_end_to_end():
     with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as tmp:
         tmp_path = tmp.name
 
@@ -277,7 +278,7 @@ def test_self_learning_engine_end_to_end():
             exit_reason="tp_50",
         )
 
-        out = engine.on_trade_closed(trade)
+        out = await engine.on_trade_closed(trade)
         assert "strategy_metrics" in out
         assert out["strategy_metrics"]["total_trades"] == 1
         assert "policy_weights" in out

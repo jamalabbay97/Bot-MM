@@ -57,6 +57,37 @@ def parse_payload_or_abi(
     return result
 
 
+async def inspect_bytecode_from_rpc(
+    w3: Any,
+    token_address: str,
+    metadata: Optional[Any] = None,
+) -> tuple[bool, list[str]]:
+    """Inspect deployed contract bytecode via AsyncWeb3 RPC call."""
+    if metadata is not None:
+        logger.debug("Inspecting bytecode for %s with metadata: %s", token_address, metadata)
+    reasons: list[str] = []
+    try:
+        code = await w3.eth.get_code(w3.to_checksum_address(token_address))
+        if not code or code == b"" or code == "0x":
+            return False, ["No bytecode deployed at token address"]
+
+        code_hex = code.hex().lower() if isinstance(code, bytes) else str(code).lower()
+        if code_hex.startswith("0x"):
+            code_hex = code_hex[2:]
+
+        if any(sel in code_hex for sel in TAX_MUTATION_SELECTORS):
+            for selector, name in TAX_MUTATION_MAP.items():
+                if selector in code_hex:
+                    reasons.append(name)
+
+        if reasons:
+            return False, reasons
+        return True, []
+    except Exception as exc:
+        logger.debug("Bytecode inspection failed for %s: %s", token_address, exc)
+        return True, []
+
+
 def inspect_bytecode_for_delayed_taxes(
     bytecode_or_w3: Any,
     token_address: Optional[str] = None,
@@ -81,30 +112,7 @@ def inspect_bytecode_for_delayed_taxes(
                     reasons.append(name)
         return BytecodeInspectionResult((len(reasons) == 0, reasons))
 
-    async def _async_inspect() -> tuple[bool, list[str]]:
-        reasons: list[str] = []
-        try:
-            code = await bytecode_or_w3.eth.get_code(bytecode_or_w3.to_checksum_address(token_address))
-            if not code or code == b"" or code == "0x":
-                return False, ["No bytecode deployed at token address"]
-
-            code_hex = code.hex().lower() if isinstance(code, bytes) else str(code).lower()
-            if code_hex.startswith("0x"):
-                code_hex = code_hex[2:]
-
-            if any(sel in code_hex for sel in TAX_MUTATION_SELECTORS):
-                for selector, name in TAX_MUTATION_MAP.items():
-                    if selector in code_hex:
-                        reasons.append(name)
-
-            if reasons:
-                return False, reasons
-            return True, []
-        except Exception as exc:
-            logger.debug("Bytecode inspection failed for %s: %s", token_address, exc)
-            return True, []
-
-    return _async_inspect()
+    return inspect_bytecode_from_rpc(bytecode_or_w3, token_address, metadata)
 
 
 
@@ -141,7 +149,7 @@ async def _tier2_evm_preflight(
     w3.middleware_onion.inject(ExtraDataToPOAMiddleware, layer=0)
 
     # ── Step 0: Bytecode delayed fee / dynamic tax inspection ────────────────
-    is_clean_bytecode, bytecode_reasons = await inspect_bytecode_for_delayed_taxes(w3, token_address)
+    is_clean_bytecode, bytecode_reasons = await inspect_bytecode_from_rpc(w3, token_address)
     if not is_clean_bytecode:
         logger.warning(
             "Tier 2 Bytecode inspection REJECTED %s: %s. Flagging as honeypot/trap.",

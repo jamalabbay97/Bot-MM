@@ -71,7 +71,7 @@ class SelfLearningEngine:
         if callback not in self._on_tune_callbacks:
             self._on_tune_callbacks.append(callback)
 
-    def on_trade_closed(self, trade_outcome: Union[ClosedTradeOutcome, dict[str, Any]]) -> dict[str, Any]:
+    async def on_trade_closed(self, trade_outcome: Union[ClosedTradeOutcome, dict[str, Any]]) -> dict[str, Any]:
         """
         Primary closed-trade hook. Invoked immediately upon trade settlement.
         Executes the complete self-learning lifecycle:
@@ -81,12 +81,23 @@ class SelfLearningEngine:
           4. Recalibrate Council weights and entry thresholds
           5. Dispatch episodic memory entry to Ruflo
         """
+        outcome_obj = self._normalize_trade_outcome(trade_outcome)
+        return await self._process_trade_closed(outcome_obj)
+
+    def on_trade_closed_sync(self, trade_outcome: Union[ClosedTradeOutcome, dict[str, Any]]) -> dict[str, Any]:
+        """
+        Synchronous variant of closed-trade hook for non-async callers.
+        """
+        outcome_obj = self._normalize_trade_outcome(trade_outcome)
+        return self._process_trade_closed_sync(outcome_obj)
+
+    def _normalize_trade_outcome(self, trade_outcome: Union[ClosedTradeOutcome, dict[str, Any]]) -> ClosedTradeOutcome:
         if isinstance(trade_outcome, dict):
             strat_val = trade_outcome.get("strategy_type", "MOMENTUM_BREAKOUT")
             if hasattr(strat_val, "value"):
                 strat_val = strat_val.value
             hold_time = float(trade_outcome.get("holding_time_seconds", trade_outcome.get("duration_s", trade_outcome.get("holding_duration_s", 60.0))))
-            trade_outcome = ClosedTradeOutcome(
+            return ClosedTradeOutcome(
                 trade_id=str(trade_outcome.get("trade_id", uuid.uuid4().hex[:8])),
                 token_address=str(trade_outcome.get("token_address", "Unknown")),
                 chain=str(trade_outcome.get("chain", "solana_mainnet")),
@@ -104,7 +115,23 @@ class SelfLearningEngine:
                 is_win=bool(trade_outcome.get("is_win", trade_outcome.get("realized_pnl_usd", 0.0) > 0)),
                 timestamp_ns=int(trade_outcome.get("timestamp_ns", time.time_ns())),
             )
+        return trade_outcome
 
+    async def _process_trade_closed(self, trade_outcome: ClosedTradeOutcome) -> dict[str, Any]:
+        result = self._execute_core_lifecycle(trade_outcome)
+        # 5. Record to Ruflo Episodic Memory asynchronously
+        if self.episodic_memory and hasattr(self.episodic_memory, "record_episode"):
+            await self._record_to_ruflo_memory_async(trade_outcome)
+        return result
+
+    def _process_trade_closed_sync(self, trade_outcome: ClosedTradeOutcome) -> dict[str, Any]:
+        result = self._execute_core_lifecycle(trade_outcome)
+        # 5. Record to Ruflo Episodic Memory if event loop running
+        if self.episodic_memory and hasattr(self.episodic_memory, "record_episode"):
+            self._record_to_ruflo_memory(trade_outcome)
+        return result
+
+    def _execute_core_lifecycle(self, trade_outcome: ClosedTradeOutcome) -> dict[str, Any]:
         logger.info(
             "SelfLearningEngine: Processing closed trade %s (%s) PnL=$%.2f (ROI=%.2f%%)",
             trade_outcome.trade_id, trade_outcome.strategy_type,
@@ -134,15 +161,41 @@ class SelfLearningEngine:
         if tuned:
             self._apply_tuned_hyperparameters(tuned)
 
-        # 5. Record to Ruflo Episodic Memory
-        if self.episodic_memory and hasattr(self.episodic_memory, "record_episode"):
-            self._record_to_ruflo_memory(trade_outcome)
-
         return {
             "strategy_metrics": metrics.to_dict(),
             "policy_weights": updated_weights,
             "tuned_hyperparameters": tuned.to_dict() if tuned else None,
         }
+
+    async def _record_to_ruflo_memory_async(self, trade: ClosedTradeOutcome) -> None:
+        """Saves trade outcome into Ruflo episodic memory."""
+        if self.episodic_memory is None:
+            return
+        try:
+            from alpha_engine.ruflo.memory import MemoryEpisode
+
+            fv = trade.feature_vector if len(trade.feature_vector) == 7 else [0.5] * 7
+            ep = MemoryEpisode(
+                episode_id=trade.trade_id,
+                token_address=trade.token_address,
+                chain=trade.chain,
+                decision_type="ENTER",
+                signal_source=trade.strategy_type,
+                confidence_score=trade.council_confidence,
+                feature_vector=fv,
+                realized_pnl_usd=trade.realized_pnl_usd,
+                roi_pct=trade.roi_pct,
+                actual_slippage_bps=trade.actual_slippage_bps,
+                fill_latency_ms=trade.fill_latency_ms,
+                root_cause_tag="PROFIT_TARGET_HIT" if trade.is_win else "STOP_LOSS_HIT",
+                summary_reflection=f"Closed with ROI {trade.roi_pct:.2f}% (PnL ${trade.realized_pnl_usd:.2f})",
+            )
+            res = self.episodic_memory.record_episode(ep)
+            if asyncio.iscoroutine(res):
+                await res
+        except Exception as exc:
+            logger.error("Failed recording episode to Ruflo episodic memory: %s", exc, exc_info=True)
+            raise
 
     def _apply_tuned_hyperparameters(self, tuned: TunedHyperparameters) -> None:
         """Apply newly tuned hyperparameters to Council and Strategy engines."""
