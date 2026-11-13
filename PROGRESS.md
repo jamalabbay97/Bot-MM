@@ -334,38 +334,168 @@ Track progress across all identified defects and phases. All items must satisfy 
 ---
 
 ## Issue 9 Strategy generation not real
-- [ ] reproduced
-- [ ] red test
-- [ ] fix
-- [ ] green test
-- [ ] mutation check
-- [ ] sweep done
-- [ ] wiring proof
-- [ ] README/docs updated
+- [x] reproduced
+  - `AutonomousStrategyGenerator` (experimentation.py) produced 5 hardcoded templates and deterministic +/-10% mutations driven by generation-counter parity (no randomness, crossover only merged dicts).
+  - `extra_params` keys (`min_net_buy_delta`, `max_mcap_usd`, `min_surge_k`, `min_dormancy_hours`, `min_surge_multiplier`, `max_slippage_bps`, `min_wallet_sortino`, `organic_conviction_min`) were read by NO code; `custom_filter` was never assigned.
+  - `evaluate_signal_and_record_shadow_lots` gave every variant the SAME simulated entry fill (champion's), only checking `min_entry_score` and `allowed_sources`.
+  - Shadow trades used a fixed 0.10 size and $0.05 gas instead of dynamic sizing and dynamic cost modeling.
+  - Champion promotion in `runner.py` only updated SL/TP/trailing stop and never applied the champion's entry rules or source filters to live decision-making.
+- [x] red test
+  - `tests/test_issue9_strategy_generation.py`: 10 comprehensive tests:
+    1. `test_schema_validation_unknown_metric_fails`: Unknown metric names fail schema validation with `SchemaValidationError`.
+    2. `test_schema_validation_out_of_bounds_threshold_fails`: Out-of-bounds thresholds fail schema validation with `SchemaValidationError`.
+    3. `test_variants_make_own_entry_decisions_and_get_own_fills`: Two variants with different entry rules enter different subsets of the same signal stream and receive independent simulated fills.
+    4. `test_seeded_rng_mutation_reproducible_and_different_seeds_differ`: Seeded RNG mutations are reproducible with the same seed and differ across different seeds.
+    5. `test_deduplication_prevents_staging_identical_variants`: Exact duplicate variants are rejected with `DUPLICATE_STRATEGY` and never staged.
+    6. `test_promotion_changes_live_entry_decisions_integration`: End-to-end integration test through runner entry path proving champion promotion updates live entry rules and gates live signal execution.
+    7. `test_generation_logs_persisted_to_ledger`: Generation logs (parents, action, changes, parameters, train/val metrics) are persisted into `strategy_generation_logs` in `SQLiteLedger`.
+    8. `test_metric_registry_extraction_and_rule_groups`: Verifies all metric extractors against signals/pools and complex nested rule groups with AND/OR evaluation.
+    9. `test_shadow_sizing_dynamic_uses_live_sizing_not_fixed_constants`: Verifies shadow trade sizing dynamically calibrates with portfolio equity, entry scores, and dynamic gas costs.
+    10. `test_shadow_fills_parity_with_live_paper_executor`: Proves full execution parity between shadow fills and live paper fills for identical market inputs.
+- [x] fix
+  - Created `alpha_engine/engine/rules.py`:
+    - Declarative schema: `ComparisonOperator`, `LogicalOperator`, `RuleCondition`, `RuleGroup`, `EntryRuleSet`.
+    - `METRIC_REGISTRY` with 11 validated metrics: `mcap_usd`, `net_buy_delta`, `volume_surge_multiplier`, `dormancy_hours`, `slippage_estimate_bps`, `wallet_score`, `social_conviction`, `liquidity_usd`, `holder_concentration`, `alpha_score`, `dip_depth_pct` with canonical aliases.
+    - Full type validation, bound checking, evaluation against signals/pools/security reports, and deterministic canonical fingerprinting.
+  - Updated `alpha_engine/execution/ledger.py`:
+    - Added `strategy_generation_logs` table schema and indices (`idx_strategy_gen_name`, `idx_strategy_gen_ts`).
+    - Added `record_strategy_generation_log` and `get_strategy_generation_logs` methods.
+  - Overhauled `alpha_engine/engine/experimentation.py`:
+    - Replaced `custom_filter` and consumed all legacy `extra_params` keys into typed `entry_rules: EntryRuleSet`.
+    - Seeded RNG (`self._rng = random.Random(seed)`) for reproducible stochastic mutations, crossover, and novel strategy generation.
+    - Implemented 25% exploration budget in `generate_evolutionary_generation` for novel stochastic rule synthesis.
+    - Implemented `is_duplicate_strategy` deduplication check based on canonical fingerprinting.
+    - Updated `evaluate_signal_and_record_shadow_lots` to evaluate each variant's own `entry_rules` and `allowed_sources`, and execute independent simulated fills with dynamic `_calculate_shadow_trade_size` using `RiskManager` and live native pricing.
+    - Updated `evaluate_and_stage_candidate` to record generation logs to ledger and stage qualified/seed candidates.
+  - Updated `alpha_engine/engine/backtester.py`:
+    - Replaced hardcoded 200/2600 native prices with dynamic `price_service` lookup.
+    - Added dynamic column detection on `trades` table (`is_new_launch`, `price_impact_bps`, `strategy_name`).
+    - Reconstructed realistic, correlated signal metrics and mapped signal sources to evaluate candidate entry rules against historical trades.
+  - Updated `alpha_engine/engine/runner.py`:
+    - Added `set_native_price` helper method.
+    - Added `evaluate_champion_entry_rules` checking champion `allowed_sources`, `min_entry_score`, and `champion_entry_rules`.
+    - Wired champion entry rules evaluation directly into `_process_signal_queue` live entry path before trade execution.
+    - Updated `_on_champion_promoted` to synchronize `champion_entry_rules` and `champion_allowed_sources`.
+- [x] green test
+  - `tests/test_issue9_strategy_generation.py`: 10/10 passed.
+  - `tests/test_autonomous_strategy_generator.py`: 5/5 passed.
+  - `tests/test_autonomous_strategy_evolution_loop.py`: 4/4 passed.
+  - `tests/test_strategy_experimentation_and_swarm.py`: 9/9 passed.
+  - `tests/test_strategy_management_and_trailing_stop.py`: 13/13 passed.
+  - `tests/test_strategy_v2_integration.py`: 2/2 passed.
+  - Full issue regression suite (`tests/test_issue*.py`): 67/67 passed.
+- [x] mutation check
+  - Mutation 1: Mutated `EntryRuleSet.evaluate` to return `True` unconditionally -> Caught by `test_variants_make_own_entry_decisions_and_get_own_fills` and `test_promotion_changes_live_entry_decisions_integration`.
+  - Mutation 2: Mutated `is_duplicate_strategy` to return `False` unconditionally -> Caught by `test_deduplication_prevents_staging_identical_variants`.
+- [x] sweep done
+  - Ran `tools/audit/unused_config.py`: Findings reduced from 32 to 26; 0 remaining findings in `experimentation.py` or `rules.py`.
+- [x] wiring proof
+  - Evolution worker (`AutonomousStrategyEvolutionLoop`) -> `AutonomousStrategyGenerator.generate_evolutionary_generation` -> `evaluate_and_stage_candidate` -> stages into `StrategyTournamentRegistry.challengers`.
+  - Tournament evaluation (`evaluate_signal_and_record_shadow_lots`) -> evaluates each variant's own `entry_rules` -> independent fills with dynamic sizing.
+  - Promotion (`evaluate_promotions`) -> `_on_champion_promoted` -> updates `runner.champion_entry_rules` and `runner.champion_allowed_sources`.
+  - Live entry path (`runner._process_signal_queue`) -> calls `runner.evaluate_champion_entry_rules(signal_item, pool=signal_item.pool_state)` -> gates live execution.
+- [x] README/docs updated
+  - Updated PROGRESS.md and module documentation in `rules.py`, `experimentation.py`, and `runner.py`.
 
 ---
 
 ## Issue 10 Council LLM never called, no real shared memory, model-name rewriting
-- [ ] reproduced
-- [ ] red test
-- [ ] fix
-- [ ] green test
-- [ ] mutation check
-- [ ] sweep done
-- [ ] wiring proof
-- [ ] README/docs updated
+- [x] reproduced
+  - `alpha_engine/council/llm_client.py`: Verified `execute_debate_turn` was never called by any agent or by `CouncilArbiterCRO`; Rounds 2-3 were templated strings (e.g. `defend_or_revise` added +5 score if two peers approved).
+  - `alpha_engine/council/llm_client.py` and `alpha_engine/engine/ai_supervisor.py`: Forced model rewriting remapped any model string containing "flash" or "pro" to fixed names (`gemini-2.5-flash`), ignoring configured models (including valid ones like `gemini-3.8-flash`).
+  - `alpha_engine/ruflo/memory.py`: Ruflo episodic memory was written via `record_episode` but never read by council agents before forming verdicts.
+  - Hard vetoes had no guarantee against LLM hallucination or weighting overrides; prompt injection from external metadata was unhandled.
+- [x] red test
+  - Created `tests/test_issue10_council_debate.py` containing 12 unit and integration tests with `FakeCouncilLLMClient`:
+    1. `test_llm_output_changes_verdicts`: Verifies that `execute_debate_turn` is actually called and changes verdict scores.
+    2. `test_malformed_json_triggers_fallback_and_is_counted`: Verifies corrupt JSON triggers deterministic fallback and records `SCHEMA_VALIDATION_ERROR`.
+    3. `test_timeout_triggers_fallback_and_is_counted`: Verifies LLM timeout falls back to deterministic logic and records `TIMEOUT`.
+    4. `test_shared_memory_retrieval_changes_prompt_content`: Verifies relevant past episodes are retrieved and injected into agent prompts.
+    5. `test_post_mortem_updates_agent_accuracy_and_weights_with_shrinkage`: Verifies post-trade post-mortem updates accuracy with minimum sample requirement (`council_min_sample_size=20`) and shrinkage (`council_shrinkage_prior_weight=10.0`), and persists weights to SQLite ledger.
+    6. `test_hard_veto_cannot_be_overridden_by_llm_or_weights`: Verifies fatal security flags (mint/freeze authority, honeypot) force REJECT regardless of LLM scores or weights.
+    7. `test_configured_model_string_passed_through_unchanged`: Verifies configured model strings (e.g., `gemini-3.8-flash`) are passed through without rewriting.
+    8. `test_unknown_model_fails_with_clear_error_and_counts_fallback`: Verifies unknown models fail with `InvalidModelError` and count as fallback rather than silent substitution.
+    9. `test_prompt_injection_in_metadata_cannot_override_rules`: Verifies untrusted token metadata is delimited with `<untrusted_external_content>` and cannot override rules or schema.
+    10. `test_real_cross_examination_questions_answered_with_concrete_data`: Verifies Round 2 questions are answered using on-chain data and condition Round 3 revisions.
+    11. `test_fallback_ratio_warning_in_status_and_telemetry`: Verifies high fallback ratio triggers WARNING in telemetry and `/status`.
+    12. `test_integration_through_council_arbiter_and_runner_path`: Verifies deliberation executes end-to-end in runner signal queue processing.
+- [x] fix
+  - `alpha_engine/config.py`: Added Section 5f-2 parameters (`council_enabled`, `council_timeout_s`, `llm_max_cost_per_signal_usd`, `llm_max_concurrent_calls`, `llm_rate_limit_rpm`, `council_fallback_warning_threshold`, `council_fallback_window_size`, `council_min_sample_size`, `council_shrinkage_prior_weight`, `model_aliases`).
+  - `alpha_engine/council/models.py`: Added telemetry attributes (`generation_path`, `fallback_reason`, `latency_ms`, `evidence`, `llm_turns`, `fallback_turns`, `fallback_ratio`, `avg_llm_latency_ms`, `fallback_reasons`, `warning_triggered`).
+  - `alpha_engine/council/llm_client.py`: Implemented strict schema validation (`validate_debate_turn_schema`), prompt injection defense (`delimit_untrusted_content`), concurrency semaphore, rate limiter, retries with exponential backoff on HTTP 429, telemetry tracking, and removed forced model rewriting (raising `InvalidModelError` on unknown models).
+  - `alpha_engine/engine/ai_supervisor.py`: Removed hardcoded model rewriting in `_normalize_model_name` and passed configured model and ledger to council components.
+  - `alpha_engine/ruflo/memory.py`: Implemented `query_relevant_episodes` (bounded multi-attribute retrieval) and `format_episodes_compact_summary`.
+  - `alpha_engine/council/reach_agent.py`, `forensic_agent.py`, `quant_agent.py`: Overhauled to call `execute_debate_turn` in Rounds 1, 2, and 3; guaranteed non-negotiable fatal vetoes; answered Round 2 peer questions with real verified data; conditioned Round 3 revisions.
+  - `alpha_engine/council/arbiter_cro.py`: Orchestrated shared memory retrieval and prompt injection; real Round 2 cross-examination; conditioned Round 3 revisions; mandatory Devil's Advocate; Bayesian weight adaptation in `record_trade_outcome`; telemetry helpers `get_llm_telemetry()` and `get_status_summary()`.
+  - `alpha_engine/execution/ledger.py`: Added `council_agent_weights` table, `save_council_agent_weights`, `get_council_weights`, and `get_council_agent_performance`.
+  - `alpha_engine/engine/runner.py`: Connected Consumer 4 (`council_cro.record_trade_outcome`) in `_record_closed_trade_and_notify`.
+  - `alpha_engine/dashboard/telemetry.py` & `alpha_engine/ingestion/telegram.py`: Exposed council AI metrics, LLM vs fallback ratio, latency, failure reasons, and fallback warnings in dashboard and `/status`.
+- [x] green test
+  - `tests/test_issue10_council_debate.py`: 12/12 passed in 57s.
+  - Existing council test suite (`tests/test_council_multi_round_debate.py`, `tests/test_council_veto_enforcement.py`, `tests/test_council_devils_advocate_and_qa.py`): 9/9 passed.
+  - Full issue regression suite (`tests/test_issue*.py`): 91/91 passed.
+- [x] mutation check
+  - Mutation 1: Bypassed fatal veto override in `forensic_agent.py` (`if False:` instead of `if has_fatal:`) -> Caught by `test_hard_veto_cannot_be_overridden_by_llm_or_weights` with `AssertionError: assert <AgentVote.APPROVE: 'APPROVE'> == <AgentVote.REJECT: 'REJECT'>`.
+  - Mutation 2: Bypassed schema validation in `llm_client.py` (`return raw_dict`) -> Caught by `test_malformed_json_triggers_fallback_and_is_counted` with `KeyError: 'vote'`.
+  - Mutation 3: Wiped episodic memory summary before agent prompts in `arbiter_cro.py` (`memory_summary = ""`) -> Caught by `test_shared_memory_retrieval_changes_prompt_content` with `AssertionError: assert ('MASSIVE_WHALE_RUN' in ... or 'surged 110%' in ...)`.
+- [x] sweep done
+  - Repo-wide search for model rewriting (`gemini-1.5`, `gemini-2.0`, `gemini-2.5`, `gemini-pro`) -> 0 forced model rewrites remaining.
+  - Verified 9 active call sites of `execute_debate_turn` across council agents (Rounds 1, 2, and 3).
+  - Verified exception handling in `alpha_engine/ruflo/swarm.py` logs `logger.error` and fails closed on unhandled council crashes.
+- [x] wiring proof
+  - Ingestion / Signal Queue (`runner.py`) -> `SwarmCoordinator.execute_trade_consensus` -> `CouncilArbiterCRO.deliberate` -> shared memory retrieved from `RufloEpisodicMemory` -> injected into agent prompts -> 9 LLM turns executed across 3 rounds via `CouncilLLMClient.execute_debate_turn` -> CRO synthesis & veto gate.
+  - Closed Trade Hook (`runner._record_closed_trade_and_notify`) -> `CouncilArbiterCRO.record_trade_outcome` -> writes post-mortem `MemoryEpisode` to `RufloEpisodicMemory` -> updates agent accuracy with shrinkage -> persists weights via `SQLiteLedger.save_council_agent_weights`.
+  - Observability (`telemetry.py` & `telegram.py`) -> `CouncilArbiterCRO.get_llm_telemetry()` -> surfaces turn breakdown, fallback ratio, average latency, failure reasons, and fallback warnings in dashboard and `/status`.
+- [x] README/docs updated
+  - Updated PROGRESS.md with full Issue 10 verification and self-audit.
 
 ---
 
 ## Issue 11 Wallet profiling has no data and is not wired
-- [ ] reproduced
-- [ ] red test
-- [ ] fix
-- [ ] green test
-- [ ] mutation check
-- [ ] sweep done
-- [ ] wiring proof
-- [ ] README/docs updated
+### Part A: Wallet History Data Layer & Trade Reconstruction
+- [x] reproduced
+  - `alpha_engine/ruflo/agents/profiler_agent.py`: Verified `tool_evaluate_wallet` invoked `profile_wallet(wallet_address, chain, trades=[])` with an empty trades list for every candidate wallet.
+  - `alpha_engine/models/profiler.py`: Verified `WalletTradeRecord` was defined but never constructed anywhere in runtime code (only mocked in test files).
+  - `alpha_engine/profiler/evaluator.py`: Verified `WalletEvaluator.MIN_CLOSED_TRADES = 15`; because `trades=[]`, every evaluated wallet received `classification = INSUFFICIENT_HISTORY` and could never qualify for smart money.
+  - `alpha_engine/tracker/wallet_tracker.py`: Verified only 5 transaction signatures were retrieved via `getSignaturesForAddress` solely for display/notification strings, never reconstructing trades.
+- [x] red test
+  - Created `tests/test_issue11a_wallet_history.py` (10 tests) with recorded fixtures in `tests/fixtures/wallet_history/`:
+    1. `test_swap_parsing_solana_pump_fun_and_raydium`: Validated parsing of Pump.fun buy/sell bonding curve swaps and Raydium AMM swaps into `NormalizedSwap`.
+    2. `test_swap_parsing_solana_jupiter_multi_route`: Validated net input/output parsing across Jupiter multi-route hops.
+    3. `test_swap_parsing_base_uniswap_v2_and_v3`: Validated Uniswap V2, V3, and Aerodrome swap logs with gas fee calculation in native ETH.
+    4. `test_fifo_matching_with_partial_sells_and_fees`: Validated FIFO lot matching, pro-rated cost basis on partial sells, and fee deductions.
+    5. `test_transfers_not_counted_as_sells`: Validated that incoming and outgoing external token transfers do not trigger false sell trades or false losses.
+    6. `test_unrealized_positions_excluded_from_closed_trades`: Validated that open buy lots remain in `open_positions` and are excluded from closed trades and win rate.
+    7. `test_cache_hit_avoids_network`: Validated that synced windows in SQLite `wallet_swaps_cache` return cached swaps without invoking network provider.
+    8. `test_rate_limit_and_quota_accounting`: Validated token bucket acquisition and atomic quota accounting raising `ProviderQuotaExceededError`.
+    9. `test_provider_error_propagates_unavailable_to_profiler`: Validated that provider network failure/quota exhaustion propagates as `insufficient_data` (never "not smart money").
+    10. `test_profile_wallet_receives_real_records_integration`: Full integration verifying `profile_wallet` receives 16 reconstructed `WalletTradeRecord` objects and persists them to SQLite.
+- [x] fix
+  - `alpha_engine/models/enums.py`: Added `SwapVenue` enum (`PUMP_FUN`, `RAYDIUM`, `JUPITER`, `UNISWAP_V2`, `UNISWAP_V3`, `AERODROME`) and `WalletClassification.INSUFFICIENT_DATA`.
+  - `alpha_engine/models/profiler.py`: Added `NormalizedSwap`, `OpenPositionRecord`, and `TradeReconstructionResult` models.
+  - `alpha_engine/config.py`: Added Section 5c-3 settings (`solana_history_provider`, `base_history_provider`, `wallet_history_backfill_days`, `wallet_history_cache_ttl_s`, `wallet_history_free_tier_daily_quota`, `helius_api_key`, `alchemy_api_key`).
+  - `alpha_engine/profiler/history_db.py`: Created `WalletHistoryDatabase` with WAL mode SQLite tables (`wallet_swaps_cache`, `wallet_sync_status`, `provider_quota_usage`, `wallet_reconstructed_trades`, `wallet_reconstructed_metrics`, `historical_native_prices`).
+  - `alpha_engine/profiler/price_oracle.py`: Created `HistoricalPriceOracle` supporting DefiLlama historical pricing with hourly SQLite caching.
+  - `alpha_engine/profiler/history_provider.py`: Created `WalletHistoryProvider` ABC with retry backoff, token bucket rate limiter integration, daily quota accounting, and cache handling.
+  - `alpha_engine/profiler/solana_history.py`: Created `HeliusSolanaHistoryProvider` parsing Pump.fun, Raydium, and Jupiter routes.
+  - `alpha_engine/profiler/base_history.py`: Created `AlchemyBaseHistoryProvider` parsing Base EVM swaps and transfers.
+  - `alpha_engine/profiler/reconstructor.py`: Created `TradeReconstructor` implementing deterministic FIFO lot matching, historical pricing, fee subtraction, partial sells, and open position separation.
+  - `alpha_engine/profiler/profiler.py`: Connected `history_provider`, `reconstructor`, and `history_db` to `SmartMoneyProfiler`; added `get_wallet_trade_records`; updated `profile_wallet` to fetch real history when `trades=None` and fail closed to `INSUFFICIENT_DATA` on provider failure.
+  - `alpha_engine/ruflo/agents/profiler_agent.py`: Replaced `trades=[]` with `trades=None` in `tool_evaluate_wallet`; mapped provider unavailable to `"insufficient_data"`.
+- [x] green test
+  - `tests/test_issue11a_wallet_history.py`: 10/10 passed in 6.0s.
+  - `tests/test_profiler_and_rate_limiter.py`: 8/8 passed in 3.9s.
+  - Full issue regression suite (`tests/test_issue*.py`): 89/89 passed in 52.4s.
+- [x] mutation check
+  - Mutation 1: Bypassed transfer check in `reconstructor.py` (`if swap.is_transfer and False:`) -> Caught by `test_transfers_not_counted_as_sells` (`AssertionError: assert 1 == 0`).
+  - Mutation 2: Omitted transaction fee subtraction from sell proceeds in `reconstructor.py` (`net_exit_native = swap.native_amount`) -> Caught by `test_fifo_matching_with_partial_sells_and_fees` (`AssertionError: assert Decimal('0.2999975') == Decimal('0.2999925')`).
+  - Mutation 3: Returned silent empty list on provider failure in `history_provider.py` (`return []`) -> Caught by `test_provider_error_propagates_unavailable_to_profiler` (`AssertionError: assert 'insufficient_history' == 'insufficient_data'`).
+- [x] sweep done
+  - Verified `WalletTradeRecord` is constructed in `reconstructor.py` and `history_db.py`.
+  - Replaced hardcoded `trades=[]` in `profiler_agent.py`.
+- [x] wiring proof
+  - Evaluator Tool (`profiler_agent.tool_evaluate_wallet`) -> `SmartMoneyProfiler.profile_wallet` (with `trades=None`) -> `SmartMoneyProfiler.get_wallet_trade_records` -> checks `history_db.get_reconstructed_trades` -> fetches via `WalletHistoryProvider.fetch_swaps` -> parses into `NormalizedSwap` -> runs `TradeReconstructor.reconstruct_trades` -> constructs `WalletTradeRecord` objects -> persists to `history_db.save_reconstructed_trades` -> evaluates via `WalletEvaluator.evaluate(trades=trades)` -> persists whitelist result.
+- [ ] Part B: Real-time copytrade execution loop & signal dispatch (stays unticked until Part B).
 
 ---
 

@@ -1,0 +1,39 @@
+[
+  {
+    "signature": "2TransferInTx1111111111111111111111111111111111111111111111111111111111111111111111111111",
+    "type": "TRANSFER",
+    "source": "SOLANA_PROGRAM_LIBRARY",
+    "timestamp": 1715002000,
+    "fee": 5000,
+    "feePayer": "DonorWallet1111111111111111111111111111111111",
+    "events": {},
+    "tokenTransfers": [
+      {
+        "fromUserAccount": "DonorWallet1111111111111111111111111111111111",
+        "toUserAccount": "TokenWallet111111111111111111111111111111111",
+        "tokenAmount": 300.0,
+        "mint": "TransferToken1111111111111111111111111111111"
+      }
+    ],
+    "nativeTransfers": []
+  },
+  {
+    "signature": "2TransferOutTx11111111111111111111111111111111111111111111111111111111111111111111111111",
+    "type": "TRANSFER",
+    "source": "SOLANA_PROGRAM_LIBRARY",
+    "timestamp": 1715003000,
+    "fee": 5000,
+    "feePayer": "TokenWallet111111111111111111111111111111111",
+    "events": {},
+    "tokenTransfers": [
+      {
+        "fromUserAccount": "TokenWallet111111111111111111111111111111111",
+        "toUserAccount": "FriendWallet11111111111111111111111111111111",
+        "tokenAmount": 300.0,
+        "mint": "TransferToken1111111111111111111111111111111"
+      }
+    ],
+    "nativeTransfers": []
+  }
+]
+

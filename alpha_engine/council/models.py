@@ -85,10 +85,13 @@ class AgentVerdict:
     metrics: dict[str, Any] = field(default_factory=dict)
     execution_time_ms: float = 0.0
     fatal_veto: bool = False
+    generation_path: str = "fallback"  # "llm" or "fallback"
+    fallback_reason: Optional[str] = None
+    evidence: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         d = asdict(self)
-        d["vote"] = self.vote.value
+        d["vote"] = self.vote.value if hasattr(self.vote, "value") else str(self.vote)
         return d
 
 
@@ -105,6 +108,10 @@ class DebateRound:
     confidence: float = 0.8
     score: float = 50.0
     flags: list[str] = field(default_factory=list)
+    generation_path: str = "fallback"  # "llm" or "fallback"
+    fallback_reason: Optional[str] = None
+    latency_ms: float = 0.0
+    evidence: list[str] = field(default_factory=list)
     timestamp: float = field(default_factory=time.time)
 
     def to_dict(self) -> dict[str, Any]:
@@ -131,6 +138,12 @@ class CouncilConsensusResult:
     devils_advocate_invoked: bool = False
     devils_advocate_report: Optional[dict[str, Any]] = None
     retrieved_episodes_count: int = 0
+    llm_turns: int = 0
+    fallback_turns: int = 0
+    fallback_ratio: float = 0.0
+    avg_llm_latency_ms: float = 0.0
+    fallback_reasons: dict[str, int] = field(default_factory=dict)
+    warning_triggered: bool = False
     created_at: float = field(default_factory=time.time)
 
     def to_dict(self) -> dict[str, Any]:
@@ -153,5 +166,11 @@ class CouncilConsensusResult:
             "devils_advocate_invoked": self.devils_advocate_invoked,
             "devils_advocate_report": self.devils_advocate_report,
             "retrieved_episodes_count": self.retrieved_episodes_count,
+            "llm_turns": self.llm_turns,
+            "fallback_turns": self.fallback_turns,
+            "fallback_ratio": self.fallback_ratio,
+            "avg_llm_latency_ms": self.avg_llm_latency_ms,
+            "fallback_reasons": self.fallback_reasons,
+            "warning_triggered": self.warning_triggered,
             "created_at": self.created_at,
         }

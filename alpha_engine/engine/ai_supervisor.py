@@ -512,7 +512,11 @@ class AlphaSupervisorAI:
 
         # Council Integration
         from alpha_engine.council.arbiter_cro import CouncilArbiterCRO
-        self._council = CouncilArbiterCRO()
+        self._council = CouncilArbiterCRO(
+            config=config,
+            ledger=self._ledger,
+            episodic_memory=self._episodic_memory,
+        )
 
     def _get_key_for_provider(self, provider: str) -> Optional[str]:
         """Resolve API key for a specific AI provider."""
@@ -547,58 +551,23 @@ class AlphaSupervisorAI:
         return "gemini-3.8-flash"
 
     def _normalize_model_name(self, model_val: str, provider: str) -> str:
-        """Clean and normalize model aliases across AI providers."""
+        """Honor configured model name exactly, applying only explicit aliases if configured."""
         m = (model_val or "").strip()
         p = provider.lower()
-        if not m or m in ("default", "auto", "gemini", ""):
+        if not m or m in ("default", "auto", ""):
             return self._get_default_model_for_provider(p)
-        if p == "gemini":
-            if m in ("gemini-flash", "flash", "gemini-2.0-flash", "gemini-2.5-flash", "gemini-1.5-flash"):
-                return "gemini-3.8-flash"
-            elif m in ("gemini-pro", "pro", "gemini-1.5-pro", "gemini-2.5-pro"):
-                return "gemini-3.1-pro-preview"
-            elif m in ("gemini-lite", "flash-lite", "gemini-1.5-flash-8b"):
-                return "gemini-3.5-flash-lite"
-            elif m.startswith("models/"):
-                return m.replace("models/", "", 1)
-        elif p == "anthropic":
-            if m in ("gemini", "gemini-3.8-flash"):
-                return "claude-3-5-sonnet-latest"
-            elif m in ("claude-sonnet", "sonnet", "claude-3.5-sonnet"):
-                return "claude-3-5-sonnet-latest"
-            elif m in ("claude-3.7-sonnet", "claude-3-7-sonnet", "sonnet-3.7"):
-                return "claude-3-7-sonnet-latest"
-            elif m in ("claude-haiku", "haiku", "claude-3.5-haiku"):
-                return "claude-3-5-haiku-latest"
-        elif p in ("openai", "openrouter"):
-            if m in ("gemini", "gemini-3.8-flash", "gpt-5.6", "gpt-5", "gpt-4", "4o", "gpt4"):
-                return "gpt-4o"
-            elif m in ("gpt-4-turbo", "turbo"):
-                return "gpt-4o"
-            elif m in ("o3", "o3-mini-high"):
-                return "o3-mini"
-            elif m in ("gpt-4.5", "4.5"):
-                return "gpt-4.5-preview"
-            elif m in ("mini", "4o-mini", "gpt-4o-mini"):
-                return "gpt-4o-mini"
-        elif p == "groq":
-            if m in ("gemini", "gemini-3.8-flash", "llama-70b", "llama-3.3", "llama"):
-                return "llama-3.3-70b-versatile"
-            elif m in ("llama-8b", "instant"):
-                return "llama-3.1-8b-instant"
-        elif p == "deepseek":
-            if m in ("gemini", "gemini-3.8-flash", "chat", "deepseek-v3", "deepseek"):
-                return "deepseek-chat"
-            elif m in ("reasoner", "r1", "deepseek-r1"):
-                return "deepseek-reasoner"
-        elif p == "ollama":
-            if m in ("gemini", "gemini-3.8-flash"):
-                return "llama3.2"
+        aliases = getattr(self._cfg, "model_aliases", {}) or {}
+        if m in aliases:
+            return aliases[m]
+        if m.startswith("models/"):
+            return m.replace("models/", "", 1)
         return m
 
     def set_episodic_memory(self, memory: Any) -> None:
         """Connect persistent Ruflo episodic memory vector store."""
         self._episodic_memory = memory
+        if hasattr(self, "_council") and self._council is not None:
+            self._council.episodic_memory = memory
 
 
     async def run_council_debate(

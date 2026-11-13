@@ -1,7 +1,7 @@
 {
   "manual_trade_amount": "0.05",
   "manual_trade_currency": "SOL",
-  "updated_at": 1794481428,
+  "updated_at": 1794577094,
   "autonomous_hyperparameters": {
     "council_weights": {
       "ChainForensic": 0.333,

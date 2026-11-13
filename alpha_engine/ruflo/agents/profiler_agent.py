@@ -13,6 +13,7 @@ from typing import Any, Optional
 from alpha_engine.models.enums import ChainIdentifier, WalletClassification, WhitelistStatus
 from alpha_engine.models.profiler import WalletProfile, WhitelistRecord
 from alpha_engine.profiler.evaluator import WalletEvaluator
+from alpha_engine.profiler.history_provider import ProviderUnavailableError
 from alpha_engine.profiler.profiler import SmartMoneyProfiler
 from alpha_engine.profiler.whitelist_db import WhitelistDatabase
 from alpha_engine.ruflo.agents.base import BaseRufloAgent
@@ -103,11 +104,46 @@ class SmartMoneyProfilerAgent(BaseRufloAgent):
             ChainIdentifier.BASE_MAINNET if "base" in chain.lower() or "evm" in chain.lower()
             else ChainIdentifier.SOLANA_MAINNET
         )
-        profile: WalletProfile = await self.profiler.profile_wallet(
-            wallet_address=wallet_address,
-            chain=chain_enum,
-            trades=[],
-        )
+        try:
+            profile: WalletProfile = await self.profiler.profile_wallet(
+                wallet_address=wallet_address,
+                chain=chain_enum,
+                trades=None,
+            )
+        except ProviderUnavailableError as exc:
+            logger.warning("History provider unavailable during wallet eval %s: %s", wallet_address[:10], exc)
+            return {
+                "wallet_address": wallet_address,
+                "chain": chain_enum.value,
+                "classification": "insufficient_data",
+                "is_whitelisted": False,
+                "eligible_for_copytrade": False,
+                "smart_money_score": 0.0,
+                "win_rate_pct": 0.0,
+                "total_trades": 0,
+                "total_pnl_usd": "0",
+                "rejection_reasons": [f"insufficient data: history provider unavailable ({exc})"],
+                "status": "insufficient_data",
+            }
+
+        if (
+            profile.classification == WalletClassification.INSUFFICIENT_DATA
+            or any("insufficient data" in r.lower() for r in profile.rejection_reasons)
+        ):
+            return {
+                "wallet_address": profile.wallet_address,
+                "chain": profile.chain.value,
+                "classification": "insufficient_data",
+                "is_whitelisted": False,
+                "eligible_for_copytrade": False,
+                "smart_money_score": 0.0,
+                "win_rate_pct": 0.0,
+                "total_trades": 0,
+                "total_pnl_usd": "0",
+                "rejection_reasons": profile.rejection_reasons or ["insufficient data: history provider unavailable"],
+                "status": "insufficient_data",
+            }
+
         is_eligible = (
             profile.is_whitelisted
             or profile.classification == WalletClassification.SMART_MONEY

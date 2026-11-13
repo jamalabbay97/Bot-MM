@@ -229,6 +229,78 @@ class RufloEpisodicMemory:
         """Async convenience alias returning (MemoryEpisode, similarity_score) tuples."""
         return self.query_similar_episodes(query_vector, top_k=top_k, min_similarity=min_similarity)
 
+    def query_relevant_episodes(
+        self,
+        query_vector: Optional[list[float]] = None,
+        chain: Optional[str] = None,
+        signal_source: Optional[str] = None,
+        token_type: Optional[str] = None,
+        top_k: int = 3,
+        min_similarity: float = 0.40,
+    ) -> list[tuple[MemoryEpisode, float]]:
+        """
+        Fast bounded retrieval of relevant past episodes by feature similarity and/or metadata matching.
+        """
+        if not self._episodes:
+            return []
+
+        candidates = self._episodes
+        chain_str = str(chain).lower() if chain else None
+        src_str = str(signal_source).lower() if signal_source else None
+
+        scored: list[tuple[MemoryEpisode, float]] = []
+        for ep in reversed(candidates):
+            sim = 0.50
+            if query_vector and ep.feature_vector and len(query_vector) == len(ep.feature_vector):
+                sim = self._cosine_similarity(query_vector, ep.feature_vector)
+
+            if chain_str and ep.chain.lower() == chain_str:
+                sim = min(1.0, sim + 0.10)
+            if src_str and ep.signal_source.lower() == src_str:
+                sim = min(1.0, sim + 0.10)
+
+            if sim >= min_similarity:
+                scored.append((ep, round(sim, 4)))
+            if len(scored) >= top_k * 4:
+                break
+
+        scored.sort(key=lambda x: x[1], reverse=True)
+        return scored[:top_k]
+
+    def format_episodes_compact_summary(
+        self,
+        episodes: list[tuple[MemoryEpisode, float]] | list[MemoryEpisode],
+    ) -> str:
+        """
+        Format retrieved episodes into a compact summary for council agent prompts.
+        """
+        if not episodes:
+            return "Historical Precedents: No relevant past episodes found in episodic memory."
+
+        items: list[str] = []
+        wins = 0
+        total = 0
+        total_roi = 0.0
+
+        for item in episodes:
+            if isinstance(item, tuple):
+                ep, sim = item
+            else:
+                ep, sim = item, 1.0
+            total += 1
+            if ep.realized_pnl_usd > 0 or ep.roi_pct > 0:
+                wins += 1
+            total_roi += ep.roi_pct
+            res_str = f"+{ep.roi_pct:.1f}%" if ep.roi_pct >= 0 else f"{ep.roi_pct:.1f}%"
+            items.append(
+                f"Token {ep.token_address[:8]}... ({ep.signal_source}, ROI: {res_str}, Cause: {ep.root_cause_tag}, Sim: {sim*100:.0f}%)"
+            )
+
+        avg_roi = (total_roi / total) if total > 0 else 0.0
+        win_rate = (wins / total * 100.0) if total > 0 else 0.0
+        summary_header = f"Historical Precedents ({len(items)} episodes, WinRate: {win_rate:.0f}%, AvgROI: {avg_roi:+.1f}%):"
+        return f"{summary_header} " + "; ".join(items)
+
     @staticmethod
     def _cosine_similarity(v1: list[float], v2: list[float]) -> float:
         if not v1 or not v2 or len(v1) != len(v2):

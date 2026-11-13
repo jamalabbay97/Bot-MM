@@ -1806,6 +1806,37 @@ class TelegramIngester:
                 eth_p, eth_age, eth_st = svc.get_price(ChainIdentifier.BASE_MAINNET)
                 native_status_str = f"SOL: ${float(sol_p):.2f} [{sol_st.value}] | ETH: ${float(eth_p):.2f} [{eth_st.value}]"
 
+        # Council AI Health & LLM Fallback Telemetry
+        council_status_str = "🟢 Active"
+        council_warning_block = ""
+        council_cro = None
+        if target:
+            if hasattr(target, "swarm_coordinator") and target.swarm_coordinator and hasattr(target.swarm_coordinator, "council_cro"):
+                council_cro = target.swarm_coordinator.council_cro
+            elif hasattr(target, "_swarm_coordinator") and target._swarm_coordinator and hasattr(target._swarm_coordinator, "council_cro"):
+                council_cro = target._swarm_coordinator.council_cro
+            elif hasattr(target, "_ai_supervisor") and target._ai_supervisor and hasattr(target._ai_supervisor, "_council"):
+                council_cro = target._ai_supervisor._council
+
+        if council_cro and hasattr(council_cro, "get_llm_telemetry"):
+            try:
+                c_telem = council_cro.get_llm_telemetry()
+                fb_ratio = c_telem.get("fallback_ratio", 0.0)
+                llm_turns = c_telem.get("llm_turns", 0)
+                fb_turns = c_telem.get("fallback_turns", 0)
+                avg_lat = c_telem.get("avg_llm_latency_ms", 0.0)
+                warn = c_telem.get("warning_triggered", False)
+                if warn:
+                    council_status_str = f"⚠️ HIGH FALLBACK ({fb_ratio*100.0:.1f}%)"
+                    council_warning_block = (
+                        f"\n⚠️ **تحذير الذكاء الاصطناعي (Council AI Warning):** Fallback ratio {fb_ratio*100.0:.1f}% exceeds threshold! "
+                        f"(Turns: {llm_turns} LLM / {fb_turns} Fallback, Avg Latency: {avg_lat:.0f}ms)"
+                    )
+                else:
+                    council_status_str = f"🟢 LLM Active ({llm_turns} LLM, {fb_ratio*100.0:.1f}% fallback)"
+            except Exception as telem_err:
+                logger.debug("Failed to query council telemetry in status: %s", telem_err)
+
         msg = (
             "📊 **تقرير حالة المحرك (Bot-MM Engine Status Report)**\n\n"
             f"⏱ **مدة التشغيل (Uptime):** `{uptime_str}`\n"
@@ -1816,6 +1847,7 @@ class TelegramIngester:
             f"📦 **المراكز النشطة - Active Lots:** `{open_lots_val}`\n"
             f"🎯 **معدل النجاح (Win Rate WR):** `{wr_str}`\n"
             f"📉 **أقصى تراجع (Max Drawdown MDD):** `{mdd_str}`\n"
+            f"🤖 **مجلس الذكاء الاصطناعي (Council AI):** `{council_status_str}`{council_warning_block}\n"
             f"💵 **مبلغ التداول المعتمد:** `{self._get_current_trade_amount_display()[0]}`\n\n"
             "🚦 **قوائم الانتظار (Queue Backlog):**\n"
             f"   • Ingest: `{ingest_q_size}/{ingest_q_max}`\n"

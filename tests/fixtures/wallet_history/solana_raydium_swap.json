@@ -1,0 +1,47 @@
+[
+  {
+    "signature": "4RaydiumSwapTx111111111111111111111111111111111111111111111111111111111111111111111111111",
+    "type": "SWAP",
+    "source": "RAYDIUM",
+    "timestamp": 1715005000,
+    "fee": 10000,
+    "feePayer": "TokenWallet111111111111111111111111111111111",
+    "events": {
+      "swap": {
+        "nativeInput": null,
+        "nativeOutput": {
+          "account": "TokenWallet111111111111111111111111111111111",
+          "amount": "400000000"
+        },
+        "tokenInputs": [
+          {
+            "userAccount": "TokenWallet111111111111111111111111111111111",
+            "tokenAccount": "ATA111111111111111111111111111111111111111",
+            "rawTokenAmount": {
+              "tokenAmount": "500000000",
+              "decimals": 6
+            },
+            "mint": "PumpToken11111111111111111111111111111111111pump"
+          }
+        ],
+        "tokenOutputs": []
+      }
+    },
+    "tokenTransfers": [
+      {
+        "fromUserAccount": "TokenWallet111111111111111111111111111111111",
+        "toUserAccount": "RaydiumPool111111111111111111111111111111111",
+        "tokenAmount": 500.0,
+        "mint": "PumpToken11111111111111111111111111111111111pump"
+      }
+    ],
+    "nativeTransfers": [
+      {
+        "fromUserAccount": "RaydiumPool111111111111111111111111111111111",
+        "toUserAccount": "TokenWallet111111111111111111111111111111111",
+        "amount": 400000000
+      }
+    ]
+  }
+]
+

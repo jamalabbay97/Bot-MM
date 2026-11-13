@@ -359,6 +359,8 @@ class PaperTradingEngine:
             self.time_exit_s = champ.parameters.time_exit_s
             self.min_entry_score = champ.parameters.min_entry_score
             self.champion_variant = champ
+            self.champion_entry_rules = getattr(champ.parameters, "entry_rules", None)
+            self.champion_allowed_sources = getattr(champ.parameters, "allowed_sources", None)
             if hasattr(self, "config") and self.config:
                 self.config.active_strategy = champ.strategy_name
                 self.config.hard_stop_loss_pct = champ.parameters.hard_stop_loss_pct
@@ -372,11 +374,12 @@ class PaperTradingEngine:
                     open_lot.custom_take_profit_pct = champ.parameters.take_profit_pct
                     open_lot.trailing_stop_from_peak_pct = champ.parameters.trailing_stop_from_peak_pct
             logger.info(
-                "Runner: Applied newly promoted Champion strategy [%s] to live trade execution. SL=%.1f%%, TP=%.1f%%, Trail=%.1f%%",
+                "Runner: Applied newly promoted Champion strategy [%s] to live trade execution. SL=%.1f%%, TP=%.1f%%, Trail=%.1f%%, Rules=%d",
                 champ.strategy_name,
                 champ.parameters.hard_stop_loss_pct * 100,
                 (champ.parameters.take_profit_pct or 0.5) * 100,
                 (champ.parameters.trailing_stop_from_peak_pct or 0.25) * 100,
+                len(champ.parameters.entry_rules.conditions) if hasattr(champ.parameters, "entry_rules") and champ.parameters.entry_rules else 0,
             )
             if hasattr(self, "dashboard_telemetry") and self.dashboard_telemetry:
                 self.dashboard_telemetry.record_activity(
@@ -388,6 +391,9 @@ class PaperTradingEngine:
                 )
 
         self._strategy_tournament.register_on_promotion_callback(_on_champion_promoted)
+        self.champion_variant = self._strategy_tournament.champion
+        self.champion_entry_rules = getattr(self.champion_variant.parameters, "entry_rules", None)
+        self.champion_allowed_sources = getattr(self.champion_variant.parameters, "allowed_sources", None)
 
         # Real-Time Observability Hub
         self.dashboard_telemetry = DashboardTelemetryAggregator(
@@ -752,6 +758,11 @@ class PaperTradingEngine:
         """Single source of truth for native asset prices in USD."""
         res = self._native_price_service.get_price(chain)
         return res.price
+
+    def set_native_price(self, chain: ChainIdentifier | str, price: Decimal | float | int | str) -> None:
+        """Sets the native asset price in USD on the underlying native price service."""
+        ch_str = chain.value if hasattr(chain, "value") else str(chain)
+        self._native_price_service.set_price(ch_str, Decimal(str(price)), source="manual_override")
 
     @property
     def _sol_price(self) -> Decimal:
@@ -1286,6 +1297,36 @@ class PaperTradingEngine:
                 logger.error("Failed recording live trade outcome in StrategyTournament: %s", tourney_err, exc_info=True)
                 self._record_telemetry_counter("hook_strategy_tournament_failed")
                 self._record_telemetry_counter("post_trade_hook_failed")
+
+        # Consumer 4: Council Arbiter CRO (post-mortem trade outcome hook)
+        council_cro = None
+        if hasattr(self, "_swarm_coordinator") and self._swarm_coordinator and hasattr(self._swarm_coordinator, "council_cro"):
+            council_cro = self._swarm_coordinator.council_cro
+        elif hasattr(self, "_ai_supervisor") and self._ai_supervisor and hasattr(self._ai_supervisor, "_council"):
+            council_cro = self._ai_supervisor._council
+
+        if council_cro is not None and hasattr(council_cro, "record_trade_outcome"):
+            try:
+                roi_val = float(pct) if pct is not None else 0.0
+                res = council_cro.record_trade_outcome(
+                    token_address=lot.token_address,
+                    pnl_usd=float(exit_pnl_usd),
+                    roi_pct=roi_val,
+                    exit_reason=exit_label,
+                    signal_id=getattr(lot, "signal_id", ""),
+                )
+                if asyncio.iscoroutine(res):
+                    task = asyncio.create_task(
+                        self._safe_invoke_post_trade_hook(
+                            "council_cro",
+                            res,
+                        )
+                    )
+                    self._active_hook_tasks.add(task)
+                    task.add_done_callback(self._active_hook_tasks.discard)
+            except Exception as cro_err:
+                logger.error("Failed scheduling council cro post-trade hook: %s", cro_err, exc_info=True)
+                self._record_telemetry_counter("hook_council_cro_failed")
 
         d_reason_lower = str(decision_reason).lower()
         if "emergency_drain" in d_reason_lower or "rug_liquidity_drain" in d_reason_lower:
@@ -3245,6 +3286,42 @@ class PaperTradingEngine:
                 pass
         return None
 
+    def evaluate_champion_entry_rules(
+        self,
+        signal: SignalEvent,
+        pool: Optional[PoolState] = None,
+    ) -> bool:
+        """
+        Evaluates whether a candidate signal passes the active Champion strategy's
+        entry rules, min_entry_score, and allowed_sources.
+        """
+        # 1. Allowed sources check
+        allowed_sources = getattr(self, "champion_allowed_sources", None)
+        if allowed_sources and hasattr(signal, "source") and signal.source is not None:
+            sig_src = signal.source.value if hasattr(signal.source, "value") else str(signal.source)
+            src_match = any(
+                sig_src.lower() == (s.value if hasattr(s, "value") else str(s)).lower()
+                for s in allowed_sources
+            )
+            if not src_match:
+                return False
+
+        # 2. Minimum entry score check
+        min_score = getattr(self, "min_entry_score", None)
+        if min_score is not None:
+            threshold = min_score / 100.0 if min_score > 1.0 else min_score
+            alpha_score = getattr(signal, "alpha_score", 0.0) or 0.0
+            if alpha_score < threshold:
+                return False
+
+        # 3. Declarative entry rules check
+        rules = getattr(self, "champion_entry_rules", None)
+        if rules is not None and hasattr(rules, "evaluate"):
+            pool_to_use = pool or getattr(signal, "pool_state", None)
+            return rules.evaluate(signal, pool=pool_to_use)
+
+        return True
+
     def get_or_create_initial_pool_state(
         self,
         chain: ChainIdentifier,
@@ -4538,7 +4615,10 @@ class PaperTradingEngine:
                         continue
 
                 # 0. Reject weak signals or scores below quality threshold
-                min_score = getattr(self._cfg, "min_entry_score", 50.0) / 100.0
+                raw_min_score = getattr(self, "min_entry_score", None)
+                if raw_min_score is None:
+                    raw_min_score = getattr(self._cfg, "min_entry_score", 50.0)
+                min_score = raw_min_score / 100.0 if raw_min_score > 1.0 else raw_min_score
                 if not is_direct_dm and signal_item.strength == SignalStrength.WEAK and signal_item.alpha_score < min_score:
                     logger.info(
                         "Dropping BUY signal for %s: alpha_score=%.3f (strength=%s) below threshold %.2f",
@@ -4781,6 +4861,25 @@ class PaperTradingEngine:
                     )
                 except Exception as exc:
                     logger.debug("Shadow tournament evaluation skipped for %s: %s", signal_item.token_address[:10], exc)
+
+            # Champion Strategy Entry Rules Evaluation (Live Entry Path)
+            if signal_item.suggested_side == OrderSide.BUY:
+                if not self.evaluate_champion_entry_rules(signal_item, pool=signal_item.pool_state):
+                    champ_name = getattr(self.champion_variant, "strategy_name", "Champion")
+                    logger.info(
+                        "Dropping BUY signal for %s: Rejected by Champion strategy [%s] entry rules/thresholds",
+                        signal_item.token_address[:10],
+                        champ_name,
+                    )
+                    self._record_telemetry_counter("champion_entry_rules_rejected")
+                    self._record_gatekeeper_eval(
+                        signal_item.token_address,
+                        signal_item.chain,
+                        f"Champion Strategy [{champ_name}] Entry Rules Rejected",
+                        passed=False,
+                    )
+                    self._position_book.release_position_slot(token_address=signal_item.token_address)
+                    continue
 
             # Unified Ruflo Multi-Agent Swarm Deliberation & BFT Consensus
             if signal_item.suggested_side == OrderSide.BUY and self._swarm_coordinator:

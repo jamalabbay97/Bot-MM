@@ -327,6 +327,33 @@ class SQLiteLedger:
     )
     """
 
+    _CREATE_STRATEGY_GENERATION_LOGS = """
+    CREATE TABLE IF NOT EXISTS strategy_generation_logs (
+        log_id              TEXT PRIMARY KEY,
+        strategy_name       TEXT NOT NULL,
+        parent_ids          TEXT NOT NULL,
+        action              TEXT NOT NULL,
+        changes_json        TEXT NOT NULL,
+        parameters_json     TEXT NOT NULL,
+        train_metrics_json  TEXT,
+        val_metrics_json    TEXT,
+        staged              INTEGER NOT NULL DEFAULT 0,
+        created_at          REAL NOT NULL
+    )
+    """
+
+    _CREATE_COUNCIL_AGENT_WEIGHTS = """
+    CREATE TABLE IF NOT EXISTS council_agent_weights (
+        agent_name          TEXT PRIMARY KEY,
+        weight              REAL NOT NULL,
+        total_calls         INTEGER NOT NULL DEFAULT 0,
+        correct_calls       INTEGER NOT NULL DEFAULT 0,
+        measured_accuracy   REAL NOT NULL DEFAULT 0.5,
+        shrunk_accuracy     REAL NOT NULL DEFAULT 0.5,
+        updated_at_ns       INTEGER NOT NULL
+    )
+    """
+
     def __init__(
         self,
         db_path: str | Path = "paper_trading.db",
@@ -399,6 +426,10 @@ class SQLiteLedger:
         await conn.execute(self._CREATE_TOKEN_REQUESTS)
         await conn.execute(self._CREATE_STRATEGY_EXPERIMENTS)
         await conn.execute(self._CREATE_AGENT_DELIBERATION_LOGS)
+        await conn.execute(self._CREATE_STRATEGY_GENERATION_LOGS)
+        await conn.execute(self._CREATE_COUNCIL_AGENT_WEIGHTS)
+        await conn.execute("CREATE INDEX IF NOT EXISTS idx_strategy_gen_name ON strategy_generation_logs(strategy_name);")
+        await conn.execute("CREATE INDEX IF NOT EXISTS idx_strategy_gen_ts ON strategy_generation_logs(created_at DESC);")
         await conn.execute("CREATE INDEX IF NOT EXISTS idx_token_requests_token ON token_requests(token_address);")
         await conn.execute("CREATE INDEX IF NOT EXISTS idx_token_requests_state ON token_requests(state);")
         await conn.execute("CREATE INDEX IF NOT EXISTS idx_token_requests_created ON token_requests(created_at);")
@@ -1885,6 +1916,144 @@ class SQLiteLedger:
             )
         rows = await cursor.fetchall()
         return [dict(r) for r in rows]
+
+    @sqlite_retry(max_retries=5, base_delay=0.1)
+    async def record_strategy_generation_log(
+        self,
+        strategy_name: str,
+        parent_ids: list[str] | str,
+        action: str,
+        changes_json: dict[str, Any] | str,
+        parameters_json: dict[str, Any] | str,
+        log_id: Optional[str] = None,
+        train_metrics_json: Optional[dict[str, Any] | str] = None,
+        val_metrics_json: Optional[dict[str, Any] | str] = None,
+        staged: bool = False,
+        created_at: Optional[float] = None,
+        **kwargs: Any,
+    ) -> None:
+        """Persist an evolutionary strategy generation log entry."""
+        conn = self._conn
+        if conn is None:
+            return
+        import uuid
+        lid = log_id or f"gen_{uuid.uuid4().hex[:12]}"
+        parents = parent_ids if isinstance(parent_ids, str) else json.dumps(parent_ids)
+        changes = changes_json if isinstance(changes_json, str) else json.dumps(changes_json)
+        params = parameters_json if isinstance(parameters_json, str) else json.dumps(parameters_json)
+        train_m = (
+            train_metrics_json
+            if (train_metrics_json is None or isinstance(train_metrics_json, str))
+            else json.dumps(train_metrics_json)
+        )
+        val_m = (
+            val_metrics_json
+            if (val_metrics_json is None or isinstance(val_metrics_json, str))
+            else json.dumps(val_metrics_json)
+        )
+        ts = float(created_at if created_at is not None else time.time())
+        staged_int = 1 if staged else 0
+
+        await conn.execute(
+            """
+            INSERT OR REPLACE INTO strategy_generation_logs (
+                log_id, strategy_name, parent_ids, action, changes_json,
+                parameters_json, train_metrics_json, val_metrics_json, staged, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+            """,
+            (lid, strategy_name, parents, action, changes, params, train_m, val_m, staged_int, ts),
+        )
+        await conn.commit()
+
+    @sqlite_retry(max_retries=5, base_delay=0.1)
+    async def get_strategy_generation_logs(self, limit: int = 100) -> list[dict[str, Any]]:
+        """Retrieve recent strategy generation logs."""
+        conn = self._conn
+        if conn is None:
+            return []
+        conn.row_factory = aiosqlite.Row
+        cursor = await conn.execute(
+            "SELECT * FROM strategy_generation_logs ORDER BY created_at DESC LIMIT ?;",
+            (limit,),
+        )
+        rows = await cursor.fetchall()
+        result = []
+        for r in rows:
+            d = dict(r)
+            try:
+                d["parent_ids"] = json.loads(d["parent_ids"])
+            except Exception:
+                pass
+            try:
+                d["changes"] = json.loads(d["changes_json"])
+            except Exception:
+                pass
+            result.append(d)
+        return result
+
+    @sqlite_retry(max_retries=5, base_delay=0.1)
+    async def save_council_agent_weights(
+        self,
+        weights: dict[str, float],
+        performance: Optional[dict[str, dict[str, Any]]] = None,
+    ) -> None:
+        """Persist adapted council agent weights and accuracy records to SQLite."""
+        conn = self._conn
+        if conn is None:
+            return
+        now_ns = time.time_ns()
+        for agent_name, weight in weights.items():
+            perf = (performance or {}).get(agent_name, {})
+            tot = int(perf.get("total_calls") or perf.get("total_trades") or 0)
+            corr = int(perf.get("correct_calls", 0))
+            meas_acc = float(perf.get("measured_accuracy", (corr / tot) if tot > 0 else 0.5))
+            shrunk_acc = float(perf.get("shrunk_accuracy", meas_acc))
+
+            await conn.execute(
+                """
+                INSERT OR REPLACE INTO council_agent_weights (
+                    agent_name, weight, total_calls, correct_calls,
+                    measured_accuracy, shrunk_accuracy, updated_at_ns
+                ) VALUES (?, ?, ?, ?, ?, ?, ?);
+                """,
+                (agent_name, float(weight), tot, corr, meas_acc, shrunk_acc, now_ns),
+            )
+        await conn.commit()
+
+    @sqlite_retry(max_retries=5, base_delay=0.1)
+    async def get_council_weights(self) -> Optional[dict[str, float]]:
+        """Retrieve persisted council agent weights."""
+        conn = self._conn
+        if conn is None:
+            return None
+        conn.row_factory = aiosqlite.Row
+        cursor = await conn.execute("SELECT agent_name, weight FROM council_agent_weights;")
+        rows = await cursor.fetchall()
+        if not rows:
+            return None
+        return {r["agent_name"]: float(r["weight"]) for r in rows}
+
+    @sqlite_retry(max_retries=5, base_delay=0.1)
+    async def get_council_agent_performance(self) -> dict[str, dict[str, Any]]:
+        """Retrieve persisted council agent performance stats."""
+        conn = self._conn
+        if conn is None:
+            return {}
+        conn.row_factory = aiosqlite.Row
+        cursor = await conn.execute("SELECT * FROM council_agent_weights;")
+        rows = await cursor.fetchall()
+        result = {}
+        for r in rows:
+            result[r["agent_name"]] = {
+                "weight": float(r["weight"]),
+                "total_calls": int(r["total_calls"]),
+                "total_trades": int(r["total_calls"]),
+                "correct_calls": int(r["correct_calls"]),
+                "measured_accuracy": float(r["measured_accuracy"]),
+                "shrunk_accuracy": float(r["shrunk_accuracy"]),
+                "updated_at_ns": int(r["updated_at_ns"]),
+            }
+        return result
 
 
 

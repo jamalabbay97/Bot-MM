@@ -19,6 +19,7 @@ from alpha_engine.models.enums import (
     SignalSource,
     SignalStrength,
     StrategyHorizon,
+    SwapVenue,
     TradeExitReason,
     TradingPlatform,
     WalletClassification,
@@ -44,6 +45,9 @@ from alpha_engine.models.news import (
 from alpha_engine.models.profiler import (
     FundingHop,
     InitialTxRecord,
+    NormalizedSwap,
+    OpenPositionRecord,
+    TradeReconstructionResult,
     WalletProfile,
     WalletTradeRecord,
     WhitelistRecord,
@@ -128,6 +132,10 @@ __all__ = [
     "InitialTxRecord",
     "WalletProfile",
     "WhitelistRecord",
+    "NormalizedSwap",
+    "OpenPositionRecord",
+    "TradeReconstructionResult",
+    "SwapVenue",
     # State & Execution Models
     "PoolState",
     "SecurityReport",

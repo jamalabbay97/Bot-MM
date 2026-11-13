@@ -111,8 +111,14 @@ class RufloSwarmCoordinator:
 
         # Unify with Council Arbiter CRO
         self.council_cro = council_cro or (
-            ai_supervisor._council if ai_supervisor and hasattr(ai_supervisor, "_council") else CouncilArbiterCRO()
+            ai_supervisor._council if ai_supervisor and hasattr(ai_supervisor, "_council") else CouncilArbiterCRO(
+                config=config,
+                episodic_memory=self.memory,
+                ledger=ledger,
+            )
         )
+        if self.council_cro is not None and getattr(self.council_cro, "episodic_memory", None) is None:
+            self.council_cro.episodic_memory = self.memory
 
         # Initialize the 7 specialized agents
         self.scout_agent = IngestionScoutingAgent(coordinator=coordinator)
@@ -176,8 +182,12 @@ class RufloSwarmCoordinator:
         if ledger is not None:
             self.execution_agent.ledger = ledger
             self._ledger = ledger
+            if self.council_cro is not None:
+                self.council_cro.ledger = ledger
         if position_book is not None:
             self.execution_agent.position_book = position_book
+        if self.council_cro is not None and getattr(self.council_cro, "episodic_memory", None) is None:
+            self.council_cro.episodic_memory = self.memory
 
     async def _safe_record_agent_deliberation(self, deliberation: dict[str, Any]) -> None:
         """Safely record multi-agent deliberation without allowing database errors to crash consensus."""
@@ -580,6 +590,7 @@ class RufloSwarmCoordinator:
 
             # 5. Council Arbiter CRO Cross-Specialist Deliberation (Reach, Forensic, Quant, CRO)
             council_res = None
+            council_exception_str = ""
             if self.council_cro is not None:
                 try:
                     council_chain = ChainIdentifier.BASE_MAINNET if "base" in chain_str.lower() else ChainIdentifier.SOLANA_MAINNET
@@ -592,12 +603,17 @@ class RufloSwarmCoordinator:
                         symbol=kwargs.get("symbol", ""),
                     )
                 except Exception as cro_err:
-                    logger.debug("Council deliberation skipped on non-fatal error: %s", cro_err)
+                    logger.error("Council deliberation failed unexpectedly for %s: %s", token_address[:10], cro_err)
+                    council_exception_str = str(cro_err)
 
             council_approved = True
             council_veto_reason = ""
             council_debate: list[str] = []
-            if council_res is not None:
+            if council_exception_str:
+                # Fail-closed policy: unexpected council crash cannot bypass gate
+                council_approved = False
+                council_veto_reason = f"Council deliberation exception: {council_exception_str}"
+            elif council_res is not None:
                 council_approved = (getattr(council_res, "decision", "") == "EXECUTE_BUY")
                 council_debate = getattr(council_res, "debate_transcript", [])
                 if not council_approved:

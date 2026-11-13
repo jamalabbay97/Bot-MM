@@ -1,0 +1,64 @@
+[
+  {
+    "signature": "3JupiterSwapTx111111111111111111111111111111111111111111111111111111111111111111111111111",
+    "type": "SWAP",
+    "source": "JUPITER",
+    "timestamp": 1715010000,
+    "fee": 15000,
+    "feePayer": "TokenWallet111111111111111111111111111111111",
+    "events": {
+      "swap": {
+        "nativeInput": {
+          "account": "TokenWallet111111111111111111111111111111111",
+          "amount": "2000000000"
+        },
+        "nativeOutput": null,
+        "tokenInputs": [],
+        "tokenOutputs": [
+          {
+            "userAccount": "TokenWallet111111111111111111111111111111111",
+            "tokenAccount": "JupATA1111111111111111111111111111111111111",
+            "rawTokenAmount": {
+              "tokenAmount": "50000000000",
+              "decimals": 9
+            },
+            "mint": "JupToken1111111111111111111111111111111111111"
+          }
+        ],
+        "innerSwaps": [
+          {
+            "source": "RAYDIUM",
+            "tokenInputs": [
+              {
+                "mint": "So11111111111111111111111111111111111111112",
+                "rawTokenAmount": {"tokenAmount": "2000000000", "decimals": 9}
+              }
+            ],
+            "tokenOutputs": [
+              {
+                "mint": "JupToken1111111111111111111111111111111111111",
+                "rawTokenAmount": {"tokenAmount": "50000000000", "decimals": 9}
+              }
+            ]
+          }
+        ]
+      }
+    },
+    "tokenTransfers": [
+      {
+        "fromUserAccount": "JupiterVault1111111111111111111111111111111",
+        "toUserAccount": "TokenWallet111111111111111111111111111111111",
+        "tokenAmount": 50.0,
+        "mint": "JupToken1111111111111111111111111111111111111"
+      }
+    ],
+    "nativeTransfers": [
+      {
+        "fromUserAccount": "TokenWallet111111111111111111111111111111111",
+        "toUserAccount": "JupiterVault1111111111111111111111111111111",
+        "amount": 2000000000
+      }
+    ]
+  }
+]
+

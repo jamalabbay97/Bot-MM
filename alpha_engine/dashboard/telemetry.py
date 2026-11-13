@@ -791,12 +791,37 @@ class DashboardTelemetryAggregator:
                 }
             ]
 
+        # Council LLM Telemetry (LLM-vs-fallback ratio, latency, failure reasons)
+        council_telem: dict[str, Any] = {
+            "total_turns": 0,
+            "llm_turns": 0,
+            "fallback_turns": 0,
+            "fallback_ratio": 0.0,
+            "avg_llm_latency_ms": 0.0,
+            "fallback_reasons": {},
+            "warning_triggered": False,
+        }
+        council_cro = None
+        if self.swarm and hasattr(self.swarm, "council_cro") and self.swarm.council_cro:
+            council_cro = self.swarm.council_cro
+        elif self.runner and hasattr(self.runner, "_swarm_coordinator") and self.runner._swarm_coordinator:
+            council_cro = getattr(self.runner._swarm_coordinator, "council_cro", None)
+        elif self.runner and hasattr(self.runner, "_ai_supervisor") and self.runner._ai_supervisor:
+            council_cro = getattr(self.runner._ai_supervisor, "_council", None)
+
+        if council_cro and hasattr(council_cro, "get_llm_telemetry"):
+            try:
+                council_telem = council_cro.get_llm_telemetry()
+            except Exception as telem_err:
+                logger.debug("Failed to retrieve council LLM telemetry: %s", telem_err)
+
         return {
             "agents": agents,
             "debates": debates,
             "total_debates_count": len(debates),
             "approved_count": sum(1 for d in debates if d.get("final_decision") == "EXECUTE_BUY"),
             "vetoed_count": sum(1 for d in debates if d.get("final_decision") != "EXECUTE_BUY"),
+            "council_llm_telemetry": council_telem,
         }
 
     # -------------------------------------------------------------------------

@@ -51,8 +51,22 @@ class WalletClassification(str, Enum):
     LUCKY_OUTLIER = "lucky_outlier"           # >60% PnL from a single lucky trade
     DEAD_REVIVAL = "dead_revival"             # Inactive >45 days, compromised/sold keys
     INSUFFICIENT_HISTORY = "insufficient_history"  # <15 trades or <21 days active
+    INSUFFICIENT_DATA = "insufficient_data"        # Provider unavailable or quota exceeded
     LOW_WIN_RATE = "low_win_rate"             # Win rate < 55%
     CIRCULAR_WASH = "circular_wash"           # Circular transaction loop / wash trading
+
+
+class SwapVenue(str, Enum):
+    """DEX / AMM venue on which a token swap executed."""
+
+    PUMP_FUN = "pump_fun"
+    PUMP_SWAP = "pump_swap"
+    RAYDIUM = "raydium"
+    JUPITER = "jupiter"
+    UNISWAP_V2 = "uniswap_v2"
+    UNISWAP_V3 = "uniswap_v3"
+    AERODROME = "aerodrome"
+    UNKNOWN = "unknown"
 
 
 class WhitelistStatus(str, Enum):

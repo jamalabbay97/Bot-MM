@@ -217,6 +217,61 @@ class EngineConfig(BaseSettings):
         description="Enforce strict veto if AI supervisor decision is PASS",
     )
 
+    # -------------------------------------------------------------------------
+    # 5f-2. Council of Agents & LLM Controls (Issue 10)
+    # -------------------------------------------------------------------------
+    council_enabled: bool = Field(
+        default=True,
+        description="Enable multi-agent Council of 4 deliberation (Reach, Forensic, Quant, CRO)",
+    )
+    council_timeout_s: float = Field(
+        default=3.5,
+        ge=0.5,
+        le=30.0,
+        description="Max latency timeout in seconds per Council debate turn",
+    )
+    llm_max_cost_per_signal_usd: float = Field(
+        default=0.05,
+        ge=0.0,
+        description="Maximum estimated LLM cost budget in USD allowed per signal deliberation",
+    )
+    llm_max_concurrent_calls: int = Field(
+        default=4,
+        ge=1,
+        le=32,
+        description="Maximum concurrent async LLM API calls allowed across council debate turns",
+    )
+    llm_rate_limit_rpm: int = Field(
+        default=60,
+        ge=1,
+        description="Global rate limit in requests per minute for LLM API calls",
+    )
+    council_fallback_warning_threshold: float = Field(
+        default=0.50,
+        ge=0.0,
+        le=1.0,
+        description="Fallback ratio threshold over window that triggers WARNING and status alert",
+    )
+    council_fallback_window_size: int = Field(
+        default=50,
+        ge=5,
+        description="Sliding window size of debate turns over which fallback ratio is measured",
+    )
+    council_min_sample_size: int = Field(
+        default=20,
+        ge=1,
+        description="Minimum closed trade sample size required before adapting agent council weights",
+    )
+    council_shrinkage_prior_weight: float = Field(
+        default=10.0,
+        ge=1.0,
+        description="Bayesian shrinkage prior pseudo-observations weight for council agent adaptation",
+    )
+    model_aliases: dict[str, str] = Field(
+        default_factory=dict,
+        description="Explicit mapping of model aliases to canonical provider model names (empty by default)",
+    )
+
 
     # -------------------------------------------------------------------------
     # 5g. Ruflo Multi-Agent Swarm Orchestration Framework
@@ -833,6 +888,42 @@ class EngineConfig(BaseSettings):
     verify_genuine_activity: bool = Field(
         default=False,
         description="Whether to verify genuine trading activity and reject wash trading / single-wallet dominance",
+    )
+
+    # -------------------------------------------------------------------------
+    # 5c-3. Wallet Profiler & History Provider Configuration
+    # -------------------------------------------------------------------------
+    solana_history_provider: str = Field(
+        default="helius",
+        description="Provider for Solana wallet swap history ('helius', 'rpc', 'mock')",
+    )
+    base_history_provider: str = Field(
+        default="alchemy",
+        description="Provider for Base EVM wallet swap history ('alchemy', 'rpc', 'mock')",
+    )
+    wallet_history_backfill_days: int = Field(
+        default=30,
+        ge=1,
+        le=365,
+        description="Number of days to backfill historical swap transactions for candidate wallets",
+    )
+    wallet_history_cache_ttl_s: int = Field(
+        default=3600,
+        ge=60,
+        description="TTL in seconds for cached wallet swaps before refreshing from provider",
+    )
+    wallet_history_free_tier_daily_quota: int = Field(
+        default=1000,
+        ge=10,
+        description="Max daily request quota for free-tier wallet history APIs (e.g. Helius / Alchemy)",
+    )
+    helius_api_key: Optional[str] = Field(
+        default=None,
+        description="Explicit Helius API key; falls back to parsing from solana_rpc_http or HELIUS_API_KEY env",
+    )
+    alchemy_api_key: Optional[str] = Field(
+        default=None,
+        description="Explicit Alchemy API key; falls back to parsing from base_rpc_http or ALCHEMY_API_KEY env",
     )
 
     # Revival / Older Tokens Tuning Parameters
