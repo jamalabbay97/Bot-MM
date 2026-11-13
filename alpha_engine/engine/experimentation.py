@@ -526,12 +526,14 @@ class StrategyTournamentRegistry:
         ledger: Optional[Any] = None,
         cost_model: Optional[Any] = None,
         config: Optional[Any] = None,
+        walk_forward_validator: Optional[Any] = None,
     ) -> None:
         self.ledger = ledger
         from alpha_engine.execution.costs import TradeCostModel
         self.cost_model = cost_model or TradeCostModel()
         from alpha_engine.config import EngineConfig
         self.config = config or getattr(self.cost_model, "config", None) or EngineConfig()
+        self.walk_forward_validator = walk_forward_validator
         import random
         seed = getattr(self.config, "execution_seed", None)
         self._rng = random.Random(seed) if seed is not None else random.Random()
@@ -1310,6 +1312,44 @@ class StrategyTournamentRegistry:
                     f"BootExp95% > $0 (LB=${boot_lower:.2f}) across N={m.trades_count} shadow trades."
                 )
 
+        if best_candidate and getattr(self, "walk_forward_validator", None) is not None:
+            lot_records = [
+                {
+                    "trade_id": getattr(lot, "lot_id", f"lot-{i}"),
+                    "timestamp_ns": getattr(lot, "closed_at_ns", getattr(lot, "opened_at_ns", 0)),
+                    "realized_pnl_usd": float(lot.realized_pnl_usd),
+                    "cost_basis_usd": float(lot.cost_basis_usd),
+                    "roi_pct": float(lot.roi_pct),
+                    "alpha_score": float(getattr(lot, "entry_score", 0.5)),
+                    "source": str(getattr(lot, "source", "FAST_LAUNCH")),
+                }
+                for i, lot in enumerate(best_candidate.closed_lots)
+            ]
+            if len(lot_records) >= getattr(self.config, "walk_forward_min_oos_trades", 5):
+                import asyncio
+                import concurrent.futures
+                try:
+                    coro = self.walk_forward_validator.evaluate_trades_walk_forward(
+                        strategy_params=best_candidate.parameters,
+                        trade_records=lot_records,
+                    )
+                    try:
+                        asyncio.get_running_loop()
+                        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+                            wf_res = pool.submit(asyncio.run, coro).result()
+                    except RuntimeError:
+                        wf_res = asyncio.run(coro)
+
+                    if wf_res and not wf_res.is_promotable:
+                        logger.info(
+                            "Challenger %s promotion blocked by walk-forward validator: %s",
+                            best_candidate.strategy_name,
+                            wf_res.rejection_reasons,
+                        )
+                        return None
+                except Exception as wf_err:
+                    logger.warning("Error running walk-forward validation during promotion check: %s", wf_err)
+
         if best_candidate:
             # Promote best candidate to Champion!
             old_champ = self.champion
@@ -1926,7 +1966,7 @@ class AutonomousStrategyGenerator:
             regime=regime,
         )
 
-        if action == "seed_archetype" or qualified or result.total_trades >= 10:  # Allow staging in shadow mode
+        if action == "seed_archetype" or qualified:  # Only stage if qualified by out-of-sample backtest or seed
             registry.register_challenger(variant)
 
         report = {

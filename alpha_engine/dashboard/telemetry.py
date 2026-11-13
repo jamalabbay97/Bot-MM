@@ -1500,6 +1500,36 @@ class DashboardTelemetryAggregator:
                 except Exception as w_exc:
                     logger.debug("Failed querying wallet pipeline metrics: %s", w_exc)
 
+            # Phase 3 Observability: Recorder, Doctor, and Model-vs-Reality metrics
+            recorder_metrics: dict[str, Any] = {}
+            if self.runner and hasattr(self.runner, "recorder") and self.runner.recorder:
+                try:
+                    recorder_metrics = self.runner.recorder.get_stats()
+                except Exception:
+                    pass
+
+            doctor_metrics: dict[str, Any] = {"entries_blocked": False, "failure_reasons": []}
+            if self.runner and hasattr(self.runner, "is_entry_blocked_by_doctor"):
+                doctor_metrics = {
+                    "entries_blocked": self.runner.is_entry_blocked_by_doctor(),
+                    "failure_reasons": getattr(self.runner, "_doctor_failure_reasons", []),
+                }
+
+            reality_metrics: dict[str, Any] = {}
+            if self.runner and hasattr(self.runner, "reality_reporter") and hasattr(self.runner, "_fill_reality_comparisons"):
+                try:
+                    rep = self.runner.reality_reporter.generate_report(self.runner._fill_reality_comparisons)
+                    reality_metrics = {
+                        "total_fills": rep.total_fills,
+                        "mean_bias_bps": rep.mean_bias_bps,
+                        "median_bias_bps": rep.median_bias_bps,
+                        "fraction_better": rep.fraction_better_than_reality,
+                        "warning_triggered": rep.warning_triggered,
+                        "per_venue": rep.per_venue_bias,
+                    }
+                except Exception:
+                    pass
+
             snapshot = {
                 "system": sys_info,
                 "connections": conn_health,
@@ -1517,6 +1547,9 @@ class DashboardTelemetryAggregator:
                 "native_prices": native_prices_info,
                 "smart_wallet_pipeline": wallet_pipeline_metrics,
                 "wallet_pipeline": wallet_pipeline_metrics,
+                "recorder": recorder_metrics,
+                "doctor": doctor_metrics,
+                "model_vs_reality": reality_metrics,
                 "timestamp": time.time(),
             }
             self._last_metrics_cache = snapshot

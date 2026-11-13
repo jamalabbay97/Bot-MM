@@ -44,4 +44,5 @@ include = ["alpha_engine*"]
 
 [tool.pytest.ini_options]
 addopts = "-p anyio"
+pythonpath = ["."]
 

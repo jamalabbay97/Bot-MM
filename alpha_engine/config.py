@@ -1217,6 +1217,57 @@ class EngineConfig(BaseSettings):
     )
 
     # -------------------------------------------------------------------------
+    # Phase 3: Observability, Tick Recorder, Replay & Validation
+    # -------------------------------------------------------------------------
+    recorder_enabled: bool = Field(
+        default=True,
+        description="Enable real-time market tick recorder to SQLite",
+    )
+    recorder_db_path: str = Field(
+        default="market_ticks.db",
+        description="Path to SQLite tick recorder database file",
+    )
+    recorder_queue_size: int = Field(
+        default=10000,
+        ge=10,
+        description="Bounded queue size for tick recorder backpressure",
+    )
+    recorder_batch_size: int = Field(
+        default=100,
+        ge=1,
+        description="Batch size for writing ticks to SQLite",
+    )
+    recorder_flush_interval_s: float = Field(
+        default=1.0,
+        ge=0.01,
+        description="Flush interval in seconds for tick recorder background writer",
+    )
+    recorder_retention_days: int = Field(
+        default=7,
+        ge=1,
+        description="Retention period in days for recorded ticks",
+    )
+    reality_bias_warning_threshold_bps: float = Field(
+        default=25.0,
+        ge=0.0,
+        description="Warning threshold in basis points for model-vs-reality execution bias",
+    )
+    walk_forward_min_oos_trades: int = Field(
+        default=10,
+        ge=1,
+        description="Minimum out-of-sample trades required during walk-forward validation",
+    )
+    walk_forward_min_profit_factor: float = Field(
+        default=1.1,
+        ge=0.0,
+        description="Minimum out-of-sample profit factor required for walk-forward validation pass",
+    )
+    doctor_fail_closed: bool = Field(
+        default=True,
+        description="If True, any FAIL in SystemDoctor startup self-check blocks new trade entries",
+    )
+
+    # -------------------------------------------------------------------------
     # Coercion & Normalization Validators
     # -------------------------------------------------------------------------
     @field_validator("telegram_channels", mode="before")

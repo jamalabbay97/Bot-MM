@@ -289,6 +289,23 @@ To ensure realistic paper trading without historical over-fitting, the engine mo
   - **Deterministic Seeding**: All stochastic latency and MEV draws are seeded via `execution_seed` (default: 42) for reproducible simulation.
 - **Unified Engine Simulation Parity**: Live Paper (`PaperExecutor`), Shadow Tournament (`StrategyTournamentRegistry`), and Walk-Forward Optimization (`WalkForwardBacktester`) share the exact same `alpha_engine.math.mev` module and pending-fill execution assumptions.
 
+### 🏛️ Venue Support & Execution Capabilities Table
+
+The execution simulator enforces explicit fail-closed routing based on the verified venue capability matrix (`alpha_engine.pricing.venue_capabilities`):
+
+| Chain | Execution Venue | Status | Default LP Fee | CPMM Modeling & Execution Mechanics |
+| :--- | :--- | :---: | :---: | :--- |
+| **Solana (SVM)** | **Pump.fun** | **Supported** | 100 bps (1.00%) | Virtual token/SOL constant product curve, graduation to Raydium |
+| **Solana (SVM)** | **Raydium AMM (v4)** | **Supported** | 25 bps (0.25%) | Constant product $x \cdot y = k$ pool math with latency & MEV |
+| **Solana (SVM)** | **Raydium CPMM** | **Supported** | 25 bps (0.25%) | Standard constant-product fee tier with pool reserve tracking |
+| **Solana (SVM)** | **Raydium CLMM** | **Unsupported** | 25 bps | **Fail-Closed**: Concentrated liquidity tick arrays rejected |
+| **Solana (SVM)** | **Orca Whirlpool** | **Unsupported** | 30 bps | **Fail-Closed**: Concentrated liquidity tick arrays rejected |
+| **Base (EVM)** | **Uniswap v2** | **Supported** | 30 bps (0.30%) | Standard UniswapV2Pair reserves with local RPC simulation |
+| **Base (EVM)** | **Uniswap v3** | **Supported** | 30 bps (0.30%) | Standard fee tier with CPMM single-tick equivalent modeling |
+| **Base (EVM)** | **Aerodrome** | **Supported** | 30 bps (0.30%) | Volatile pool $x \cdot y = k$ reserves on Base L2 |
+
+Any order signal targeting an unsupported venue (e.g. Raydium CLMM or Orca Whirlpool) is rejected immediately with zero balance impact.
+
 ### Position Book & State Persistence
 - **PositionBook (`book.py`)**: In-memory portfolio tracking with First-In-First-Out (FIFO) tax lots, tracking realized PnL, unrealized PnL, and maximum run-up.
 - **SQLiteLedger (`ledger.py`)**: Thread-safe asynchronous SQLite database running in **WAL (Write-Ahead Logging)** mode with `synchronous = NORMAL` and 30-second busy timeout locks. Persists all fills, decisions, and periodic portfolio snapshots.
@@ -648,6 +665,19 @@ python3 -m unittest tests/test_telegram_commands_and_buttons.py
 6. `test_evm_decoders_and_normalization`: Validates ABI event unpacking.
 7. `test_position_book_fifo`: Tests FIFO accounting and running PnL calculations.
 8. `test_sqlite_ledger_persistence`: Validates SQLite WAL mode transactions and concurrency.
+
+---
+
+## ⚠️ Known Limitations & Unverified Items
+
+In adherence to the Anti-Shallow Contract and truthful engineering standards, the following aspects are explicitly documented as **UNVERIFIED** or subject to operational constraints:
+
+1. **Simulation-Only Execution (No Live Orders)**: Real on-chain order placement and transaction submission (RPC `sendTransaction`) are intentionally NOT implemented in this engine. The engine operates purely as a paper trading, backtesting, and market analytics system. Live private key execution must not be enabled without separate custodial infrastructure.
+2. **Private Route Assumption**: When `is_private_route=True` is configured, MEV frontrun drag is modeled as 0 bps under the assumption that Jito bundles (Solana) or Flashbots/Titan builders (Base) protect against public mempool visibility. Under severe RPC network congestion or bundle landing misses, real transactions would experience public fallback or drop.
+3. **Concentrated Liquidity (CLMM) Approximations**: Pools utilizing concentrated liquidity (Raydium CLMM, Uniswap v3 full tick arrays) are either rejected fail-closed or evaluated under single-tick CPMM assumptions. Fills crossing tick boundaries are not modeled.
+4. **Off-Chain Price Service Fallback**: During multi-source price aggregation, if external API quotes (DexScreener, GeckoTerminal, DeFiLlama) become unavailable, the engine fails closed unless static price fallbacks are explicitly enabled for testing.
+5. **LLM Advisory Fallback**: If LLM provider APIs (Gemini, Claude, DeepSeek) experience rate limits or downtime, the Council automatically falls back to deterministic rule-based heuristics (`deterministic_fallback=True`), explicitly tagged in telemetry and decision ticks.
+6. **Multi-Hop Route Optimization**: Cross-pool aggregators (Jupiter on Solana, 1inch on Base) are represented via spot quotes and single-pool equivalents rather than multi-leg atomic bundle execution.
 
 ---
 

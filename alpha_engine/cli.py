@@ -11,6 +11,7 @@ import asyncio
 import logging
 import os
 import sys
+from decimal import Decimal
 
 from alpha_engine.config import EngineConfig
 from alpha_engine.engine.runner import PaperTradingEngine, _build_example_config
@@ -82,6 +83,28 @@ def main(args: list[str] | None = None) -> int:
         "--doctor",
         action="store_true",
         help="Run system doctor diagnostics",
+    )
+    parser.add_argument(
+        "--replay",
+        action="store_true",
+        help="Re-run deterministic simulation replay against recorded SQLite market ticks",
+    )
+    parser.add_argument(
+        "--replay-db",
+        type=str,
+        default=None,
+        help="Custom path to tick recorder SQLite database for replay",
+    )
+    parser.add_argument(
+        "--replay-seed",
+        type=int,
+        default=None,
+        help="Explicit random seed for deterministic replay execution",
+    )
+    parser.add_argument(
+        "--reality-report",
+        action="store_true",
+        help="Generate simulator Model-vs-Reality execution fidelity and bias report",
     )
     parser.add_argument(
         "--swarm",
@@ -194,12 +217,69 @@ def main(args: list[str] | None = None) -> int:
         from alpha_engine.chat_interface import cli_chat
         return asyncio.run(cli_chat(config.db_path))
 
-    if parsed.doctor:
-        from alpha_engine.reach.doctor import SystemDoctor
-        doctor = SystemDoctor()
-        report = asyncio.run(doctor.run_diagnostics())
-        print(doctor.format_cli_summary(report))
+    if parsed.replay:
+        from alpha_engine.observability.replay import ReplayEngine
+        db_p = parsed.replay_db or config.recorder_db_path
+        seed = parsed.replay_seed if parsed.replay_seed is not None else config.execution_seed
+        engine = ReplayEngine(tick_db_path=db_p, config=config, seed=seed)
+        print(f"\n=== 🔄 Running Deterministic Market Replay on {db_p} (Seed: {seed}) ===")
+        res = asyncio.run(engine.run_replay())
+        print(f"Total Events Processed: {res.total_events_processed}")
+        print(f"Signals Evaluated: {res.signals_evaluated} | Orders Executed: {res.orders_executed} | Rejected: {res.orders_rejected}")
+        print(f"Fills Captured: {len(res.fills)} | Duration: {res.replay_duration_s:.2f}s")
+        if res.rejection_reasons:
+            print("Rejections Breakdown:")
+            for r_name, r_cnt in res.rejection_reasons.items():
+                print(f"  • {r_name}: {r_cnt}")
         return 0
+
+    if parsed.reality_report:
+        from alpha_engine.observability.model_vs_reality import ModelVsRealityReporter, FillRealityComparison
+        from alpha_engine.observability.recorder import MarketTickRecorder
+        from alpha_engine.execution.ledger import SQLiteLedger
+        
+        async def _run_report():
+            recorder = MarketTickRecorder(db_path=config.recorder_db_path)
+            ledger = SQLiteLedger(config.db_path)
+            async with ledger:
+                trades = await ledger.get_closed_trades_dataset(lookback_hours=168.0, limit=5000)
+                comparisons: list[FillRealityComparison] = []
+                for t in trades:
+                    tok = t.get("token_address")
+                    fill_p = Decimal(str(t.get("effective_price") or t.get("buy_price") or 0))
+                    ts_ns = int(t.get("signal_timestamp_ns") or t.get("opened_at_ns") or 0)
+                    if tok and fill_p > 0 and ts_ns > 0:
+                        obs = recorder.get_observed_market_state(tok, ts_ns)
+                        if obs and "spot_price" in obs:
+                            from alpha_engine.models.enums import ExecutionVenue, OrderSide
+                            from alpha_engine.observability.replay import _parse_venue
+                            v_str = t.get("platform") or t.get("venue") or "RAYDIUM_AMM"
+                            venue = _parse_venue(v_str)
+                            side = OrderSide.BUY if str(t.get("side", "buy")).lower() == "buy" else OrderSide.SELL
+                            comparisons.append(FillRealityComparison(
+                                trade_id=str(t.get("trade_id", "")),
+                                venue=venue,
+                                side=side,
+                                size_usd=Decimal(str(t.get("cost_basis_usd") or 20.0)),
+                                modeled_fill_price=fill_p,
+                                observed_market_price=Decimal(str(obs["spot_price"])),
+                                timestamp_ns=ts_ns,
+                            ))
+                reporter = ModelVsRealityReporter(bias_warning_threshold_bps=config.reality_bias_warning_threshold_bps)
+                rep = reporter.generate_report(comparisons)
+                print(rep.format_cli_summary())
+                return 0
+
+        return asyncio.run(_run_report())
+
+    if parsed.doctor:
+        from alpha_engine.observability.doctor import SystemDoctor, CheckStatus
+        from alpha_engine.observability.recorder import MarketTickRecorder
+        rec = MarketTickRecorder(db_path=config.recorder_db_path)
+        doctor = SystemDoctor(config=config, recorder=rec)
+        report = asyncio.run(doctor.run_full_diagnostics())
+        print(doctor.format_cli_table(report))
+        return 0 if report.overall_status != CheckStatus.FAIL else 1
 
     if parsed.decisions:
         import sqlite3
@@ -238,7 +318,6 @@ def main(args: list[str] | None = None) -> int:
         return 0
 
     if parsed.audit:
-        from decimal import Decimal
         from alpha_engine.engine.ai_supervisor import AlphaSupervisorAI
         from alpha_engine.models.enums import ChainIdentifier, OrderSide, SignalStrength
         from alpha_engine.models.events import SignalEvent

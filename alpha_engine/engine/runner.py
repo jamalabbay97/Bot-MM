@@ -58,6 +58,16 @@ from alpha_engine.execution.executor import PaperExecutor
 from alpha_engine.execution.ledger import SQLiteLedger
 from alpha_engine.tracer import tracer
 from alpha_engine.models.observability import TraceStage, TraceStatus
+from alpha_engine.observability import (
+    CheckStatus,
+    DoctorResult,
+    FillRealityComparison,
+    MarketTickRecorder,
+    ModelRealityReport,
+    ModelVsRealityReporter,
+    SystemDoctor,
+    WalkForwardValidator,
+)
 from alpha_engine.ingestion.coordinator import IngestionCoordinator
 from alpha_engine.ingestion.market_oracle import MarketOracle
 from alpha_engine.logging_config import setup_production_logging
@@ -425,6 +435,63 @@ class PaperTradingEngine:
             port=dashboard_port,
             aggregator=self.dashboard_telemetry,
         )
+
+        # Phase 3 Observability: Tick Recorder, System Doctor & Reality Reporter
+        self._recorder: Optional[MarketTickRecorder] = None
+        if getattr(config, "recorder_enabled", True):
+            self._recorder = MarketTickRecorder(
+                db_path=getattr(config, "recorder_db_path", "market_ticks.db"),
+                queue_size=getattr(config, "recorder_queue_size", 10000),
+                batch_size=getattr(config, "recorder_batch_size", 100),
+                flush_interval_s=getattr(config, "recorder_flush_interval_s", 1.0),
+                retention_days=getattr(config, "recorder_retention_days", 7),
+            )
+
+        self._doctor: SystemDoctor = SystemDoctor(
+            config=config,
+            price_service=self._native_price_service,
+            recorder=self._recorder,
+        )
+        self._reality_reporter: ModelVsRealityReporter = ModelVsRealityReporter(
+            bias_warning_threshold_bps=getattr(config, "reality_bias_warning_threshold_bps", 25.0),
+        )
+        self._entries_blocked: bool = False
+        self._doctor_failure_reasons: list[str] = []
+        self._fill_reality_comparisons: list[FillRealityComparison] = []
+        self._last_doctor_result: Optional[DoctorResult] = None
+        self._last_reality_report: Optional[ModelRealityReport] = None
+
+    def is_entry_blocked_by_doctor(self) -> bool:
+        """Check if new trading entries are blocked by SystemDoctor diagnostic check."""
+        return self._entries_blocked
+
+    @property
+    def last_doctor_result(self) -> Optional[DoctorResult]:
+        """Last diagnostic result from SystemDoctor."""
+        return self._last_doctor_result
+
+    @property
+    def last_reality_report(self) -> Optional[ModelRealityReport]:
+        """Last generated model-vs-reality execution fidelity report."""
+        return self._last_reality_report
+
+    def generate_reality_report(self) -> ModelRealityReport:
+        """Generate and cache the latest ModelRealityReport from accumulated fills."""
+        report: ModelRealityReport = self._reality_reporter.generate_report(self._fill_reality_comparisons)
+        self._last_reality_report = report
+        return report
+
+    @property
+    def recorder(self) -> Optional[MarketTickRecorder]:
+        return self._recorder
+
+    @property
+    def doctor(self) -> SystemDoctor:
+        return self._doctor
+
+    @property
+    def reality_reporter(self) -> ModelVsRealityReporter:
+        return self._reality_reporter
 
     @property
     def wallet_pipeline(self) -> SmartMoneyPipeline:
@@ -3436,6 +3503,8 @@ class PaperTradingEngine:
             if isinstance(item, PoolStateUpdateEvent):
                 self._pool_registry.set(item.pool_address, item.new_pool_state)
                 self._metrics_aggregator.record_pool_state(item.new_pool_state)
+                if self._recorder is not None:
+                    self._recorder.record_pool_tick(item.new_pool_state, provenance="ingestion_stream")
                 logger.debug(
                     "Pool registry refreshed from Sync: pool=%s native=%s",
                     item.pool_address[:10],
@@ -3514,6 +3583,8 @@ class PaperTradingEngine:
                 continue
 
             swap: SwapEvent = item
+            if self._recorder is not None:
+                self._recorder.record_swap_tick(swap, provenance="ingestion_stream")
 
             out_is_native = is_blacklisted_token(swap.token_out, swap.chain)
             in_is_native = is_blacklisted_token(swap.token_in, swap.chain)
@@ -4587,6 +4658,22 @@ class PaperTradingEngine:
             is_new_launch = self._is_new_launch_signal(signal_item)
             sizing_res = None
             preliminary_cost = None
+
+            # Doctor entry gate: fail-closed if doctor reported critical failure
+            if self.is_entry_blocked_by_doctor():
+                logger.warning(
+                    "Signal %s for %s blocked: System doctor self-check failed (%s)",
+                    getattr(signal_item, "signal_id", "unknown"),
+                    getattr(signal_item, "token_address", "")[:10],
+                    ", ".join(self._doctor_failure_reasons),
+                )
+                self.telemetry.increment("doctor_check_failed")
+                continue
+
+            # Record signal tick to tick recorder
+            if self._recorder is not None:
+                src_val = signal_item.source.value if hasattr(signal_item.source, "value") else str(signal_item.source)
+                self._recorder.record_signal_tick(signal_item, provenance=src_val)
 
             if signal_item.suggested_side == OrderSide.BUY:
                 is_direct_dm = bool(getattr(signal_item, "is_direct_dm", False)) or (
@@ -6778,6 +6865,31 @@ class PaperTradingEngine:
             self.tracer.ledger = self._ledger
             self.tracer.start_worker()
             await self._native_price_service.start()
+            if self._recorder is not None:
+                await self._recorder.start()
+
+            # Execute SystemDoctor Startup Self-Check
+            doc_res: DoctorResult = await self._doctor.run_full_diagnostics()
+            self._last_doctor_result = doc_res
+            logger.info("Doctor diagnostics:\n%s", self._doctor.format_cli_table(doc_res))
+            if (doc_res.has_critical_failure or doc_res.overall_status == CheckStatus.FAIL) and getattr(self.config, "doctor_fail_closed", True):
+                self._entries_blocked = True
+                self._doctor_failure_reasons = doc_res.failed_checks
+                logger.critical(
+                    "PaperTradingEngine: SystemDoctor reported critical failure on [%s]. New trade entries BLOCKED fail-closed!",
+                    ", ".join(doc_res.failed_checks),
+                )
+            else:
+                self._entries_blocked = False
+                self._doctor_failure_reasons = []
+
+            # Wire walk_forward_validator to strategy tournament
+            if hasattr(self, "_strategy_tournament") and self._strategy_tournament is not None:
+                self._strategy_tournament.walk_forward_validator = WalkForwardValidator(
+                    ledger=self._ledger,
+                    min_oos_trades=getattr(self.config, "walk_forward_min_oos_trades", 5),
+                    min_oos_profit_factor=getattr(self.config, "walk_forward_min_profit_factor", 1.10),
+                )
             await self._sync_ledger_settings()
 
             # Restore open lots from ledger to prevent state loss across restarts
@@ -7164,6 +7276,11 @@ class PaperTradingEngine:
                         await self._native_price_service.stop()
                     except Exception:
                         pass
+                    if self._recorder is not None:
+                        try:
+                            await self._recorder.stop()
+                        except Exception:
+                            pass
                     await ledger.checkpoint()
 
         logger.info(

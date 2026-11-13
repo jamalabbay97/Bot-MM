@@ -559,12 +559,44 @@ Track progress across all identified defects and phases. All items must satisfy 
 ---
 
 ## Phase 3 Tick recorder, replay, walk-forward, model-vs-reality report, README truthfulness
-- [ ] reproduced
-- [ ] red test
-- [ ] fix
-- [ ] green test
-- [ ] mutation check
-- [ ] sweep done
-- [ ] wiring proof
-- [ ] README/docs updated
-
+- [x] reproduced
+  - Prior state lacked historical tick recording from real ingestion; replay was not implemented against recorded SQLite events; generated strategies lacked out-of-sample walk-forward validation prior to promotion; simulator execution bias (modeled fill vs observed market) was not quantified; startup dependencies (RPC, DB, price service, LLM, quotas, venue capabilities) were not verified at boot fail-closed; README contained stale claims and lacked explicit UNVERIFIED limitation disclaimers.
+- [x] red test
+  - Created `tests/test_phase3_observability_and_validation.py` (6 tests with zero network mocks where appropriate):
+    1. `test_tick_recorder_writes_from_ingestion_and_handles_backpressure`: Pool states, swaps, quotes, native prices, security reports, signals, and decisions written to WAL SQLite; backpressure triggers non-blocking drops with counters.
+    2. `test_replay_reproduces_session_deterministically_and_matches_live_paper`: ReplayEngine reproduces identical fills, effective prices, slippage, latency, and PnL given the same seed, reusing `PaperExecutor`, `TradeCostModel`, and `RiskEngine`.
+    3. `test_walk_forward_rejects_overfit_strategy`: WalkForwardValidator splits historical time series into in-sample / out-of-sample segments and rejects an overfit candidate strategy that won in-sample but bleeds out-of-sample, persisting results to ledger.
+    4. `test_model_vs_reality_report_computes_bias_and_triggers_warning`: ModelVsRealityReporter computes signed bias in bps, fraction of fills better than reality, per-venue and per-size breakdowns, and triggers WARNING when bias exceeds configured threshold.
+    5. `test_doctor_fails_and_blocks_entries_on_missing_dependency`: SystemDoctor verifies price service, RPCs, DB writability, recorder, quotas, and venue capabilities; fails closed and blocks new runner trade entries when a dependency is offline.
+    6. `test_readme_claims_audit_passes`: Audit tool `tools/audit/readme_claims.py` checks latency ranges, fee schedules, Kelly fractions, venue capabilities, and limitations against EngineConfig defaults.
+- [x] fix
+  - `alpha_engine/observability/recorder.py`: Implemented `MarketTickRecorder` with separate SQLite WAL database, bounded async queue, batch flusher, retention pruning, query methods (`get_ticks_stream`, `get_observed_market_state`).
+  - `alpha_engine/observability/replay.py`: Implemented `ReplayEngine` with deterministic random seed, reusing `PaperExecutor`, `TradeCostModel`, `RiskEngine`, `PoolRegistry`, and deterministic fallback council labeling.
+  - `alpha_engine/observability/walk_forward.py`: Implemented `WalkForwardValidator` with rolling train/validation splits, calculating in-sample / out-of-sample Profit Factor, Net PnL, Drawdown, Sortino, and rejection gates (`is_promotable`).
+  - `alpha_engine/observability/model_vs_reality.py`: Implemented `ModelVsRealityReporter` computing execution model bias vs subsequently observed ticks, per-venue and per-size breakdowns, and CLI / dashboard reporting with warning alerts.
+  - `alpha_engine/observability/doctor.py`: Implemented `SystemDoctor` running startup self-checks on price service, Gemini LLM, Solana RPC, Base RPC, SQLite WAL ledger DB, tick recorder, developer quotas, and venue capability tables; formatting PASS/WARN/FAIL CLI tables and blocking entries fail-closed on FAIL.
+  - `alpha_engine/execution/ledger.py`: Added `walk_forward_validations` table and query methods.
+  - `alpha_engine/engine/experimentation.py`: Extended strategy promotion gate to require out-of-sample qualification via `WalkForwardValidator`.
+  - `alpha_engine/engine/runner.py`:
+    - Wired `MarketTickRecorder` directly to real ingestion queue (`_process_ingestion_queue`) for pool states and DEX swaps, and signal queue (`_process_signal_queue`) for signals, decisions, and fills.
+    - Wired `SystemDoctor` into startup cycle and gated new entry signal processing on `is_entry_blocked_by_doctor()`.
+    - Integrated `WalkForwardValidator` into tournament evaluation.
+    - Added model-vs-reality comparisons recording.
+  - `alpha_engine/cli.py`: Added `--doctor`, `--replay`, `--replay-db`, `--replay-seed`, `--reality-report`.
+  - `alpha_engine/dashboard/telemetry.py`: Added recorder stats, doctor diagnostics, and model-vs-reality metrics to the telemetry snapshot.
+  - `README.md`: Added Venue Support & Execution Capabilities Table (documenting fail-closed rejection for Raydium CLMM and Orca Whirlpool), corrected fee and latency documentation, and added "Known Limitations & Unverified Items" section.
+  - `tools/audit/readme_claims.py`: AST/regex script verifying README fidelity against `EngineConfig`.
+- [x] green test
+  - `tests/test_phase3_observability_and_validation.py`: 6/6 passed in 3.74s.
+  - `tools/audit/readme_claims.py`: 0 findings (all claims verified against code defaults).
+  - `tests/test_issue*.py`: 100/100 passed in 53.72s.
+- [x] mutation check
+  - Mutated `WalkForwardValidator` by forcing `is_promotable = True`: verified `test_walk_forward_rejects_overfit_strategy` failed with `AssertionError: Overfit strategy failing OOS must be rejected fail-closed`. Reverted and verified green.
+  - Mutated `MarketTickRecorder._enqueue` by swallowing queue overflow without incrementing drop counter: verified `test_tick_recorder_writes_from_ingestion_and_handles_backpressure` failed with `AssertionError: Backpressure must drop excess items when queue is full: assert 0 > 0`. Reverted and verified green.
+- [x] sweep done
+  - Full codebase sweep confirmed no leftover stubs; replay engine reuses genuine `PaperExecutor` and `TradeCostModel`; recorder operates on bounded queue with non-blocking backpressure; doctor checks real network and database endpoints fail-closed.
+- [x] wiring proof
+  - Recorder Ingestion Wiring: `runner._process_ingestion_queue` -> writes `pool_ticks` and `swap_ticks` via `self._recorder.record_pool_tick` and `record_swap_tick`. In `_process_signal_queue` -> writes `signal_ticks`, `decision_ticks`, `quote_ticks` and records `FillRealityComparison`.
+  - Replay Call Graph: `cli.py` (`--replay`) -> `ReplayEngine.run_replay` -> reads `MarketTickRecorder.get_ticks_stream` -> reconstructs signals -> checks candidate strategy entry rules -> sizes via `RiskEngine.calculate_order_size` -> executes via `PaperExecutor.execute_signal` with seeded RNG -> matches live paper deterministic mechanics.
+- [x] README/docs updated
+  - README updated with Venue Support & Execution Capabilities Table and Known Limitations & Unverified Items; `PROGRESS.md` updated with Phase 3 complete.

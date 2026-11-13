@@ -354,6 +354,23 @@ class SQLiteLedger:
     )
     """
 
+    _CREATE_WALK_FORWARD_VALIDATIONS = """
+    CREATE TABLE IF NOT EXISTS walk_forward_validations (
+        validation_id       TEXT PRIMARY KEY,
+        strategy_name       TEXT NOT NULL,
+        is_promotable       INTEGER NOT NULL,
+        in_sample_trades    INTEGER NOT NULL,
+        in_sample_pf        REAL NOT NULL,
+        in_sample_pnl       REAL NOT NULL,
+        oos_trades          INTEGER NOT NULL,
+        oos_pf              REAL NOT NULL,
+        oos_pnl             REAL NOT NULL,
+        oos_mdd             REAL NOT NULL,
+        rejections_json     TEXT NOT NULL,
+        created_at          REAL NOT NULL
+    )
+    """
+
     def __init__(
         self,
         db_path: str | Path = "paper_trading.db",
@@ -428,6 +445,9 @@ class SQLiteLedger:
         await conn.execute(self._CREATE_AGENT_DELIBERATION_LOGS)
         await conn.execute(self._CREATE_STRATEGY_GENERATION_LOGS)
         await conn.execute(self._CREATE_COUNCIL_AGENT_WEIGHTS)
+        await conn.execute(self._CREATE_WALK_FORWARD_VALIDATIONS)
+        await conn.execute("CREATE INDEX IF NOT EXISTS idx_wf_val_strategy ON walk_forward_validations(strategy_name);")
+        await conn.execute("CREATE INDEX IF NOT EXISTS idx_wf_val_ts ON walk_forward_validations(created_at DESC);")
         await conn.execute("CREATE INDEX IF NOT EXISTS idx_strategy_gen_name ON strategy_generation_logs(strategy_name);")
         await conn.execute("CREATE INDEX IF NOT EXISTS idx_strategy_gen_ts ON strategy_generation_logs(created_at DESC);")
         await conn.execute("CREATE INDEX IF NOT EXISTS idx_token_requests_token ON token_requests(token_address);")
@@ -2053,6 +2073,85 @@ class SQLiteLedger:
                 "shrunk_accuracy": float(r["shrunk_accuracy"]),
                 "updated_at_ns": int(r["updated_at_ns"]),
             }
+        return result
+
+
+
+    @sqlite_retry(max_retries=5, base_delay=0.1)
+    async def record_walk_forward_validation(
+        self,
+        validation_id: str,
+        strategy_name: str,
+        is_promotable: bool,
+        in_sample_trades: int,
+        in_sample_pf: float,
+        in_sample_pnl: float,
+        oos_trades: int,
+        oos_pf: float,
+        oos_pnl: float,
+        oos_mdd: float,
+        rejections: list[str],
+    ) -> None:
+        """Persist walk-forward rolling validation audit record."""
+        conn = self._conn
+        if conn is None:
+            return
+        await conn.execute(
+            """
+            INSERT OR REPLACE INTO walk_forward_validations (
+                validation_id, strategy_name, is_promotable,
+                in_sample_trades, in_sample_pf, in_sample_pnl,
+                oos_trades, oos_pf, oos_pnl, oos_mdd,
+                rejections_json, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+            """,
+            (
+                validation_id,
+                strategy_name,
+                1 if is_promotable else 0,
+                in_sample_trades,
+                float(in_sample_pf),
+                float(in_sample_pnl),
+                oos_trades,
+                float(oos_pf),
+                float(oos_pnl),
+                float(oos_mdd),
+                json.dumps(rejections),
+                time.time(),
+            ),
+        )
+        await conn.commit()
+
+    @sqlite_retry(max_retries=5, base_delay=0.1)
+    async def get_walk_forward_validations(
+        self,
+        strategy_name: Optional[str] = None,
+        limit: int = 50,
+    ) -> list[dict[str, Any]]:
+        """Retrieve recent walk-forward validation audit records."""
+        conn = self._conn
+        if conn is None:
+            return []
+        conn.row_factory = aiosqlite.Row
+        if strategy_name:
+            cursor = await conn.execute(
+                "SELECT * FROM walk_forward_validations WHERE strategy_name = ? ORDER BY created_at DESC LIMIT ?;",
+                (strategy_name, limit),
+            )
+        else:
+            cursor = await conn.execute(
+                "SELECT * FROM walk_forward_validations ORDER BY created_at DESC LIMIT ?;",
+                (limit,),
+            )
+        rows = await cursor.fetchall()
+        result = []
+        for r in rows:
+            d = dict(r)
+            try:
+                d["rejections"] = json.loads(d["rejections_json"])
+            except Exception:
+                d["rejections"] = []
+            result.append(d)
         return result
 
 
