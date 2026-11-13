@@ -44,7 +44,11 @@ class BacktestTradeRecord:
     roi_pct: float
     timestamp_ns: int
     alpha_score: float = 0.5
+    top10_concentration: float = 0.15
     peak_multiplier: float = 1.0
+    is_new_launch: int = 0
+    price_impact_bps: int = 50
+    strategy_name: str = ""
     extra_metadata: Optional[Dict[str, Any]] = None
     native_spent_decimal: Optional[Decimal] = None
 
@@ -142,8 +146,17 @@ class WalkForwardBacktester:
             con = sqlite3.connect(self.db_path)
             cur = con.cursor()
 
+            cols = [col[1].lower() for col in cur.execute("PRAGMA table_info(trades)").fetchall()]
+            has_strategy_name = "strategy_name" in cols
+            has_is_new_launch = "is_new_launch" in cols
+            has_price_impact = "price_impact_bps" in cols
+
+            strat_col = "COALESCE(b.strategy_name, '')" if has_strategy_name else "''"
+            launch_col = "COALESCE(b.is_new_launch, 0)" if has_is_new_launch else "0"
+            impact_col = "COALESCE(b.price_impact_bps, 50)" if has_price_impact else "50"
+
             # Query historical buy trades paired with exit sell trades
-            query = """
+            query = f"""
                 SELECT 
                     b.trade_id, b.signal_id, b.token_address, b.chain,
                     b.effective_price as buy_price,
@@ -151,7 +164,11 @@ class WalkForwardBacktester:
                     b.native_spent as buy_spent,
                     s.realized_pnl_usd,
                     b.signal_timestamp_ns,
-                    sig.alpha_score
+                    sig.alpha_score,
+                    COALESCE(sig.top10_concentration, 0.15),
+                    {launch_col},
+                    {impact_col},
+                    {strat_col}
                 FROM trades b
                 JOIN trades s ON b.token_address = s.token_address AND LOWER(s.side) = 'sell'
                 LEFT JOIN signals sig ON b.signal_id = sig.signal_id
@@ -163,16 +180,31 @@ class WalkForwardBacktester:
             rows = cur.fetchall()
             con.close()
 
+            from alpha_engine.models.enums import ChainIdentifier
             records = []
             for r in rows:
-                trade_id, sig_id, token_addr, ch, buy_p, sell_p, nat_spent, pnl_usd, sig_ts, alpha = r
+                trade_id, sig_id, token_addr, ch, buy_p, sell_p, nat_spent, pnl_usd, sig_ts, alpha, top10, is_new_launch, price_impact, strat_name = r
                 buy_p_val = float(buy_p or 0.0)
                 sell_p_val = float(sell_p or 0.0)
                 nat_val = float(nat_spent or 0.0)
                 pnl_val = float(pnl_usd or 0.0)
-                cost_usd = nat_val * (200.0 if "solana" in str(ch).lower() else 2600.0)
+
+                chain_enum = (
+                    ChainIdentifier.SOLANA_MAINNET
+                    if "solana" in str(ch).lower()
+                    else ChainIdentifier.BASE_MAINNET
+                )
+                native_price = None
+                if hasattr(self.cost_model, "_price_service") and self.cost_model._price_service:
+                    p_res = self.cost_model._price_service.get_price(chain_enum)
+                    if getattr(p_res, "price", None):
+                        native_price = float(p_res.price)
+                if not native_price:
+                    native_price = float(getattr(self.config, "sol_price_usd", 200.0)) if chain_enum == ChainIdentifier.SOLANA_MAINNET else float(getattr(self.config, "eth_price_usd", 2600.0))
+
+                cost_usd = nat_val * native_price
                 if cost_usd <= 0.0:
-                    cost_usd = 20.0 # Default $20 trade
+                    cost_usd = 20.0  # Default $20 trade
                 roi = (pnl_val / cost_usd * 100.0) if cost_usd > 0 else 0.0
                 peak_mult = 1.0 + max(0.0, roi / 100.0) * 1.3
 
@@ -189,7 +221,11 @@ class WalkForwardBacktester:
                     roi_pct=roi,
                     timestamp_ns=int(sig_ts or 0),
                     alpha_score=float(alpha or 0.5),
+                    top10_concentration=float(top10 or 0.15),
                     peak_multiplier=peak_mult,
+                    is_new_launch=int(is_new_launch or 0),
+                    price_impact_bps=int(price_impact or 50),
+                    strategy_name=str(strat_name or ""),
                 )
                 records.append(rec)
 
@@ -224,11 +260,102 @@ class WalkForwardBacktester:
                 rejection_reasons=["NO_HISTORICAL_DATA"],
             )
 
-        # Filter by minimum entry score
-        qualifying_trades = [
-            t for t in trades
-            if (t.alpha_score * 100.0) >= params.min_entry_score
-        ]
+        # Filter by minimum entry score and declarative entry rules
+        from alpha_engine.models.enums import (
+            ChainIdentifier,
+            OrderSide,
+            SecurityTier,
+            SignalSource,
+            SignalStrength,
+        )
+        from alpha_engine.models.events import SignalEvent
+        from alpha_engine.models.state import PoolState, SecurityReport
+
+        qualifying_trades = []
+        for t in trades:
+            score_100 = t.alpha_score * 100.0
+            if score_100 < params.min_entry_score:
+                continue
+
+            chain_enum = (
+                ChainIdentifier.SOLANA_MAINNET
+                if "solana" in str(t.chain).lower()
+                else ChainIdentifier.BASE_MAINNET
+            )
+
+            # Map trade to simulated signal source
+            is_launch = getattr(t, "is_new_launch", 0)
+            strat_str = getattr(t, "strategy_name", "").lower()
+            if is_launch:
+                sig_source = SignalSource.RAYDIUM_NEW_POOL if chain_enum == ChainIdentifier.SOLANA_MAINNET else SignalSource.PAIR_CREATED
+            elif "wave2" in strat_str:
+                sig_source = SignalSource.WAVE2_BREAKOUT
+            elif "revival" in strat_str:
+                sig_source = SignalSource.REVIVAL_BREAKOUT
+            elif "smart" in strat_str or "whale" in strat_str:
+                sig_source = SignalSource.WHALE_WALLET
+            elif "narrative" in strat_str or "meme" in strat_str:
+                sig_source = SignalSource.MEME_RADAR_BURST
+            else:
+                sig_source = SignalSource.DEX_SWAP
+
+            if params.allowed_sources:
+                sig_val = sig_source.value if hasattr(sig_source, "value") else str(sig_source)
+                source_matched = any(
+                    sig_val.lower() == (s.value if hasattr(s, "value") else str(s)).lower()
+                    for s in params.allowed_sources
+                )
+                if not source_matched and not (sig_source == SignalSource.DEX_SWAP and any((s.value if hasattr(s, "value") else str(s)).lower() == "dex_swap" for s in params.allowed_sources)):
+                    continue
+
+            # Evaluate declarative entry rules if present
+            if hasattr(params, "entry_rules") and params.entry_rules and params.entry_rules.conditions:
+                pool_mock = PoolState(
+                    pool_address="PoolBacktest11111111111111111111111111111",
+                    chain=chain_enum,
+                    native_reserve=Decimal("50.0"),
+                    token_reserve=Decimal("1000000.0"),
+                    spot_price_native_per_token=Decimal("0.00005"),
+                    fee_numerator=25,
+                    fee_denominator=10000,
+                    last_updated_block=1000,
+                )
+                sec_mock = SecurityReport(
+                    token_address=t.token_address,
+                    chain=chain_enum,
+                    tier=SecurityTier.CLEAN,
+                    is_honeypot=False,
+                    buy_tax_bps=0,
+                    sell_tax_bps=0,
+                    top10_concentration=t.top10_concentration,
+                    audit_passed=True,
+                )
+                t_hash = abs(hash(t.trade_id))
+                mcap = Decimal(str(max(5000.0, t.cost_basis_usd * 2000.0)))
+                net_buy = min(0.95, max(0.25, 0.45 + (t.alpha_score * 0.45)))
+                surge = max(1.2, 1.0 + (t.alpha_score * 3.5) + ((t_hash % 20) / 10.0))
+                dormancy = 1.0 + ((t_hash % 100) / 4.0)
+
+                sig_mock = SignalEvent(
+                    timestamp_ns=t.timestamp_ns or time.time_ns(),
+                    chain=chain_enum,
+                    pool_address="PoolBacktest11111111111111111111111111111",
+                    token_address=t.token_address,
+                    suggested_side=OrderSide.BUY,
+                    pool_state=pool_mock,
+                    strength=SignalStrength.STRONG if t.alpha_score >= 0.70 else SignalStrength.MODERATE,
+                    alpha_score=t.alpha_score,
+                    source=sig_source,
+                    security_report=sec_mock,
+                    market_cap_usd=mcap,
+                    net_buy_delta=net_buy,
+                    volume_surge_multiplier=surge,
+                    consolidation_length_hours=dormancy,
+                )
+                if not params.entry_rules.evaluate(signal=sig_mock, pool=pool_mock):
+                    continue
+
+            qualifying_trades.append(t)
 
         # Re-evaluate each trade under strategy exit rules
         simulated_trades: list[Tuple[float, float]] = [] # list of (pnl_usd, roi_pct)
@@ -262,7 +389,7 @@ class WalkForwardBacktester:
             round_trip_fee_pct = float(self.cost_model.get_venue_fee_pct(venue) * Decimal(2))
 
             # Latency and conditional MEV drag simulation
-            lat_ms = sample_fill_latency(chain=chain, config=self.config, rng=self.rng)
+            sample_fill_latency(chain=chain, config=self.config, rng=self.rng)
             is_private = getattr(self.config, "default_is_private_route", False)
             sim_native_reserve = Decimal(str(t.native_spent * 100)) if t.native_spent > 0 else Decimal("100.0")
             dummy_pool = PoolState(

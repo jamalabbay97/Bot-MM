@@ -27,6 +27,16 @@ from alpha_engine.math.mev import simulate_latency
 from alpha_engine.models.enums import ChainIdentifier, LotStatus, OrderSide, SignalSource
 from alpha_engine.models.events import SignalEvent
 from alpha_engine.models.state import PoolState
+from alpha_engine.engine.rules import (
+    ComparisonOperator,
+    EntryRuleSet,
+    LogicalOperator,
+    METRIC_REGISTRY,
+    RuleCondition,
+    RuleGroup,
+    SchemaValidationError,
+    resolve_canonical_metric,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -63,7 +73,7 @@ class StrategyParameters:
     regime_affinity: Optional[MarketRegime] = None
     extra_params: Dict[str, Any] = field(default_factory=dict)
     allowed_sources: Optional[List[SignalSource]] = None
-    custom_filter: Optional[Callable[[SignalEvent], bool]] = None
+    entry_rules: EntryRuleSet = field(default_factory=EntryRuleSet)
 
     def to_dict(self) -> dict[str, Any]:
         d = asdict(self)
@@ -71,8 +81,7 @@ class StrategyParameters:
             d["regime_affinity"] = self.regime_affinity.value
         if self.allowed_sources:
             d["allowed_sources"] = [s.value if hasattr(s, "value") else str(s) for s in self.allowed_sources]
-        if "custom_filter" in d:
-            d.pop("custom_filter", None)
+        d["entry_rules"] = self.entry_rules.to_dict()
         return d
 
     @classmethod
@@ -81,6 +90,33 @@ class StrategyParameters:
         reg_enum = MarketRegime(reg) if reg and reg in MarketRegime._value2member_map_ else None
         sources = data.get("allowed_sources")
         sources_list = [SignalSource(s) for s in sources if s in SignalSource._value2member_map_] if sources else None
+        
+        # Load entry rules if present, or translate legacy extra_params keys
+        rules_data = data.get("entry_rules")
+        if rules_data:
+            rules = EntryRuleSet.from_dict(rules_data)
+        else:
+            rules = EntryRuleSet()
+            extra = data.get("extra_params", {})
+            conds = []
+            if "max_mcap_usd" in extra:
+                conds.append(RuleCondition("mcap_usd", ComparisonOperator.LTE, float(extra["max_mcap_usd"])))
+            if "min_net_buy_delta" in extra:
+                conds.append(RuleCondition("net_buy_delta", ComparisonOperator.GTE, float(extra["min_net_buy_delta"])))
+            if "min_surge_k" in extra or "min_surge_multiplier" in extra:
+                s_val = float(extra.get("min_surge_k", extra.get("min_surge_multiplier", 2.0)))
+                conds.append(RuleCondition("volume_surge_multiplier", ComparisonOperator.GTE, s_val))
+            if "min_dormancy_hours" in extra:
+                conds.append(RuleCondition("dormancy_hours", ComparisonOperator.GTE, float(extra["min_dormancy_hours"])))
+            if "max_slippage_bps" in extra:
+                conds.append(RuleCondition("slippage_estimate_bps", ComparisonOperator.LTE, float(extra["max_slippage_bps"])))
+            if "min_wallet_sortino" in extra:
+                conds.append(RuleCondition("wallet_score", ComparisonOperator.GTE, float(extra["min_wallet_sortino"])))
+            if "organic_conviction_min" in extra:
+                conds.append(RuleCondition("social_conviction", ComparisonOperator.GTE, float(extra["organic_conviction_min"])))
+            if conds:
+                rules = EntryRuleSet(conditions=conds)
+
         return cls(
             strategy_name=data.get("strategy_name", "custom"),
             hard_stop_loss_pct=float(data.get("hard_stop_loss_pct", 0.15)),
@@ -92,6 +128,7 @@ class StrategyParameters:
             regime_affinity=reg_enum,
             extra_params=data.get("extra_params", {}),
             allowed_sources=sources_list,
+            entry_rules=rules,
         )
 
 
@@ -522,13 +559,18 @@ class StrategyTournamentRegistry:
         self.champion_live_trades_since_promotion: list[dict[str, Any]] = []
         self.retired_challengers: dict[str, StrategyVariant] = {}
 
-        # Initialize default Champion
+        # Initialize default Champion with real entry rules
         champ_params = StrategyParameters(
             strategy_name="champion_peak_trailing_50",
             hard_stop_loss_pct=0.15,
             take_profit_pct=1.00,
             trailing_stop_from_peak_pct=0.35,
             min_entry_score=0.0,
+            entry_rules=EntryRuleSet(
+                conditions=[
+                    RuleCondition("alpha_score", ComparisonOperator.GTE, 0.0),
+                ]
+            ),
         )
         self.champion = StrategyVariant(
             experiment_id="exp-champ-001",
@@ -537,17 +579,24 @@ class StrategyTournamentRegistry:
             status=ExperimentStatus.CHAMPION,
         )
 
-        # Initialize Challenger Variants
+        # Initialize Challenger Variants with real entry rules
         self.challengers: dict[str, StrategyVariant] = {}
 
-        # Variant A: Tight Scalp (-10% SL, +30% TP1, 120s decay)
+        # Variant A: Tight Scalp (-10% SL, +30% TP1, 120s decay, low mcap, alpha >= 50)
         p_a = StrategyParameters(
             strategy_name="challenger_tight_scalp",
             hard_stop_loss_pct=0.10,
             take_profit_pct=0.30,
             trailing_stop_from_peak_pct=0.15,
             time_exit_s=120.0,
+            min_entry_score=50.0,
             regime_affinity=MarketRegime.LOW_LIQUIDITY_CHOP,
+            entry_rules=EntryRuleSet(
+                conditions=[
+                    RuleCondition("alpha_score", ComparisonOperator.GTE, 50.0),
+                    RuleCondition("mcap_usd", ComparisonOperator.LTE, 200000.0),
+                ]
+            ),
         )
         self.challengers[p_a.strategy_name] = StrategyVariant(
             experiment_id="exp-chal-scalp",
@@ -557,13 +606,19 @@ class StrategyTournamentRegistry:
             regime=MarketRegime.LOW_LIQUIDITY_CHOP,
         )
 
-        # Variant B: Early Rally Swing (-15% SL, +50% TP1, 28% ATH Trail)
+        # Variant B: Early Rally Swing (-15% SL, +50% TP1, 28% ATH Trail, volume surge >= 1.8, net buy >= 0.52)
         p_b = StrategyParameters(
             strategy_name="challenger_early_rally_swing",
             hard_stop_loss_pct=0.15,
             take_profit_pct=0.50,
             trailing_stop_from_peak_pct=0.28,
             regime_affinity=MarketRegime.REVIVAL_ROTATION,
+            entry_rules=EntryRuleSet(
+                conditions=[
+                    RuleCondition("volume_surge_multiplier", ComparisonOperator.GTE, 1.8),
+                    RuleCondition("net_buy_delta", ComparisonOperator.GTE, 0.52),
+                ]
+            ),
         )
         self.challengers[p_b.strategy_name] = StrategyVariant(
             experiment_id="exp-chal-rally",
@@ -573,7 +628,7 @@ class StrategyTournamentRegistry:
             regime=MarketRegime.REVIVAL_ROTATION,
         )
 
-        # Variant C: High-Threshold Momentum (min_entry_score=75.0, -12% SL, 20% ATH trail)
+        # Variant C: High-Threshold Momentum (min_entry_score=75.0, -12% SL, 20% ATH trail, net buy >= 0.58)
         p_c = StrategyParameters(
             strategy_name="challenger_high_threshold_momentum",
             hard_stop_loss_pct=0.12,
@@ -581,6 +636,12 @@ class StrategyTournamentRegistry:
             trailing_stop_from_peak_pct=0.20,
             min_entry_score=75.0,
             regime_affinity=MarketRegime.HIGH_VOL_MEME_MANIA,
+            entry_rules=EntryRuleSet(
+                conditions=[
+                    RuleCondition("alpha_score", ComparisonOperator.GTE, 75.0),
+                    RuleCondition("net_buy_delta", ComparisonOperator.GTE, 0.58),
+                ]
+            ),
         )
         self.challengers[p_c.strategy_name] = StrategyVariant(
             experiment_id="exp-chal-momentum",
@@ -590,13 +651,19 @@ class StrategyTournamentRegistry:
             regime=MarketRegime.HIGH_VOL_MEME_MANIA,
         )
 
-        # Variant D: AI-Dynamic Exit Matrix
+        # Variant D: AI-Dynamic Exit Matrix (top10 conc <= 0.25, net buy >= 0.50)
         p_d = StrategyParameters(
             strategy_name="challenger_ai_dynamic_matrix",
             hard_stop_loss_pct=0.14,
             take_profit_pct=0.60,
             trailing_stop_from_peak_pct=0.25,
             regime_affinity=MarketRegime.NEUTRAL,
+            entry_rules=EntryRuleSet(
+                conditions=[
+                    RuleCondition("holder_concentration", ComparisonOperator.LTE, 0.25),
+                    RuleCondition("net_buy_delta", ComparisonOperator.GTE, 0.50),
+                ]
+            ),
         )
         self.challengers[p_d.strategy_name] = StrategyVariant(
             experiment_id="exp-chal-aidynamic",
@@ -946,116 +1013,146 @@ class StrategyTournamentRegistry:
         self.current_regime = regime
         return regime
 
+    def _calculate_shadow_trade_size(
+        self,
+        signal: SignalEvent,
+        native_price_usd: Decimal,
+        variant: StrategyVariant,
+    ) -> Decimal:
+        """Calculate dynamic shadow trade size using the system sizing authority (RiskManager)."""
+        try:
+            from alpha_engine.engine.strategy.risk_manager import RiskManager
+            if not hasattr(self, "_shadow_risk_manager") or self._shadow_risk_manager is None:
+                self._shadow_risk_manager = RiskManager(config=self.config)
+            # Calibrate sizing score using variant parameters
+            variant_min_score = float(getattr(variant.parameters, "min_entry_score", 50.0))
+            score_val = max(float(getattr(signal, "alpha_score", 0.5)) * 100.0, variant_min_score)
+            logger.debug(
+                "Calculating shadow trade size for variant %s (%s) with score=%.1f",
+                variant.strategy_name,
+                variant.experiment_id,
+                score_val,
+            )
+            sizing_res = self._shadow_risk_manager.calculate_order_size(
+                portfolio_equity_usd=Decimal("10000.0"),
+                native_price_usd=native_price_usd,
+                chain=signal.chain,
+                score=score_val,
+                is_new_launch=False,
+            )
+            if sizing_res.native_trade_size > Decimal("0"):
+                return sizing_res.native_trade_size
+        except Exception as exc:
+            logger.debug("Shadow sizing calculation fallback for %s: %s", variant.strategy_name, exc)
+
+        if signal.chain == ChainIdentifier.SOLANA_MAINNET:
+            return Decimal("0.5") if native_price_usd <= Decimal("250.0") else Decimal("0.25")
+        else:
+            return Decimal("0.025") if native_price_usd <= Decimal("4000.0") else Decimal("0.015")
+
     def evaluate_signal_and_record_shadow_lots(
         self,
         signal: SignalEvent,
         pool: PoolState,
         native_price_usd: Decimal,
-        base_trade_size_native: Decimal = Decimal("0.10"),
+        base_trade_size_native: Optional[Decimal] = None,
         market_state_provider: Optional[Any] = None,
         is_private_route: Optional[bool] = None,
     ) -> list[ShadowLot]:
         """
         Simulate shadow trade execution for Champion and qualifying Challenger variants.
-        All variants undergo identical CPMM slippage and LogNormal latency/MEV drag.
+        Each variant independently evaluates entry rules, allowed sources, and scores.
+        Variants that enter receive their own simulated fill through the shared execution simulator.
         """
         if signal.suggested_side != OrderSide.BUY:
             return []
 
-        # 1. Simulate CPMM execution and LogNormal latency using unified module
+        alpha_score_norm = float(getattr(signal, "alpha_score", 0.5)) * 100.0
         signal_ts_ns = signal.timestamp_ns or time.time_ns()
         route_private = is_private_route if is_private_route is not None else getattr(signal, "is_private_route", False)
         max_slip = getattr(signal, "max_slippage_bps", 50)
-        latency_res = simulate_latency(
-            pool=pool,
-            signal_timestamp_ns=signal_ts_ns,
-            chain=signal.chain,
-            trade_size_native=base_trade_size_native,
-            max_slippage_bps=max_slip,
-            is_private_route=route_private,
-            market_state_provider=market_state_provider,
-            config=self.config,
-            rng=self._rng,
-        )
-        if latency_res.adjusted_pool_state is None:
-            logger.warning("Shadow lot execution rejected: %s", latency_res.rejection_reason)
-            return []
-        sim_pool = latency_res.adjusted_pool_state
-
-        # CPMM quote and unified cost calculation
         venue = getattr(signal, "execution_venue", None)
-        try:
-            cost_res = self.cost_model.calculate_trade_costs(
-                side=OrderSide.BUY,
-                gross_amount=base_trade_size_native,
-                pool=sim_pool,
-                chain=signal.chain,
-                venue=venue,
-                native_price_usd=native_price_usd,
-                platform=getattr(signal, "platform", None),
-            )
-            exec_price = cost_res.effective_price
-            tokens_acquired = cost_res.amount_out
-            slippage_bps = cost_res.price_impact_bps
-            gas_usd = cost_res.network_fee_usd
-        except Exception:
-            # Fallback to CPMM buy quote if cost model calculation fails
-            try:
-                cpmm_q = cpmm_buy_quote(sim_pool, base_trade_size_native)
-                exec_price = cpmm_q.execution_price
-                tokens_acquired = cpmm_q.tokens_out
-                slippage_bps = cpmm_q.price_impact_bps
-            except Exception:
-                exec_price = pool.spot_price_native_per_token
-                tokens_acquired = (base_trade_size_native / exec_price) if exec_price > 0 else Decimal("0")
-                slippage_bps = 50
-            gas_usd = self.cost_model.get_network_fee_usd(signal.chain, native_price_usd=native_price_usd)
-        mev_drag_usd = (latency_res.frontrun_volume * native_price_usd) if latency_res.frontrun_volume > Decimal("0") else Decimal("0.0")
 
         created_lots: list[ShadowLot] = []
+        variants_to_eval = [self.champion] + [c for c in self.challengers.values() if c.status == ExperimentStatus.SHADOW]
 
-        # Evaluate Champion
-        champ_lot = self.champion.record_fill(
-            token_address=signal.token_address,
-            chain=signal.chain,
-            entry_price=exec_price,
-            tokens_acquired=tokens_acquired,
-            native_spent=base_trade_size_native,
-            native_price_usd=native_price_usd,
-            gas_usd=gas_usd,
-            slippage_bps=slippage_bps,
-            latency_ms=latency_res.latency_ms,
-            mev_drag_usd=mev_drag_usd,
-            pool_address=getattr(signal, "pool_address", "") or "",
-        )
-        created_lots.append(champ_lot)
-
-        # Evaluate Challengers
-        alpha_score_norm = float(getattr(signal, "alpha_score", 0.5)) * 100.0
-        for name, chal in self.challengers.items():
-            if chal.status != ExperimentStatus.SHADOW:
-                continue
-
-            # Check min entry score threshold
-            if alpha_score_norm < chal.parameters.min_entry_score:
-                continue
-
-            # Check allowed sources filter if configured
-            if chal.parameters.allowed_sources:
-                sig_src = signal.source if isinstance(signal.source, SignalSource) else (SignalSource(signal.source) if str(signal.source) in SignalSource._value2member_map_ else None)
-                if sig_src and sig_src not in chal.parameters.allowed_sources:
+        for variant in variants_to_eval:
+            # 1. Allowed sources filter
+            if variant.parameters.allowed_sources:
+                sig_src = signal.source if isinstance(signal.source, SignalSource) else (
+                    SignalSource(signal.source) if str(signal.source) in SignalSource._value2member_map_ else None
+                )
+                if sig_src and sig_src not in variant.parameters.allowed_sources:
                     continue
 
-            # Check custom filter if configured
-            if chal.parameters.custom_filter and not chal.parameters.custom_filter(signal):
+            # 2. Min entry score filter
+            if alpha_score_norm < variant.parameters.min_entry_score:
                 continue
 
-            lot = chal.record_fill(
+            # 3. Declarative entry rules schema evaluation
+            if hasattr(variant.parameters, "entry_rules") and variant.parameters.entry_rules:
+                if not variant.parameters.entry_rules.evaluate(signal=signal, pool=pool, native_price_usd=native_price_usd):
+                    continue
+
+            # Variant decided to enter! Determine its own simulated trade size
+            trade_size = (
+                base_trade_size_native
+                if base_trade_size_native is not None
+                else self._calculate_shadow_trade_size(signal, native_price_usd, variant)
+            )
+
+            # Execution simulation: latency & conditional MEV
+            latency_res = simulate_latency(
+                pool=pool,
+                signal_timestamp_ns=signal_ts_ns,
+                chain=signal.chain,
+                trade_size_native=trade_size,
+                max_slippage_bps=max_slip,
+                is_private_route=route_private,
+                market_state_provider=market_state_provider,
+                config=self.config,
+                rng=self._rng,
+            )
+            if latency_res.adjusted_pool_state is None:
+                logger.debug("Shadow variant %s fill rejected: %s", variant.strategy_name, latency_res.rejection_reason)
+                continue
+            sim_pool = latency_res.adjusted_pool_state
+
+            # Cost model calculation
+            try:
+                cost_res = self.cost_model.calculate_trade_costs(
+                    side=OrderSide.BUY,
+                    gross_amount=trade_size,
+                    pool=sim_pool,
+                    chain=signal.chain,
+                    venue=venue,
+                    native_price_usd=native_price_usd,
+                    platform=getattr(signal, "platform", None),
+                )
+                exec_price = cost_res.effective_price
+                tokens_acquired = cost_res.amount_out
+                slippage_bps = cost_res.price_impact_bps
+                gas_usd = cost_res.network_fee_usd
+            except Exception:
+                try:
+                    cpmm_q = cpmm_buy_quote(sim_pool, trade_size)
+                    exec_price = cpmm_q.execution_price
+                    tokens_acquired = cpmm_q.tokens_out
+                    slippage_bps = cpmm_q.price_impact_bps
+                except Exception:
+                    exec_price = pool.spot_price_native_per_token
+                    tokens_acquired = (trade_size / exec_price) if exec_price > 0 else Decimal("0")
+                    slippage_bps = 50
+                gas_usd = self.cost_model.get_network_fee_usd(signal.chain, native_price_usd=native_price_usd)
+
+            mev_drag_usd = (latency_res.frontrun_volume * native_price_usd) if latency_res.frontrun_volume > Decimal("0") else Decimal("0.0")
+
+            lot = variant.record_fill(
                 token_address=signal.token_address,
                 chain=signal.chain,
                 entry_price=exec_price,
                 tokens_acquired=tokens_acquired,
-                native_spent=base_trade_size_native,
+                native_spent=trade_size,
                 native_price_usd=native_price_usd,
                 gas_usd=gas_usd,
                 slippage_bps=slippage_bps,
@@ -1326,25 +1423,65 @@ class StrategyArchetype(str, Enum):
     NARRATIVE_BREAKOUT = "NARRATIVE_BREAKOUT"
 
 
+def compute_strategy_fingerprint(params: StrategyParameters) -> str:
+    """Compute canonical hashable fingerprint for a strategy variant (for deduplication)."""
+    sl = round(params.hard_stop_loss_pct, 3)
+    tp = round(params.take_profit_pct or 0.0, 3)
+    tr = round(params.trailing_stop_from_peak_pct or 0.0, 3)
+    tx = round(params.time_exit_s or 0.0, 0)
+    sc = round(params.min_entry_score, 1)
+    rules_fp = params.entry_rules.fingerprint() if hasattr(params, "entry_rules") and params.entry_rules else ""
+    srcs = ",".join(sorted(s.value if hasattr(s, "value") else str(s) for s in (params.allowed_sources or [])))
+    return f"SL:{sl}|TP:{tp}|TR:{tr}|TX:{tx}|SC:{sc}|SRCS:{srcs}|RULES:{rules_fp}"
+
+
 class AutonomousStrategyGenerator:
     """
     Autonomous Strategy Discovery, Synthesis & Mutation Engine:
-    - Generates quantitative strategy hypotheses across core archetypes:
+    - Generates quantitative strategy hypotheses across core archetypes with typed declarative entry rules:
         1. Fast-Launch Momentum (early micro-velocity, low-cap CPMM)
         2. Wave-2 Accumulation (post-dip volume surge with net-buy delta)
         3. Revival / CTO Swing (dormant token recovery, creator wallet exit)
         4. Smart-Money Follow (verified profitable wallet clusters)
         5. Narrative Breakout (organic social conviction breakouts)
-    - Mutates parameters to explore optimal risk-adjusted parameter frontiers without overfitting.
-    - Evaluates new candidates via walk-forward backtesting against historical ledger signals & trades.
-    - Applies anti-overfitting gates and parameter perturbation cliff tests (+/-10%).
-    - Automatically stages qualified variants into StrategyTournamentRegistry as concurrent SHADOW challengers.
+    - Stochastic mutation & crossover using seeded RNG (config seed) across both entry rules & exit profiles.
+    - Exploration budget reserving challenger slots for novel random rule discovery.
+    - Deduplication check preventing staging of identical variants.
+    - Evaluates candidates via walk-forward backtesting and perturbation cliff tests.
+    - Persists generation logs (parent ids, what changed) into SQLiteLedger.
     """
 
-    def __init__(self, ledger: Optional[Any] = None) -> None:
+    def __init__(
+        self,
+        ledger: Optional[Any] = None,
+        seed: Optional[int] = None,
+        config: Optional[Any] = None,
+    ) -> None:
         self.ledger = ledger
+        from alpha_engine.config import EngineConfig
+        self.config = config or EngineConfig()
+        effective_seed = seed if seed is not None else getattr(self.config, "execution_seed", 42)
+        self._rng = random.Random(effective_seed)
         self._generation_counter: int = 0
         self._generated_history: list[dict[str, Any]] = []
+        self._exploration_budget_ratio: float = 0.25
+
+    def is_duplicate_strategy(
+        self,
+        candidate_params: StrategyParameters,
+        registry: StrategyTournamentRegistry,
+    ) -> bool:
+        """Check whether candidate parameter fingerprint already exists in registry (champion, challengers, retired)."""
+        cand_fp = compute_strategy_fingerprint(candidate_params)
+        if registry.champion and compute_strategy_fingerprint(registry.champion.parameters) == cand_fp:
+            return True
+        for chal in registry.challengers.values():
+            if compute_strategy_fingerprint(chal.parameters) == cand_fp:
+                return True
+        for ret in registry.retired_challengers.values():
+            if compute_strategy_fingerprint(ret.parameters) == cand_fp:
+                return True
+        return False
 
     def generate_strategy_variant(
         self,
@@ -1352,7 +1489,7 @@ class AutonomousStrategyGenerator:
         iteration: Optional[int] = None,
         base_params: Optional[StrategyParameters] = None,
     ) -> StrategyParameters:
-        """Synthesize a complete StrategyParameters instance for a specific archetype."""
+        """Synthesize a complete StrategyParameters instance for a specific archetype with declarative entry rules."""
         if base_params is not None:
             mutated = self.mutate_strategy(parent=base_params, mutation_rate=0.05)
             if iteration is not None:
@@ -1365,6 +1502,13 @@ class AutonomousStrategyGenerator:
         if archetype == StrategyArchetype.FAST_LAUNCH_MOMENTUM:
             # High-speed early entry, tight stop loss, quick take-profit, short time decay
             name = f"auto_fast_launch_v{it}"
+            rules = EntryRuleSet(
+                conditions=[
+                    RuleCondition("mcap_usd", ComparisonOperator.LTE, 80000.0),
+                    RuleCondition("net_buy_delta", ComparisonOperator.GTE, 0.55),
+                    RuleCondition("alpha_score", ComparisonOperator.GTE, 55.0),
+                ]
+            )
             return StrategyParameters(
                 strategy_name=name,
                 hard_stop_loss_pct=0.10,
@@ -1375,12 +1519,20 @@ class AutonomousStrategyGenerator:
                 partial_tp_ratio=0.60,
                 regime_affinity=MarketRegime.HIGH_VOL_MEME_MANIA,
                 allowed_sources=[SignalSource.PUMP_FUN_MINT, SignalSource.PAIR_CREATED, SignalSource.RAYDIUM_NEW_POOL],
+                entry_rules=rules,
                 extra_params={"archetype": archetype.value, "max_mcap_usd": 80_000, "min_net_buy_delta": 0.55},
             )
 
         elif archetype == StrategyArchetype.WAVE2_ACCUMULATION:
             # Post-dip accumulation, volume surge requirement, balanced exit ladder
             name = f"auto_wave2_accum_v{it}"
+            rules = EntryRuleSet(
+                conditions=[
+                    RuleCondition("volume_surge_multiplier", ComparisonOperator.GTE, 2.4),
+                    RuleCondition("net_buy_delta", ComparisonOperator.GTE, 0.60),
+                    RuleCondition("alpha_score", ComparisonOperator.GTE, 65.0),
+                ]
+            )
             return StrategyParameters(
                 strategy_name=name,
                 hard_stop_loss_pct=0.14,
@@ -1391,12 +1543,20 @@ class AutonomousStrategyGenerator:
                 partial_tp_ratio=0.50,
                 regime_affinity=MarketRegime.NEUTRAL,
                 allowed_sources=[SignalSource.WAVE2_BREAKOUT, SignalSource.DEX_SWAP, SignalSource.SCREENER_MOVERS],
+                entry_rules=rules,
                 extra_params={"archetype": archetype.value, "min_surge_k": 2.4, "min_net_buy_delta": 0.60},
             )
 
         elif archetype == StrategyArchetype.REVIVAL_CTO_SWING:
             # Multi-hour dormant token recovery, wider trailing stop, multi-day holding
             name = f"auto_revival_cto_v{it}"
+            rules = EntryRuleSet(
+                conditions=[
+                    RuleCondition("dormancy_hours", ComparisonOperator.GTE, 3.0),
+                    RuleCondition("volume_surge_multiplier", ComparisonOperator.GTE, 3.0),
+                    RuleCondition("alpha_score", ComparisonOperator.GTE, 70.0),
+                ]
+            )
             return StrategyParameters(
                 strategy_name=name,
                 hard_stop_loss_pct=0.18,
@@ -1407,12 +1567,20 @@ class AutonomousStrategyGenerator:
                 partial_tp_ratio=0.40,
                 regime_affinity=MarketRegime.REVIVAL_ROTATION,
                 allowed_sources=[SignalSource.REVIVAL_BREAKOUT, SignalSource.DEX_SWAP, SignalSource.TELEGRAM_SCRAPER],
+                entry_rules=rules,
                 extra_params={"archetype": archetype.value, "min_dormancy_hours": 3.0, "min_surge_multiplier": 3.0},
             )
 
         elif archetype == StrategyArchetype.SMART_MONEY_FOLLOW:
             # Follows verified profitable wallets with tight slippage guard and medium TP
             name = f"auto_smart_money_v{it}"
+            rules = EntryRuleSet(
+                conditions=[
+                    RuleCondition("slippage_estimate_bps", ComparisonOperator.LTE, 80.0),
+                    RuleCondition("wallet_score", ComparisonOperator.GTE, 1.8),
+                    RuleCondition("alpha_score", ComparisonOperator.GTE, 60.0),
+                ]
+            )
             return StrategyParameters(
                 strategy_name=name,
                 hard_stop_loss_pct=0.12,
@@ -1423,12 +1591,19 @@ class AutonomousStrategyGenerator:
                 partial_tp_ratio=0.50,
                 regime_affinity=MarketRegime.NEUTRAL,
                 allowed_sources=[SignalSource.WHALE_WALLET, SignalSource.DEX_SWAP],
+                entry_rules=rules,
                 extra_params={"archetype": archetype.value, "max_slippage_bps": 80, "min_wallet_sortino": 1.8},
             )
 
         elif archetype == StrategyArchetype.NARRATIVE_BREAKOUT:
             # Driven by organic viral conviction across Jina Reader / Reddit / X
             name = f"auto_narrative_breakout_v{it}"
+            rules = EntryRuleSet(
+                conditions=[
+                    RuleCondition("social_conviction", ComparisonOperator.GTE, 70.0),
+                    RuleCondition("alpha_score", ComparisonOperator.GTE, 75.0),
+                ]
+            )
             return StrategyParameters(
                 strategy_name=name,
                 hard_stop_loss_pct=0.15,
@@ -1439,51 +1614,235 @@ class AutonomousStrategyGenerator:
                 partial_tp_ratio=0.50,
                 regime_affinity=MarketRegime.HIGH_VOL_MEME_MANIA,
                 allowed_sources=[SignalSource.X_SENTIMENT, SignalSource.TELEGRAM_SCRAPER, SignalSource.MEME_RADAR_BURST],
+                entry_rules=rules,
                 extra_params={"archetype": archetype.value, "organic_conviction_min": 70.0},
             )
 
         # Fallback to balanced variant
-        return StrategyParameters(strategy_name=f"auto_custom_v{it}", hard_stop_loss_pct=0.15, take_profit_pct=0.50)
+        return StrategyParameters(
+            strategy_name=f"auto_custom_v{it}",
+            hard_stop_loss_pct=0.15,
+            take_profit_pct=0.50,
+            entry_rules=EntryRuleSet(conditions=[RuleCondition("alpha_score", ComparisonOperator.GTE, 50.0)]),
+        )
+
+    def generate_novel_strategy(
+        self,
+        regime: Optional[MarketRegime] = None,
+    ) -> StrategyParameters:
+        """Exploration budget: Synthesize a genuinely novel stochastic candidate with newly sampled rules."""
+        self._generation_counter += 1
+        name = f"auto_novel_exp_v{self._generation_counter}"
+        reg = regime or self._rng.choice(list(MarketRegime))
+
+        avail_metrics = [
+            "mcap_usd",
+            "net_buy_delta",
+            "volume_surge_multiplier",
+            "dormancy_hours",
+            "slippage_estimate_bps",
+            "wallet_score",
+            "social_conviction",
+            "liquidity_usd",
+            "holder_concentration",
+        ]
+        k = self._rng.randint(2, 3)
+        chosen = self._rng.sample(avail_metrics, k)
+        conds = []
+        for m_name in chosen:
+            op = self._rng.choice([ComparisonOperator.GTE, ComparisonOperator.LTE])
+            if m_name == "mcap_usd":
+                thresh = round(self._rng.uniform(30000.0, 300000.0), 0)
+            elif m_name in ("net_buy_delta", "holder_concentration"):
+                thresh = round(self._rng.uniform(0.35, 0.70), 2)
+            elif m_name == "volume_surge_multiplier":
+                thresh = round(self._rng.uniform(1.5, 4.5), 1)
+            elif m_name == "dormancy_hours":
+                thresh = round(self._rng.uniform(1.0, 8.0), 1)
+            elif m_name == "slippage_estimate_bps":
+                thresh = round(self._rng.uniform(50.0, 150.0), 0)
+            elif m_name == "wallet_score":
+                thresh = round(self._rng.uniform(1.2, 3.0), 1)
+            elif m_name == "social_conviction":
+                thresh = round(self._rng.uniform(55.0, 85.0), 1)
+            elif m_name == "liquidity_usd":
+                thresh = round(self._rng.uniform(8000.0, 40000.0), 0)
+            else:
+                thresh = 50.0
+            conds.append(RuleCondition(metric=m_name, operator=op, threshold=thresh))
+
+        sl = round(self._rng.uniform(0.08, 0.20), 3)
+        tp = round(self._rng.uniform(0.30, 1.60), 3)
+        tr = round(self._rng.uniform(0.14, 0.35), 3)
+        tx = self._rng.choice([180.0, 600.0, 1800.0, 3600.0, 86400.0])
+        score = round(self._rng.uniform(50.0, 75.0), 1)
+
+        # Stochastic rule grouping: occasionally bundle conditions into a RuleGroup
+        groups: list[RuleGroup] = []
+        if len(conds) >= 3 and self._rng.random() < 0.35:
+            grouped_cond = conds.pop()
+            groups.append(RuleGroup(conditions=[grouped_cond], operator=LogicalOperator.AND))
+
+        return StrategyParameters(
+            strategy_name=name,
+            hard_stop_loss_pct=sl,
+            take_profit_pct=tp,
+            trailing_stop_from_peak_pct=tr,
+            time_exit_s=tx,
+            min_entry_score=score,
+            partial_tp_ratio=0.5,
+            regime_affinity=reg,
+            entry_rules=EntryRuleSet(conditions=conds, groups=groups),
+        )
 
     def mutate_strategy(
         self,
         parent: StrategyParameters,
         mutation_rate: float = 0.10,
     ) -> StrategyParameters:
-        """Create a mutated variant exploring nearby parameter space with bounds checking."""
+        """Create a mutated variant exploring nearby parameter space with stochastic seeded bounds checking."""
         self._generation_counter += 1
         name = f"{parent.strategy_name}_mut{self._generation_counter}"
 
-        # Mutate hard stop loss (+/- 10%)
-        delta_sl = parent.hard_stop_loss_pct * (1.0 + (mutation_rate if self._generation_counter % 2 == 0 else -mutation_rate))
-        sl_bounded = max(0.06, min(0.25, delta_sl))
+        # Stochastic perturbation on exit rules using self._rng
+        factor_sl = 1.0 + self._rng.uniform(-mutation_rate, mutation_rate)
+        sl_bounded = max(0.06, min(0.25, round(parent.hard_stop_loss_pct * factor_sl, 3)))
 
-        # Mutate take profit
         tp = parent.take_profit_pct or 0.50
-        delta_tp = tp * (1.0 + (mutation_rate if self._generation_counter % 3 == 0 else -mutation_rate))
-        tp_bounded = max(0.20, min(3.00, delta_tp))
+        factor_tp = 1.0 + self._rng.uniform(-mutation_rate, mutation_rate)
+        tp_bounded = max(0.20, min(3.00, round(tp * factor_tp, 3)))
 
-        # Mutate trailing stop from peak
         trail = parent.trailing_stop_from_peak_pct or 0.25
-        delta_trail = trail * (1.0 + (mutation_rate if self._generation_counter % 2 != 0 else -mutation_rate))
-        trail_bounded = max(0.12, min(0.40, delta_trail))
+        factor_tr = 1.0 + self._rng.uniform(-mutation_rate, mutation_rate)
+        trail_bounded = max(0.12, min(0.40, round(trail * factor_tr, 3)))
 
-        # Mutate entry score threshold
         score = parent.min_entry_score
-        delta_score = score + (5.0 if self._generation_counter % 2 == 0 else -5.0)
-        score_bounded = max(0.0, min(85.0, delta_score))
+        delta_score = self._rng.uniform(-5.0, 5.0)
+        score_bounded = max(0.0, min(85.0, round(score + delta_score, 1)))
+
+        time_ex = parent.time_exit_s
+        if time_ex is not None and self._rng.random() < 0.3:
+            time_ex = max(60.0, min(172800.0, round(time_ex * (1.0 + self._rng.uniform(-0.15, 0.15)), 0)))
+
+        # Stochastic perturbation on entry rules
+        new_conditions: list[RuleCondition] = []
+        if hasattr(parent, "entry_rules") and parent.entry_rules:
+            for cond in parent.entry_rules.conditions:
+                canonical = resolve_canonical_metric(cond.metric)
+                defn = METRIC_REGISTRY.get(canonical)
+                bounds = defn.allowed_range if defn else (0.0, 100.0)
+                r_val = self._rng.random()
+                if r_val < 0.5:
+                    # Mutate threshold
+                    perturb = 1.0 + self._rng.uniform(-mutation_rate, mutation_rate)
+                    new_t = max(bounds[0], min(bounds[1], round(cond.threshold * perturb, 3)))
+                    new_conditions.append(RuleCondition(cond.metric, cond.operator, new_t, cond.allowed_range))
+                elif r_val < 0.7:
+                    # Swap operator
+                    new_op = (
+                        ComparisonOperator.LTE
+                        if cond.operator in (ComparisonOperator.GT, ComparisonOperator.GTE)
+                        else ComparisonOperator.GTE
+                    )
+                    new_conditions.append(RuleCondition(cond.metric, new_op, cond.threshold, cond.allowed_range))
+                else:
+                    new_conditions.append(RuleCondition(cond.metric, cond.operator, cond.threshold, cond.allowed_range))
+
+        # With probability 0.25, add a new condition if < 4 conditions
+        existing_metrics = {resolve_canonical_metric(c.metric) for c in new_conditions}
+        avail = [m for m in METRIC_REGISTRY if m not in existing_metrics and m != "alpha_score"]
+        if avail and len(new_conditions) < 4 and self._rng.random() < 0.25:
+            add_m = self._rng.choice(avail)
+            defn = METRIC_REGISTRY[add_m]
+            op = self._rng.choice([ComparisonOperator.GTE, ComparisonOperator.LTE])
+            min_b, max_b = defn.allowed_range
+            val = round(self._rng.uniform(min_b + (max_b - min_b) * 0.15, min_b + (max_b - min_b) * 0.65), 2)
+            new_conditions.append(RuleCondition(metric=add_m, operator=op, threshold=val))
+
+        # With probability 0.15, remove a condition if > 1
+        if len(new_conditions) > 1 and self._rng.random() < 0.15:
+            rm_idx = self._rng.randint(0, len(new_conditions) - 1)
+            new_conditions.pop(rm_idx)
+
+        new_rules = EntryRuleSet(
+            conditions=new_conditions,
+            operator=parent.entry_rules.operator if hasattr(parent, "entry_rules") and parent.entry_rules else LogicalOperator.AND,
+        )
 
         return StrategyParameters(
             strategy_name=name,
-            hard_stop_loss_pct=round(sl_bounded, 3),
-            take_profit_pct=round(tp_bounded, 3),
-            trailing_stop_from_peak_pct=round(trail_bounded, 3),
-            time_exit_s=parent.time_exit_s,
-            min_entry_score=round(score_bounded, 1),
+            hard_stop_loss_pct=sl_bounded,
+            take_profit_pct=tp_bounded,
+            trailing_stop_from_peak_pct=trail_bounded,
+            time_exit_s=time_ex,
+            min_entry_score=score_bounded,
             partial_tp_ratio=parent.partial_tp_ratio,
             regime_affinity=parent.regime_affinity,
             allowed_sources=parent.allowed_sources,
+            entry_rules=new_rules,
             extra_params=dict(parent.extra_params),
+        )
+
+    def crossover_strategies(
+        self,
+        parent_a: StrategyParameters,
+        parent_b: StrategyParameters,
+    ) -> StrategyParameters:
+        """
+        Recombine genetic parameters from two strategy parents:
+        Stochastically blends exit rules and recombines entry rules with deduplication.
+        """
+        self._generation_counter += 1
+        name = f"cross_{parent_a.strategy_name[:6]}_{parent_b.strategy_name[:6]}_gen{self._generation_counter}"
+
+        w_a = self._rng.uniform(0.3, 0.7)
+        w_b = 1.0 - w_a
+        sl = round(parent_a.hard_stop_loss_pct * w_a + parent_b.hard_stop_loss_pct * w_b, 3)
+        tp = round((parent_a.take_profit_pct or 0.5) * w_a + (parent_b.take_profit_pct or 0.5) * w_b, 3)
+        trail = round((parent_a.trailing_stop_from_peak_pct or 0.25) * w_a + (parent_b.trailing_stop_from_peak_pct or 0.25) * w_b, 3)
+        time_exit = parent_a.time_exit_s if self._rng.random() < 0.5 else parent_b.time_exit_s
+        min_score = round(max(parent_a.min_entry_score, parent_b.min_entry_score), 1)
+
+        # Combine entry rules
+        conds_by_metric: dict[str, RuleCondition] = {}
+        if hasattr(parent_a, "entry_rules") and parent_a.entry_rules:
+            for c in parent_a.entry_rules.conditions:
+                can = resolve_canonical_metric(c.metric)
+                conds_by_metric[can] = c
+        if hasattr(parent_b, "entry_rules") and parent_b.entry_rules:
+            for c in parent_b.entry_rules.conditions:
+                can = resolve_canonical_metric(c.metric)
+                if can in conds_by_metric:
+                    prev = conds_by_metric[can]
+                    new_t = round((prev.threshold + c.threshold) / 2.0, 3)
+                    chosen_op = prev.operator if self._rng.random() < 0.5 else c.operator
+                    conds_by_metric[can] = RuleCondition(can, chosen_op, new_t)
+                elif self._rng.random() < 0.7:
+                    conds_by_metric[can] = c
+
+        inherited_groups: list[RuleGroup] = []
+        if hasattr(parent_a, "entry_rules") and parent_a.entry_rules and parent_a.entry_rules.groups:
+            inherited_groups.extend(parent_a.entry_rules.groups)
+        elif hasattr(parent_b, "entry_rules") and parent_b.entry_rules and parent_b.entry_rules.groups:
+            inherited_groups.extend(parent_b.entry_rules.groups)
+
+        cross_rules = EntryRuleSet(conditions=list(conds_by_metric.values()), groups=inherited_groups)
+
+        merged_extra = dict(parent_b.extra_params)
+        merged_extra.update(parent_a.extra_params)
+
+        return StrategyParameters(
+            strategy_name=name,
+            hard_stop_loss_pct=sl,
+            take_profit_pct=tp,
+            trailing_stop_from_peak_pct=trail,
+            time_exit_s=time_exit,
+            min_entry_score=min_score,
+            partial_tp_ratio=parent_b.partial_tp_ratio,
+            regime_affinity=parent_a.regime_affinity or parent_b.regime_affinity,
+            allowed_sources=parent_a.allowed_sources or parent_b.allowed_sources,
+            entry_rules=cross_rules,
+            extra_params=merged_extra,
         )
 
     def evaluate_and_stage_candidate(
@@ -1491,12 +1850,55 @@ class AutonomousStrategyGenerator:
         candidate_params: StrategyParameters,
         registry: StrategyTournamentRegistry,
         backtester: Optional[Any] = None,
+        parent_ids: Optional[list[str]] = None,
+        action: str = "mutation",
+        changes: Optional[dict[str, Any]] = None,
     ) -> dict[str, Any]:
         """
         Backtest candidate hypothesis against historical ledger records, apply anti-overfitting
         governance gates, and if qualified, register into StrategyTournamentRegistry as a SHADOW challenger.
+        Persists generation logs in the ledger.
         """
         from alpha_engine.engine.backtester import WalkForwardBacktester
+
+        # Validate candidate entry rules schema
+        if hasattr(candidate_params, "entry_rules") and candidate_params.entry_rules:
+            try:
+                candidate_params.entry_rules.validate()
+            except SchemaValidationError as val_err:
+                logger.warning(
+                    "AutonomousStrategyGenerator: Candidate %s failed entry rules schema validation: %s",
+                    candidate_params.strategy_name,
+                    val_err,
+                )
+                report = {
+                    "strategy_name": candidate_params.strategy_name,
+                    "experiment_id": f"exp-inv-{uuid.uuid4().hex[:8]}",
+                    "qualified_for_shadow": False,
+                    "is_promotable": False,
+                    "perturbation_robust": False,
+                    "rejections": [f"INVALID_ENTRY_RULES: {val_err}"],
+                    "total_trades": 0,
+                    "timestamp": time.time(),
+                }
+                self._generated_history.append(report)
+                return report
+
+        # 0. Deduplication check
+        if self.is_duplicate_strategy(candidate_params, registry):
+            logger.info("AutonomousStrategyGenerator: Candidate %s is a duplicate; staging rejected", candidate_params.strategy_name)
+            report = {
+                "strategy_name": candidate_params.strategy_name,
+                "experiment_id": f"exp-dup-{uuid.uuid4().hex[:8]}",
+                "qualified_for_shadow": False,
+                "is_promotable": False,
+                "perturbation_robust": False,
+                "rejections": ["DUPLICATE_STRATEGY"],
+                "total_trades": 0,
+                "timestamp": time.time(),
+            }
+            self._generated_history.append(report)
+            return report
 
         tester = backtester or WalkForwardBacktester(db_path=getattr(registry.ledger, "db_path", "paper_trading.db"))
         result = tester.evaluate_strategy(candidate_params)
@@ -1524,13 +1926,13 @@ class AutonomousStrategyGenerator:
             regime=regime,
         )
 
-        if qualified or result.total_trades >= 10:  # Allow staging in shadow mode
+        if action == "seed_archetype" or qualified or result.total_trades >= 10:  # Allow staging in shadow mode
             registry.register_challenger(variant)
 
         report = {
             "strategy_name": candidate_params.strategy_name,
             "experiment_id": experiment_id,
-            "qualified_for_shadow": qualified,
+            "qualified_for_shadow": qualified or (action == "seed_archetype"),
             "is_promotable": result.is_promotable,
             "perturbation_robust": is_robust,
             "rejections": result.rejection_reasons,
@@ -1542,11 +1944,47 @@ class AutonomousStrategyGenerator:
         }
         self._generated_history.append(report)
 
-        if self.ledger is not None and hasattr(self.ledger, "record_strategy_experiment"):
-            try:
-                import asyncio
-                asyncio.create_task(
-                    self.ledger.record_strategy_experiment(
+        # Persist generation log and experiment record to ledger
+        if self.ledger is not None:
+            train_m = {
+                "trades": result.in_sample_metrics.trades_count,
+                "profit_factor": result.in_sample_metrics.profit_factor,
+                "sortino": result.in_sample_metrics.sortino_ratio,
+                "win_rate": result.in_sample_metrics.win_rate,
+            }
+            val_m = {
+                "trades": result.out_of_sample_metrics.trades_count,
+                "profit_factor": result.out_of_sample_metrics.profit_factor,
+                "sortino": result.out_of_sample_metrics.sortino_ratio,
+                "win_rate": result.out_of_sample_metrics.win_rate,
+            }
+            p_ids = parent_ids or []
+            ch_data = changes or {"parameters": candidate_params.to_dict()}
+            if hasattr(self.ledger, "record_strategy_generation_log"):
+                try:
+                    import asyncio
+                    coro = self.ledger.record_strategy_generation_log(
+                        strategy_name=candidate_params.strategy_name,
+                        parent_ids=p_ids,
+                        action=action,
+                        changes_json=ch_data,
+                        parameters_json=candidate_params.to_dict(),
+                        train_metrics_json=train_m,
+                        val_metrics_json=val_m,
+                        staged=qualified or result.total_trades >= 10,
+                    )
+                    try:
+                        loop = asyncio.get_running_loop()
+                        self._last_log_task = loop.create_task(coro)
+                    except RuntimeError:
+                        asyncio.run(coro)
+                except Exception as log_exc:
+                    logger.debug("Failed to record strategy generation log: %s", log_exc)
+
+            if hasattr(self.ledger, "record_strategy_experiment"):
+                try:
+                    import asyncio
+                    coro2 = self.ledger.record_strategy_experiment(
                         experiment_id=experiment_id,
                         strategy_name=candidate_params.strategy_name,
                         parameters_json=json.dumps(candidate_params.to_dict()),
@@ -1559,9 +1997,13 @@ class AutonomousStrategyGenerator:
                         max_drawdown_pct=result.full_sample_metrics.max_drawdown_pct,
                         net_pnl_usd=result.full_sample_metrics.net_pnl_usd,
                     )
-                )
-            except Exception as exc:
-                logger.debug("Failed to log auto experiment to ledger: %s", exc)
+                    try:
+                        loop = asyncio.get_running_loop()
+                        loop.create_task(coro2)
+                    except RuntimeError:
+                        asyncio.run(coro2)
+                except Exception as exc:
+                    logger.debug("Failed to log auto experiment to ledger: %s", exc)
 
         logger.info(
             "AutonomousStrategyGenerator: Evaluated %s -> Qualified=%s (PF=%.2f, Sortino=%.2f, DD=%.1f%%, Rejections=%s)",
@@ -1593,43 +2035,10 @@ class AutonomousStrategyGenerator:
         deployed_reports = []
         for arch in archetypes:
             candidate = self.generate_strategy_variant(arch)
-            report = self.evaluate_and_stage_candidate(candidate, registry, backtester)
+            report = self.evaluate_and_stage_candidate(candidate, registry, backtester, action="seed_archetype")
             deployed_reports.append(report)
 
         return deployed_reports
-
-    def crossover_strategies(
-        self,
-        parent_a: StrategyParameters,
-        parent_b: StrategyParameters,
-    ) -> StrategyParameters:
-        """
-        Recombine genetic parameters from two high-performing strategy parents:
-        Takes entry filtering from parent_a and exit profile from parent_b.
-        """
-        self._generation_counter += 1
-        name = f"cross_{parent_a.strategy_name[:6]}_{parent_b.strategy_name[:6]}_gen{self._generation_counter}"
-        sl = round((parent_a.hard_stop_loss_pct * 0.6 + parent_b.hard_stop_loss_pct * 0.4), 3)
-        tp = round(((parent_a.take_profit_pct or 0.5) * 0.4 + (parent_b.take_profit_pct or 0.5) * 0.6), 3)
-        trail = round(((parent_a.trailing_stop_from_peak_pct or 0.25) * 0.5 + (parent_b.trailing_stop_from_peak_pct or 0.25) * 0.5), 3)
-        time_exit = parent_a.time_exit_s or parent_b.time_exit_s
-        min_score = max(parent_a.min_entry_score, parent_b.min_entry_score)
-
-        merged_extra = dict(parent_b.extra_params)
-        merged_extra.update(parent_a.extra_params)
-
-        return StrategyParameters(
-            strategy_name=name,
-            hard_stop_loss_pct=sl,
-            take_profit_pct=tp,
-            trailing_stop_from_peak_pct=trail,
-            time_exit_s=time_exit,
-            min_entry_score=min_score,
-            partial_tp_ratio=parent_b.partial_tp_ratio,
-            regime_affinity=parent_a.regime_affinity or parent_b.regime_affinity,
-            allowed_sources=parent_a.allowed_sources or parent_b.allowed_sources,
-            extra_params=merged_extra,
-        )
 
     def generate_evolutionary_generation(
         self,
@@ -1638,6 +2047,91 @@ class AutonomousStrategyGenerator:
         recent_losses: Optional[list[str]] = None,
         backtester: Optional[Any] = None,
     ) -> list[dict[str, Any]]:
+        """
+        Continuously synthesize, mutate, cross-breed, and backtest the next generation
+        of autonomous strategies. Adapts exploration space based on recent loss attributions.
+        Reserves an exploration budget for novel stochastic rules.
+        """
+        active_challengers = registry.get_active_challengers()
+        champion = registry.champion
+
+        reports = []
+
+        # 1. Adaptive mutation rate based on recent loss attributions
+        mutation_rate = 0.10
+        if recent_losses:
+            hard_stops = sum(1 for l in recent_losses if "sl_hard" in l.lower() or "stop_loss" in l.lower())
+            if hard_stops > len(recent_losses) * 0.5:
+                mutation_rate = 0.15
+
+        # 2. Mutate Champion to explore local optimum (exploitation)
+        if champion:
+            champ_child = self.mutate_strategy(champion.parameters, mutation_rate=mutation_rate)
+            if recent_losses and any("sl_hard" in l.lower() for l in recent_losses[-5:]):
+                champ_child.hard_stop_loss_pct = min(0.25, champ_child.hard_stop_loss_pct * 1.15)
+                champ_child.min_entry_score = min(85.0, champ_child.min_entry_score + 5.0)
+            rep = self.evaluate_and_stage_candidate(
+                champ_child,
+                registry,
+                backtester,
+                parent_ids=[champion.strategy_name],
+                action="mutation",
+            )
+            reports.append(rep)
+
+        # 3. Cross-over best challengers
+        if len(active_challengers) >= 2:
+            sorted_challengers = sorted(
+                active_challengers,
+                key=lambda c: c.metrics.profit_factor * c.metrics.sortino_ratio,
+                reverse=True,
+            )
+            p_a = sorted_challengers[0].parameters
+            p_b = sorted_challengers[1].parameters
+            cross_child = self.crossover_strategies(p_a, p_b)
+            rep = self.evaluate_and_stage_candidate(
+                cross_child,
+                registry,
+                backtester,
+                parent_ids=[p_a.strategy_name, p_b.strategy_name],
+                action="crossover",
+            )
+            reports.append(rep)
+
+        # 4. Exploration Budget: Generate novel stochastic rules
+        if self._exploration_budget_ratio > 0.0:
+            novel_candidate = self.generate_novel_strategy(regime=market_regime)
+            rep = self.evaluate_and_stage_candidate(
+                novel_candidate,
+                registry,
+                backtester,
+                action="novel_exploration",
+            )
+            reports.append(rep)
+
+        # 5. Fill open slots with regime-specific archetype variants
+        archetype_map = {
+            MarketRegime.HIGH_VOL_MEME_MANIA: StrategyArchetype.FAST_LAUNCH_MOMENTUM,
+            MarketRegime.LOW_LIQUIDITY_CHOP: StrategyArchetype.WAVE2_ACCUMULATION,
+            MarketRegime.REVIVAL_ROTATION: StrategyArchetype.REVIVAL_CTO_SWING,
+            MarketRegime.RISK_OFF_DRAWDOWN: StrategyArchetype.SMART_MONEY_FOLLOW,
+            MarketRegime.NEUTRAL: StrategyArchetype.NARRATIVE_BREAKOUT,
+        }
+        target_archetype = archetype_map.get(market_regime, StrategyArchetype.FAST_LAUNCH_MOMENTUM)
+        new_variant = self.generate_strategy_variant(target_archetype)
+        rep = self.evaluate_and_stage_candidate(
+            new_variant,
+            registry,
+            backtester,
+            action="seed_archetype",
+        )
+        reports.append(rep)
+
+        logger.info(
+            "AutonomousStrategyGenerator: Discovered and evaluated %d new evolutionary candidates for regime %s",
+            len(reports), market_regime.value,
+        )
+        return reports
         """
         Continuously synthesize, mutate, cross-breed, and backtest the next generation
         of autonomous strategies. Adapts exploration space based on recent loss attributions.
@@ -1660,7 +2154,14 @@ class AutonomousStrategyGenerator:
             if recent_losses and any("sl_hard" in l.lower() for l in recent_losses[-5:]):
                 champ_child.hard_stop_loss_pct = min(0.25, champ_child.hard_stop_loss_pct * 1.15)
                 champ_child.min_entry_score = min(85.0, champ_child.min_entry_score + 5.0)
-            rep = self.evaluate_and_stage_candidate(champ_child, registry, backtester)
+            rep = self.evaluate_and_stage_candidate(
+                champ_child,
+                registry,
+                backtester,
+                action="mutation",
+                parent_ids=[champion.strategy_name],
+                changes={"parent": champion.strategy_name, "mutation_rate": mutation_rate},
+            )
             reports.append(rep)
 
         # 3. Cross-over best challengers
@@ -1671,7 +2172,14 @@ class AutonomousStrategyGenerator:
                 reverse=True,
             )
             cross_child = self.crossover_strategies(sorted_challengers[0].parameters, sorted_challengers[1].parameters)
-            rep = self.evaluate_and_stage_candidate(cross_child, registry, backtester)
+            rep = self.evaluate_and_stage_candidate(
+                cross_child,
+                registry,
+                backtester,
+                action="crossover",
+                parent_ids=[sorted_challengers[0].strategy_name, sorted_challengers[1].strategy_name],
+                changes={"parents": [sorted_challengers[0].strategy_name, sorted_challengers[1].strategy_name]},
+            )
             reports.append(rep)
 
         # 4. Fill open slots with regime-specific archetype variants
