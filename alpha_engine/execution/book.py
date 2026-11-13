@@ -917,6 +917,8 @@ class PositionBook:
         security_report: Any | None = None,
         partial_exit_fraction: Decimal | None = None,
         hard_stop_loss_pct: Optional[float | Decimal] = None,
+        custom_take_profit_pct: Optional[float | Decimal] = None,
+        trailing_stop_from_peak_pct: Optional[float | Decimal] = None,
         current_pool_address: Optional[str] = None,
         **kwargs: Any,
     ) -> ExitDecision | None:
@@ -1100,14 +1102,14 @@ class PositionBook:
         entry_sl_threshold = None
         if lot.ai_hard_stop_loss_pct is not None:
             entry_sl_threshold = normalize_stop_loss_pct(lot.ai_hard_stop_loss_pct)
+        elif hard_stop_loss_pct is not None:
+            entry_sl_threshold = normalize_stop_loss_pct(hard_stop_loss_pct)
         elif lot.custom_stop_loss_pct is not None and lot.custom_stop_loss_pct <= 0.25:
             entry_sl_threshold = normalize_stop_loss_pct(lot.custom_stop_loss_pct)
         elif is_early_rally_strategy:
             entry_sl_threshold = normalize_stop_loss_pct(lot.custom_stop_loss_pct) or Decimal("0.15")
         elif lot.hard_stop_loss_pct is not None:
             entry_sl_threshold = normalize_stop_loss_pct(lot.hard_stop_loss_pct)
-        elif hard_stop_loss_pct is not None:
-            entry_sl_threshold = normalize_stop_loss_pct(hard_stop_loss_pct)
         else:
             entry_sl_threshold = None
 
@@ -1150,21 +1152,26 @@ class PositionBook:
         # --- TRAILING STOP-LOSS BASED ON HIGHEST RECORDED PRICE (ATH PEAK) ---
         # Requirement 2: Trailing stop-loss based on highest price reached after entering trade.
         # Drops of 28%, 50%, or 60% from peak trigger exit; does not close trade simply at -25% from entry.
+        trail_from_peak = (
+            trailing_stop_from_peak_pct
+            if trailing_stop_from_peak_pct is not None
+            else lot.trailing_stop_from_peak_pct
+        )
+        if trail_from_peak is None:
+            if is_early_rally_strategy:
+                trail_from_peak = 0.28
+            elif lot.strategy_name == "peak_trailing_60":
+                trail_from_peak = 0.60
+            elif lot.strategy_name in ("peak_trailing_50", "custom"):
+                trail_from_peak = 0.50
+
         is_peak_trailing_strategy = (
-            lot.strategy_name in ("peak_trailing_50", "peak_trailing_60", "early_rally", "early_rally_breakout", "custom")
-            and (lot.trailing_stop_from_peak_pct is not None or is_early_rally_strategy)
-        ) or is_early_rally_strategy
+            (trail_from_peak is not None and float(trail_from_peak) > 0)
+            or is_early_rally_strategy
+            or lot.strategy_name in ("peak_trailing_50", "peak_trailing_60", "early_rally", "early_rally_breakout", "custom")
+        )
 
         if is_peak_trailing_strategy and lot.peak_price > Decimal(0):
-            trail_from_peak = lot.trailing_stop_from_peak_pct
-            if trail_from_peak is None:
-                if is_early_rally_strategy:
-                    trail_from_peak = 0.28
-                elif lot.strategy_name == "peak_trailing_60":
-                    trail_from_peak = 0.60
-                else:
-                    trail_from_peak = 0.50
-
             # Dynamic floor tracking from ATH peak
             trail_floor = (lot.peak_price * (Decimal("1.0") - Decimal(str(trail_from_peak)))).quantize(Decimal("1e-18"))
             lot.trailing_stop_active = True
@@ -1204,7 +1211,11 @@ class PositionBook:
                 )
 
             # Target Take-Profit with Multi-Stage Scale-Out Support:
-            target_tp = lot.custom_take_profit_pct
+            target_tp = (
+                custom_take_profit_pct
+                if custom_take_profit_pct is not None
+                else lot.custom_take_profit_pct
+            )
             if target_tp is None:
                 target_tp = 0.60 if lot.strategy_name == "peak_trailing_60" else 0.50
 

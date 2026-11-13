@@ -293,6 +293,17 @@ To ensure realistic paper trading without historical over-fitting, the engine mo
 - **PositionBook (`book.py`)**: In-memory portfolio tracking with First-In-First-Out (FIFO) tax lots, tracking realized PnL, unrealized PnL, and maximum run-up.
 - **SQLiteLedger (`ledger.py`)**: Thread-safe asynchronous SQLite database running in **WAL (Write-Ahead Logging)** mode with `synchronous = NORMAL` and 30-second busy timeout locks. Persists all fills, decisions, and periodic portfolio snapshots.
 
+### Strategy Tournament & Promotion Governance
+The strategy tournament (`StrategyTournamentRegistry` in `experimentation.py`) executes parallel shadow lots for challenger variants alongside the live Champion:
+- **Sample Size Gate**: Minimum 50 closed shadow trades (`tournament_min_promotion_trades`, or 30 if champion is underperforming) to ensure statistical significance.
+- **Statistical Confidence Criterion**: 95% bootstrap lower bound of expectancy must be strictly positive ($> \$0.00$ at `tournament_bootstrap_confidence_level=0.95`, 1,000 resamples).
+- **Out-of-Sample (OOS) Consistency**: Time-split validation gate (70% in-sample, 30% out-of-sample). The challenger must maintain positive Net PnL, Profit Factor $\ge 1.20$, bounded drawdown, and positive Sortino on the unseen later segment.
+- **Risk-Adjusted Hurdle**: Sortino ratio must exceed Champion by $\ge 0.10$ with Profit Factor $\ge 1.35$ and Maximum Drawdown $< 8.0\%$ (or $< 12.0\%$ if champion is bleeding).
+- **Outlier Win Gate**: $\le 60\%$ of total profits may derive from a single windfall trade.
+- **Cooldown & Rollback Safety**: Minimum 10 trades / 300s cooldown between promotions. If a newly promoted champion loses $\ge \$20.00$ or drops below 25% win rate in its first 10 live trades, it is automatically demoted back to shadow and the previous champion is restored.
+- **Atomic Live Synchronization**: Promotion atomically updates runner exit parameters (`hard_stop_loss_pct`, `custom_take_profit_pct`, `trailing_stop_from_peak_pct`, `time_exit_s`, `min_entry_score`) and refreshes open lot exit rules in `PositionBook`.
+
+
 ---
 
 ## 💬 Conversational Supervisor & Telegram Interactive Bot

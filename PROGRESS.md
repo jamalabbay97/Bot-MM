@@ -274,14 +274,62 @@ Track progress across all identified defects and phases. All items must satisfy 
 ---
 
 ## Issue 8 Promotion gate precedence bug + weak statistics
-- [ ] reproduced
-- [ ] red test
-- [ ] fix
-- [ ] green test
-- [ ] mutation check
-- [ ] sweep done
-- [ ] wiring proof
-- [ ] README/docs updated
+- [x] reproduced
+  - `alpha_engine/engine/experimentation.py:943` (now line 1128): `if m.max_drawdown_pct >= 12.0 if is_champ_underperforming else 8.0: continue` parsed in Python as `((mdd >= 12.0) if is_champ_underperforming else 8.0)`. When the champion is healthy (`is_champ_underperforming=False`), it evaluated to `8.0` (truthy), rejecting 100% of challengers regardless of metrics.
+  - Inadequate sample size: `min_promotion_trades` was 8 (healthy) and 15 (underperforming), where standard error of the mean is large and random noise easily passes.
+  - No statistical confidence criterion: lacked bootstrap lower bound or hypothesis test on expectancy.
+  - No out-of-sample validation: curve-fit strategies failing out-of-sample were eligible for promotion.
+  - Ignored live exit parameters: `PositionBook.evaluate_lot_exit` restricted trailing stops and take profit to a hardcoded 5-strategy whitelist; newly promoted champions were ignored by the live exit engine.
+  - Challenger retirement leak: `prune_underperforming_challengers` set status to `RETIRED` but left variants in `self.challengers`, allowing them to accumulate shadow trades and be evaluated for promotion.
+  - Sortino calculation bug: in `recompute_metrics`, 0 losing trades evaluated `sortino_ratio` to 0.0 instead of 99.0, causing 100% win rate challengers to be rejected.
+- [x] red test
+  - `tests/test_issue8_promotion_gate.py`: 12 comprehensive tests:
+    1. `test_reproduce_precedence_bug_healthy_champ_blocks_superior_challenger`: Superior challenger rejected when champion is healthy under bug; passes with fix.
+    2. `test_inferior_challenger_is_not_promoted`: Inferior challenger (PF < 1.35 or Sortino <= champ + 0.1) rejected.
+    3. `test_high_drawdown_challenger_rejected`: Challenger with MDD >= threshold rejected.
+    4. `test_drawdown_boundary_thresholds_healthy_and_underperforming`: Validates exact boundary conditions (8.0% healthy, 12.0% underperforming).
+    5. `test_insufficient_sample_size_rejected`: Challenger with N < min_trades rejected.
+    6. `test_retired_challengers_cannot_be_promoted_and_do_not_leak`: Pruned challengers moved to `retired_challengers` and cannot be promoted.
+    7. `test_outlier_win_dependency_rejected`: Challenger with > 60% profit from single trade rejected.
+    8. `test_confidence_criterion_bootstrap_rejects_noisy_edge`: Challenger with superficial edge but 95% bootstrap lower bound of expectancy <= 0 rejected.
+    9. `test_superior_in_sample_inferior_out_of_sample_rejected`: Time-split gate catches in-sample curve fitting and rejects out-of-sample bleeding.
+    10. `test_cooldown_prevents_immediate_subsequent_promotion`: Immediate back-to-back promotion blocked during cooldown; succeeds after cooldown expiry.
+    11. `test_rollback_demotes_failing_new_champion`: Newly promoted champion losing >= $20 in first 10 trades rolled back to previous champion.
+    12. `test_promotion_changes_live_exit_decisions_integration`: Full integration test proving promotion callback atomically updates runner parameters and changes live exit engine behavior.
+- [x] fix
+  - `alpha_engine/config.py`: Added Section 5d-3 with typed configuration: `tournament_min_promotion_trades=50`, `tournament_min_promotion_trades_underperforming=30`, `tournament_train_fraction=0.70`, `tournament_bootstrap_resamples=1000`, `tournament_bootstrap_confidence_level=0.95`, `tournament_promotion_cooldown_trades=10`, `tournament_promotion_cooldown_seconds=300.0`, `tournament_rollback_max_trades=10`, `tournament_rollback_max_loss_usd=-20.0`, `tournament_rollback_min_win_rate=25.0`.
+  - `alpha_engine/engine/experimentation.py`:
+    - Rewrote conditional with explicit local variable: `mdd_threshold = 12.0 if is_champ_underperforming else 8.0; if m.max_drawdown_pct >= mdd_threshold: continue`.
+    - Added `StrategyVariant.compute_metrics_from_lots`, `split_closed_lots_by_time`, and `compute_bootstrap_expectancy`.
+    - Fixed Sortino calculation in `recompute_metrics` when downside deviation is zero to evaluate to 99.0 when net return is positive.
+    - Fixed `prune_underperforming_challengers` to pop retired variants from `self.challengers` into `self.retired_challengers`.
+    - Implemented promotion cooldown check (`is_in_promotion_cooldown`), 95% bootstrap lower bound check (`boot_lower > 0.0`), and time-split out-of-sample validation gate.
+    - Implemented automated rollback rule (`evaluate_rollback`) in `record_live_trade_outcome`.
+  - `alpha_engine/execution/book.py`:
+    - Updated `evaluate_lot_exit` to accept `custom_take_profit_pct` and `trailing_stop_from_peak_pct` arguments and removed restrictive strategy name whitelist.
+    - Ensured passed `hard_stop_loss_pct` overrides lot default.
+  - `alpha_engine/engine/runner.py`:
+    - Overhauled `_on_champion_promoted` to atomically synchronize `active_strategy`, `hard_stop_loss_pct`, `custom_take_profit_pct`, `trailing_stop_from_peak_pct`, `time_exit_s`, `min_entry_score`, and open lot parameters.
+    - Forwarded updated parameters from `_monitor_and_manage_positions` directly to `evaluate_lot_exit`.
+- [x] green test
+  - `tests/test_issue8_promotion_gate.py`: 12/12 passed.
+  - `tests/test_strategy_experimentation_and_swarm.py` & `tests/test_autonomous_strategy_evolution_loop.py`: 13/13 passed.
+- [x] mutation check
+  - Mutation 1 (Precedence bug restored): `test_reproduce_precedence_bug_healthy_champ_blocks_superior_challenger` failed (`AssertionError: None is not None`).
+  - Mutation 2 (OOS gate bypassed): `test_superior_in_sample_inferior_out_of_sample_rejected` failed (`AssertionError: Challenger bleeding on out-of-sample segment must be rejected`).
+  - Mutation 3 (Bootstrap gate bypassed): `test_confidence_criterion_bootstrap_rejects_noisy_edge` failed (`AssertionError: Noisy challenger failing bootstrap confidence bound must be rejected`).
+  - Mutation 4 (Cooldown bypassed): `test_cooldown_prevents_immediate_subsequent_promotion` failed (`AssertionError: Promotion during cooldown period must be blocked`).
+  - Mutation 5 (Rollback bypassed): `test_rollback_demotes_failing_new_champion` failed (`AssertionError: Failing champion must be rolled back to previous champion`).
+- [x] sweep done
+  - `tools/audit/conditional_precedence.py`: Findings reduced from 54 to 52; `ast.IfExp used directly as test of 'if'` eliminated completely repo-wide (0 findings).
+  - All 52 remaining findings audited and verified as safe parenthesized fallback chains or standard ternaries.
+- [x] wiring proof
+  - `evaluate_promotions` promotes challenger -> invokes `_on_champion_promoted` in `runner.py`.
+  - `_on_champion_promoted` updates `runner.hard_stop_loss_pct`, `runner.trailing_stop_from_peak_pct`, `runner.custom_take_profit_pct`, `runner.time_exit_s`, `runner.min_entry_score`, and existing open lots in `PositionBook`.
+  - `runner._monitor_and_manage_positions` passes updated parameters to `evaluate_lot_exit`.
+  - Verified by `test_promotion_changes_live_exit_decisions_integration`.
+- [x] README/docs updated
+  - Documented promotion criteria, cooldown, rollback rules, bootstrap expectancy bounds, and OOS time-split validation.
 
 ---
 

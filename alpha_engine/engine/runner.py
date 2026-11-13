@@ -356,6 +356,21 @@ class PaperTradingEngine:
             self.hard_stop_loss_pct = champ.parameters.hard_stop_loss_pct
             self.custom_take_profit_pct = champ.parameters.take_profit_pct
             self.trailing_stop_from_peak_pct = champ.parameters.trailing_stop_from_peak_pct
+            self.time_exit_s = champ.parameters.time_exit_s
+            self.min_entry_score = champ.parameters.min_entry_score
+            self.champion_variant = champ
+            if hasattr(self, "config") and self.config:
+                self.config.active_strategy = champ.strategy_name
+                self.config.hard_stop_loss_pct = champ.parameters.hard_stop_loss_pct
+                self.config.custom_take_profit_pct = champ.parameters.take_profit_pct
+                self.config.trailing_stop_from_peak_pct = champ.parameters.trailing_stop_from_peak_pct
+            if hasattr(self, "_position_book") and self._position_book:
+                for open_lot in self._position_book.get_open_lots():
+                    if open_lot.ai_hard_stop_loss_pct is None:
+                        open_lot.hard_stop_loss_pct = champ.parameters.hard_stop_loss_pct
+                        open_lot.custom_stop_loss_pct = champ.parameters.hard_stop_loss_pct
+                    open_lot.custom_take_profit_pct = champ.parameters.take_profit_pct
+                    open_lot.trailing_stop_from_peak_pct = champ.parameters.trailing_stop_from_peak_pct
             logger.info(
                 "Runner: Applied newly promoted Champion strategy [%s] to live trade execution. SL=%.1f%%, TP=%.1f%%, Trail=%.1f%%",
                 champ.strategy_name,
@@ -6279,6 +6294,8 @@ class PaperTradingEngine:
                         bonding_curve_mode=lot.bonding_curve_mode,
                         exit_grace_period_sec=grace_sec,
                         hard_stop_loss_pct=getattr(self, "hard_stop_loss_pct", 0.20),
+                        trailing_stop_from_peak_pct=getattr(self, "trailing_stop_from_peak_pct", None),
+                        custom_take_profit_pct=getattr(self, "custom_take_profit_pct", None),
                     )
                     if decision is not None and decision.should_exit:
                         # Idempotent state transition: OPEN -> PENDING_SELL

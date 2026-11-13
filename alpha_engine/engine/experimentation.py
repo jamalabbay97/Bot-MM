@@ -14,6 +14,7 @@ from __future__ import annotations
 import json
 import logging
 import math
+import random
 import time
 import uuid
 from dataclasses import asdict, dataclass, field
@@ -305,15 +306,15 @@ class StrategyVariant:
         except Exception:
             return pool.spot_price_native_per_token
 
-    def recompute_metrics(self) -> StrategyMetrics:
-        """Calculate institutional risk-adjusted performance metrics across closed shadow lots."""
-        n = len(self.closed_lots)
+    @classmethod
+    def compute_metrics_from_lots(cls, lots: list[ShadowLot]) -> StrategyMetrics:
+        """Calculate institutional risk-adjusted performance metrics across a given list of closed lots."""
+        n = len(lots)
         if n == 0:
-            self.metrics = StrategyMetrics()
-            return self.metrics
+            return StrategyMetrics()
 
-        pnls = [float(lot.realized_pnl_usd or 0.0) for lot in self.closed_lots]
-        rois = [float(lot.roi_pct or 0.0) for lot in self.closed_lots]
+        pnls = [float(lot.realized_pnl_usd or 0.0) for lot in lots]
+        rois = [float(lot.roi_pct or 0.0) for lot in lots]
 
         wins = [p for p in pnls if p > 0]
         losses = [p for p in pnls if p <= 0]
@@ -327,15 +328,25 @@ class StrategyVariant:
         mean_roi = sum(rois) / n
         variance = sum((r - mean_roi) ** 2 for r in rois) / n if n > 1 else 0.0
         std_roi = math.sqrt(variance) if variance > 0 else 0.0
-        sharpe = (mean_roi / std_roi) if std_roi > 0 else 0.0
+        if std_roi > 0:
+            sharpe = mean_roi / std_roi
+        elif mean_roi > 0:
+            sharpe = 99.0
+        else:
+            sharpe = 0.0
 
         downside_rois = [min(0.0, r) for r in rois]
         downside_variance = sum(dr ** 2 for dr in downside_rois) / n if n > 1 else 0.0
         downside_std = math.sqrt(downside_variance) if downside_variance > 0 else 0.0
-        sortino = (mean_roi / downside_std) if downside_std > 0 else 0.0
+        if downside_std > 0:
+            sortino = mean_roi / downside_std
+        elif mean_roi > 0:
+            sortino = 99.0  # Conventionally high when zero downside volatility exists with positive return
+        else:
+            sortino = 0.0
 
         # Maximum Drawdown (% of cumulative curve)
-        cum_equity = 1000.0 # Standard base $1000 portfolio
+        cum_equity = 1000.0  # Standard base $1000 portfolio
         peak = cum_equity
         max_dd = 0.0
         for p in pnls:
@@ -358,7 +369,7 @@ class StrategyVariant:
         max_single_win = max(wins) if wins else 0.0
         outlier_ratio = (max_single_win / net_profit) if net_profit > 0 and wins else 0.0
 
-        self.metrics = StrategyMetrics(
+        return StrategyMetrics(
             trades_count=n,
             winning_trades=len(wins),
             losing_trades=len(losses),
@@ -371,7 +382,60 @@ class StrategyVariant:
             expectancy_usd=round(expectancy, 2),
             outlier_win_ratio=round(outlier_ratio, 3),
         )
+
+    def recompute_metrics(self) -> StrategyMetrics:
+        """Calculate institutional risk-adjusted performance metrics across closed shadow lots."""
+        self.metrics = self.compute_metrics_from_lots(self.closed_lots)
         return self.metrics
+
+    def split_closed_lots_by_time(
+        self, train_fraction: float = 0.70
+    ) -> tuple[list[ShadowLot], list[ShadowLot]]:
+        """
+        Chronologically split closed shadow lots into in-sample (train) and out-of-sample (test) segments.
+        Extensible for Phase 3 walk-forward replay backtesting.
+        """
+        if not self.closed_lots:
+            return ([], [])
+        sorted_lots = sorted(self.closed_lots, key=lambda lot: lot.entry_timestamp or 0.0)
+        n = len(sorted_lots)
+        if n < 2:
+            return (sorted_lots, [])
+        split_idx = max(1, min(n - 1, int(n * train_fraction)))
+        return (sorted_lots[:split_idx], sorted_lots[split_idx:])
+
+    @classmethod
+    def compute_bootstrap_expectancy(
+        cls,
+        lots: list[ShadowLot],
+        confidence_level: float = 0.95,
+        n_resamples: int = 1000,
+        rng: Optional[random.Random] = None,
+    ) -> tuple[float, float, float]:
+        """
+        Compute bootstrap confidence bounds for mathematical expectancy (mean PnL per trade in USD).
+        Returns (mean_expectancy, lower_bound, upper_bound).
+        At 95% confidence, lower_bound represents the 5th percentile of the bootstrap mean distribution.
+        """
+        if not lots:
+            return (0.0, 0.0, 0.0)
+        pnls = [float(lot.realized_pnl_usd or 0.0) for lot in lots]
+        n = len(pnls)
+        mean_exp = sum(pnls) / n
+        if n < 5:
+            return (mean_exp, mean_exp, mean_exp)
+
+        local_rng = rng if rng is not None else random.Random()
+        boot_means = []
+        for _ in range(n_resamples):
+            sample = [local_rng.choice(pnls) for _ in range(n)]
+            boot_means.append(sum(sample) / n)
+
+        boot_means.sort()
+        alpha = max(0.001, min(0.5, 1.0 - confidence_level))
+        lower_idx = max(0, min(n_resamples - 1, int(n_resamples * alpha)))
+        upper_idx = max(0, min(n_resamples - 1, int(n_resamples * (1.0 - alpha))))
+        return (mean_exp, boot_means[lower_idx], boot_means[upper_idx])
 
     def check_perturbation_stability(self, perturbation_pct: float = 0.10) -> bool:
         """
@@ -436,6 +500,27 @@ class StrategyTournamentRegistry:
         self._rng = random.Random(seed) if seed is not None else random.Random()
         self.current_regime: MarketRegime = MarketRegime.NEUTRAL
         self.on_promotion_callbacks: list[Callable[[StrategyVariant, str], Any]] = []
+
+        # Statistical Governance & Anti-Overfitting Configuration
+        # Defaults: N >= 50 closed trades ensures narrow standard error of the mean;
+        # in emergency underperforming conditions, N >= 30 maintains minimum statistical power.
+        self.min_promotion_trades: int = int(getattr(self.config, "tournament_min_promotion_trades", 50))
+        self.min_promotion_trades_underperforming: int = int(getattr(self.config, "tournament_min_promotion_trades_underperforming", 30))
+        self.train_fraction: float = float(getattr(self.config, "tournament_train_fraction", 0.70))
+        self.bootstrap_resamples: int = int(getattr(self.config, "tournament_bootstrap_resamples", 1000))
+        self.bootstrap_confidence_level: float = float(getattr(self.config, "tournament_bootstrap_confidence_level", 0.95))
+        self.promotion_cooldown_trades: int = int(getattr(self.config, "tournament_promotion_cooldown_trades", 10))
+        self.promotion_cooldown_seconds: float = float(getattr(self.config, "tournament_promotion_cooldown_seconds", 300.0))
+        self.rollback_max_trades: int = int(getattr(self.config, "tournament_rollback_max_trades", 10))
+        self.rollback_max_loss_usd: float = float(getattr(self.config, "tournament_rollback_max_loss_usd", -20.0))
+        self.rollback_min_win_rate: float = float(getattr(self.config, "tournament_rollback_min_win_rate", 25.0))
+
+        # Promotion, Cooldown & Rollback Governance State
+        self.previous_champion: Optional[StrategyVariant] = None
+        self.last_promotion_timestamp: float = 0.0
+        self.last_promotion_trade_count: int = 0
+        self.champion_live_trades_since_promotion: list[dict[str, Any]] = []
+        self.retired_challengers: dict[str, StrategyVariant] = {}
 
         # Initialize default Champion
         champ_params = StrategyParameters(
@@ -556,6 +641,101 @@ class StrategyTournamentRegistry:
         if callback not in self.on_promotion_callbacks:
             self.on_promotion_callbacks.append(callback)
 
+    def _get_total_closed_trades_count(self) -> int:
+        """Return total closed lots across champion and all active/retired challengers."""
+        cnt = len(self.champion.closed_lots) if self.champion else 0
+        for c in self.challengers.values():
+            cnt += len(c.closed_lots)
+        for c in self.retired_challengers.values():
+            cnt += len(c.closed_lots)
+        return cnt
+
+    def is_in_promotion_cooldown(self) -> bool:
+        """Check if promotion governance is currently in a cooldown window."""
+        if self.last_promotion_timestamp <= 0.0:
+            return False
+        elapsed_s = time.time() - self.last_promotion_timestamp
+        cooldown_s = getattr(self, "promotion_cooldown_seconds", getattr(self.config, "tournament_promotion_cooldown_seconds", 300.0))
+        if elapsed_s < cooldown_s:
+            logger.info("StrategyTournamentRegistry: Promotion blocked by time cooldown (%.1fs < %.1fs)", elapsed_s, cooldown_s)
+            return True
+        cooldown_trades = getattr(self, "promotion_cooldown_trades", getattr(self.config, "tournament_promotion_cooldown_trades", 10))
+        trades_since = self._get_total_closed_trades_count() - self.last_promotion_trade_count
+        if trades_since < cooldown_trades:
+            logger.info("StrategyTournamentRegistry: Promotion blocked by trade count cooldown (%d < %d trades)", trades_since, cooldown_trades)
+            return True
+        return False
+
+    def evaluate_rollback(self) -> Optional[Tuple[StrategyVariant, str]]:
+        """
+        Rollback rule:
+        If the newly promoted champion's live results fall below configured bounds
+        within rollback_max_trades (e.g. cumulative loss <= -$20.0 or low win rate),
+        demote the champion back to SHADOW and restore previous_champion.
+        """
+        if self.previous_champion is None:
+            return None
+
+        trades = self.champion_live_trades_since_promotion
+        if not trades:
+            return None
+
+        max_trades = getattr(self, "rollback_max_trades", getattr(self.config, "tournament_rollback_max_trades", 10))
+        max_loss_usd = getattr(self, "rollback_max_loss_usd", getattr(self.config, "tournament_rollback_max_loss_usd", -20.0))
+        min_win_rate = getattr(self, "rollback_min_win_rate", getattr(self.config, "tournament_rollback_min_win_rate", 25.0))
+
+        n = len(trades)
+        if n > max_trades:
+            return None
+
+        cum_pnl = sum(float(t.get("realized_pnl_usd", 0.0)) for t in trades)
+        wins = sum(1 for t in trades if t.get("is_win", False))
+        win_rate = (wins / n) * 100.0
+
+        should_rollback = False
+        rollback_reason = ""
+
+        if cum_pnl <= max_loss_usd:
+            should_rollback = True
+            rollback_reason = (
+                f"ROLLBACK TRIGGERED: New champion {self.champion.strategy_name} cumulative live loss "
+                f"${cum_pnl:.2f} <= ${max_loss_usd:.2f} within N={n} live trades."
+            )
+        elif n >= 5 and win_rate < min_win_rate:
+            should_rollback = True
+            rollback_reason = (
+                f"ROLLBACK TRIGGERED: New champion {self.champion.strategy_name} live win rate "
+                f"{win_rate:.1f}% < {min_win_rate:.1f}% across N={n} live trades."
+            )
+
+        if should_rollback:
+            logger.warning(
+                "⚠️ %s Demoting to SHADOW and restoring previous champion %s",
+                rollback_reason, self.previous_champion.strategy_name,
+            )
+            demoted_champ = self.champion
+            demoted_champ.status = ExperimentStatus.SHADOW
+            self.challengers[demoted_champ.strategy_name] = demoted_champ
+
+            restored_champ = self.previous_champion
+            restored_champ.status = ExperimentStatus.CHAMPION
+            self.champion = restored_champ
+            self.challengers.pop(restored_champ.strategy_name, None)
+            self.previous_champion = None
+            self.champion_live_trades_since_promotion = []
+            self.last_promotion_timestamp = time.time()
+            self.last_promotion_trade_count = self._get_total_closed_trades_count()
+
+            for cb in self.on_promotion_callbacks:
+                try:
+                    cb(restored_champ, rollback_reason)
+                except Exception as cb_err:
+                    logger.warning("Error in on_promotion_callback during rollback: %s", cb_err)
+
+            return (restored_champ, rollback_reason)
+
+        return None
+
     def prune_underperforming_challengers(
         self,
         min_trades: int = 15,
@@ -574,6 +754,8 @@ class StrategyTournamentRegistry:
             if m.trades_count >= min_trades:
                 if m.profit_factor < min_pf or m.max_drawdown_pct >= max_dd_pct or m.win_rate < 30.0:
                     chal.status = ExperimentStatus.RETIRED
+                    self.retired_challengers[name] = chal
+                    del self.challengers[name]
                     pruned.append(name)
                     logger.info(
                         "StrategyTournamentRegistry: Retired underperforming challenger %s (N=%d, PF=%.2f, DD=%.1f%%, WR=%.1f%%)",
@@ -684,6 +866,16 @@ class StrategyTournamentRegistry:
                 "StrategyTournamentRegistry: Recorded live %s trade for %s (%s) -> PnL=$%.2f, ROI=%.2f%%, HoldTime=%.1fs (Trades=%d, WinRate=%.1f%%, PF=%.2f, Sortino=%.2f)",
                 outcome_label, strategy_name, actual_token[:10], float(realized_pnl), float(roi_pct), float(hold_time_s), m.trades_count, m.win_rate, m.profit_factor, m.sortino_ratio,
             )
+
+            # Record in champion live evaluation window if trade belongs to champion
+            if self.champion and strategy_name == self.champion.strategy_name:
+                self.champion_live_trades_since_promotion.append({
+                    "realized_pnl_usd": float(realized_pnl),
+                    "is_win": bool(is_win),
+                    "timestamp": now,
+                })
+                # Check for rollback demotion if live performance breaches safety bounds
+                self.evaluate_rollback()
 
     async def on_trade_closed(self, trade_outcome: dict[str, Any]) -> None:
         """Async hook adapter for post-trade lifecycle."""
@@ -906,24 +1098,47 @@ class StrategyTournamentRegistry:
     def evaluate_promotions(self) -> Optional[Tuple[StrategyVariant, str]]:
         """
         Anti-Overfitting & Promotion/Demotion Governance:
-        1. Minimum Sample Size: N >= min_promotion_trades (default 8 if champion underperforming, 15 otherwise)
-        2. Out-of-Sample Consistency: Sortino > Champion + 0.1 and Profit Factor > 1.35
-        3. Max Drawdown < 8.0%
-        4. Outlier Win Dependency: <= 60% of total profits from a single trade
-        5. Parameter Perturbation: Must pass cliff stability check
+        1. Cooldown Guard: Suppresses promotion if cooldown period (time or trades) has not elapsed.
+        2. Minimum Sample Size: N >= min_promotion_trades (default 50 trades, or 30 if champion underperforming).
+           Justification: Small samples (<30) have wide confidence intervals where random luck easily masquerades as edge.
+        3. Risk-Adjusted Edge: Sortino > Champion + 0.1 and Profit Factor > 1.35 (positive metrics required if champion bleeding).
+        4. Maximum Drawdown Gate: MDD < 8.0% (healthy champ) or < 12.0% (underperforming champ).
+        5. Outlier Win Dependency: <= 60% of total profits from a single trade.
+        6. Statistical Confidence: 95% bootstrap lower bound of expectancy > $0.00.
+        7. Out-of-Sample (OOS) Consistency: Time-split validation gate requires later 30% segment to hold positive edge (Net PnL > 0, PF >= 1.20, Sortino > 0).
+        8. Parameter Perturbation: Cliff check confirms stability under +/-10% stop-loss shifts.
         """
+        # 0. Cooldown gate
+        if self.is_in_promotion_cooldown():
+            return None
+
         champ_metrics = self.champion.metrics
         is_champ_underperforming = (
             champ_metrics.trades_count >= 5
             and (champ_metrics.win_rate < 35.0 or champ_metrics.net_pnl_usd < -10.0 or champ_metrics.sortino_ratio < -0.5)
         )
-        min_trades = getattr(self, "min_promotion_trades", 8 if is_champ_underperforming else 15)
+        min_trades_default = (
+            self.min_promotion_trades_underperforming
+            if is_champ_underperforming
+            else self.min_promotion_trades
+        )
+        min_trades = getattr(self, "min_promotion_trades", min_trades_default)
+
+        # Drawdown threshold with explicit local variables
+        mdd_threshold = 12.0 if is_champ_underperforming else 8.0
 
         best_candidate: Optional[StrategyVariant] = None
         best_score: float = -999.0
         promotion_rationale = ""
 
-        for name, chal in self.challengers.items():
+        conf_level = getattr(self.config, "tournament_bootstrap_confidence_level", getattr(self, "bootstrap_confidence_level", 0.95))
+        n_boot = getattr(self.config, "tournament_bootstrap_resamples", getattr(self, "bootstrap_resamples", 1000))
+        train_fraction = getattr(self.config, "tournament_train_fraction", getattr(self, "train_fraction", 0.70))
+
+        for name, chal in list(self.challengers.items()):
+            if chal.status != ExperimentStatus.SHADOW:
+                continue
+
             m = chal.metrics
 
             # 1. Sample size gate
@@ -932,15 +1147,15 @@ class StrategyTournamentRegistry:
 
             # 2. Risk-adjusted metrics gate
             if is_champ_underperforming:
-                # If champion is bleeding, any demonstrably superior challenger with positive metrics qualifies
-                if m.win_rate < 40.0 or m.sortino_ratio <= champ_metrics.sortino_ratio:
+                # If champion is bleeding, require strictly positive metrics and higher Sortino
+                if m.net_pnl_usd <= 0.0 or m.win_rate < 40.0 or m.sortino_ratio <= 0.0 or m.sortino_ratio <= champ_metrics.sortino_ratio:
                     continue
             else:
                 if m.profit_factor < 1.35 or m.sortino_ratio <= (champ_metrics.sortino_ratio + 0.1):
                     continue
 
-            # 3. Maximum Drawdown gate
-            if m.max_drawdown_pct >= 12.0 if is_champ_underperforming else 8.0:
+            # 3. Maximum Drawdown gate (explicit local variable)
+            if m.max_drawdown_pct >= mdd_threshold:
                 continue
 
             # 4. Outlier Win Dependency gate (prevent survivorship bias)
@@ -951,7 +1166,39 @@ class StrategyTournamentRegistry:
                 )
                 continue
 
-            # 5. Parameter Perturbation cliff check
+            # 5. Statistical Confidence Criterion: Bootstrap lower bound of expectancy > 0
+            mean_exp, boot_lower, _ = chal.compute_bootstrap_expectancy(
+                lots=chal.closed_lots,
+                confidence_level=conf_level,
+                n_resamples=n_boot,
+                rng=self._rng,
+            )
+            if boot_lower <= 0.0:
+                logger.info(
+                    "Challenger %s rejected: bootstrap lower bound of expectancy $%.2f <= 0 at %.1f%% confidence (mean=$%.2f)",
+                    name, boot_lower, conf_level * 100.0, mean_exp,
+                )
+                continue
+
+            # 6. Out-of-Sample (OOS) Consistency: Time-split validation gate
+            is_lots, oos_lots = chal.split_closed_lots_by_time(train_fraction=train_fraction)
+            if len(oos_lots) >= 5:
+                oos_m = StrategyVariant.compute_metrics_from_lots(oos_lots)
+                if (
+                    oos_m.net_pnl_usd <= 0.0
+                    or oos_m.profit_factor < 1.20
+                    or oos_m.max_drawdown_pct >= mdd_threshold
+                    or oos_m.sortino_ratio <= 0.0
+                ):
+                    logger.info(
+                        "Challenger %s rejected by OOS gate (train=%.0f%%, test=%.0f%%): OOS PnL=$%.2f, PF=%.2f, MDD=%.1f%%, Sortino=%.2f",
+                        name, train_fraction * 100.0, (1.0 - train_fraction) * 100.0,
+                        oos_m.net_pnl_usd, oos_m.profit_factor,
+                        oos_m.max_drawdown_pct, oos_m.sortino_ratio,
+                    )
+                    continue
+
+            # 7. Parameter Perturbation cliff check
             if not chal.check_perturbation_stability(perturbation_pct=0.10):
                 continue
 
@@ -962,7 +1209,8 @@ class StrategyTournamentRegistry:
                 promotion_rationale = (
                     f"Outperformed Champion: Sortino {m.sortino_ratio:.2f} > {champ_metrics.sortino_ratio:.2f}, "
                     f"PF {m.profit_factor:.2f}, MDD {m.max_drawdown_pct:.1f}%, "
-                    f"OutlierDep {m.outlier_win_ratio*100:.1f}% <= 60% across N={m.trades_count} shadow trades."
+                    f"OutlierDep {m.outlier_win_ratio*100:.1f}% <= 60%, "
+                    f"BootExp95% > $0 (LB=${boot_lower:.2f}) across N={m.trades_count} shadow trades."
                 )
 
         if best_candidate:
@@ -973,7 +1221,13 @@ class StrategyTournamentRegistry:
 
             best_candidate.status = ExperimentStatus.CHAMPION
             del self.challengers[best_candidate.strategy_name]
+            self.previous_champion = old_champ
             self.champion = best_candidate
+
+            # Reset promotion cooldown tracking and live window
+            self.last_promotion_timestamp = time.time()
+            self.last_promotion_trade_count = self._get_total_closed_trades_count()
+            self.champion_live_trades_since_promotion = []
 
             # Notify registered live engine callbacks
             for cb in self.on_promotion_callbacks:
@@ -1035,16 +1289,17 @@ class StrategyTournamentRegistry:
         })
 
         # Challenger entries
+        min_trades = getattr(self, "min_promotion_trades", 50)
         for name, chal in self.challengers.items():
             m = chal.metrics
             ready = (
-                m.trades_count >= 30
+                m.trades_count >= min_trades
                 and m.profit_factor > 1.35
                 and m.sortino_ratio > self.champion.metrics.sortino_ratio
                 and m.max_drawdown_pct < 8.0
                 and m.outlier_win_ratio <= 0.60
             )
-            ready_str = "✅ READY" if ready else f"⏳ {m.trades_count}/30 trades"
+            ready_str = "✅ READY" if ready else f"⏳ {m.trades_count}/{min_trades} trades"
             leaderboard.append({
                 "status": "🔬 CHALLENGER",
                 "name": chal.strategy_name,

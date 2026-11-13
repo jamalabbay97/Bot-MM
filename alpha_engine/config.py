@@ -733,6 +733,70 @@ class EngineConfig(BaseSettings):
         default=0.20,
         description="Independent hard stop-loss percentage measured from entry price (fractional: 0.20 = 20% loss from entry). Evaluated independently of trailing peak stop.",
     )
+
+    # -------------------------------------------------------------------------
+    # 5d-3. Strategy Tournament & Champion Promotion Governance Parameters
+    # -------------------------------------------------------------------------
+    # Statistical sample size justification:
+    # 8-15 trades is statistically meaningless; small sample noise allows random coin-flip runs
+    # to masquerade as an edge (e.g. 5 consecutive meme token wins can produce a false 100% win rate).
+    # Requiring >= 50 closed trades ensures the standard error of the mean return is narrow enough
+    # to distinguish a genuine mathematical edge from luck.
+    # In emergency underperforming conditions, >= 30 trades maintains minimum statistical power.
+    tournament_min_promotion_trades: int = Field(
+        default=50,
+        ge=10,
+        description="Minimum closed shadow trades required to evaluate a challenger for promotion (default 50).",
+    )
+    tournament_min_promotion_trades_underperforming: int = Field(
+        default=30,
+        ge=10,
+        description="Minimum closed shadow trades required when champion is underperforming (default 30).",
+    )
+    tournament_train_fraction: float = Field(
+        default=0.70,
+        ge=0.50,
+        le=0.90,
+        description="Fraction of historical closed shadow lots used for in-sample evaluation (default 0.70; remaining 30% is out-of-sample).",
+    )
+    tournament_bootstrap_resamples: int = Field(
+        default=1000,
+        ge=100,
+        description="Number of bootstrap resamples for expectancy confidence bound computation (default 1000).",
+    )
+    tournament_bootstrap_confidence_level: float = Field(
+        default=0.95,
+        ge=0.80,
+        le=0.999,
+        description="Confidence level for bootstrap lower bound test (default 0.95, i.e. 95% one-sided confidence).",
+    )
+    tournament_promotion_cooldown_trades: int = Field(
+        default=10,
+        ge=1,
+        description="Minimum trades that must close after a promotion before another promotion can occur.",
+    )
+    tournament_promotion_cooldown_seconds: float = Field(
+        default=300.0,
+        ge=0.0,
+        description="Minimum seconds that must elapse after a promotion before another promotion can occur.",
+    )
+    tournament_rollback_max_trades: int = Field(
+        default=10,
+        ge=1,
+        description="Number of live trades evaluated for early rollback demotion of a newly promoted champion.",
+    )
+    tournament_rollback_max_loss_usd: float = Field(
+        default=-20.0,
+        le=0.0,
+        description="Cumulative realized live loss threshold ($) triggering rollback of a newly promoted champion.",
+    )
+    tournament_rollback_min_win_rate: float = Field(
+        default=25.0,
+        ge=0.0,
+        le=100.0,
+        description="Minimum live win rate (%) required across at least 5 trades to avoid early rollback demotion.",
+    )
+
     auto_trade_enabled: bool = Field(
         default=True,
         description="Whether the bot should automatically execute trades whenever qualifying opportunities are detected",
