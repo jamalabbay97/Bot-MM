@@ -110,6 +110,8 @@ class OpenLot:
     exit_mcap_usd: Decimal = Decimal(0)
     entry_native_price_usd: Decimal = Decimal(0)
     price_degraded: bool = False
+    wallet_address: Optional[str] = None
+    copied_wallets: list[str] = field(default_factory=list)
 
     def record_tick(
         self,
@@ -692,6 +694,8 @@ class PositionBook:
         hard_stop_loss_pct: Optional[float] = None,
         entry_feature_vector: Optional[list[float]] = None,
         entry_native_price_usd: Decimal = Decimal(0),
+        wallet_address: Optional[str] = None,
+        copied_wallets: Optional[list[str]] = None,
     ) -> OpenLot:
         if fill.effective_price <= Decimal(0):
             raise ValueError(
@@ -748,6 +752,8 @@ class PositionBook:
             hard_stop_loss_pct=hard_stop_loss_pct,
             entry_feature_vector=list(entry_feature_vector) if entry_feature_vector else [],
             entry_native_price_usd=entry_native_price_usd,
+            wallet_address=wallet_address,
+            copied_wallets=list(copied_wallets) if copied_wallets else ([] if not wallet_address else [wallet_address]),
             price_history=[(entry_ts, fill.effective_price, fill.simulated_native_spent)],
             tick_prices_5m=[(entry_ts, fill.effective_price)],
             tick_returns_5m=[],

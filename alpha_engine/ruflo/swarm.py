@@ -135,6 +135,8 @@ class RufloSwarmCoordinator:
             feedback_engine=feedback_engine,
             rpc_monitor=rpc_monitor,
             episodic_memory=self.memory,
+            profiler=profiler,
+            whitelist_db=whitelist_db,
         )
         self.learner_agent = RufloLearningAgent(
             episodic_memory=self.memory,
@@ -171,6 +173,8 @@ class RufloSwarmCoordinator:
         executor: Optional[PaperExecutor] = None,
         ledger: Optional[SQLiteLedger] = None,
         position_book: Optional[PositionBook] = None,
+        profiler: Optional[SmartMoneyProfiler] = None,
+        whitelist_db: Optional[WhitelistDatabase] = None,
     ) -> None:
         """Inject live engine dependencies into the swarm coordinator and child agents."""
         if coordinator is not None:
@@ -186,6 +190,12 @@ class RufloSwarmCoordinator:
                 self.council_cro.ledger = ledger
         if position_book is not None:
             self.execution_agent.position_book = position_book
+        if profiler is not None:
+            self.profiler_agent.profiler = profiler
+            self.supervisor_agent.profiler = profiler
+        if whitelist_db is not None:
+            self.profiler_agent.whitelist_db = whitelist_db
+            self.supervisor_agent.whitelist_db = whitelist_db
         if self.council_cro is not None and getattr(self.council_cro, "episodic_memory", None) is None:
             self.council_cro.episodic_memory = self.memory
 
@@ -335,6 +345,8 @@ class RufloSwarmCoordinator:
         chain_str = chain.value if hasattr(chain, "value") else str(chain)
         src_str = source.value if hasattr(source, "value") else str(source or signal_source)
         sig_id = getattr(signal, "signal_id", "") if signal else str(kwargs.get("signal_id", ""))
+        if wallet_address is None and signal is not None:
+            wallet_address = getattr(signal, "wallet_address", None)
         if signal is None:
             import types
             from decimal import Decimal
@@ -666,6 +678,9 @@ class RufloSwarmCoordinator:
                 liquidity_usd=liquidity_usd,
                 wallet_address=wallet_address or "",
                 source=src_str,
+                signal=signal,
+                pool_state=pool,
+                security_report=report,
                 **kwargs,
             )
             if audit_result.get("decision") in ("PASS", "SKIP"):

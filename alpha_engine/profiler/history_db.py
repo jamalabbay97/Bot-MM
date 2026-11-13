@@ -420,6 +420,30 @@ class WalletHistoryDatabase:
             await self._conn.commit()
             return True
 
+    @sqlite_retry(max_retries=5, base_delay=0.1)
+    async def get_daily_quota_usage(self, target: Optional[Any] = None) -> int:
+        """
+        Get daily quota usage for a provider/chain or total for all providers for today.
+        """
+        await self.connect()
+        assert self._conn is not None
+
+        date_key = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        target_str = target.value if hasattr(target, "value") else str(target or "")
+        async with self._lock:
+            if target_str:
+                cursor = await self._conn.execute(
+                    "SELECT SUM(request_count) as total FROM provider_quota_usage WHERE (provider_name = ? OR provider_name LIKE ?) AND date_key = ?;",
+                    (target_str, f"%{target_str}%", date_key),
+                )
+            else:
+                cursor = await self._conn.execute(
+                    "SELECT SUM(request_count) as total FROM provider_quota_usage WHERE date_key = ?;",
+                    (date_key,),
+                )
+            row = await cursor.fetchone()
+            return int(row["total"]) if (row and row["total"]) else 0
+
     # -------------------------------------------------------------------------
     # Reconstructed Trades & Metrics
     # -------------------------------------------------------------------------

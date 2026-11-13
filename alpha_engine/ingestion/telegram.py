@@ -145,13 +145,11 @@ SVM_CA_REGEX = re.compile(r"\b([1-9A-HJ-NP-za-km-z]{32,44})\b")
 
 # Default public channels for macro news & whale intel
 DEFAULT_TELEGRAM_CHANNELS: list[str] = [
-    "insiderpaper",
-    "disclosetv",
-    "financialjuice",
     "TreeNewsFeed",
     "lookonchain",
     "WatcherGuru",
     "bubblemaps",
+    "whale_alert_io",
 ]
 
 # High-impact news keywords & narrative triggers
@@ -1837,6 +1835,21 @@ class TelegramIngester:
             except Exception as telem_err:
                 logger.debug("Failed to query council telemetry in status: %s", telem_err)
 
+        # Smart Wallet Pipeline Telemetry
+        wallet_cand = metrics.get("candidates_count", metrics.get("wallet_candidates_count", 0))
+        wallet_q = metrics.get("queue_depth", metrics.get("wallet_queue_depth", 0))
+        wallet_wl = metrics.get("whitelisted_count", metrics.get("wallet_whitelisted_count", 0))
+        wallet_evals = metrics.get("evaluations_per_hour", metrics.get("wallet_evaluations_per_hour", 0.0))
+        wallet_quota = metrics.get("quota_usage_pct", metrics.get("wallet_quota_usage_pct", metrics.get("quota_usage", 0.0)))
+        wallet_sigs = metrics.get("signals_emitted", metrics.get("wallet_signals_emitted", 0))
+
+        wallet_status_block = (
+            "\n🐋 **خط أنابيب المحافظ الذكية (Smart Wallets Pipeline):**\n"
+            f"   • المرشحون (Candidates): `{wallet_cand}` | الانتظار (Queue): `{wallet_q}`\n"
+            f"   • القائمة البيضاء (Whitelisted): `{wallet_wl}` | الإشارات (Signals): `{wallet_sigs}`\n"
+            f"   • التقييم/ساعة (Evals/hr): `{float(wallet_evals):.1f}` | الكوتا (Quota): `{float(wallet_quota):.1f}%`\n"
+        )
+
         msg = (
             "📊 **تقرير حالة المحرك (Bot-MM Engine Status Report)**\n\n"
             f"⏱ **مدة التشغيل (Uptime):** `{uptime_str}`\n"
@@ -1848,6 +1861,7 @@ class TelegramIngester:
             f"🎯 **معدل النجاح (Win Rate WR):** `{wr_str}`\n"
             f"📉 **أقصى تراجع (Max Drawdown MDD):** `{mdd_str}`\n"
             f"🤖 **مجلس الذكاء الاصطناعي (Council AI):** `{council_status_str}`{council_warning_block}\n"
+            f"{wallet_status_block}\n"
             f"💵 **مبلغ التداول المعتمد:** `{self._get_current_trade_amount_display()[0]}`\n\n"
             "🚦 **قوائم الانتظار (Queue Backlog):**\n"
             f"   • Ingest: `{ingest_q_size}/{ingest_q_max}`\n"

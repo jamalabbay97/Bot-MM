@@ -51,6 +51,7 @@ from alpha_engine.engine.staging import RevivalBreakoutBuffer, Wave2StagingBuffe
 from alpha_engine.ruflo.protocol import ConsensusProtocol, SwarmTopology
 from alpha_engine.ruflo.swarm import RufloSwarmCoordinator
 from alpha_engine.engine.experimentation import AutonomousStrategyGenerator, StrategyTournamentRegistry
+from alpha_engine.profiler.pipeline import SmartMoneyPipeline
 from alpha_engine.execution.book import OpenLot, PositionBook, RunningMetrics
 from alpha_engine.execution.costs import TradeCostModel
 from alpha_engine.execution.executor import PaperExecutor
@@ -297,6 +298,14 @@ class PaperTradingEngine:
             }
         )
 
+        # Smart Money & Whale Wallet Pipeline (Discovery, History, Whitelist, Tracking & Copy Attribution)
+        self._wallet_pipeline: SmartMoneyPipeline = SmartMoneyPipeline(
+            config=config,
+            db_path=getattr(config, "db_path", "paper_trading.db"),
+            dedupe_cooldown_s=float(getattr(config, "wallet_dedupe_cooldown_s", 60.0)),
+            re_eval_interval_s=float(getattr(config, "wallet_re_eval_interval_s", 1800.0)),
+        )
+
         # Ruflo Multi-Agent Swarm Orchestrator
         self._swarm_coordinator: Optional[RufloSwarmCoordinator] = None
         if getattr(config, "ruflo_enabled", True):
@@ -317,6 +326,8 @@ class PaperTradingEngine:
             self._swarm_coordinator = RufloSwarmCoordinator(
                 config=config,
                 coordinator=None,
+                profiler=self._wallet_pipeline.profiler,
+                whitelist_db=self._wallet_pipeline.whitelist_db,
                 gatekeeper=None,
                 executor=self._executor,
                 position_book=self._position_book,
@@ -406,6 +417,7 @@ class PaperTradingEngine:
             rpc_health_monitor=self._rpc_monitor,
             supervisor=self._ai_supervisor,
             staging_buffer=self._wave2_buffer,
+            wallet_pipeline=self._wallet_pipeline,
         )
         dashboard_port = int(getattr(config, "dashboard_port", 8000))
         self.dashboard_server = DashboardServer(
@@ -413,6 +425,10 @@ class PaperTradingEngine:
             port=dashboard_port,
             aggregator=self.dashboard_telemetry,
         )
+
+    @property
+    def wallet_pipeline(self) -> SmartMoneyPipeline:
+        return self._wallet_pipeline
 
     @property
     def strategy_tournament(self) -> StrategyTournamentRegistry:
@@ -1328,6 +1344,50 @@ class PaperTradingEngine:
                 logger.error("Failed scheduling council cro post-trade hook: %s", cro_err, exc_info=True)
                 self._record_telemetry_counter("hook_council_cro_failed")
 
+        # Consumer 5: Smart Money Pipeline (copy-trade outcome hook)
+        if hasattr(self, "_wallet_pipeline") and self._wallet_pipeline is not None:
+            wallets_to_update = set(getattr(lot, "copied_wallets", []) or [])
+            if getattr(lot, "wallet_address", None):
+                wallets_to_update.add(lot.wallet_address)
+            for w in wallets_to_update:
+                try:
+                    res = self._wallet_pipeline.record_copied_trade_outcome(
+                        wallet_address=w,
+                        chain=lot.chain,
+                        realized_pnl_usd=exit_pnl_usd,
+                        is_win=is_win,
+                    )
+                    if asyncio.iscoroutine(res):
+                        task = asyncio.create_task(
+                            self._safe_invoke_post_trade_hook(
+                                f"wallet_pipeline_{w[:8]}",
+                                res,
+                            )
+                        )
+                        self._active_hook_tasks.add(task)
+                        task.add_done_callback(self._active_hook_tasks.discard)
+                except Exception as w_err:
+                    logger.error("Failed recording copy-trade outcome for wallet %s: %s", w, w_err, exc_info=True)
+                    self._record_telemetry_counter("hook_wallet_pipeline_failed")
+
+        # Smart Money Discovery on High Performing Closed Trades (>100% gain)
+        if is_win and pct >= 100.0 and hasattr(self, "_wallet_pipeline") and self._wallet_pipeline is not None:
+            try:
+                task = asyncio.create_task(
+                    self._safe_invoke_post_trade_hook(
+                        "wallet_discovery_winning_token",
+                        self._wallet_pipeline.discover_from_winning_token(
+                            token_address=lot.token_address,
+                            chain=lot.chain,
+                            price_gain_pct=pct,
+                        ),
+                    )
+                )
+                self._active_hook_tasks.add(task)
+                task.add_done_callback(self._active_hook_tasks.discard)
+            except Exception as disc_err:
+                logger.debug("Failed triggering candidate discovery on winning token: %s", disc_err)
+
         d_reason_lower = str(decision_reason).lower()
         if "emergency_drain" in d_reason_lower or "rug_liquidity_drain" in d_reason_lower:
             status_icon = "⚠️"
@@ -1782,6 +1842,8 @@ class PaperTradingEngine:
             custom_take_profit_pct=getattr(self, "custom_take_profit_pct", getattr(self._cfg, "custom_take_profit_pct", 0.50)),
             trailing_stop_from_peak_pct=getattr(self, "trailing_stop_from_peak_pct", getattr(self._cfg, "trailing_stop_from_peak_pct", 0.15)),
             entry_native_price_usd=self.get_native_price(fill.chain),
+            wallet_address=getattr(signal, "wallet_address", None),
+            copied_wallets=list(getattr(signal, "qualifying_wallets", []) or ([signal.wallet_address] if getattr(signal, "wallet_address", None) else [])),
         )
 
         # 6. Commit reserved slot and register pool
@@ -2442,6 +2504,8 @@ class PaperTradingEngine:
             hard_stop_loss_pct=hard_sl,
             entry_feature_vector=entry_vec,
             entry_native_price_usd=self.get_native_price(fill.chain),
+            wallet_address=getattr(signal, "wallet_address", None),
+            copied_wallets=list(getattr(signal, "qualifying_wallets", []) or ([signal.wallet_address] if getattr(signal, "wallet_address", None) else [])),
         )
         self._position_book.commit_slot_to_lot_by_token(record.token_address, record.chain)
         if pool is not None and lot.pool_address:
@@ -3463,6 +3527,28 @@ class PaperTradingEngine:
             is_buy = not out_is_native
             sol_amount = swap.amount_in if is_buy else swap.amount_out
 
+            # Smart Money Whitelist Tracking & WHALE_WALLET Signal Generation
+            if is_buy and self._wallet_pipeline is not None:
+                try:
+                    whale_sig = await self._wallet_pipeline.on_swap_event(
+                        swap,
+                        pool_registry=self._pool_registry,
+                        gatekeeper=gk,
+                    )
+                    if whale_sig is not None:
+                        logger.info(
+                            "Runner: Whitelist tracking detected smart wallet buy: wallet=%s token=%s score=%.2f cluster=%d",
+                            getattr(whale_sig, "wallet_address", "")[:10],
+                            whale_sig.token_address[:10],
+                            getattr(whale_sig, "wallet_score", 0.0),
+                            getattr(whale_sig, "cluster_size", 1),
+                        )
+                        if self._ledger:
+                            await self._ledger.record_signal(whale_sig)
+                        await self._signal_q.put(whale_sig)
+                except Exception as w_sig_err:
+                    logger.debug("Runner: Error in wallet pipeline on_swap_event: %s", w_sig_err)
+
             # Fast-path check: immediately drop swap if token is in negative rejection cache,
             # unless an impactful buy arrives (>= 0.25 SOL/ETH) or it is eligible for dynamic reassessment
             if gk.is_rejected(target_token, swap.chain) is True:
@@ -4353,6 +4439,7 @@ class PaperTradingEngine:
                 # 2. Track whale alert if lookonchain, bubblemaps, or whale keyword
                 lower_src = item.source_channel.lower()
                 lower_text = item.raw_text.lower()
+                is_whale_feed = any(w in lower_src for w in ["lookonchain", "bubblemaps", "whale_alert", "whalealert"]) or ("whale" in lower_text and any(c in lower_src for c in ["tree", "guru"]))
                 if "lookonchain" in lower_src or "bubblemaps" in lower_src or "whale" in lower_text:
                     action_match = "BUY/ACCUMULATE" if item.sentiment_score > 0 else "SELL/DUMP" if item.sentiment_score < 0 else "ALERT"
                     for kw in ["bought", "accumulating", "sold", "dumped", "transferred", "swap"]:
@@ -4367,6 +4454,24 @@ class PaperTradingEngine:
                         "summary": news_headline[:80],
                         "timestamp": item.timestamp,
                     })
+
+                # Surface smart wallet candidates from news/whale feeds with provenance
+                if self._wallet_pipeline is not None:
+                    try:
+                        chain_guess = (
+                            ChainIdentifier.SOLANA_MAINNET
+                            if item.detected_mints and (len(item.detected_mints[0]) > 42 or not item.detected_mints[0].startswith("0x"))
+                            else ChainIdentifier.BASE_MAINNET
+                        )
+                        asyncio.create_task(
+                            self._wallet_pipeline.discover_from_news_or_feed(
+                                text=item.raw_text,
+                                chain=chain_guess,
+                                channel=item.source_channel,
+                            )
+                        )
+                    except Exception as disc_err:
+                        logger.debug("Error discovering candidates from news feed: %s", disc_err)
 
                 # 3. Actionable check: contains detected mint and sentiment_score > 0.4
                 if not item.is_actionable or not item.detected_mints:
@@ -4410,6 +4515,14 @@ class PaperTradingEngine:
                         if not report.passes_hard_gates:
                             logger.info("News token %s rejected by gatekeeper: %s", mint[:10], reason)
                             continue
+
+                    # Whale feeds are strictly candidate sources only — never trusted blindly without wallet evaluation
+                    if is_whale_feed:
+                        logger.debug(
+                            "Whale/alert feed %s is treated as candidate source only; skipping unvetted trade signal for %s",
+                            item.source_channel, mint[:10]
+                        )
+                        continue
 
                     if report is None:
                         from alpha_engine.models.enums import SecurityTier
@@ -5074,6 +5187,8 @@ class PaperTradingEngine:
                     hard_stop_loss_pct=selected_params.hard_stop_loss_pct,
                     entry_feature_vector=entry_feature_vector,
                     entry_native_price_usd=self.get_native_price(fill.chain),
+                    wallet_address=getattr(signal_item, "wallet_address", None),
+                    copied_wallets=list(getattr(signal_item, "qualifying_wallets", []) or ([signal_item.wallet_address] if getattr(signal_item, "wallet_address", None) else [])),
                 )
 
                 if self._ledger:
@@ -5881,7 +5996,7 @@ class PaperTradingEngine:
                 "is_new_launch": getattr(lot, "is_new_launch", False),
             })
 
-        return {
+        status_dict = {
             "uptime_str": uptime_str,
             "rss_mb": rss_mb,
             "equity_usd": self._current_equity_usd(),
@@ -5900,6 +6015,12 @@ class PaperTradingEngine:
             "recent_closed_trades": list(self._recent_closed_trades),
             "ai_supervisor": self._ai_supervisor.get_status() if hasattr(self, "_ai_supervisor") else {},
         }
+        if hasattr(self, "_wallet_pipeline") and self._wallet_pipeline is not None:
+            try:
+                status_dict.update(self._wallet_pipeline.get_cached_metrics())
+            except Exception as w_err:
+                logger.debug("Failed querying wallet pipeline metrics in _get_engine_status: %s", w_err)
+        return status_dict
 
 
     async def _poll_open_lots_prices(self, lots: list[OpenLot]) -> None:
@@ -6788,8 +6909,18 @@ class PaperTradingEngine:
                     executor=self._executor,
                     ledger=self._ledger,
                     position_book=self._position_book,
+                    profiler=self._wallet_pipeline.profiler,
+                    whitelist_db=self._wallet_pipeline.whitelist_db,
                 )
                 await self._swarm_coordinator.start()
+
+            # 2b. Start Smart Money Wallet Discovery & Tracking Pipeline
+            if getattr(self.config, "wallet_pipeline_enabled", True) and hasattr(self, "_wallet_pipeline") and self._wallet_pipeline:
+                try:
+                    await self._wallet_pipeline.start()
+                    logger.info("Runner: Smart money wallet pipeline started.")
+                except Exception as wp_err:
+                    logger.warning("Runner: Could not start wallet pipeline: %s", wp_err)
 
             # 3. Start Real-Time Institutional Observability Dashboard Hub
             if getattr(self.config, "dashboard_enabled", True) and hasattr(self, "dashboard_server") and self.dashboard_server:
@@ -6801,6 +6932,7 @@ class PaperTradingEngine:
                     self.dashboard_telemetry.staging_buffer = self._wave2_buffer
                     self.dashboard_telemetry.council = getattr(self._ai_supervisor, "_council", None)
                     self.dashboard_telemetry.swarm = self._swarm_coordinator
+                    self.dashboard_telemetry.wallet_pipeline = self._wallet_pipeline
                     self.dashboard_telemetry.self_learning = self._feedback
                     self.dashboard_telemetry.rpc_monitor = self._rpc_monitor
                 try:
@@ -7013,6 +7145,13 @@ class PaperTradingEngine:
                     if hasattr(self, "dashboard_server") and self.dashboard_server:
                         try:
                             await self.dashboard_server.stop()
+                        except Exception:
+                            pass
+
+                    # 3d. Stop smart money wallet pipeline
+                    if hasattr(self, "_wallet_pipeline") and self._wallet_pipeline:
+                        try:
+                            await self._wallet_pipeline.stop()
                         except Exception:
                             pass
 

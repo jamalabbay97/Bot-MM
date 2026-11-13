@@ -120,6 +120,12 @@ class SignalEvent(BaseModel):
     originating_channel: Optional[str] = Field(default=None, description="Originating channel or DM handle")
     is_direct_dm: bool = Field(default=False, description="Flag indicating signal was directly sent via Telegram DM")
     custom_amount_native: Optional[Decimal] = Field(default=None, description="Custom trade amount in native asset for manual trades")
+    wallet_address: Optional[str] = Field(default=None, description="Initiating or copy-traded wallet address")
+    wallet_score: Optional[float] = Field(default=None, description="Smart money score of the initiating wallet")
+    cluster_size: Optional[int] = Field(default=None, description="Count of smart wallets in agreement cluster")
+    wallet_conviction: Optional[float] = Field(default=None, description="Wallet conviction score based on size and cluster")
+    wallet_provenance: Optional[str] = Field(default=None, description="Discovery provenance of the wallet")
+    qualifying_wallets: list[str] = Field(default_factory=list, description="List of wallet addresses in copy-trade cluster")
 
     @model_validator(mode="before")
     @classmethod
@@ -192,6 +198,12 @@ class RawSignalEvent(BaseModel):
     is_direct_dm: bool = False
     custom_amount_native: Optional[Decimal] = None
     narrative_cluster: Optional[str] = Field(default=None, description="Theme cluster: ai, dog, cat, political, utility, etc.")
+    wallet_address: Optional[str] = None
+    wallet_score: Optional[float] = None
+    cluster_size: Optional[int] = None
+    wallet_conviction: Optional[float] = None
+    wallet_provenance: Optional[str] = None
+    qualifying_wallets: list[str] = Field(default_factory=list)
 
 
 class ScreenerDiscoveryEvent(BaseModel):

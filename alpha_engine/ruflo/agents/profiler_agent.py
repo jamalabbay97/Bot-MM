@@ -104,6 +104,42 @@ class SmartMoneyProfilerAgent(BaseRufloAgent):
             ChainIdentifier.BASE_MAINNET if "base" in chain.lower() or "evm" in chain.lower()
             else ChainIdentifier.SOLANA_MAINNET
         )
+
+        # 1. Consult Whitelist DB first in the decision path
+        if self.whitelist_db is not None:
+            try:
+                rec = await self.whitelist_db.get_wallet(wallet_address)
+                if rec and rec.status == WhitelistStatus.ACTIVE:
+                    return {
+                        "wallet_address": wallet_address,
+                        "chain": chain_enum.value,
+                        "classification": rec.classification.value if hasattr(rec.classification, "value") else str(rec.classification),
+                        "is_whitelisted": True,
+                        "eligible_for_copytrade": True,
+                        "smart_money_score": rec.smart_money_score,
+                        "win_rate_pct": rec.win_rate_pct,
+                        "total_trades": rec.total_trades,
+                        "total_pnl_usd": str(rec.total_pnl_usd),
+                        "rejection_reasons": [],
+                        "status": "APPROVED",
+                    }
+                elif rec and rec.status in (WhitelistStatus.BANNED, WhitelistStatus.SUSPENDED):
+                    return {
+                        "wallet_address": wallet_address,
+                        "chain": chain_enum.value,
+                        "classification": "BANNED",
+                        "is_whitelisted": False,
+                        "eligible_for_copytrade": False,
+                        "smart_money_score": rec.smart_money_score,
+                        "win_rate_pct": rec.win_rate_pct,
+                        "total_trades": rec.total_trades,
+                        "total_pnl_usd": str(rec.total_pnl_usd),
+                        "rejection_reasons": [rec.rejection_reasons or "BANNED"],
+                        "status": rec.status.value,
+                    }
+            except Exception as wdb_err:
+                logger.debug("Whitelist DB lookup error in tool_evaluate_wallet: %s", wdb_err)
+
         try:
             profile: WalletProfile = await self.profiler.profile_wallet(
                 wallet_address=wallet_address,

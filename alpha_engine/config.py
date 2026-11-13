@@ -146,11 +146,10 @@ class EngineConfig(BaseSettings):
     )
     telegram_channels: list[str] | str = Field(
         default_factory=lambda: [
-            "insiderpaper",
-            "disclosetv",
-            "TreeNewsFeed",
             "lookonchain",
+            "TreeNewsFeed",
             "WatcherGuru",
+            "whale_alert_io",
         ],
         description="Target alpha channels/groups to scrape (comma-separated or JSON array)",
     )
@@ -921,6 +920,20 @@ class EngineConfig(BaseSettings):
         default=None,
         description="Explicit Helius API key; falls back to parsing from solana_rpc_http or HELIUS_API_KEY env",
     )
+    wallet_pipeline_enabled: bool = Field(
+        default=True,
+        description="Enable Smart Money & Whale Wallet Discovery, Tracking & Copy-Trading Pipeline",
+    )
+    wallet_dedupe_cooldown_s: float = Field(
+        default=60.0,
+        ge=5.0,
+        description="Minimum seconds between copy signals for the same wallet and token",
+    )
+    wallet_re_eval_interval_s: float = Field(
+        default=1800.0,
+        ge=60.0,
+        description="Interval in seconds for periodic re-evaluation of whitelisted smart wallets",
+    )
     alchemy_api_key: Optional[str] = Field(
         default=None,
         description="Explicit Alchemy API key; falls back to parsing from base_rpc_http or ALCHEMY_API_KEY env",
@@ -1211,11 +1224,10 @@ class EngineConfig(BaseSettings):
     def parse_telegram_channels(cls, v: Any) -> list[str]:
         """Convert comma-separated strings or empty strings into list[str]."""
         default_channels = [
-            "insiderpaper",
-            "disclosetv",
-            "TreeNewsFeed",
             "lookonchain",
+            "TreeNewsFeed",
             "WatcherGuru",
+            "whale_alert_io",
         ]
         if v is None:
             return list(default_channels)

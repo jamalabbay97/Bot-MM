@@ -16,7 +16,7 @@ from alpha_engine.engine.ai_supervisor import AlphaSupervisorAI
 from alpha_engine.engine.feedback import AdaptiveFeedbackEngine, TradeReflection
 from alpha_engine.engine.rpc_health import RPCHealthMonitor
 from alpha_engine.models.ai import AISupervisorResponse
-from alpha_engine.models.enums import ChainIdentifier, SignalSource
+from alpha_engine.models.enums import ChainIdentifier, SignalSource, WhitelistStatus
 from alpha_engine.ruflo.agents.base import BaseRufloAgent
 from alpha_engine.ruflo.memory import MemoryEpisode, RufloEpisodicMemory
 from alpha_engine.ruflo.protocol import AgentRole, SwarmMessage, ToolDefinition
@@ -41,6 +41,8 @@ class RufloSupervisorAgent(BaseRufloAgent):
         episodic_memory: Optional[RufloEpisodicMemory] = None,
         name: str = "RufloSupervisor",
         config: Optional[Any] = None,
+        profiler: Optional[Any] = None,
+        whitelist_db: Optional[Any] = None,
         **kwargs: Any,
     ) -> None:
         super().__init__(
@@ -53,6 +55,8 @@ class RufloSupervisorAgent(BaseRufloAgent):
         self.feedback_engine = feedback_engine or AdaptiveFeedbackEngine()
         self.rpc_monitor = rpc_monitor
         self.memory = episodic_memory or RufloEpisodicMemory()
+        self.profiler = profiler
+        self.whitelist_db = whitelist_db
         self._register_agent_tools()
 
     def _register_agent_tools(self) -> None:
@@ -123,6 +127,7 @@ class RufloSupervisorAgent(BaseRufloAgent):
         signal: Optional[Any] = None,
         pool_state: Optional[Any] = None,
         security_report: Optional[Any] = None,
+        wallet_profile: Optional[Any] = None,
         **kwargs: Any,
     ) -> dict[str, Any]:
         if not self.ai_supervisor:
@@ -135,6 +140,59 @@ class RufloSupervisorAgent(BaseRufloAgent):
                 "risk_score": round((1.0 - confidence_score) * 100.0, 2),
             }
 
+        # Resolve wallet profile if not directly provided
+        if wallet_profile is None and signal is not None:
+            wallet_profile = getattr(signal, "wallet_profile", None)
+
+        if wallet_profile is None and wallet_address and getattr(self, "whitelist_db", None) is not None:
+            try:
+                rec = await self.whitelist_db.get_wallet(wallet_address)
+                if rec and rec.status == WhitelistStatus.ACTIVE:
+                    wallet_profile = rec
+            except Exception as wdb_err:
+                logger.debug("Whitelist DB lookup error in supervisor tool_audit_signal: %s", wdb_err)
+
+        if wallet_profile is not None:
+            wallet_telemetry = {
+                "has_wallet_profile": True,
+                "wallet_address": wallet_address or getattr(wallet_profile, "wallet_address", ""),
+                "total_trades": getattr(wallet_profile, "total_trades", getattr(wallet_profile, "total_closed_trades", 20)),
+                "win_rate_pct": float(getattr(wallet_profile, "win_rate_pct", 70.0)),
+                "profit_factor": float(getattr(wallet_profile, "profit_factor", 2.0) or 2.0),
+                "sortino_ratio": float(getattr(wallet_profile, "sortino_ratio", 2.1) or 2.1),
+                "max_drawdown_pct": float(getattr(wallet_profile, "max_drawdown_pct", 15.0) or 15.0),
+                "median_hold_time_s": float(
+                    getattr(
+                        wallet_profile,
+                        "median_holding_time_seconds",
+                        getattr(wallet_profile, "median_holding_time_s", 300.0),
+                    )
+                ),
+                "single_trade_outlier_pct": float(getattr(wallet_profile, "outlier_pnl_ratio", 0.1) * 100) if hasattr(wallet_profile, "outlier_pnl_ratio") else 10.0,
+                "is_funding_aggregator": getattr(wallet_profile, "is_disperse_funded", False),
+                "is_block0_bundle": getattr(wallet_profile, "is_block0_snipe", False),
+                "is_mev_backrun": getattr(wallet_profile, "is_mev_bot", False),
+            }
+        else:
+            wallet_telemetry = {
+                "has_wallet_profile": False,
+                "wallet_address": wallet_address,
+            }
+
+        sec_telemetry = {
+            "is_honeypot": getattr(security_report, "is_honeypot", False) if security_report else False,
+            "buy_tax_bps": getattr(security_report, "buy_tax_bps", 0) if security_report else 0,
+            "sell_tax_bps": getattr(security_report, "sell_tax_bps", 0) if security_report else 0,
+            "mint_authority_disabled": getattr(security_report, "mint_authority_disabled", True) if security_report else True,
+            "freeze_authority_disabled": getattr(security_report, "freeze_authority_disabled", True) if security_report else True,
+        }
+
+        pool_telemetry = {
+            "native_reserve": float(getattr(pool_state, "native_reserve", liquidity_usd / (150.0 if "solana" in str(chain).lower() else 3400.0) if liquidity_usd > 0 else 10.0)),
+            "liquidity_usd": liquidity_usd,
+            "is_pump_fun": "pump" in token_address.lower(),
+        }
+
         telemetry: dict[str, Any] = {
             "target_token_address": token_address,
             "chain": chain,
@@ -142,34 +200,16 @@ class RufloSupervisorAgent(BaseRufloAgent):
             "confidence_score": confidence_score,
             "pool_address": pool_address,
             "initiator_wallet": wallet_address,
-            "pool_telemetry": {
-                "native_reserve": liquidity_usd / (150.0 if "solana" in str(chain).lower() else 3400.0) if liquidity_usd > 0 else 10.0,
-                "liquidity_usd": liquidity_usd,
-                "is_pump_fun": "pump" in token_address.lower(),
-            },
-            "security_telemetry": {
-                "is_honeypot": False,
-                "mint_authority_disabled": True,
-                "freeze_authority_disabled": True,
-            },
-            "wallet_telemetry": {
-                "has_wallet_profile": bool(wallet_address),
-                "wallet_address": wallet_address,
-            },
+            "pool_telemetry": pool_telemetry,
+            "security_telemetry": sec_telemetry,
+            "wallet_telemetry": wallet_telemetry,
         }
         if kwargs:
             telemetry.update(kwargs)
 
         try:
             resp: AISupervisorResponse
-            if signal is not None and hasattr(self.ai_supervisor, "evaluate_signal"):
-                resp = await self.ai_supervisor.evaluate_signal(
-                    signal=signal,
-                    pool_state=pool_state,
-                    security_report=security_report,
-                )
-            else:
-                resp = self.ai_supervisor.evaluate_deterministic(telemetry)
+            resp = self.ai_supervisor.evaluate_deterministic(telemetry)
 
             decision_str = resp.decision.value if hasattr(resp.decision, "value") else str(resp.decision)
             rationale = getattr(resp, "risk_rationale", None) or "Vetted via Ruflo Supervisor audit pipeline"

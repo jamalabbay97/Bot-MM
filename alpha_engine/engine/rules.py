@@ -216,6 +216,12 @@ def _extract_wallet_score(signal: Any, pool: Optional[Any], native_price_usd: Op
     ctx_val = _extract_metric_context("wallet_score", ctx, pool, native_price_usd)
     if ctx_val is not None:
         return ctx_val
+    ws = getattr(signal, "wallet_score", None)
+    if ws is not None:
+        try:
+            return float(ws)
+        except (TypeError, ValueError):
+            pass
     profile = getattr(signal, "wallet_profile", None)
     if profile is not None:
         score = getattr(profile, "sortino_ratio", None)
@@ -234,6 +240,37 @@ def _extract_wallet_score(signal: Any, pool: Optional[Any], native_price_usd: Op
         return float(vec.smart_wallet_inflows)
     except Exception:
         return None
+
+
+def _extract_cluster_size(signal: Any, pool: Optional[Any], native_price_usd: Optional[Decimal], ctx: Optional[Dict[str, Any]]) -> Optional[float]:
+    """Extract cluster size or number of smart wallets in agreement."""
+    ctx_val = _extract_metric_context("cluster_size", ctx, pool, native_price_usd)
+    if ctx_val is not None:
+        return ctx_val
+    c_size = getattr(signal, "cluster_size", None)
+    if c_size is not None:
+        try:
+            return float(c_size)
+        except (TypeError, ValueError):
+            pass
+    qw = getattr(signal, "qualifying_wallets", None)
+    if qw:
+        return float(len(qw))
+    return None
+
+
+def _extract_wallet_conviction(signal: Any, pool: Optional[Any], native_price_usd: Optional[Decimal], ctx: Optional[Dict[str, Any]]) -> Optional[float]:
+    """Extract wallet conviction multiplier or score."""
+    ctx_val = _extract_metric_context("wallet_conviction", ctx, pool, native_price_usd)
+    if ctx_val is not None:
+        return ctx_val
+    conv = getattr(signal, "wallet_conviction", None)
+    if conv is not None:
+        try:
+            return float(conv)
+        except (TypeError, ValueError):
+            pass
+    return None
 
 
 def _extract_social_conviction(signal: Any, pool: Optional[Any], native_price_usd: Optional[Decimal], ctx: Optional[Dict[str, Any]]) -> Optional[float]:
@@ -402,6 +439,18 @@ METRIC_REGISTRY: Dict[str, MetricDefinition] = {
         allowed_range=(0.0, 100.0),
         extractor=_extract_dip_depth_pct,
     ),
+    "cluster_size": MetricDefinition(
+        name="cluster_size",
+        description="Number of smart wallets in agreement cluster",
+        allowed_range=(1.0, 1000.0),
+        extractor=_extract_cluster_size,
+    ),
+    "wallet_conviction": MetricDefinition(
+        name="wallet_conviction",
+        description="Smart wallet conviction based on size relative to history and cluster agreement",
+        allowed_range=(0.0, 100.0),
+        extractor=_extract_wallet_conviction,
+    ),
 }
 
 # Canonical Metric Aliases
@@ -421,6 +470,9 @@ METRIC_ALIASES: dict[str, str] = {
     "slippage_estimate": "slippage_estimate_bps",
     "min_wallet_sortino": "wallet_score",
     "wallet_sortino": "wallet_score",
+    "cluster_agreement": "cluster_size",
+    "smart_money_cluster": "cluster_size",
+    "conviction": "wallet_conviction",
     "organic_conviction": "social_conviction",
     "organic_conviction_min": "social_conviction",
     "liquidity": "liquidity_usd",

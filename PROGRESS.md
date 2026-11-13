@@ -495,7 +495,66 @@ Track progress across all identified defects and phases. All items must satisfy 
   - Replaced hardcoded `trades=[]` in `profiler_agent.py`.
 - [x] wiring proof
   - Evaluator Tool (`profiler_agent.tool_evaluate_wallet`) -> `SmartMoneyProfiler.profile_wallet` (with `trades=None`) -> `SmartMoneyProfiler.get_wallet_trade_records` -> checks `history_db.get_reconstructed_trades` -> fetches via `WalletHistoryProvider.fetch_swaps` -> parses into `NormalizedSwap` -> runs `TradeReconstructor.reconstruct_trades` -> constructs `WalletTradeRecord` objects -> persists to `history_db.save_reconstructed_trades` -> evaluates via `WalletEvaluator.evaluate(trades=trades)` -> persists whitelist result.
-- [ ] Part B: Real-time copytrade execution loop & signal dispatch (stays unticked until Part B).
+- [x] Part B: Smart-Wallet Discovery, Evaluation, Whitelist, Tracking and Signals
+  - [x] reproduced
+    - Runtime dead ends: `evaluate_and_whitelist`, `record_wallet_purchase`, `is_whitelisted`, `reverse_engineer_winning_tokens` had zero runtime callers in the runner/coordinator loop.
+    - Whitelist DB was never consulted in the decision path before evaluating candidate trades or signals.
+    - `SignalSource.WHALE_WALLET` was never produced by the runner or ingestion coordinators.
+    - No continuous background candidate discovery, evaluation queue, or demotion loop existed in the runner lifecycle.
+  - [x] red test
+    - Created `tests/test_issue11b_smart_wallets.py` (11 tests with fixtures, no external network):
+      1. `test_known_profitable_wallet_whitelisted`: A consistent profitable wallet (>15 trades, >60% win rate, low outlier ratio) is evaluated and whitelisted.
+      2. `test_wash_trader_rejected_with_right_reason`: Circular wash-trading cycles and churning volume with net near-zero PnL are rejected as `CIRCULAR_WASH`/`WASH_TRADER`.
+      3. `test_single_lucky_trade_wallet_rejected_with_right_reason`: Wallets where a single trade accounts for >60% of total PnL are rejected as `LUCKY_OUTLIER`.
+      4. `test_mev_bot_rejected_with_right_reason`: High-speed MEV/sandwich patterns (median hold time < 45s, same-block buy/sell) are rejected as `MEV_BOT`.
+      5. `test_insider_funded_wallet_rejected_with_right_reason`: Wallets funded by deployer or mixer hops (<3 hops) are rejected as `CABAL_INSIDER`.
+      6. `test_insufficient_data_deferred_not_rejected`: Wallets with provider rate-limit/quota errors are marked `DEFERRED` for re-queueing, not rejected.
+      7. `test_out_of_sample_consistency_failure_rejected`: Wallets with in-sample profitability that fail out-of-sample forward testing are rejected for multiple-testing bias.
+      8. `test_cluster_agreement_increases_conviction`: Multiple independent whitelisted wallets buying the same token within 120s increases cluster size, conviction multiplier, and alpha score.
+      9. `test_whitelisted_wallet_signal_gatekeeper_security_veto_applies`: Whitelisted wallet signals enter the normal gatekeeper and Ruflo Council path; honeypot/security flags fail closed.
+      10. `test_demotion_after_bad_copy_trade_results`: Underperforming copied trades (3 consecutive losses or net negative copy PnL) trigger automatic demotion to `SUSPENDED` in SQLite whitelist.
+      11. `test_end_to_end_runner_swap_stream_to_paper_fill_with_wallet_attribution`: End-to-end integration test through runner from a fixture swap stream to a paper fill with wallet attribution on `OpenLot` and post-trade performance recording.
+  - [x] fix
+    - `alpha_engine/profiler/pipeline.py`: Created `SmartMoneyPipeline` orchestrating the 6 pipeline stages:
+      1. Candidate discovery: early buyers via `reverse_engineer_winning_tokens`, recurring winners, and Telegram/news feeds stored with provenance in SQLite `wallet_candidates`.
+      2. Quota-aware prioritization queue: background worker prioritizing recurring candidates while respecting free-tier daily quotas.
+      3. Evaluation with `WalletEvaluator`: multi-criteria behavioral analysis (outlier ratio, circular wash trading, funding hops, MEV bot detection, out-of-sample split).
+      4. Whitelist curation: `whitelist_db` with status, score, reasons, last-evaluated time; periodic re-evaluation and automatic demotion/ban hooked to real copy-trade outcomes.
+      5. Live tracking: monitoring whitelisted wallets on SVM/EVM swap streams, deduplicating within cooldown, computing conviction (trade size vs baseline) and cluster agreement.
+      6. Signal emission: Emits `WHALE_WALLET` signals into the normal gatekeeper -> council -> sizing -> execution path with wallet score, cluster size, conviction, and provenance.
+    - `alpha_engine/engine/rules.py`: Registered `wallet_score`, `cluster_size`, `wallet_conviction` in `METRIC_REGISTRY` with extractors and canonical aliases.
+    - `alpha_engine/models/events.py`: Added wallet attribution fields (`wallet_address`, `wallet_score`, `cluster_size`, `wallet_conviction`, `wallet_provenance`, `qualifying_wallets`) to `SignalEvent`.
+    - `alpha_engine/execution/book.py`: Added `wallet_address` and `copied_wallets` to `OpenLot` and `PositionBook.open_lot()`.
+    - `alpha_engine/engine/runner.py`:
+      - Instantiated `self._wallet_pipeline` in `PaperTradingEngine` and scheduled `start()` and `stop()` in the runner lifecycle.
+      - Wired swap events in `_process_ingestion_queue` to `on_swap_event`, streaming `WHALE_WALLET` signals into `_signal_q`.
+      - Wired `_record_closed_trade_and_notify` Consumer 5 to record copy-trade outcomes via `record_copied_trade_outcome()` and discover candidates on winning tokens (`discover_from_winning_token()`).
+      - Wired news/whale feeds to `discover_from_news_or_feed()` and enforced that whale alert feeds are treated as candidate discovery only, not trusted blindly without wallet evaluation.
+      - Exposed `wallet_pipeline` state in `_get_engine_status()`.
+    - `alpha_engine/ruflo/swarm.py`:
+      - Wired `profiler` and `whitelist_db` into `SmartMoneyProfilerAgent` and `RufloSupervisorAgent`.
+      - In `execute_trade_consensus`, auto-extract `wallet_address` from signals and consult `whitelist_db` directly in the decision path before external API profiling.
+      - Passed `signal`, `pool`, `report`, and wallet profile to supervisor audit tool.
+    - `alpha_engine/ruflo/agents/supervisor_agent.py`:
+      - Added `whitelist_db` and `profiler` injection.
+      - Populated `wallet_telemetry` with genuine profile metrics (`total_trades`, `win_rate_pct`, `median_hold_time_s`, `single_trade_outlier_pct`) when evaluating whitelisted wallets, preventing false survivorship-bias vetoes.
+    - `alpha_engine/dashboard/telemetry.py` & `alpha_engine/ingestion/telegram.py`:
+      - Exposed candidates, queue depth, whitelisted count, evaluations/hr, quota usage, and signals emitted in dashboard telemetry and `/status`.
+      - Cleaned up default `telegram_channels`: removed placeholder/irrelevant entries (`insiderpaper`, `disclosetv`).
+  - [x] green test
+    - `tests/test_issue11b_smart_wallets.py`: 11/11 passed in 15.18s.
+    - `tests/test_telegram_news_whale_ingestion.py`: 8/8 passed in 4.12s.
+    - `tests/test_issue*.py`: 100/100 passed in 157.96s.
+  - [x] mutation check
+    - Mutated outlier bias check in `evaluator.py` (`if False and outlier_pnl_ratio > cfg_max_outlier_ratio:`); verified `test_single_lucky_trade_wallet_rejected_with_right_reason` failed with `AssertionError: assert low_win_rate == lucky_outlier`. Reverted mutation and verified green.
+  - [x] sweep done
+    - Verified previously uncalled functions (`evaluate_and_whitelist`, `record_wallet_purchase`, `is_whitelisted`, `reverse_engineer_winning_tokens`) now have active runtime callers.
+    - Verified `SignalSource.WHALE_WALLET` is actively emitted by `on_swap_event` and processed by the runner.
+    - Verified whitelist DB is consulted in the decision path before external API calls.
+  - [x] wiring proof
+    - Swap Ingestion -> `runner._process_ingestion_queue` -> `SmartMoneyPipeline.on_swap_event` -> Whitelist check (`whitelist_db.is_whitelisted`) -> Dedupe & Conviction sizing -> Cluster agreement (`profiler.record_wallet_purchase`) -> Gatekeeper Preflight -> Emits `WHALE_WALLET` `SignalEvent` -> Runner `_process_signal_queue` -> Gatekeeper Screening -> Ruflo Swarm Consensus (Scout, Profiler, Gatekeeper, Quant, Reach, Council CRO, Supervisor) -> RiskEngine Half-Kelly Sizing -> `PositionBook.open_lot` (persisting `wallet_address` and `copied_wallets`) -> Trade Exit (`_record_closed_trade_and_notify`) -> Consumer 5 calls `SmartMoneyPipeline.record_copied_trade_outcome()` -> Updates `wallet_copy_performance` in SQLite -> Auto-demotes to `SUSPENDED` if underperforming.
+  - [x] README/docs updated
+    - Updated `PROGRESS.md` with Issue 11 Part B completed and ticked.
 
 ---
 

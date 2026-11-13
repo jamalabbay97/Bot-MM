@@ -287,10 +287,11 @@ def test_config_telegram_defaults() -> None:
         solana_rpc_ws="wss://mainnet.helius-rpc.com/?api-key=test",
     )
     assert cfg.telegram_session_name == "alpha_engine_listener"
-    assert "insiderpaper" in cfg.telegram_channels
+    assert "insiderpaper" not in cfg.telegram_channels
     assert "TreeNewsFeed" in cfg.telegram_channels
     assert "lookonchain" in cfg.telegram_channels
     assert "WatcherGuru" in cfg.telegram_channels
+    assert "whale_alert_io" in cfg.telegram_channels
 
 
 def test_telegram_broadcast_and_rich_closed_trades_command() -> None:

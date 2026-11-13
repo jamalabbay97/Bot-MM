@@ -11,7 +11,7 @@ from collections import defaultdict
 import statistics
 import time
 from decimal import Decimal
-from typing import Optional, Sequence
+from typing import Optional, Sequence, Any
 
 from alpha_engine.models.enums import ChainIdentifier, WalletClassification
 from alpha_engine.models.profiler import (
@@ -35,9 +35,13 @@ class WalletEvaluator:
     MIN_ACTIVE_DAYS: float = 21.0
     MAX_OUTLIER_PNL_RATIO: float = 0.60
     MIN_MEDIAN_HOLDING_TIME_S: float = 45.0
+    MIN_HOLDING_TIME_SNIPER_S: float = 5.0
     MAX_INACTIVE_DAYS_REVIVAL: float = 45.0
     MAX_FUNDING_HOPS: int = 3
     MAX_SINGLE_DEV_VOLUME_RATIO: float = 0.80
+    OOS_SPLIT_RATIO: float = 0.60
+    MIN_OOS_TRADES: int = 3
+    MIN_OOS_WIN_RATE_PCT: float = 35.0
 
     @staticmethod
     def calculate_smart_money_score(
@@ -67,6 +71,18 @@ class WalletEvaluator:
         funding_hops: Optional[Sequence[FundingHop]] = None,
         current_timestamp: Optional[int] = None,
         cluster_tag: Optional[str] = None,
+        config: Optional[Any] = None,
+        min_closed_trades: Optional[int] = None,
+        min_win_rate_pct: Optional[float] = None,
+        min_active_days: Optional[float] = None,
+        max_outlier_pnl_ratio: Optional[float] = None,
+        min_median_holding_time_s: Optional[float] = None,
+        max_inactive_days_revival: Optional[float] = None,
+        max_funding_hops: Optional[int] = None,
+        max_single_dev_volume_ratio: Optional[float] = None,
+        oos_split_ratio: Optional[float] = None,
+        min_oos_trades: Optional[int] = None,
+        min_oos_win_rate_pct: Optional[float] = None,
     ) -> WalletProfile:
         """
         Execute full behavioral evaluation and return a WalletProfile.
@@ -74,18 +90,31 @@ class WalletEvaluator:
         if current_timestamp is None:
             current_timestamp = int(time.time())
 
+        # Resolve configurable thresholds from kwargs, config, or class defaults
+        cfg_min_trades = min_closed_trades if min_closed_trades is not None else getattr(config, "wallet_min_closed_trades", cls.MIN_CLOSED_TRADES)
+        cfg_min_win_rate = min_win_rate_pct if min_win_rate_pct is not None else getattr(config, "wallet_min_win_rate_pct", cls.MIN_WIN_RATE_PCT)
+        cfg_min_active_days = min_active_days if min_active_days is not None else getattr(config, "wallet_min_active_days", cls.MIN_ACTIVE_DAYS)
+        cfg_max_outlier_ratio = max_outlier_pnl_ratio if max_outlier_pnl_ratio is not None else getattr(config, "wallet_max_outlier_pnl_ratio", cls.MAX_OUTLIER_PNL_RATIO)
+        cfg_min_median_hold_s = min_median_holding_time_s if min_median_holding_time_s is not None else getattr(config, "wallet_min_median_holding_time_s", cls.MIN_MEDIAN_HOLDING_TIME_S)
+        cfg_max_inactive_revival = max_inactive_days_revival if max_inactive_days_revival is not None else getattr(config, "wallet_max_inactive_days_revival", cls.MAX_INACTIVE_DAYS_REVIVAL)
+        cfg_max_funding_hops = max_funding_hops if max_funding_hops is not None else getattr(config, "wallet_max_funding_hops", cls.MAX_FUNDING_HOPS)
+        cfg_max_single_dev_vol = max_single_dev_volume_ratio if max_single_dev_volume_ratio is not None else getattr(config, "wallet_max_single_dev_volume_ratio", cls.MAX_SINGLE_DEV_VOLUME_RATIO)
+        cfg_oos_split_ratio = oos_split_ratio if oos_split_ratio is not None else getattr(config, "wallet_oos_split_ratio", cls.OOS_SPLIT_RATIO)
+        cfg_min_oos_trades = min_oos_trades if min_oos_trades is not None else getattr(config, "wallet_min_oos_trades", cls.MIN_OOS_TRADES)
+        cfg_min_oos_win_rate = min_oos_win_rate_pct if min_oos_win_rate_pct is not None else getattr(config, "wallet_min_oos_win_rate_pct", cls.MIN_OOS_WIN_RATE_PCT)
+
         rejection_reasons: list[str] = []
         classification = WalletClassification.APPROVED
 
         # -------------------------------------------------------------
-        # 1. Evaluate Wash-Trading & Self-Funding Provenance (<= 3 hops)
+        # 1. Evaluate Wash-Trading & Self-Funding Provenance (<= max hops)
         # -------------------------------------------------------------
         insider_detected = False
         detected_hops: list[FundingHop] = list(funding_hops) if funding_hops else []
 
         if detected_hops:
             for hop in detected_hops:
-                if hop.hop_depth <= cls.MAX_FUNDING_HOPS:
+                if hop.hop_depth <= cfg_max_funding_hops:
                     if hop.is_deployer:
                         insider_detected = True
                         rejection_reasons.append(
@@ -151,12 +180,12 @@ class WalletEvaluator:
             active_days = 0.0
             days_since_last_active = 0.0
 
-        # Check for historical dormancy gap > 45 days inside trading history
+        # Check for historical dormancy gap inside trading history
         has_dormancy_gap = False
         sorted_trades = sorted(trades, key=lambda t: t.buy_timestamp)
         for i in range(1, len(sorted_trades)):
             gap_days = (sorted_trades[i].buy_timestamp - sorted_trades[i - 1].sell_timestamp) / 86400.0
-            if gap_days > cls.MAX_INACTIVE_DAYS_REVIVAL:
+            if gap_days > cfg_max_inactive_revival:
                 has_dormancy_gap = True
                 break
 
@@ -170,49 +199,68 @@ class WalletEvaluator:
         # -------------------------------------------------------------
         # 6. Apply Behavioral Filters & Classifications
         # -------------------------------------------------------------
-        if not insider_detected:
-            # Check Outlier Bias (> 60% PnL from one trade)
-            if outlier_pnl_ratio > cls.MAX_OUTLIER_PNL_RATIO:
+        # Circular wash trading check (evaluated first)
+        if not insider_detected and cls.detect_circular_wash_trading(wallet_address, trades):
+            classification = WalletClassification.CIRCULAR_WASH
+            rejection_reasons.append("Circular fund routing / mixer clustering detected")
+
+        if not insider_detected and classification == WalletClassification.APPROVED:
+            # Check Outlier Bias (> threshold of PnL from one trade, or profit entirely dependent on single trade)
+            if outlier_pnl_ratio > cfg_max_outlier_ratio:
                 classification = WalletClassification.LUCKY_OUTLIER
                 rejection_reasons.append(
                     f"Survivorship/Outlier bias: single trade contributed {outlier_pnl_ratio:.1%} "
-                    f"(> {cls.MAX_OUTLIER_PNL_RATIO:.0%}) of total lifetime PnL"
+                    f"(> {cfg_max_outlier_ratio:.0%}) of total lifetime PnL"
+                )
+            elif len(trades) >= 5 and total_pnl_usd > Decimal(0) and (total_pnl_usd - max_single_trade_pnl_usd) <= Decimal(0):
+                classification = WalletClassification.LUCKY_OUTLIER
+                rejection_reasons.append(
+                    f"Survivorship/Outlier bias: lifetime profitability entirely dependent on single lucky trade (PnL without top trade: ${float(total_pnl_usd - max_single_trade_pnl_usd):,.2f} <= $0)"
                 )
 
-            # Check Holding Time (< 45s MEV bot)
-            elif total_trades > 0 and median_holding_time < cls.MIN_MEDIAN_HOLDING_TIME_S:
+            # Check Holding Time (< 45s MEV bot) or ultra-fast holds (< 5s on multiple trades)
+            elif total_trades > 0 and (median_holding_time < cfg_min_median_hold_s or sum(1 for t in trades if t.holding_time_seconds < cls.MIN_HOLDING_TIME_SNIPER_S) >= max(3, int(total_trades * 0.25))):
                 classification = WalletClassification.MEV_BOT
                 rejection_reasons.append(
                     f"HFT/MEV Bot: median holding time {median_holding_time:.1f}s is < "
-                    f"{cls.MIN_MEDIAN_HOLDING_TIME_S:.1f}s (cannot replicate on free-tier RPC)"
+                    f"{cfg_min_median_hold_s:.1f}s or same-block execution detected"
                 )
 
-            # Check Dead-Wallet Revival (> 45 days dormant)
-            elif has_dormancy_gap or days_since_last_active > cls.MAX_INACTIVE_DAYS_REVIVAL:
-                classification = WalletClassification.DEAD_REVIVAL
-                dormant_val = max(days_since_last_active, 45.1)
-                rejection_reasons.append(
-                    f"Dead-wallet revival: dormant for > {cls.MAX_INACTIVE_DAYS_REVIVAL:.0f} days "
-                    f"({dormant_val:.1f}d) before sudden activity; possible sold/compromised private key"
-                )
+            # Check Copy-Trade Bot patterns: repetitive identical routes or latency delays
+            elif total_trades >= 5 and any(
+                str(t.custom_metadata.get("is_copy_bot", "")).lower() == "true" or
+                str(t.custom_metadata.get("bot_type", "")).lower() in ("copy_bot", "sniper_bot")
+                for t in trades
+            ):
+                classification = WalletClassification.MEV_BOT
+                rejection_reasons.append("Copy-trade bot / automated mirror bot pattern detected")
 
-            # Check Minimum Criteria
-            elif total_trades < cls.MIN_CLOSED_TRADES:
+            # Check Minimum Criteria (Insufficient data -> DEFERRED, not rejected)
+            elif total_trades < cfg_min_trades:
                 classification = WalletClassification.INSUFFICIENT_HISTORY
                 rejection_reasons.append(
-                    f"Insufficient closed trades: {total_trades} < {cls.MIN_CLOSED_TRADES}"
+                    f"Insufficient closed trades: {total_trades} < {cfg_min_trades}"
                 )
 
-            elif win_rate_pct < cls.MIN_WIN_RATE_PCT:
+            elif win_rate_pct < cfg_min_win_rate:
                 classification = WalletClassification.LOW_WIN_RATE
                 rejection_reasons.append(
-                    f"Low win rate: {win_rate_pct:.1f}% < {cls.MIN_WIN_RATE_PCT:.1f}%"
+                    f"Low win rate: {win_rate_pct:.1f}% < {cfg_min_win_rate:.1f}%"
                 )
 
-            elif active_days < cls.MIN_ACTIVE_DAYS:
+            elif active_days < cfg_min_active_days:
                 classification = WalletClassification.INSUFFICIENT_HISTORY
                 rejection_reasons.append(
-                    f"Active trading history too short: {active_days:.1f} days < {cls.MIN_ACTIVE_DAYS:.1f} days"
+                    f"Active trading history too short: {active_days:.1f} days < {cfg_min_active_days:.1f} days"
+                )
+
+            # Check Dead-Wallet Revival (> threshold days dormant)
+            elif has_dormancy_gap or days_since_last_active > cfg_max_inactive_revival:
+                classification = WalletClassification.DEAD_REVIVAL
+                dormant_val = max(days_since_last_active, cfg_max_inactive_revival + 0.1)
+                rejection_reasons.append(
+                    f"Dead-wallet revival: dormant for > {cfg_max_inactive_revival:.0f} days "
+                    f"({dormant_val:.1f}d) before sudden activity; possible sold/compromised private key"
                 )
 
             elif total_pnl_usd <= Decimal(0):
@@ -221,7 +269,7 @@ class WalletEvaluator:
                     f"Unprofitable lifetime PnL: ${total_pnl_usd:,.2f} <= $0"
                 )
 
-        # Single-developer volume concentration check (> 80%)
+        # Single-developer volume concentration check
         if not insider_detected and trades:
             total_vol = sum((t.invested_native for t in trades), Decimal(0))
             if total_vol > Decimal(0):
@@ -232,6 +280,36 @@ class WalletEvaluator:
                         (t.custom_metadata or {}).get("developer_address")
                         or (t.custom_metadata or {}).get("dev_wallet")
                         or (t.custom_metadata or {}).get("deployer_address")
+                    )
+                    if dev:
+                        has_dev_info = True
+                        dev_vols[dev.lower().strip()] += t.invested_native
+                if has_dev_info and dev_vols:
+                    max_dev_vol = max(dev_vols.values())
+                    if (max_dev_vol / total_vol) > Decimal(str(cfg_max_single_dev_vol)):
+                        classification = WalletClassification.INSIDER
+                        rejection_reasons.append(
+                            f"Single-developer token concentration: {float(max_dev_vol/total_vol):.1%} volume (> {cfg_max_single_dev_vol:.0%}) on single developer"
+                        )
+
+        # Circular wash trading check
+        if classification == WalletClassification.APPROVED and cls.detect_circular_wash_trading(wallet_address, trades):
+            classification = WalletClassification.CIRCULAR_WASH
+            rejection_reasons.append("Circular fund routing / mixer clustering detected")
+
+        # Out-of-sample consistency check (multiple-testing caution)
+        if classification == WalletClassification.APPROVED and len(trades) >= cfg_min_trades:
+            sorted_by_buy = sorted(trades, key=lambda t: t.buy_timestamp)
+            split_idx = int(len(sorted_by_buy) * cfg_oos_split_ratio)
+            oos_trades = sorted_by_buy[split_idx:]
+            if len(oos_trades) >= cfg_min_oos_trades:
+                oos_wins = sum(1 for t in oos_trades if t.is_win)
+                oos_wr = (oos_wins / len(oos_trades) * 100.0)
+                oos_pnl = sum((t.realized_pnl_usd for t in oos_trades), Decimal(0))
+                if oos_pnl <= Decimal(0) or oos_wr < cfg_min_oos_win_rate:
+                    classification = WalletClassification.LOW_WIN_RATE
+                    rejection_reasons.append(
+                        f"Out-of-sample consistency failure: OOS PnL=${float(oos_pnl):,.2f} <= 0 or OOS win rate {oos_wr:.1f}% < {cfg_min_oos_win_rate:.1f}%"
                     )
                     if dev:
                         has_dev_info = True
@@ -342,7 +420,7 @@ class WalletEvaluator:
             token_trade_counts[t.token_address] = token_trade_counts.get(t.token_address, 0) + 1
 
         for tok, count in token_trade_counts.items():
-            if count >= 6:
+            if count >= 4:
                 tok_trades = [t for t in trades if t.token_address == tok]
                 total_abs_pnl = sum(abs(t.realized_pnl_usd) for t in tok_trades)
                 if total_abs_pnl < Decimal("1.0"):

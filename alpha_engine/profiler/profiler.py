@@ -482,7 +482,7 @@ class SmartMoneyProfiler:
 
         # Filter candidate wallets by address format if chain is specified
         if chain == ChainIdentifier.BASE_MAINNET:
-            candidates = [c for c in candidates if c.startswith("0x") and len(c) == 42]
+            candidates = [c for c in candidates if c.startswith("0x") and 40 <= len(c) <= 46]
         elif chain == ChainIdentifier.SOLANA_MAINNET:
             candidates = [c for c in candidates if 32 <= len(c) <= 44 and not c.startswith("0x")]
 

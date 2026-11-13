@@ -50,6 +50,7 @@ class DashboardTelemetryAggregator:
         staging_buffer: Optional[Any] = None,
         wallet_tracker: Optional[Any] = None,
         whitelist_db: Optional[Any] = None,
+        wallet_pipeline: Optional[Any] = None,
     ) -> None:
         self.runner = engine_runner
         self.strategy_manager = strategy_manager
@@ -63,6 +64,7 @@ class DashboardTelemetryAggregator:
         self.rpc_monitor = rpc_health_monitor
         self.wallet_tracker = wallet_tracker
         self.whitelist_db = whitelist_db
+        self.wallet_pipeline = wallet_pipeline
 
         self.start_time: float = time.time()
         self._last_metrics_cache: dict[str, Any] = {}
@@ -1482,6 +1484,22 @@ class DashboardTelemetryAggregator:
                     all_ok = sol_res.status == NativePriceStatus.OK and eth_res.status == NativePriceStatus.OK
                     native_prices_info["status"] = "OK" if all_ok else "DEGRADED"
 
+            # Smart Money Pipeline metrics
+            wallet_pipeline_metrics: dict[str, Any] = {}
+            w_pipe = None
+            if hasattr(self, "wallet_pipeline") and self.wallet_pipeline:
+                w_pipe = self.wallet_pipeline
+            elif self.runner and hasattr(self.runner, "wallet_pipeline") and self.runner.wallet_pipeline:
+                w_pipe = self.runner.wallet_pipeline
+            elif self.runner and hasattr(self.runner, "_wallet_pipeline") and self.runner._wallet_pipeline:
+                w_pipe = self.runner._wallet_pipeline
+
+            if w_pipe and hasattr(w_pipe, "get_metrics"):
+                try:
+                    wallet_pipeline_metrics = w_pipe.get_metrics()
+                except Exception as w_exc:
+                    logger.debug("Failed querying wallet pipeline metrics: %s", w_exc)
+
             snapshot = {
                 "system": sys_info,
                 "connections": conn_health,
@@ -1497,6 +1515,8 @@ class DashboardTelemetryAggregator:
                 "swarm": swarm_info,
                 "alerts": alerts,
                 "native_prices": native_prices_info,
+                "smart_wallet_pipeline": wallet_pipeline_metrics,
+                "wallet_pipeline": wallet_pipeline_metrics,
                 "timestamp": time.time(),
             }
             self._last_metrics_cache = snapshot
@@ -1909,6 +1929,21 @@ class DashboardTelemetryAggregator:
             else 75.0
         )
 
+        pipe_metrics: dict[str, Any] = {}
+        w_pipe = None
+        if hasattr(self, "wallet_pipeline") and self.wallet_pipeline:
+            w_pipe = self.wallet_pipeline
+        elif self.runner and hasattr(self.runner, "wallet_pipeline") and self.runner.wallet_pipeline:
+            w_pipe = self.runner.wallet_pipeline
+        elif self.runner and hasattr(self.runner, "_wallet_pipeline") and self.runner._wallet_pipeline:
+            w_pipe = self.runner._wallet_pipeline
+
+        if w_pipe and hasattr(w_pipe, "get_metrics"):
+            try:
+                pipe_metrics = w_pipe.get_metrics()
+            except Exception as w_exc:
+                logger.debug("Failed querying wallet pipeline metrics for wallets overview: %s", w_exc)
+
         return {
             "tracked": tracked_list,
             "discovered": discovered_list,
@@ -1917,6 +1952,13 @@ class DashboardTelemetryAggregator:
                 "total_discovered": total_discovered,
                 "avg_win_rate_pct": round(avg_wr, 1),
                 "global_copy_trading": global_copy,
+                "pipeline": pipe_metrics,
+                "candidates_count": pipe_metrics.get("candidates_count", 0),
+                "queue_depth": pipe_metrics.get("queue_depth", 0),
+                "whitelisted_count": pipe_metrics.get("whitelisted_count", 0),
+                "evaluations_per_hour": pipe_metrics.get("evaluations_per_hour", 0.0),
+                "quota_usage_pct": pipe_metrics.get("quota_usage_pct", 0.0),
+                "signals_emitted": pipe_metrics.get("signals_emitted", 0),
             },
         }
 
