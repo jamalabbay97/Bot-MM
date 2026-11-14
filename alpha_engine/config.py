@@ -267,8 +267,13 @@ class EngineConfig(BaseSettings):
         description="Bayesian shrinkage prior pseudo-observations weight for council agent adaptation",
     )
     model_aliases: dict[str, str] = Field(
-        default_factory=dict,
-        description="Explicit mapping of model aliases to canonical provider model names (empty by default)",
+        default_factory=lambda: {
+            "gemini-3.6-flash": "gemini-3.8-flash",
+            "gpt-5.6": "gpt-5.6-mini",
+            "o3": "o3-mini",
+            "claude-4.5-sonnet": "claude-4.5-sonnet-latest",
+        },
+        description="Explicit mapping of model aliases to canonical provider model names",
     )
 
 

@@ -554,7 +554,7 @@ class AlphaSupervisorAI:
         """Honor configured model name exactly, applying only explicit aliases if configured."""
         m = (model_val or "").strip()
         p = provider.lower()
-        if not m or m in ("default", "auto", ""):
+        if not m or m in ("default", "auto", "") or (p != "gemini" and m == "gemini-3.8-flash"):
             return self._get_default_model_for_provider(p)
         aliases = getattr(self._cfg, "model_aliases", {}) or {}
         if m in aliases:

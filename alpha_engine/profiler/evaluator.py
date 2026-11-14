@@ -311,21 +311,6 @@ class WalletEvaluator:
                     rejection_reasons.append(
                         f"Out-of-sample consistency failure: OOS PnL=${float(oos_pnl):,.2f} <= 0 or OOS win rate {oos_wr:.1f}% < {cfg_min_oos_win_rate:.1f}%"
                     )
-                    if dev:
-                        has_dev_info = True
-                        dev_vols[dev.lower().strip()] += t.invested_native
-                if has_dev_info and dev_vols:
-                    max_dev_vol = max(dev_vols.values())
-                    if (max_dev_vol / total_vol) > Decimal(str(cls.MAX_SINGLE_DEV_VOLUME_RATIO)):
-                        classification = WalletClassification.INSIDER
-                        rejection_reasons.append(
-                            f"Single-developer token concentration: {float(max_dev_vol/total_vol):.1%} volume (> {cls.MAX_SINGLE_DEV_VOLUME_RATIO:.0%}) on single developer"
-                        )
-
-        # Circular wash trading check
-        if classification == WalletClassification.APPROVED and cls.detect_circular_wash_trading(wallet_address, trades):
-            classification = WalletClassification.CIRCULAR_WASH
-            rejection_reasons.append("Circular fund routing / mixer clustering detected")
 
         # Smart Money Score formula:
         # S_wallet = (WinRate * 0.4) + (SharpeRatio * 0.3) + (HoldingDiscipline * 0.2) + (Longevity * 0.1)

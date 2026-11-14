@@ -132,7 +132,7 @@ class CouncilArbiterCRO:
                 if saved:
                     self.council_weights.update(saved)
             except Exception as w_err:
-                logger.debug("Could not load council weights from ledger: %s", w_err)
+                logger.warning("Could not load council weights from ledger: %s", w_err, exc_info=True)
 
         async with tracer.span(
             token_address=token_ca,
@@ -204,7 +204,7 @@ class CouncilArbiterCRO:
                         debate_transcript.append("─── 🧠 RUFLO INTELLIGENCE PIPELINE: HISTORICAL PRECEDENTS ───")
                         debate_transcript.append(f"🔍 {memory_summary}")
                 except Exception as mem_err:
-                    logger.debug("Episodic memory query error: %s", mem_err)
+                    logger.warning("Episodic memory query error: %s", mem_err, exc_info=True)
 
             # =========================================================================
             # ROUND 1: Independent Initial Evaluations (conditioned on Shared Memory)
@@ -670,7 +670,7 @@ class CouncilArbiterCRO:
                         "timestamp_ns": time.time_ns(),
                     })
                 except Exception as log_err:
-                    logger.debug("Failed to record council deliberation to ledger: %s", log_err)
+                    logger.warning("Failed to record council deliberation to ledger: %s", log_err, exc_info=True)
 
             if should_buy:
                 trace_event.status = TraceStatus.PASSED
@@ -780,7 +780,7 @@ class CouncilArbiterCRO:
             try:
                 await self.episodic_memory.record_episode(ep)
             except Exception as ep_err:
-                logger.debug("Failed writing post-mortem episode to memory: %s", ep_err)
+                logger.error("Failed writing post-mortem episode to memory: %s", ep_err, exc_info=True)
 
         # Persist updated weights and performance to SQLite ledger
         if self.ledger and hasattr(self.ledger, "save_council_agent_weights"):
@@ -790,7 +790,7 @@ class CouncilArbiterCRO:
                     performance=self._agent_performance,
                 )
             except Exception as s_err:
-                logger.debug("Failed persisting council agent weights to ledger: %s", s_err)
+                logger.error("Failed persisting council agent weights to ledger: %s", s_err, exc_info=True)
 
     async def get_council_weights(self) -> dict[str, float]:
         """Return current normalized council agent weights."""

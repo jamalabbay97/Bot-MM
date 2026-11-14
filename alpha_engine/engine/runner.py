@@ -314,6 +314,7 @@ class PaperTradingEngine:
             db_path=getattr(config, "db_path", "paper_trading.db"),
             dedupe_cooldown_s=float(getattr(config, "wallet_dedupe_cooldown_s", 60.0)),
             re_eval_interval_s=float(getattr(config, "wallet_re_eval_interval_s", 1800.0)),
+            price_service=self._native_price_service,
         )
 
         # Ruflo Multi-Agent Swarm Orchestrator

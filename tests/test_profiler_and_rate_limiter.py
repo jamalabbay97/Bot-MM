@@ -437,7 +437,7 @@ def test_wallet_profiler_approved_whitelist():
             # 20 trades, 14 wins (70% win rate), span 25 days, holding time 600s, balanced PnL
             trades = []
             for i in range(20):
-                is_win = (i < 14)
+                is_win = (i not in (3, 7, 10, 13, 16, 19))
                 pnl = Decimal("150") if is_win else Decimal("-50")
                 t_buy = now - int((26 - i * (25.0 / 19.0)) * 86400)
                 trades.append(

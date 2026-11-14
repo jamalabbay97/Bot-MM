@@ -314,8 +314,7 @@ def test_instant_trade_execution_endpoints():
     assert "Unsupported side" in res_bad_side.json()["message"]
 
 
-@pytest.mark.asyncio
-async def test_smart_wallet_endpoints():
+def test_smart_wallet_endpoints():
     agg = DashboardTelemetryAggregator()
     app = create_app(agg)
     client = TestClient(app)

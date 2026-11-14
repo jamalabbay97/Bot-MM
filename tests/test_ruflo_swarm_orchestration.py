@@ -235,6 +235,7 @@ async def test_ruflo_tool_and_agent_registries():
 # 4. Specialized Swarm Agents Tests
 # =========================================================================
 
+@pytest.mark.timeout(30)
 @pytest.mark.asyncio
 async def test_specialized_agents_lifecycle_and_tools(test_config, temp_db):
     """Test all 6 specialized agents' initialization, tool registration, and handlers."""
@@ -353,6 +354,7 @@ async def test_specialized_agents_lifecycle_and_tools(test_config, temp_db):
 # 5. Ruflo Swarm Coordinator & Multi-Agent Consensus
 # =========================================================================
 
+@pytest.mark.timeout(30)
 @pytest.mark.asyncio
 async def test_ruflo_swarm_coordinator_consensus_flow(test_config):
     """Test full multi-agent consensus trade execution from scouting to execution."""

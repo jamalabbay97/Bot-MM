@@ -199,8 +199,16 @@ class WalkForwardBacktester:
                     p_res = self.cost_model._price_service.get_price(chain_enum)
                     if getattr(p_res, "price", None):
                         native_price = float(p_res.price)
+                if not native_price and getattr(self.config, "allow_static_native_prices", False):
+                    static_p = (
+                        self.config.sol_price_usd
+                        if chain_enum == ChainIdentifier.SOLANA_MAINNET
+                        else self.config.eth_price_usd
+                    )
+                    if static_p is not None:
+                        native_price = float(static_p)
                 if not native_price:
-                    native_price = float(getattr(self.config, "sol_price_usd", 200.0)) if chain_enum == ChainIdentifier.SOLANA_MAINNET else float(getattr(self.config, "eth_price_usd", 2600.0))
+                    native_price = 1.0
 
                 cost_usd = nat_val * native_price
                 if cost_usd <= 0.0:

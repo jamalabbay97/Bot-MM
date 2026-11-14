@@ -97,17 +97,25 @@ class ReplayResult:
 class ReplayNativePriceService:
     """Mock/Replay price service driven strictly by recorded native price ticks."""
 
-    def __init__(self, default_sol: Decimal = Decimal("200.0"), default_eth: Decimal = Decimal("2600.0")) -> None:
-        self._prices: Dict[ChainIdentifier, Decimal] = {
-            ChainIdentifier.SOLANA_MAINNET: default_sol,
-            ChainIdentifier.BASE_MAINNET: default_eth,
-        }
+    def __init__(self, default_sol: Optional[Decimal] = None, default_eth: Optional[Decimal] = None) -> None:
+        self._prices: Dict[ChainIdentifier, Decimal] = {}
+        if default_sol is not None:
+            self._prices[ChainIdentifier.SOLANA_MAINNET] = default_sol
+        if default_eth is not None:
+            self._prices[ChainIdentifier.BASE_MAINNET] = default_eth
 
     def set_price(self, chain: ChainIdentifier, price: Decimal) -> None:
         self._prices[chain] = price
 
     def get_price(self, chain: ChainIdentifier) -> PriceResult:
-        p = self._prices.get(chain, Decimal("200.0"))
+        p = self._prices.get(chain)
+        if p is None:
+            return PriceResult(
+                price=None,
+                age_s=0.0,
+                status=NativePriceStatus.STALE,
+                source="replay_recorder",
+            )
         return PriceResult(
             price=p,
             age_s=0.0,
@@ -142,7 +150,17 @@ class ReplayEngine:
 
         self._rng = random.Random(self.seed)
         self._pool_registry = PoolRegistry()
-        self._price_service = ReplayNativePriceService()
+        def_sol = (
+            self.config.sol_price_usd
+            if getattr(self.config, "allow_static_native_prices", False)
+            else None
+        )
+        def_eth = (
+            self.config.eth_price_usd
+            if getattr(self.config, "allow_static_native_prices", False)
+            else None
+        )
+        self._price_service = ReplayNativePriceService(default_sol=def_sol, default_eth=def_eth)
         self._position_book = PositionBook()
         self._cost_model = TradeCostModel(config=self.config, price_service=self._price_service)
 

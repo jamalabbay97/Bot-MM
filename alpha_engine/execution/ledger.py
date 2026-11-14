@@ -380,6 +380,7 @@ class SQLiteLedger:
         self._jsonl_path = Path(jsonl_path) if jsonl_path else Path(self._db_path).with_suffix(".jsonl")
         self._conn: aiosqlite.Connection | None = None
         self._lock = AsyncRLock()
+        self._pending_tasks: list[asyncio.Task[Any]] = []
 
     async def __aenter__(self) -> "SQLiteLedger":
         self._conn = await asyncio.wait_for(
@@ -414,6 +415,11 @@ class SQLiteLedger:
                 logger.warning("WAL checkpoint failed: %s", exc)
 
     async def __aexit__(self, *_: object) -> None:
+        if hasattr(self, "_pending_tasks") and self._pending_tasks:
+            pending = [t for t in self._pending_tasks if not t.done()]
+            if pending:
+                await asyncio.gather(*pending, return_exceptions=True)
+            self._pending_tasks.clear()
         if self._conn:
             await self.checkpoint(mode="PASSIVE")
             await self._conn.close()

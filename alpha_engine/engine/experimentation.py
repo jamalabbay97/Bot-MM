@@ -1891,7 +1891,7 @@ class AutonomousStrategyGenerator:
         registry: StrategyTournamentRegistry,
         backtester: Optional[Any] = None,
         parent_ids: Optional[list[str]] = None,
-        action: str = "mutation",
+        action: str = "seed_archetype",
         changes: Optional[dict[str, Any]] = None,
     ) -> dict[str, Any]:
         """
@@ -1966,13 +1966,13 @@ class AutonomousStrategyGenerator:
             regime=regime,
         )
 
-        if action == "seed_archetype" or qualified:  # Only stage if qualified by out-of-sample backtest or seed
+        if action in ("seed_archetype", "seed") or qualified:  # Only stage if qualified by out-of-sample backtest or seed
             registry.register_challenger(variant)
 
         report = {
             "strategy_name": candidate_params.strategy_name,
             "experiment_id": experiment_id,
-            "qualified_for_shadow": qualified or (action == "seed_archetype"),
+            "qualified_for_shadow": qualified or (action in ("seed_archetype", "seed")),
             "is_promotable": result.is_promotable,
             "perturbation_robust": is_robust,
             "rejections": result.rejection_reasons,
@@ -2011,15 +2011,17 @@ class AutonomousStrategyGenerator:
                         parameters_json=candidate_params.to_dict(),
                         train_metrics_json=train_m,
                         val_metrics_json=val_m,
-                        staged=qualified or result.total_trades >= 10,
+                        staged=qualified or (action in ("seed_archetype", "seed")) or result.total_trades >= 10,
                     )
                     try:
                         loop = asyncio.get_running_loop()
                         self._last_log_task = loop.create_task(coro)
+                        if hasattr(self.ledger, "_pending_tasks"):
+                            self.ledger._pending_tasks.append(self._last_log_task)
                     except RuntimeError:
                         asyncio.run(coro)
                 except Exception as log_exc:
-                    logger.debug("Failed to record strategy generation log: %s", log_exc)
+                    logger.error("Failed to record strategy generation log: %s", log_exc, exc_info=True)
 
             if hasattr(self.ledger, "record_strategy_experiment"):
                 try:
@@ -2039,11 +2041,13 @@ class AutonomousStrategyGenerator:
                     )
                     try:
                         loop = asyncio.get_running_loop()
-                        loop.create_task(coro2)
+                        t2 = loop.create_task(coro2)
+                        if hasattr(self.ledger, "_pending_tasks"):
+                            self.ledger._pending_tasks.append(t2)
                     except RuntimeError:
                         asyncio.run(coro2)
                 except Exception as exc:
-                    logger.debug("Failed to log auto experiment to ledger: %s", exc)
+                    logger.error("Failed to log auto experiment to ledger: %s", exc, exc_info=True)
 
         logger.info(
             "AutonomousStrategyGenerator: Evaluated %s -> Qualified=%s (PF=%.2f, Sortino=%.2f, DD=%.1f%%, Rejections=%s)",

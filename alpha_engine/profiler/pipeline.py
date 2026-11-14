@@ -66,11 +66,13 @@ class SmartMoneyPipeline:
         evaluator: Optional[WalletEvaluator] = None,
         dedupe_cooldown_s: Optional[float] = None,
         re_eval_interval_s: Optional[float] = None,
+        price_service: Optional[Any] = None,
     ) -> None:
         self.config = config or EngineConfig()
         self.db_path = db_path
         self._lock = AsyncRLock()
         self._conn: Optional[aiosqlite.Connection] = None
+        self.price_service = price_service
 
         self.whitelist_db = whitelist_db or WhitelistDatabase(db_path=db_path)
         self.history_db = history_db or WalletHistoryDatabase(db_path=db_path)
@@ -698,10 +700,21 @@ class SmartMoneyPipeline:
 
         sig_mcap = None
         if pool_st is not None:
-            base_p = Decimal("3000.0") if chain == ChainIdentifier.BASE_MAINNET else Decimal("200.0")
-            sig_mcap = pool_st.calculate_market_cap_usd(native_price_usd=base_p)
-        if sig_mcap is None or sig_mcap <= Decimal(0):
-            sig_mcap = Decimal("50000.0")
+            base_p = None
+            if self.price_service is not None:
+                p_res = self.price_service.get_price(chain)
+                if p_res and getattr(p_res, "price", None):
+                    base_p = p_res.price
+            elif getattr(self.config, "allow_static_native_prices", False):
+                base_p = (
+                    self.config.sol_price_usd
+                    if chain == ChainIdentifier.SOLANA_MAINNET
+                    else self.config.eth_price_usd
+                )
+            if base_p is not None:
+                sig_mcap = pool_st.calculate_market_cap_usd(native_price_usd=base_p)
+        if sig_mcap is not None and sig_mcap <= Decimal(0):
+            sig_mcap = None
 
         if sec_report is None:
             sec_report = SecurityReport(
